@@ -49,8 +49,12 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Core resources
   - apiGroups: [""]
-    resources: ["configmaps", "secrets", "services", "serviceaccounts", "namespaces", "nodes"]
+    resources: ["configmaps", "secrets", "services", "serviceaccounts"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read-only: namespace labels (webhook) and node count (SNO detection)
+  - apiGroups: [""]
+    resources: ["namespaces", "nodes"]
+    verbs: ["get", "list", "watch"]
   # OpenShift routes
   - apiGroups: ["route.openshift.io"]
     resources: ["routes"]
