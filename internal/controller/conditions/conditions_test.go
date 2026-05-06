@@ -195,6 +195,35 @@ func TestAggregateReady_MixedNotConfiguredAndFailing(t *testing.T) {
 	}
 }
 
+// TestAggregateReady_ConfiguredFeatureInitializing: a configured feature still
+// in Unknown state should produce Ready=Unknown, Degraded=False.
+func TestAggregateReady_ConfiguredFeatureInitializing(t *testing.T) {
+	cm := NewConditionsManager(1)
+	cm.MarkTrue(ConditionMonitoringAvailable)
+
+	// MonitoringStackAvailable stays Unknown (default from NewConditionsManager)
+	// to simulate a configured feature that hasn't finished initializing yet.
+	// Mark everything else as not configured.
+	cm.MarkFalse(ConditionThanosQuerierAvailable, MetricsNotConfiguredReason, MetricsNotConfiguredMessage)
+	cm.MarkFalse(ConditionTempoAvailable, TracesNotConfiguredReason, TracesNotConfiguredMessage)
+	cm.MarkFalse(ConditionInstrumentationAvailable, TracesNotConfiguredReason, TracesNotConfiguredMessage)
+	cm.MarkFalse(ConditionOpenTelemetryCollectorAvailable, MetricsAndTracesNotConfiguredReason, MetricsAndTracesNotConfiguredMessage)
+	cm.MarkFalse(ConditionAlertingAvailable, AlertingNotConfiguredReason, AlertingNotConfiguredMessage)
+	cm.MarkFalse(ConditionPersesAvailable, MetricsAndTracesNotConfiguredReason, MetricsAndTracesNotConfiguredMessage)
+	cm.MarkFalse(ConditionPersesTempoDataSourceAvailable, TracesNotConfiguredReason, TracesNotConfiguredMessage)
+	cm.MarkFalse(ConditionPersesPrometheusDataSourceAvailable, MetricsNotConfiguredReason, MetricsNotConfiguredMessage)
+	cm.MarkFalse(ConditionNodeMetricsEndpointAvailable, MetricsNotConfiguredReason, MetricsNotConfiguredMessage)
+
+	cm.AggregateReady()
+
+	if got := ready(cm); got != metav1.ConditionUnknown {
+		t.Errorf("Ready: want Unknown, got %s", got)
+	}
+	if got := degraded(cm); got != metav1.ConditionFalse {
+		t.Errorf("Degraded: want False, got %s", got)
+	}
+}
+
 // TestPhase_Ready: Phase() returns PhaseReady when Ready=True.
 func TestPhase_Ready(t *testing.T) {
 	cm := NewConditionsManager(1)
