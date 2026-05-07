@@ -7,7 +7,7 @@ metadata:
     {{- include "odh-observability.labels" . | nindent 4 }}
   {{- if .Values.certManager.enabled }}
   annotations:
-    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/{{ .Values.certManager.certificateName }}
+    cert-manager.io/inject-ca-from: {{ .Values.operatorNamespace }}/{{ .Values.certManager.certificateName }}
   {{- end }}
 webhooks:
   - name: podmonitor-injector.opendatahub.io
@@ -15,7 +15,7 @@ webhooks:
     clientConfig:
       service:
         name: {{ include "odh-observability.fullname" . }}-webhook
-        namespace: {{ .Release.Namespace }}
+        namespace: {{ .Values.operatorNamespace }}
         path: /mutate-prometheus-monitors
         port: {{ .Values.webhook.port }}
     failurePolicy: Fail
@@ -24,7 +24,7 @@ webhooks:
         - key: kubernetes.io/metadata.name
           operator: NotIn
           values:
-            - {{ .Release.Namespace }}
+            - {{ .Values.operatorNamespace }}
             - kube-system
     rules:
       - apiGroups: ["monitoring.coreos.com"]
@@ -38,7 +38,7 @@ webhooks:
     clientConfig:
       service:
         name: {{ include "odh-observability.fullname" . }}-webhook
-        namespace: {{ .Release.Namespace }}
+        namespace: {{ .Values.operatorNamespace }}
         path: /mutate-prometheus-monitors
         port: {{ .Values.webhook.port }}
     failurePolicy: Fail
@@ -47,7 +47,7 @@ webhooks:
         - key: kubernetes.io/metadata.name
           operator: NotIn
           values:
-            - {{ .Release.Namespace }}
+            - {{ .Values.operatorNamespace }}
             - kube-system
     rules:
       - apiGroups: ["monitoring.coreos.com"]
@@ -61,7 +61,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "odh-observability.fullname" . }}-webhook
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ .Values.operatorNamespace }}
   labels:
     {{- include "odh-observability.labels" . | nindent 4 }}
 spec:

@@ -12,10 +12,21 @@ rules:
   - apiGroups: ["services.platform.opendatahub.io"]
     resources: ["monitorings/status", "monitorings/finalizers"]
     verbs: ["get", "update", "patch"]
-  # COO / Prometheus
+  # COO / Prometheus (RHOBS API group)
   - apiGroups: ["monitoring.rhobs"]
     resources: ["monitoringstacks", "thanosqueriers", "servicemonitors", "prometheusrules"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Upstream Prometheus Operator (granted via cluster-monitoring-view binding)
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["prometheuses/api"]
+    verbs: ["get", "create", "update"]
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["podmonitors", "servicemonitors", "probes"]
+    verbs: ["get", "list", "watch"]
+  # OpenShift infrastructure (SNO detection + granted via generate-processors-role)
+  - apiGroups: ["config.openshift.io"]
+    resources: ["infrastructures", "infrastructures/status", "endpoints", "pods", "namespaces", "services"]
+    verbs: ["get", "list", "watch"]
   # Tempo
   - apiGroups: ["tempo.grafana.com"]
     resources: ["tempomonolithics", "tempostacks"]
@@ -40,9 +51,9 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Workloads
+  # Workloads (deployments for direct use; replicasets granted via generate-processors-role)
   - apiGroups: ["apps"]
-    resources: ["deployments"]
+    resources: ["deployments", "replicasets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
@@ -51,9 +62,16 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps", "secrets", "services", "serviceaccounts"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  # Read-only: namespace labels (webhook) and node count (SNO detection)
+  # Read-only: granted via generate-processors-role for collector RBAC
   - apiGroups: [""]
-    resources: ["namespaces", "nodes"]
+    resources: ["endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["namespaces", "nodes", "nodes/metrics", "infrastructures", "infrastructures/status"]
+    verbs: ["get", "list", "watch"]
+  # Endpoint discovery (granted via generate-processors-role)
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
   # OpenShift routes
   - apiGroups: ["route.openshift.io"]
@@ -71,6 +89,16 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Auth delegation (needed to grant RBAC for auth-delegator bindings)
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+  # Non-resource URLs (granted via collector RBAC for k8s API discovery)
+  - nonResourceURLs: ["/api", "/metrics", "/apis/*"]
+    verbs: ["get"]
   # Events
   - apiGroups: [""]
     resources: ["events"]
@@ -89,4 +117,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: {{ include "odh-observability.fullname" . }}
-    namespace: {{ .Release.Namespace }}
+    namespace: {{ .Values.operatorNamespace }}
