@@ -19,10 +19,8 @@ limitations under the License.
 package conditions
 
 import (
-	"sort"
-	"time"
-
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	libconditions "github.com/opendatahub-io/odh-platform-utilities/pkg/controller/conditions"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -65,12 +63,12 @@ const (
 
 // Reason constants.
 const (
-	MissingOperatorReason                    = "MissingOperator"
-	MetricsNotConfiguredReason               = "MetricsNotConfigured"
-	TracesNotConfiguredReason                = "TracesNotConfigured"
-	AlertingNotConfiguredReason              = "AlertingNotConfigured"
-	MetricsAndTracesNotConfiguredReason      = "MetricsAndTracesNotConfigured"
-	MetricsAndTracesNotConfiguredMessage     = "Metrics and traces are not configured in Monitoring CR"
+	MissingOperatorReason                = "MissingOperator"
+	MetricsNotConfiguredReason           = "MetricsNotConfigured"
+	TracesNotConfiguredReason            = "TracesNotConfigured"
+	AlertingNotConfiguredReason          = "AlertingNotConfigured"
+	MetricsAndTracesNotConfiguredReason  = "MetricsAndTracesNotConfigured"
+	MetricsAndTracesNotConfiguredMessage = "Metrics and traces are not configured in Monitoring CR"
 )
 
 // Message constants.
@@ -79,85 +77,83 @@ const (
 	TracesNotConfiguredMessage   = "Traces not configured in Monitoring CR"
 	AlertingNotConfiguredMessage = "Alerting not configured in Monitoring CR"
 
-	TempoOperatorMissingMessage                  = "Tempo operator must be installed for traces configuration"
-	COOMissingMessage                            = "ClusterObservability operator must be installed for metrics configuration"
+	TempoOperatorMissingMessage                 = "Tempo operator must be installed for traces configuration"
+	COOMissingMessage                           = "ClusterObservability operator must be installed for metrics configuration"
 	OpenTelemetryCollectorOperatorMissingMessage = "OpenTelemetryCollector operator must be installed for OpenTelemetry configuration"
 )
 
-// allConditionTypes lists all condition types managed by this controller.
-// The ConditionsManager initialises these to Unknown on each reconcile.
-var allConditionTypes = []string{
-	string(platformcommon.ConditionTypeReady),
-	string(platformcommon.ConditionTypeProvisioningSucceeded),
-	string(platformcommon.ConditionTypeDegraded),
-	ConditionMonitoringAvailable,
-	ConditionMonitoringStackAvailable,
-	ConditionThanosQuerierAvailable,
-	ConditionTempoAvailable,
-	ConditionInstrumentationAvailable,
-	ConditionOpenTelemetryCollectorAvailable,
-	ConditionAlertingAvailable,
-	ConditionPersesAvailable,
-	ConditionPersesTempoDataSourceAvailable,
-	ConditionPersesPrometheusDataSourceAvailable,
-	ConditionNodeMetricsEndpointAvailable,
+// featureConditionTypes lists the feature-specific condition types that
+// participate in the Ready/Degraded aggregation.
+var featureConditionTypes = map[string]bool{
+	ConditionMonitoringStackAvailable:           true,
+	ConditionThanosQuerierAvailable:             true,
+	ConditionTempoAvailable:                     true,
+	ConditionInstrumentationAvailable:           true,
+	ConditionOpenTelemetryCollectorAvailable:     true,
+	ConditionAlertingAvailable:                  true,
+	ConditionPersesAvailable:                    true,
+	ConditionPersesTempoDataSourceAvailable:     true,
+	ConditionPersesPrometheusDataSourceAvailable: true,
+	ConditionNodeMetricsEndpointAvailable:        true,
 }
 
 // ConditionsManager manages the set of conditions for a Monitoring CR reconcile cycle.
+// It operates directly on the CR's status via ConditionsAccessor, ensuring proper
+// LastTransitionTime handling across reconciles.
 type ConditionsManager struct {
-	conditions map[string]platformcommon.Condition
+	accessor   platformcommon.ConditionsAccessor
 	generation int64
 }
 
-// NewConditionsManager creates a ConditionsManager with all conditions initialised to Unknown.
-func NewConditionsManager(generation int64) *ConditionsManager {
-	cm := &ConditionsManager{
-		conditions: make(map[string]platformcommon.Condition, len(allConditionTypes)),
+// NewConditionsManager creates a ConditionsManager bound to the given accessor.
+func NewConditionsManager(accessor platformcommon.ConditionsAccessor, generation int64) *ConditionsManager {
+	return &ConditionsManager{
+		accessor:   accessor,
 		generation: generation,
 	}
-	for _, ct := range allConditionTypes {
-		cm.set(platformcommon.Condition{
-			Type:               ct,
-			Status:             metav1.ConditionUnknown,
-			Reason:             "Initializing",
-			Message:            "",
-			LastTransitionTime: metav1.NewTime(time.Now()),
-			ObservedGeneration: generation,
-		})
-	}
-	return cm
 }
 
 // MarkTrue sets a condition to True.
 func (cm *ConditionsManager) MarkTrue(condType string) {
-	cm.set(platformcommon.Condition{
+	libconditions.SetStatusCondition(cm.accessor, platformcommon.Condition{
 		Type:               condType,
 		Status:             metav1.ConditionTrue,
 		Reason:             "Available",
-		LastTransitionTime: metav1.NewTime(time.Now()),
 		ObservedGeneration: cm.generation,
 	})
 }
 
 // MarkFalse sets a condition to False with the given reason and message.
 func (cm *ConditionsManager) MarkFalse(condType, reason, message string) {
-	cm.set(platformcommon.Condition{
+	libconditions.SetStatusCondition(cm.accessor, platformcommon.Condition{
 		Type:               condType,
 		Status:             metav1.ConditionFalse,
 		Reason:             reason,
 		Message:            message,
-		LastTransitionTime: metav1.NewTime(time.Now()),
+		ObservedGeneration: cm.generation,
+	})
+}
+
+// MarkNotConfigured sets a condition to False with ConditionSeverityInfo,
+// indicating the feature is intentionally not configured by the user.
+// Info-severity conditions are excluded from Degraded aggregation.
+func (cm *ConditionsManager) MarkNotConfigured(condType, reason, message string) {
+	libconditions.SetStatusCondition(cm.accessor, platformcommon.Condition{
+		Type:               condType,
+		Status:             metav1.ConditionFalse,
+		Reason:             reason,
+		Message:            message,
+		Severity:           platformcommon.ConditionSeverityInfo,
 		ObservedGeneration: cm.generation,
 	})
 }
 
 // MarkUnknown sets a condition to Unknown.
 func (cm *ConditionsManager) MarkUnknown(condType string) {
-	cm.set(platformcommon.Condition{
+	libconditions.SetStatusCondition(cm.accessor, platformcommon.Condition{
 		Type:               condType,
 		Status:             metav1.ConditionUnknown,
 		Reason:             "Progressing",
-		LastTransitionTime: metav1.NewTime(time.Now()),
 		ObservedGeneration: cm.generation,
 	})
 }
@@ -165,17 +161,15 @@ func (cm *ConditionsManager) MarkUnknown(condType string) {
 // AggregateReady computes and sets the Ready, ProvisioningSucceeded, and Degraded
 // top-level conditions based on the monitoring-specific conditions.
 //
-// Conditions that are False because a feature is deliberately not configured
-// (MetricsNotConfigured, TracesNotConfigured, etc.) are excluded from Degraded
-// aggregation — they represent user intent, not failures.
+// Conditions with ConditionSeverityInfo (intentionally not configured features)
+// are excluded from Degraded aggregation — they represent user intent, not failures.
 //
 // Ready = True when MonitoringAvailable is True and no configured feature is actively failing.
 // ProvisioningSucceeded = True when MonitoringAvailable is True (manifests applied without error).
 // Degraded = True when a configured feature is failing (CRD missing, operator unavailable, etc.).
 func (cm *ConditionsManager) AggregateReady() {
-	// MonitoringAvailable must be True for provisioning to succeed.
-	monAvail, ok := cm.conditions[ConditionMonitoringAvailable]
-	if !ok || monAvail.Status != metav1.ConditionTrue {
+	monAvail := libconditions.FindStatusCondition(cm.accessor, ConditionMonitoringAvailable)
+	if monAvail == nil || monAvail.Status != metav1.ConditionTrue {
 		cm.MarkFalse(string(platformcommon.ConditionTypeProvisioningSucceeded),
 			"PreconditionsFailed", "Required operators are not installed")
 		cm.MarkFalse(string(platformcommon.ConditionTypeReady),
@@ -184,39 +178,16 @@ func (cm *ConditionsManager) AggregateReady() {
 		return
 	}
 
-	// notConfiguredReasons are intentional absences — the user has not enabled a
-	// feature. They do not indicate failure and must not contribute to Degraded.
-	notConfiguredReasons := map[string]bool{
-		MetricsNotConfiguredReason:          true,
-		TracesNotConfiguredReason:           true,
-		AlertingNotConfiguredReason:         true,
-		MetricsAndTracesNotConfiguredReason: true,
-	}
+	anyFailing := false
+	anyUnknown := false
 
-	featureConditions := []string{
-		ConditionMonitoringStackAvailable,
-		ConditionThanosQuerierAvailable,
-		ConditionTempoAvailable,
-		ConditionInstrumentationAvailable,
-		ConditionOpenTelemetryCollectorAvailable,
-		ConditionAlertingAvailable,
-		ConditionPersesAvailable,
-		ConditionPersesTempoDataSourceAvailable,
-		ConditionPersesPrometheusDataSourceAvailable,
-		ConditionNodeMetricsEndpointAvailable,
-	}
-
-	anyFailing := false // a configured feature is actively failing
-	anyUnknown := false // a configured feature is still initialising
-
-	for _, ct := range featureConditions {
-		c, ok := cm.conditions[ct]
-		if !ok {
+	for _, c := range cm.accessor.GetConditions() {
+		if !featureConditionTypes[c.Type] {
 			continue
 		}
 		switch c.Status {
 		case metav1.ConditionFalse:
-			if !notConfiguredReasons[c.Reason] {
+			if c.Severity != platformcommon.ConditionSeverityInfo {
 				anyFailing = true
 			}
 		case metav1.ConditionUnknown:
@@ -224,21 +195,16 @@ func (cm *ConditionsManager) AggregateReady() {
 		}
 	}
 
-	// Provisioning succeeded: MonitoringAvailable is True, so manifests applied cleanly.
 	cm.MarkTrue(string(platformcommon.ConditionTypeProvisioningSucceeded))
 
 	switch {
 	case anyFailing:
-		// A configured feature is failing; the module is operational for working
-		// features but degraded overall.
 		cm.MarkTrue(string(platformcommon.ConditionTypeReady))
 		cm.MarkTrue(string(platformcommon.ConditionTypeDegraded))
 	case anyUnknown:
-		// Configured features are still initialising.
 		cm.MarkUnknown(string(platformcommon.ConditionTypeReady))
 		cm.MarkFalse(string(platformcommon.ConditionTypeDegraded), "NotDegraded", "")
 	default:
-		// All configured features are working (or nothing is configured).
 		cm.MarkTrue(string(platformcommon.ConditionTypeReady))
 		cm.MarkFalse(string(platformcommon.ConditionTypeDegraded), "NotDegraded", "")
 	}
@@ -246,31 +212,8 @@ func (cm *ConditionsManager) AggregateReady() {
 
 // Phase returns the top-level lifecycle phase derived from the Ready condition.
 func (cm *ConditionsManager) Phase() platformcommon.Phase {
-	c, ok := cm.conditions[string(platformcommon.ConditionTypeReady)]
-	if ok && c.Status == metav1.ConditionTrue {
+	if libconditions.IsStatusConditionTrue(cm.accessor, string(platformcommon.ConditionTypeReady)) {
 		return platformcommon.PhaseReady
 	}
 	return platformcommon.PhaseNotReady
-}
-
-// All returns the current conditions as a slice, sorted by Type for deterministic output.
-func (cm *ConditionsManager) All() []platformcommon.Condition {
-	result := make([]platformcommon.Condition, 0, len(cm.conditions))
-	for _, c := range cm.conditions {
-		result = append(result, c)
-	}
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].Type < result[j].Type
-	})
-	return result
-}
-
-func (cm *ConditionsManager) set(c platformcommon.Condition) {
-	// Preserve LastTransitionTime if status hasn't changed.
-	if existing, ok := cm.conditions[c.Type]; ok {
-		if existing.Status == c.Status {
-			c.LastTransitionTime = existing.LastTransitionTime
-		}
-	}
-	cm.conditions[c.Type] = c
 }

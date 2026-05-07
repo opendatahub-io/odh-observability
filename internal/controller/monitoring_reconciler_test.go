@@ -26,14 +26,18 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	fakedynamic "k8s.io/client-go/dynamic/fake"
+	fakeclientset "k8s.io/client-go/kubernetes/fake"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
 	routev1 "github.com/openshift/api/route/v1"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
@@ -51,6 +55,18 @@ func newTestScheme(t *testing.T) *runtime.Scheme {
 	utilruntime.Must(networkingv1.AddToScheme(s))
 	utilruntime.Must(rbacv1.AddToScheme(s))
 	return s
+}
+
+func newTestReconciler(t *testing.T, s *runtime.Scheme, c client.Client) *MonitoringReconciler {
+	t.Helper()
+	cs := fakeclientset.NewSimpleClientset()
+	return &MonitoringReconciler{
+		Client:          c,
+		Scheme:          s,
+		Deployer:        deploy.NewDeployer(deploy.WithFieldOwner("monitoring")),
+		DynamicClient:   fakedynamic.NewSimpleDynamicClient(s),
+		DiscoveryClient: cs.Discovery(),
+	}
 }
 
 func newMonitoring(name string) *v1alpha1.Monitoring {
@@ -75,10 +91,7 @@ func TestReconcile_Removed(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.ManagementState = platformcommon.Removed
 
-	r := &MonitoringReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build(),
-		Scheme: s,
-	}
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build())
 
 	_, err := r.reconcile(context.Background(), m)
 	if err != nil {
@@ -119,10 +132,7 @@ func TestReconcile_PreconditionsFailed(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Metrics = &v1alpha1.Metrics{}
 
-	r := &MonitoringReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build(),
-		Scheme: s,
-	}
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build())
 
 	_, err := r.reconcile(context.Background(), m)
 	if err != nil {
@@ -161,10 +171,7 @@ func TestReconcile_NothingConfigured(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	// No Metrics/Traces configured: no operator precondition checks triggered.
 
-	r := &MonitoringReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build(),
-		Scheme: s,
-	}
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build())
 
 	_, err := r.reconcile(context.Background(), m)
 	if err != nil {
@@ -258,10 +265,7 @@ func TestReconcile_ReleasesPopulated(t *testing.T) {
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 
-	r := &MonitoringReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build(),
-		Scheme: s,
-	}
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build())
 
 	_, err := r.reconcile(context.Background(), m)
 	if err != nil {
@@ -294,10 +298,7 @@ func TestReconcile_ObservedGenerationSet(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Generation = 7
 
-	r := &MonitoringReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build(),
-		Scheme: s,
-	}
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build())
 
 	_, err := r.reconcile(context.Background(), m)
 	if err != nil {

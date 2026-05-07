@@ -28,149 +28,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
+	odhLabels "github.com/opendatahub-io/odh-platform-utilities/pkg/metadata/labels"
 	routev1 "github.com/openshift/api/route/v1"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
-	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 )
 
-const (
-	fieldManager = "odh-observability-controller"
-	// partOfLabel is the label key used to track resources owned by this controller.
-	partOfLabel = "platform.opendatahub.io/part-of"
-	// partOfValue is the label value for all resources owned by this controller.
-	partOfValue = "monitoring"
-	// instanceNameAnnotation records which Monitoring CR owns the resource.
-	instanceNameAnnotation = "platform.opendatahub.io/instance.name"
-)
-
-// applyResources applies all desired resources to the cluster using Server-Side Apply.
-// Each resource gets the part-of label and instance-name annotation stamped on it.
-func applyResources(ctx context.Context, c client.Client, owner *v1alpha1.Monitoring, desired []unstructured.Unstructured) error {
-	log := logf.FromContext(ctx)
-	for i := range desired {
-		obj := &desired[i]
-
-		// Stamp ownership labels and annotations.
-		labels := obj.GetLabels()
-		if labels == nil {
-			labels = make(map[string]string)
-		}
-		labels[partOfLabel] = partOfValue
-		obj.SetLabels(labels)
-
-		annotations := obj.GetAnnotations()
-		if annotations == nil {
-			annotations = make(map[string]string)
-		}
-		annotations[instanceNameAnnotation] = owner.Name
-		obj.SetAnnotations(annotations)
-
-		log.V(1).Info("Applying resource", "gvk", obj.GroupVersionKind(), "name", obj.GetName(), "namespace", obj.GetNamespace())
-
-		if err := c.Patch(ctx, obj, client.Apply, client.FieldOwner(fieldManager), client.ForceOwnership); err != nil {
-			return fmt.Errorf("failed to apply %s %s/%s: %w", obj.GetKind(), obj.GetNamespace(), obj.GetName(), err)
-		}
-	}
-	return nil
-}
-
-// garbageCollect deletes owned resources that are no longer in the desired set.
-// It iterates over all GVKs that the controller manages and removes resources
-// labelled with part-of=monitoring that are absent from desired.
-func garbageCollect(ctx context.Context, c client.Client, desired []unstructured.Unstructured) error {
-	log := logf.FromContext(ctx)
-
-	// Build a lookup set of desired resources.
-	type key struct {
-		gvk       schema.GroupVersionKind
-		namespace string
-		name      string
-	}
-	desiredSet := make(map[key]struct{}, len(desired))
-	for i := range desired {
-		obj := &desired[i]
-		desiredSet[key{
-			gvk:       obj.GroupVersionKind(),
-			namespace: obj.GetNamespace(),
-			name:      obj.GetName(),
-		}] = struct{}{}
-	}
-
-	// All GVKs whose resources may need GC.
-	allGVKs := []schema.GroupVersionKind{
-		gvk.MonitoringStack,
-		gvk.ThanosQuerier,
-		gvk.TempoMonolithic,
-		gvk.TempoStack,
-		gvk.OpenTelemetryCollector,
-		gvk.Instrumentation,
-		gvk.ServiceMonitor,
-		gvk.PrometheusRule,
-		gvk.PersesV1Alpha1,
-		gvk.PersesV1Alpha2,
-		gvk.PersesDatasourceV1Alpha1,
-		gvk.PersesDatasourceV1Alpha2,
-		gvk.PersesDashboardV1Alpha1,
-		gvk.PersesDashboardV1Alpha2,
-		gvk.ValidatingAdmissionPolicy,
-		gvk.ValidatingAdmissionPolicyBinding,
-		// Core Kubernetes resource types.
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "Role"},
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "RoleBinding"},
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRole"},
-		{Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding"},
-		{Group: "networking.k8s.io", Version: "v1", Kind: "NetworkPolicy"},
-		{Group: "apps", Version: "v1", Kind: "Deployment"},
-		{Group: "batch", Version: "v1", Kind: "Job"},
-		{Group: "", Version: "v1", Kind: "ConfigMap"},
-		{Group: "", Version: "v1", Kind: "Secret"},
-		{Group: "", Version: "v1", Kind: "Service"},
-		{Group: "", Version: "v1", Kind: "ServiceAccount"},
-		{Group: "route.openshift.io", Version: "v1", Kind: "Route"},
-	}
-
-	selector := client.MatchingLabels{partOfLabel: partOfValue}
-
-	for _, g := range allGVKs {
-		list := &unstructured.UnstructuredList{}
-		list.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   g.Group,
-			Version: g.Version,
-			Kind:    g.Kind + "List",
-		})
-
-		if err := c.List(ctx, list, selector); err != nil {
-			if errors.IsNotFound(err) || meta.IsNoMatchError(err) {
-				continue // CRD not installed — nothing to GC
-			}
-			log.Error(err, "Failed to list resources for GC", "gvk", g)
-			continue
-		}
-
-		for i := range list.Items {
-			obj := &list.Items[i]
-			k := key{
-				gvk:       obj.GroupVersionKind(),
-				namespace: obj.GetNamespace(),
-				name:      obj.GetName(),
-			}
-			if _, ok := desiredSet[k]; !ok {
-				log.Info("Garbage collecting resource", "gvk", g, "name", obj.GetName(), "namespace", obj.GetNamespace())
-				if err := c.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
-					log.Error(err, "Failed to delete stale resource", "gvk", g, "name", obj.GetName())
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-// deleteAllOwned removes all resources owned by this controller (used on Removed state).
-func deleteAllOwned(ctx context.Context, c client.Client) error {
-	return garbageCollect(ctx, c, nil) // empty desired → delete everything
-}
+const fieldManager = "odh-observability-controller"
 
 // hasCRD checks whether a CRD for the given GVK is installed.
 // Uses a cheap List to avoid the retry backoff of CustomResourceDefinitionExists.
@@ -236,7 +100,7 @@ func syncPrometheusWebTLSCA(ctx context.Context, c client.Client, monitoring *v1
 	secret.SetKind("Secret")
 	secret.SetNamespace(namespace)
 	secret.SetName("prometheus-web-tls-ca")
-	secret.SetLabels(map[string]string{partOfLabel: partOfValue})
+	secret.SetLabels(map[string]string{odhLabels.PlatformPartOf: "monitoring"})
 
 	if err := unstructured.SetNestedField(secret.Object, "Opaque", "type"); err != nil {
 		return fmt.Errorf("failed to set secret type: %w", err)

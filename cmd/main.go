@@ -27,6 +27,8 @@ import (
 	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -35,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
 	routev1 "github.com/openshift/api/route/v1"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
@@ -77,7 +80,9 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	setupLog := ctrl.Log.WithName("setup")
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	cfg := ctrl.GetConfigOrDie()
+
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress: metricsAddr,
@@ -95,9 +100,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	deployer := deploy.NewDeployer(
+		deploy.WithFieldOwner("monitoring"),
+		deploy.WithMode(deploy.ModeSSA),
+		deploy.WithCache(),
+		deploy.WithApplyOrder(),
+	)
+
+	dynamicClient := dynamic.NewForConfigOrDie(cfg)
+	discoveryClient := discovery.NewDiscoveryClientForConfigOrDie(cfg)
+
 	if err := (&moncontroller.MonitoringReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		Deployer:        deployer,
+		DynamicClient:   dynamicClient,
+		DiscoveryClient: discoveryClient,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create Monitoring controller")
 		os.Exit(1)

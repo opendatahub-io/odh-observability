@@ -29,8 +29,12 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,6 +44,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/controller/gc"
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
+	odhLabels "github.com/opendatahub-io/odh-platform-utilities/pkg/metadata/labels"
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
 	routev1 "github.com/openshift/api/route/v1"
 
@@ -50,7 +57,10 @@ import (
 // MonitoringReconciler reconciles a Monitoring object.
 type MonitoringReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme          *runtime.Scheme
+	Deployer        *deploy.Deployer
+	DynamicClient   dynamic.Interface
+	DiscoveryClient discovery.DiscoveryInterface
 }
 
 // +kubebuilder:rbac:groups=services.platform.opendatahub.io,resources=monitorings,verbs=get;list;watch;create;update;patch;delete
@@ -101,10 +111,9 @@ func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alpha1.Monitoring) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
-	cm := conditions.NewConditionsManager(monitoring.Generation)
+	cm := conditions.NewConditionsManager(monitoring, monitoring.Generation)
 
 	defer func() {
-		monitoring.SetConditions(cm.All())
 		monitoring.Status.Status.ObservedGeneration = monitoring.Generation
 		monitoring.Status.Status.Phase = cm.Phase()
 		monitoring.SetReleaseStatus(platformcommon.ComponentReleaseStatus{
@@ -119,8 +128,8 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	// Handle Removed state.
 	if monitoring.Spec.ManagementState == platformcommon.Removed {
 		log.Info("ManagementState is Removed, deleting all owned resources")
-		if err := deleteAllOwned(ctx, r.Client); err != nil {
-			return ctrl.Result{}, fmt.Errorf("deleting owned resources: %w", err)
+		if err := r.deleteAllOwned(ctx, monitoring); err != nil {
+			log.Error(err, "Failed to delete owned resources, will retry on next reconcile")
 		}
 		cm.MarkFalse(string(platformcommon.ConditionTypeReady), "Removed", "Monitoring is in Removed state")
 		cm.MarkFalse(string(platformcommon.ConditionTypeProvisioningSucceeded), "Removed", "Monitoring is in Removed state")
@@ -184,13 +193,18 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		return ctrl.Result{}, fmt.Errorf("rendering templates: %w", err)
 	}
 
-	// Apply desired resources via SSA.
-	if err := applyResources(ctx, r.Client, monitoring, desired); err != nil {
+	// Apply desired resources via the deploy library (SSA with caching).
+	if err := r.Deployer.Deploy(ctx, deploy.DeployInput{
+		Client:    r.Client,
+		Owner:     monitoring,
+		Release:   deploy.ReleaseInfo{Type: "OpenDataHub", Version: os.Getenv("OPERATOR_VERSION")},
+		Resources: desired,
+	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("applying resources: %w", err)
 	}
 
-	// Garbage-collect stale owned resources.
-	if err := garbageCollect(ctx, r.Client, desired); err != nil {
+	// Garbage-collect stale owned resources via API discovery.
+	if err := r.collectGarbage(ctx, monitoring, desired); err != nil {
 		log.Error(err, "Garbage collection encountered errors")
 	}
 
@@ -204,6 +218,69 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 
 	cm.AggregateReady()
 	return ctrl.Result{}, nil
+}
+
+// resourceKey identifies a Kubernetes resource for desired-set comparison.
+type resourceKey struct {
+	gvk       schema.GroupVersionKind
+	namespace string
+	name      string
+}
+
+// collectGarbage deletes owned resources not in the desired set using API discovery.
+func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v1alpha1.Monitoring, desired []unstructured.Unstructured) error {
+	desiredSet := make(map[resourceKey]struct{}, len(desired))
+	for i := range desired {
+		obj := &desired[i]
+		desiredSet[resourceKey{
+			gvk:       obj.GroupVersionKind(),
+			namespace: obj.GetNamespace(),
+			name:      obj.GetName(),
+		}] = struct{}{}
+	}
+
+	collector := gc.New(
+		gc.WithOnlyCollectOwned(false),
+		gc.WithLabel(odhLabels.PlatformPartOf, "monitoring"),
+		gc.WithObjectPredicate(func(_ gc.RunParams, obj unstructured.Unstructured) (bool, error) {
+			k := resourceKey{
+				gvk:       obj.GroupVersionKind(),
+				namespace: obj.GetNamespace(),
+				name:      obj.GetName(),
+			}
+			_, inDesired := desiredSet[k]
+			return !inDesired, nil
+		}),
+	)
+
+	return collector.Run(ctx, gc.RunParams{
+		Client:          r.Client,
+		DynamicClient:   r.DynamicClient,
+		DiscoveryClient: r.DiscoveryClient,
+		Owner:           monitoring,
+		Version:         os.Getenv("OPERATOR_VERSION"),
+		PlatformType:    "OpenDataHub",
+	})
+}
+
+// deleteAllOwned removes all resources owned by this controller (used on Removed state).
+func (r *MonitoringReconciler) deleteAllOwned(ctx context.Context, monitoring *v1alpha1.Monitoring) error {
+	collector := gc.New(
+		gc.WithOnlyCollectOwned(false),
+		gc.WithLabel(odhLabels.PlatformPartOf, "monitoring"),
+		gc.WithObjectPredicate(func(_ gc.RunParams, _ unstructured.Unstructured) (bool, error) {
+			return true, nil
+		}),
+	)
+
+	return collector.Run(ctx, gc.RunParams{
+		Client:          r.Client,
+		DynamicClient:   r.DynamicClient,
+		DiscoveryClient: r.DiscoveryClient,
+		Owner:           monitoring,
+		Version:         os.Getenv("OPERATOR_VERSION"),
+		PlatformType:    "OpenDataHub",
+	})
 }
 
 // patchStatus uses MergePatch to update the status subresource.
@@ -226,7 +303,7 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// The prometheus-web-tls-ca ConfigMap is created by our template with this label,
 	// so CA rotation events are also covered without a separate watch.
 	managedPredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
-		return obj.GetLabels()[partOfLabel] == partOfValue
+		return obj.GetLabels()[odhLabels.PlatformPartOf] == "monitoring"
 	})
 
 	return ctrl.NewControllerManagedBy(mgr).

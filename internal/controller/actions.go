@@ -94,8 +94,8 @@ func deployMonitoringStackWithQuerierAndRestrictions(
 	sources *[]rendertemplate.TemplateSource,
 ) error {
 	if monitoring.Spec.Metrics == nil {
-		cm.MarkFalse(conditions.ConditionMonitoringStackAvailable, conditions.MetricsNotConfiguredReason, conditions.MetricsNotConfiguredMessage)
-		cm.MarkFalse(conditions.ConditionThanosQuerierAvailable, conditions.MetricsNotConfiguredReason, conditions.MetricsNotConfiguredMessage)
+		cm.MarkNotConfigured(conditions.ConditionMonitoringStackAvailable, conditions.MetricsNotConfiguredReason, conditions.MetricsNotConfiguredMessage)
+		cm.MarkNotConfigured(conditions.ConditionThanosQuerierAvailable, conditions.MetricsNotConfiguredReason, conditions.MetricsNotConfiguredMessage)
 		return nil
 	}
 
@@ -149,8 +149,8 @@ func deployTracingStack(
 	sources *[]rendertemplate.TemplateSource,
 ) error {
 	if monitoring.Spec.Traces == nil {
-		cm.MarkFalse(conditions.ConditionTempoAvailable, conditions.TracesNotConfiguredReason, conditions.TracesNotConfiguredMessage)
-		cm.MarkFalse(conditions.ConditionInstrumentationAvailable, conditions.TracesNotConfiguredReason, conditions.TracesNotConfiguredMessage)
+		cm.MarkNotConfigured(conditions.ConditionTempoAvailable, conditions.TracesNotConfiguredReason, conditions.TracesNotConfiguredMessage)
+		cm.MarkNotConfigured(conditions.ConditionInstrumentationAvailable, conditions.TracesNotConfiguredReason, conditions.TracesNotConfiguredMessage)
 		return nil
 	}
 
@@ -201,7 +201,7 @@ func deployOpenTelemetryCollector(
 	sources *[]rendertemplate.TemplateSource,
 ) error {
 	if monitoring.Spec.Metrics == nil && monitoring.Spec.Traces == nil {
-		cm.MarkFalse(conditions.ConditionOpenTelemetryCollectorAvailable,
+		cm.MarkNotConfigured(conditions.ConditionOpenTelemetryCollectorAvailable,
 			conditions.MetricsAndTracesNotConfiguredReason,
 			conditions.MetricsAndTracesNotConfiguredMessage)
 		return nil
@@ -243,7 +243,7 @@ func deployAlerting(
 	sources *[]rendertemplate.TemplateSource,
 ) error {
 	if monitoring.Spec.Alerting == nil {
-		cm.MarkFalse(conditions.ConditionAlertingAvailable,
+		cm.MarkNotConfigured(conditions.ConditionAlertingAvailable,
 			conditions.AlertingNotConfiguredReason, conditions.AlertingNotConfiguredMessage)
 		return nil
 	}
@@ -276,7 +276,7 @@ func deployPerses(
 	persesFound bool,
 ) error {
 	if monitoring.Spec.Metrics == nil && monitoring.Spec.Traces == nil {
-		cm.MarkFalse(conditions.ConditionPersesAvailable,
+		cm.MarkNotConfigured(conditions.ConditionPersesAvailable,
 			conditions.MetricsAndTracesNotConfiguredReason,
 			"Perses requires at least Metrics or Traces to be configured")
 		return nil
@@ -353,7 +353,7 @@ func deployPersesTempoIntegration(
 				return fmt.Errorf("deleting PersesDashboard: %w", err)
 			}
 		}
-		cm.MarkFalse(conditions.ConditionPersesTempoDataSourceAvailable,
+		cm.MarkNotConfigured(conditions.ConditionPersesTempoDataSourceAvailable,
 			conditions.TracesNotConfiguredReason, conditions.TracesNotConfiguredMessage)
 		return nil
 	}
@@ -393,7 +393,7 @@ func deployPersesPrometheusIntegration(
 	persesFound bool,
 ) error {
 	if monitoring.Spec.Metrics == nil {
-		cm.MarkFalse(conditions.ConditionPersesPrometheusDataSourceAvailable,
+		cm.MarkNotConfigured(conditions.ConditionPersesPrometheusDataSourceAvailable,
 			conditions.MetricsNotConfiguredReason,
 			"Prometheus datasource requires metrics configuration")
 		return nil
@@ -435,7 +435,7 @@ func deployNodeMetricsEndpoint(
 	sources *[]rendertemplate.TemplateSource,
 ) error {
 	if monitoring.Spec.Metrics == nil {
-		cm.MarkFalse(conditions.ConditionNodeMetricsEndpointAvailable,
+		cm.MarkNotConfigured(conditions.ConditionNodeMetricsEndpointAvailable,
 			conditions.MetricsNotConfiguredReason, conditions.MetricsNotConfiguredMessage)
 		return nil
 	}
