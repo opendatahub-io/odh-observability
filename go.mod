@@ -4,7 +4,7 @@ go 1.25.7
 
 require (
 	github.com/hashicorp/go-multierror v1.1.1
-	github.com/opendatahub-io/odh-platform-utilities v0.0.0
+	github.com/opendatahub-io/odh-platform-utilities v0.0.0-20260506180717-e15e712db78d
 	github.com/openshift/api v0.0.0-20230823114715-5fdd7511b790
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.35.2
@@ -101,8 +101,3 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.0 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
-
-// TODO: remove this replace directive once odh-platform-utilities is published
-// to a public Go module proxy. Until then, building requires a sibling checkout
-// of github.com/opendatahub-io/odh-platform-utilities at ../odh-platform-utilities.
-replace github.com/opendatahub-io/odh-platform-utilities => ../odh-platform-utilities
