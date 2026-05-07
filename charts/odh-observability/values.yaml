@@ -1,0 +1,48 @@
+nameOverride: ""
+fullnameOverride: ""
+
+operatorNamespace: opendatahub-operator-system
+
+image:
+  repository: quay.io/opendatahub/odh-observability
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+webhook:
+  enabled: true
+  port: 9443
+
+certManager:
+  # When enabled, creates a self-signed Issuer and Certificate for webhook TLS.
+  # Requires cert-manager to be installed in the cluster.
+  enabled: true
+  # Name of the Certificate and Secret created for the webhook.
+  certificateName: odh-observability-webhook-cert
+  secretName: odh-observability-webhook-cert
+
+# Leader election - enable when running multiple replicas.
+leaderElect: false
+
+# Image pull secrets for private registries.
+imagePullSecrets: []
+
+# Node selector, tolerations, and affinity for the controller pod.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Extra environment variables injected into the controller container.
+# Use for RELATED_IMAGE_* overrides.
+env: []
+# - name: RELATED_IMAGE_PERSES_IMAGE
+#   value: "registry.redhat.io/cluster-observability-operator/perses-rhel9:1.3.1"
