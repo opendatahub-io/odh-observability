@@ -71,7 +71,7 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election for controller manager.")
 	flag.StringVar(&webhookCertDir, "webhook-cert-dir", "/tmp/k8s-webhook-server/serving-certs", "Directory containing the webhook TLS certificate.")
-	flag.BoolVar(&enableWebhook, "enable-webhook", true, "Enable the mutating admission webhook.")
+	flag.BoolVar(&enableWebhook, "enable-webhook", false, "Enable the mutating admission webhook (requires TLS certs to be mounted).")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -82,7 +82,7 @@ func main() {
 
 	cfg := ctrl.GetConfigOrDie()
 
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+	mgrOpts := ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress: metricsAddr,
@@ -90,11 +90,16 @@ func main() {
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         leaderElect,
 		LeaderElectionID:       "odh-observability-leader",
-		WebhookServer: webhook.NewServer(webhook.Options{
+	}
+
+	if enableWebhook {
+		mgrOpts.WebhookServer = webhook.NewServer(webhook.Options{
 			Port:    9443,
 			CertDir: webhookCertDir,
-		}),
-	})
+		})
+	}
+
+	mgr, err := ctrl.NewManager(cfg, mgrOpts)
 	if err != nil {
 		setupLog.Error(err, "Unable to create manager")
 		os.Exit(1)
