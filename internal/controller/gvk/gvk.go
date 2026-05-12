@@ -141,6 +141,20 @@ var (
 		Kind:    "PersesDashboard",
 	}
 
+	// CertManagerIssuer (cert-manager.io/v1).
+	CertManagerIssuer = schema.GroupVersionKind{
+		Group:   "cert-manager.io",
+		Version: "v1",
+		Kind:    "Issuer",
+	}
+
+	// CertManagerCertificate (cert-manager.io/v1).
+	CertManagerCertificate = schema.GroupVersionKind{
+		Group:   "cert-manager.io",
+		Version: "v1",
+		Kind:    "Certificate",
+	}
+
 	// ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1).
 	ValidatingAdmissionPolicy = schema.GroupVersionKind{
 		Group:   "admissionregistration.k8s.io",
