@@ -59,6 +59,10 @@ const (
 
 	// ConditionNodeMetricsEndpointAvailable indicates the node metrics proxy is deployed.
 	ConditionNodeMetricsEndpointAvailable = "NodeMetricsEndpointAvailable"
+
+	// ConditionWebhookAvailable indicates the webhook infrastructure (Service,
+	// cert-manager Issuer/Certificate, MutatingWebhookConfiguration) is deployed.
+	ConditionWebhookAvailable = "WebhookAvailable"
 )
 
 // Reason constants.
@@ -95,6 +99,7 @@ var featureConditionTypes = map[string]bool{
 	ConditionPersesTempoDataSourceAvailable:     true,
 	ConditionPersesPrometheusDataSourceAvailable: true,
 	ConditionNodeMetricsEndpointAvailable:        true,
+	ConditionWebhookAvailable:                    true,
 }
 
 // ConditionsManager manages the set of conditions for a Monitoring CR reconcile cycle.

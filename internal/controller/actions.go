@@ -61,6 +61,9 @@ const (
 	TempoServiceCAConfigMapTemplate               = "resources/tempo-service-ca-configmap.tmpl.yaml"
 	PersesOperatorAccessNetworkPolicyTemplate     = "resources/perses-operator-access-network-policy.tmpl.yaml"
 	OperatorPrometheusRulesTemplate               = "monitoring/operator-prometheusrules.tmpl.yaml"
+	WebhookServiceTemplate                        = "resources/webhook-service.tmpl.yaml"
+	WebhookCertManagerTemplate                    = "resources/webhook-cert-manager.tmpl.yaml"
+	WebhookConfigurationTemplate                  = "resources/webhook-configuration.tmpl.yaml"
 
 	PersesTempoDatasourceName = "tempo-datasource"
 	PersesTempoDashboardName  = "data-science-tempo-traces"
@@ -442,5 +445,38 @@ func deployNodeMetricsEndpoint(
 
 	cm.MarkTrue(conditions.ConditionNodeMetricsEndpointAvailable)
 	*sources = append(*sources, src(PrometheusClusterProxyTemplate))
+	return nil
+}
+
+// deployWebhookInfrastructure deploys the webhook Service, cert-manager
+// Issuer+Certificate, and MutatingWebhookConfiguration. These resources are
+// managed by the module operator (not the platform chart) so the operator
+// controls their lifecycle alongside its own reconciliation.
+func deployWebhookInfrastructure(
+	ctx context.Context,
+	c client.Client,
+	_ *v1alpha1.Monitoring,
+	cm *conditions.ConditionsManager,
+	sources *[]rendertemplate.TemplateSource,
+) error {
+	issuerExists, err := hasCRD(ctx, c, gvk.CertManagerIssuer)
+	if err != nil {
+		return fmt.Errorf("checking Issuer CRD: %w", err)
+	}
+
+	if !issuerExists {
+		cm.MarkFalse(conditions.ConditionWebhookAvailable,
+			"CertManagerNotAvailable",
+			"cert-manager CRDs not found; webhook TLS cannot be provisioned")
+		return nil
+	}
+
+	cm.MarkTrue(conditions.ConditionWebhookAvailable)
+
+	*sources = append(*sources,
+		src(WebhookServiceTemplate),
+		src(WebhookCertManagerTemplate),
+		src(WebhookConfigurationTemplate),
+	)
 	return nil
 }
