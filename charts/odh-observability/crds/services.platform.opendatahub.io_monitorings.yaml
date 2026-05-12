@@ -201,11 +201,13 @@ spec:
             type: object
             x-kubernetes-validations:
             - message: Alerting configuration requires metrics.storage to be configured
-              rule: 'has(self.alerting) ? has(self.metrics.storage) : true'
+              rule: 'has(self.alerting) ? (has(self.metrics) && has(self.metrics.storage))
+                : true'
             - message: CollectorReplicas can only be set when metrics.storage or traces
                 are configured, and must be > 0
               rule: '!has(self.collectorReplicas) || (self.collectorReplicas > 0 &&
-                (self.metrics.storage != null || self.traces != null))'
+                ((has(self.metrics) && self.metrics.storage != null) || self.traces
+                != null))'
           status:
             description: MonitoringStatus defines the observed state of Monitoring.
             properties:
