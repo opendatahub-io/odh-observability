@@ -12,7 +12,6 @@ covcounters*
 config/crd/bases/
 config/rbac/role.yaml
 config/webhook/manifests.yaml
-api/v1alpha1/zz_generated.deepcopy.go
 
 # Generated CRDs in Helm chart (populated by make helm-update-crds)
 charts/odh-observability/crds/
