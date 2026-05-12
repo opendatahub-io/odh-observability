@@ -39,8 +39,16 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
-test: manifests generate fmt vet ## Run tests.
+test: manifests generate fmt vet ## Run tests with coverage (full pipeline).
 	go test ./... -coverprofile cover.out
+
+.PHONY: unit-test
+unit-test: ## Run unit tests (no codegen prerequisites).
+	go test ./...
+
+.PHONY: test-verbose
+test-verbose: ## Run unit tests with verbose output.
+	go test -v ./...
 
 ##@ Build
 
