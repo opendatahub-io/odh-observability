@@ -38,6 +38,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -53,6 +54,8 @@ import (
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 )
+
+const monitoringFinalizer = "monitoring.opendatahub.io/cleanup"
 
 // MonitoringReconciler reconciles a Monitoring object.
 type MonitoringReconciler struct {
@@ -91,6 +94,31 @@ func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
+	}
+
+	// Handle finalizer for cleanup on deletion. The ODH module handler's
+	// two-phase cleanup relies on the finalizer keeping the CR alive while
+	// deleteAllOwned runs.
+	if !monitoring.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(monitoring, monitoringFinalizer) {
+			log.Info("Monitoring CR is being deleted, cleaning up owned resources")
+			if err := r.deleteAllOwned(ctx, monitoring); err != nil {
+				log.Error(err, "Failed to delete owned resources during finalizer cleanup")
+				return ctrl.Result{}, err
+			}
+			controllerutil.RemoveFinalizer(monitoring, monitoringFinalizer)
+			if err := r.Update(ctx, monitoring); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	if !controllerutil.ContainsFinalizer(monitoring, monitoringFinalizer) {
+		controllerutil.AddFinalizer(monitoring, monitoringFinalizer)
+		if err := r.Update(ctx, monitoring); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Snapshot status for patch at end.
@@ -213,10 +241,15 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	// Sync Prometheus CA ConfigMap → Secret (workaround for COO-1270).
 	if err := syncPrometheusWebTLSCA(ctx, r.Client, monitoring); err != nil {
 		log.Error(err, "Failed to sync Prometheus web TLS CA")
+		cm.MarkFalse(conditions.ConditionMonitoringStackAvailable,
+			"PrometheusCAConfigSyncFailed",
+			fmt.Sprintf("Failed to sync Prometheus web TLS CA: %v", err))
 	}
 
 	// Populate status.url from the Thanos Querier route.
-	syncStatusURL(ctx, r.Client, monitoring)
+	if err := syncStatusURL(ctx, r.Client, monitoring); err != nil {
+		log.Error(err, "Failed to sync status URL")
+	}
 
 	cm.AggregateReady()
 	return ctrl.Result{}, nil
