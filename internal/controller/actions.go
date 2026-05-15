@@ -562,26 +562,53 @@ func ensureWebhookEnabled(
 
 	container.Args = append(container.Args, webhookArgEnabled)
 
-	container.Ports = append(container.Ports, corev1.ContainerPort{
-		Name:          "webhook",
-		ContainerPort: webhookPort,
-		Protocol:      corev1.ProtocolTCP,
-	})
+	hasPort := false
+	for _, p := range container.Ports {
+		if p.Name == "webhook" {
+			hasPort = true
+			break
+		}
+	}
+	if !hasPort {
+		container.Ports = append(container.Ports, corev1.ContainerPort{
+			Name:          "webhook",
+			ContainerPort: webhookPort,
+			Protocol:      corev1.ProtocolTCP,
+		})
+	}
 
-	container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
-		Name:      webhookVolumeName,
-		MountPath: webhookCertMountPath,
-		ReadOnly:  true,
-	})
+	hasMount := false
+	for _, m := range container.VolumeMounts {
+		if m.Name == webhookVolumeName {
+			hasMount = true
+			break
+		}
+	}
+	if !hasMount {
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      webhookVolumeName,
+			MountPath: webhookCertMountPath,
+			ReadOnly:  true,
+		})
+	}
 
-	dep.Spec.Template.Spec.Volumes = append(dep.Spec.Template.Spec.Volumes, corev1.Volume{
-		Name: webhookVolumeName,
-		VolumeSource: corev1.VolumeSource{
-			Secret: &corev1.SecretVolumeSource{
-				SecretName: secretName,
+	hasVolume := false
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.Name == webhookVolumeName {
+			hasVolume = true
+			break
+		}
+	}
+	if !hasVolume {
+		dep.Spec.Template.Spec.Volumes = append(dep.Spec.Template.Spec.Volumes, corev1.Volume{
+			Name: webhookVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: secretName,
+				},
 			},
-		},
-	})
+		})
+	}
 
 	return c.Update(ctx, dep)
 }
