@@ -506,6 +506,14 @@ func deployWebhookInfrastructure(
 		return fmt.Errorf("checking webhook TLS secret: %w", err)
 	}
 
+	if len(secret.Data["tls.crt"]) == 0 || len(secret.Data["tls.key"]) == 0 {
+		log.Info("webhook TLS secret exists but certificate data not yet populated", "secret", secretName)
+		cm.MarkFalse(conditions.ConditionWebhookAvailable,
+			"TLSSecretPending",
+			"TLS secret exists but certificate data not yet populated by cert-manager")
+		return nil
+	}
+
 	if err := ensureWebhookEnabled(ctx, c, operatorName, operatorNamespace, secretName); err != nil {
 		log.Error(err, "Failed to enable webhook on operator Deployment")
 		cm.MarkFalse(conditions.ConditionWebhookAvailable,
@@ -552,29 +560,12 @@ func ensureWebhookEnabled(
 		}
 	}
 
-	if hasWebhookArg {
-		return nil
-	}
-
-	log := logf.FromContext(ctx)
-	log.Info("Patching operator Deployment to enable webhook",
-		"deployment", operatorName, "namespace", operatorNamespace)
-
-	container.Args = append(container.Args, webhookArgEnabled)
-
 	hasPort := false
 	for _, p := range container.Ports {
 		if p.Name == "webhook" {
 			hasPort = true
 			break
 		}
-	}
-	if !hasPort {
-		container.Ports = append(container.Ports, corev1.ContainerPort{
-			Name:          "webhook",
-			ContainerPort: webhookPort,
-			Protocol:      corev1.ProtocolTCP,
-		})
 	}
 
 	hasMount := false
@@ -584,13 +575,6 @@ func ensureWebhookEnabled(
 			break
 		}
 	}
-	if !hasMount {
-		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
-			Name:      webhookVolumeName,
-			MountPath: webhookCertMountPath,
-			ReadOnly:  true,
-		})
-	}
 
 	hasVolume := false
 	for _, v := range dep.Spec.Template.Spec.Volumes {
@@ -599,6 +583,35 @@ func ensureWebhookEnabled(
 			break
 		}
 	}
+
+	if hasWebhookArg && hasPort && hasMount && hasVolume {
+		return nil
+	}
+
+	log := logf.FromContext(ctx)
+	log.Info("Patching operator Deployment to enable webhook",
+		"deployment", operatorName, "namespace", operatorNamespace)
+
+	if !hasWebhookArg {
+		container.Args = append(container.Args, webhookArgEnabled)
+	}
+
+	if !hasPort {
+		container.Ports = append(container.Ports, corev1.ContainerPort{
+			Name:          "webhook",
+			ContainerPort: webhookPort,
+			Protocol:      corev1.ProtocolTCP,
+		})
+	}
+
+	if !hasMount {
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      webhookVolumeName,
+			MountPath: webhookCertMountPath,
+			ReadOnly:  true,
+		})
+	}
+
 	if !hasVolume {
 		dep.Spec.Template.Spec.Volumes = append(dep.Spec.Template.Spec.Volumes, corev1.Volume{
 			Name: webhookVolumeName,
