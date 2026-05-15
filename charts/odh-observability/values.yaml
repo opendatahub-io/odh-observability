@@ -29,6 +29,15 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
+webhook:
+  enabled: true
+  port: 9443
+
+certManager:
+  enabled: true
+  certificateName: odh-observability-webhook-cert
+  secretName: odh-observability-webhook-tls
+
 # Extra environment variables injected into the controller container.
 # Use for RELATED_IMAGE_* overrides.
 env: []
