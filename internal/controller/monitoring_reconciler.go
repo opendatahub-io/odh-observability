@@ -231,6 +231,10 @@ type resourceKey struct {
 
 // collectGarbage deletes owned resources not in the desired set using API discovery.
 func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v1alpha1.Monitoring, desired []unstructured.Unstructured) error {
+	if monitoring.Spec.Namespace == "" {
+		return fmt.Errorf("monitoring.Spec.Namespace is empty, cannot safely perform garbage collection")
+	}
+
 	desiredSet := make(map[resourceKey]struct{}, len(desired))
 	for i := range desired {
 		obj := &desired[i]
@@ -244,6 +248,7 @@ func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v
 	collector := gc.New(
 		gc.WithOnlyCollectOwned(false),
 		gc.WithLabel(odhLabels.PlatformPartOf, "monitoring"),
+		gc.InNamespace(monitoring.Spec.Namespace),
 		gc.WithObjectPredicate(func(_ gc.RunParams, obj unstructured.Unstructured) (bool, error) {
 			k := resourceKey{
 				gvk:       obj.GroupVersionKind(),
@@ -267,9 +272,14 @@ func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v
 
 // deleteAllOwned removes all resources owned by this controller (used on Removed state).
 func (r *MonitoringReconciler) deleteAllOwned(ctx context.Context, monitoring *v1alpha1.Monitoring) error {
+	if monitoring.Spec.Namespace == "" {
+		return fmt.Errorf("monitoring.Spec.Namespace is empty, cannot safely delete owned resources")
+	}
+
 	collector := gc.New(
 		gc.WithOnlyCollectOwned(false),
 		gc.WithLabel(odhLabels.PlatformPartOf, "monitoring"),
+		gc.InNamespace(monitoring.Spec.Namespace),
 		gc.WithObjectPredicate(func(_ gc.RunParams, _ unstructured.Unstructured) (bool, error) {
 			return true, nil
 		}),
