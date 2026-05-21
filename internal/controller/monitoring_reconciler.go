@@ -106,8 +106,9 @@ func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				log.Error(err, "Failed to delete owned resources during finalizer cleanup")
 				return ctrl.Result{}, err
 			}
+			patch := client.MergeFrom(monitoring.DeepCopy())
 			controllerutil.RemoveFinalizer(monitoring, monitoringFinalizer)
-			if err := r.Update(ctx, monitoring); err != nil {
+			if err := r.Patch(ctx, monitoring, patch); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -115,8 +116,9 @@ func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	if !controllerutil.ContainsFinalizer(monitoring, monitoringFinalizer) {
+		patch := client.MergeFrom(monitoring.DeepCopy())
 		controllerutil.AddFinalizer(monitoring, monitoringFinalizer)
-		if err := r.Update(ctx, monitoring); err != nil {
+		if err := r.Patch(ctx, monitoring, patch); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
