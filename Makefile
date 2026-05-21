@@ -1,5 +1,7 @@
 # Image URL to use all building/pushing image targets
 IMG ?= quay.io/opendatahub/odh-observability:latest
+PLATFORM ?= linux/amd64
+CGO_ENABLED ?= 1
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -61,12 +63,15 @@ run: manifests generate fmt vet ## Run a controller from your host.
 	go run ./cmd/main.go
 
 .PHONY: docker-build
-docker-build: ## Build docker image with the manager (uses parent dir as context for odh-platform-utilities).
-	docker build -f Dockerfile -t ${IMG} ..
+docker-build: ## Build docker image with the manager.
+	podman build --platform $(PLATFORM) --build-arg CGO_ENABLED=$(CGO_ENABLED) -f Dockerfile -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
-	docker push ${IMG}
+	podman push ${IMG}
+
+.PHONY: image
+image: docker-build docker-push ## Build and push image with the manager.
 
 ##@ Deployment
 
