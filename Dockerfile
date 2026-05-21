@@ -10,17 +10,13 @@ ARG TARGETOS
 ARG TARGETARCH
 USER root
 WORKDIR /workspace
-COPY odh-observability/go.mod go.mod
-COPY odh-observability/go.sum go.sum
-
-# Local odh-platform-utilities sibling directory
-COPY odh-platform-utilities/ /odh-platform-utilities/
+COPY go.mod go.sum ./
 
 RUN go mod download
 
-COPY odh-observability/cmd/main.go cmd/main.go
-COPY odh-observability/api/ api/
-COPY odh-observability/internal/ internal/
+COPY cmd/main.go cmd/main.go
+COPY api/ api/
+COPY internal/ internal/
 
 RUN CGO_ENABLED=${CGO_ENABLED} GOEXPERIMENT=${GOEXPERIMENT} GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -trimpath -ldflags="-s -w" -o manager cmd/main.go
 
