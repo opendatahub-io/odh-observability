@@ -81,22 +81,22 @@ const (
 	TracesNotConfiguredMessage   = "Traces not configured in Monitoring CR"
 	AlertingNotConfiguredMessage = "Alerting not configured in Monitoring CR"
 
-	TempoOperatorMissingMessage                 = "Tempo operator must be installed for traces configuration"
-	COOMissingMessage                           = "ClusterObservability operator must be installed for metrics configuration"
+	TempoOperatorMissingMessage                  = "Tempo operator must be installed for traces configuration"
+	COOMissingMessage                            = "ClusterObservability operator must be installed for metrics configuration"
 	OpenTelemetryCollectorOperatorMissingMessage = "OpenTelemetryCollector operator must be installed for OpenTelemetry configuration"
 )
 
 // featureConditionTypes lists the feature-specific condition types that
 // participate in the Ready/Degraded aggregation.
 var featureConditionTypes = map[string]bool{
-	ConditionMonitoringStackAvailable:           true,
-	ConditionThanosQuerierAvailable:             true,
-	ConditionTempoAvailable:                     true,
-	ConditionInstrumentationAvailable:           true,
+	ConditionMonitoringStackAvailable:            true,
+	ConditionThanosQuerierAvailable:              true,
+	ConditionTempoAvailable:                      true,
+	ConditionInstrumentationAvailable:            true,
 	ConditionOpenTelemetryCollectorAvailable:     true,
-	ConditionAlertingAvailable:                  true,
-	ConditionPersesAvailable:                    true,
-	ConditionPersesTempoDataSourceAvailable:     true,
+	ConditionAlertingAvailable:                   true,
+	ConditionPersesAvailable:                     true,
+	ConditionPersesTempoDataSourceAvailable:      true,
 	ConditionPersesPrometheusDataSourceAvailable: true,
 	ConditionNodeMetricsEndpointAvailable:        true,
 	ConditionWebhookAvailable:                    true,
