@@ -1,0 +1,39 @@
+# Build the manager binary
+FROM registry.redhat.io/ubi9/go-toolset:1.25 AS builder
+
+# These built-in args are defined in the global scope, and are not automatically accessible within build stages or RUN commands.
+# To expose these arguments inside the build stage, we need to redefine it without a value.
+ARG TARGETOS TARGETARCH
+RUN echo "GOOS=${TARGETOS} GOARCH=${TARGETARCH}"
+
+WORKDIR /workspace
+COPY go.mod go.sum ./
+
+RUN go mod download
+
+COPY cmd/ cmd/
+COPY api/ api/
+COPY internal/ internal/
+
+USER root
+RUN CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOEXPERIMENT=strictfipsruntime go build -tags strictfipsruntime -a -trimpath -ldflags="-s -w" -o manager cmd/main.go
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+
+RUN microdnf install -y shadow-utils && \
+    microdnf clean all && \
+    useradd odh-observability -m -u 1000
+RUN microdnf remove -y shadow-utils
+
+WORKDIR /
+COPY --from=builder /workspace/manager .
+USER 1000:1000
+
+ENTRYPOINT ["/manager"]
+
+LABEL com.redhat.component="odh-observability" \
+      name="odh-observability" \
+      description="odh-observability" \
+      summary="odh-observability" \
+      io.k8s.display-name="odh-observability" \
+      io.k8s.description="odh-observability"
