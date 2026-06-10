@@ -31,9 +31,12 @@ USER 1000:1000
 
 ENTRYPOINT ["/manager"]
 
-LABEL com.redhat.component="odh-observability" \
-      name="odh-observability" \
-      description="odh-observability" \
-      summary="odh-observability" \
-      io.k8s.display-name="odh-observability" \
-      io.k8s.description="odh-observability"
+LABEL com.redhat.component="odh-observability-rhel9" \
+      name="rhoai/odh-observability-rhel9" \
+      description="odh-observability-rhel9" \
+      summary="odh-observability-rhel9" \
+      maintainer="['managed-open-data-hub@redhat.com']" \
+      io.openshift.expose-services="" \
+      io.k8s.display-name="odh-observability-rhel9" \
+      io.k8s.description="odh-observability-rhel9" \
+      com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf"
