@@ -1,0 +1,42 @@
+# Build the manager binary
+FROM registry.redhat.io/ubi9/go-toolset@sha256:2a913b5473089fb4dc4e71b6206192460b149ebd6d948bb818ee5e339d9af65d AS builder
+
+# These built-in args are defined in the global scope, and are not automatically accessible within build stages or RUN commands.
+# To expose these arguments inside the build stage, we need to redefine it without a value.
+ARG TARGETOS TARGETARCH
+RUN echo "GOOS=${TARGETOS} GOARCH=${TARGETARCH}"
+
+WORKDIR /workspace
+COPY go.mod go.sum ./
+
+RUN go mod download
+
+COPY cmd/ cmd/
+COPY api/ api/
+COPY internal/ internal/
+
+USER root
+RUN CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOEXPERIMENT=strictfipsruntime go build -tags strictfipsruntime -a -trimpath -ldflags="-s -w" -o manager cmd/main.go
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal@sha256:94234988db7ce0e451e2dd9a8c4dcf1abf6895278a1c2d8633316a3e61d82a8f
+
+RUN microdnf install -y shadow-utils && \
+    microdnf clean all && \
+    useradd odh-observability -m -u 1000
+RUN microdnf remove -y shadow-utils
+
+WORKDIR /
+COPY --from=builder /workspace/manager .
+USER 1000:1000
+
+ENTRYPOINT ["/manager"]
+
+LABEL com.redhat.component="odh-observability-rhel9" \
+      name="rhoai/odh-observability-rhel9" \
+      description="odh-observability-rhel9" \
+      summary="odh-observability-rhel9" \
+      maintainer="['managed-open-data-hub@redhat.com']" \
+      io.openshift.expose-services="" \
+      io.k8s.display-name="odh-observability-rhel9" \
+      io.k8s.description="odh-observability-rhel9" \
+      com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf"
