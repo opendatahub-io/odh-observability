@@ -1,5 +1,5 @@
 # Build the manager binary
-FROM registry.redhat.io/ubi9/go-toolset:1.25 AS builder
+FROM registry.redhat.io/ubi9/go-toolset@sha256:2a913b5473089fb4dc4e71b6206192460b149ebd6d948bb818ee5e339d9af65d AS builder
 
 # These built-in args are defined in the global scope, and are not automatically accessible within build stages or RUN commands.
 # To expose these arguments inside the build stage, we need to redefine it without a value.
@@ -18,7 +18,7 @@ COPY internal/ internal/
 USER root
 RUN CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOEXPERIMENT=strictfipsruntime go build -tags strictfipsruntime -a -trimpath -ldflags="-s -w" -o manager cmd/main.go
 
-FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+FROM registry.access.redhat.com/ubi9/ubi-minimal@sha256:94234988db7ce0e451e2dd9a8c4dcf1abf6895278a1c2d8633316a3e61d82a8f
 
 RUN microdnf install -y shadow-utils && \
     microdnf clean all && \
