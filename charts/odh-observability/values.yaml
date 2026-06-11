@@ -5,8 +5,8 @@ operatorNamespace: opendatahub-operator-system
 
 image:
   repository: quay.io/opendatahub/odh-observability
-  tag: latest
-  pullPolicy: IfNotPresent
+  tag: odh-stable
+  pullPolicy: Always
 
 replicaCount: 1
 
