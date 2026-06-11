@@ -1,5 +1,5 @@
 # Image URL to use all building/pushing image targets
-IMG ?= quay.io/opendatahub/odh-observability:latest
+IMG ?= quay.io/opendatahub/odh-observability:odh-stable
 PLATFORM ?= linux/amd64
 CGO_ENABLED ?= 1
 
