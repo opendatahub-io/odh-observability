@@ -37,6 +37,7 @@ func monitoringTestSuite(t *testing.T) {
 		WithEventuallyPollingInterval(2 * time.Second),
 	}
 
+	monitoringServiceCtx.ensureMonitoringCRExists(t)
 	monitoringServiceCtx.runBaseConfigurationTests(t)
 	monitoringServiceCtx.runMetricsAndMonitoringStackTests(t)
 	monitoringServiceCtx.runCollectorTests(t)

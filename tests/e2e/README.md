@@ -6,17 +6,7 @@ End-to-end tests for the odh-observability monitoring module. These tests run ag
 
 - An OpenShift cluster with `KUBECONFIG` set
 - The odh-observability operator deployed and running
-- A `Monitoring` CR must exist before running tests. In a full RHOAI deployment the platform operator creates this via SSA from the DSCI. For standalone testing, create one manually:
-  ```bash
-  oc apply -f - <<EOF
-  apiVersion: services.platform.opendatahub.io/v1alpha1
-  kind: Monitoring
-  metadata:
-    name: default-monitoring
-  spec:
-    managementState: Managed
-  EOF
-  ```
+- The test suite creates the `Monitoring` CR automatically if it does not already exist
 - Dependent operators installed via OLM:
   - Cluster Observability Operator (provides MonitoringStack, ThanosQuerier)
   - Tempo Operator (provides TempoMonolithic, TempoStack)

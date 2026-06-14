@@ -62,6 +62,20 @@ var monitoringOwnerReferencesCondition = And(
 	jq.Match(`.metadata.ownerReferences[0].name == "%s"`, MonitoringCRName),
 )
 
+// ensureMonitoringCRExists creates the Monitoring CR if it does not already exist.
+func (tc *MonitoringTestCtx) ensureMonitoringCRExists(t *testing.T) {
+	t.Helper()
+
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			return jq.TransformPipeline(withManagementState(common.Managed))(u)
+		}),
+		WithCondition(jq.Match(`.status.phase == "%s"`, common.PhaseReady)),
+		WithCustomErrorMsg("Monitoring CR should exist and reach Ready phase"),
+	)
+}
+
 // updateMonitoringConfig patches the Monitoring CR with the given transforms
 // and waits for the CR to reach Ready status.
 func (tc *MonitoringTestCtx) updateMonitoringConfig(transforms ...jq.TransformFn) {
