@@ -45,6 +45,10 @@ func monitoringTestSuite(t *testing.T) {
 	monitoringServiceCtx.runTracesWithPVBackendTests(t)
 	monitoringServiceCtx.runTracesWithCloudStorageTests(t)
 	monitoringServiceCtx.runPersesTests(t)
+	monitoringServiceCtx.runNetworkingTests(t)
+	monitoringServiceCtx.runWebhookTests(t)
+	monitoringServiceCtx.runNegativeConditionTests(t)
+	monitoringServiceCtx.runDisabledTests(t)
 }
 
 // ========================================================================
@@ -1550,4 +1554,383 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceLifecycle(t *testing.T) {
 		WithCondition(jq.Match(`.metadata.name == "%s"`, ClusterPrometheusDatasourceName)),
 		WithCustomErrorMsg("Cluster Prometheus PersesDatasource should be recreated when metrics are re-enabled"),
 	)
+}
+
+// ========================================================================
+// Group 9: Advanced Networking / RBAC
+// ========================================================================
+
+func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
+	t.Helper()
+
+	t.Run("Group 9: Networking and RBAC", func(t *testing.T) {
+		tc.setupMetrics(t)
+
+		t.Cleanup(func() {
+			tc.cleanupGroup(t, "")
+		})
+
+		t.Run("Prometheus restricted resource configuration", tc.ValidatePrometheusRestrictedResourceConfiguration)
+		t.Run("Prometheus secure proxy authentication", tc.ValidatePrometheusSecureProxyAuthentication)
+		t.Run("Node metrics endpoint deployment", tc.ValidateNodeMetricsEndpointDeployment)
+		t.Run("Node metrics endpoint RBAC configuration", tc.ValidateNodeMetricsEndpointRBACConfiguration)
+	})
+}
+
+func (tc *MonitoringTestCtx) waitForPrometheusNamespaceProxyPrerequisites(t *testing.T) {
+	t.Helper()
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.MonitoringStack, types.NamespacedName{
+			Name:      MonitoringStackName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.status.conditions[] | select(.type == "Available") | .status == "True"`)),
+		WithCustomErrorMsg("MonitoringStack should be Available before prometheus-namespace-proxy deployment"),
+	)
+
+	t.Logf("MonitoringStack CR is Available — prerequisites met for prometheus-namespace-proxy")
+}
+
+func (tc *MonitoringTestCtx) validatePrometheusNamespaceProxyResourcesCommon(t *testing.T) {
+	t.Helper()
+
+	tc.waitForPrometheusNamespaceProxyPrerequisites(t)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      "data-science-prometheus-namespace-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.status.readyReplicas == 1`),
+			jq.Match(`.spec.template.spec.containers | length == 2`),
+		)),
+		WithCustomErrorMsg("data-science-prometheus-namespace-proxy deployment should be created and ready"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ServiceAccount, types.NamespacedName{
+			Name:      "data-science-prometheus-namespace-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "data-science-prometheus-namespace-proxy",
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.name == "cluster-monitoring-view"`),
+			jq.Match(`.subjects[0].name == "data-science-prometheus-namespace-proxy"`),
+			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
+		)),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      "data-science-prometheus-namespace-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.ports[0].port == 8443`),
+			jq.Match(`.spec.ports[0].name == "https"`),
+			jq.Match(`.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == "data-science-prometheus-namespace-proxy-tls"`),
+		)),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Route, types.NamespacedName{
+			Name:      "data-science-prometheus-route",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.to.name == "data-science-prometheus-namespace-proxy"`),
+			jq.Match(`.spec.tls.termination == "reencrypt"`),
+			jq.Match(`.spec.tls.insecureEdgeTerminationPolicy == "Redirect"`),
+		)),
+	)
+}
+
+func (tc *MonitoringTestCtx) ValidatePrometheusRestrictedResourceConfiguration(t *testing.T) {
+	t.Helper()
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(jq.Match(`.status.phase == "%s"`, common.PhaseReady)),
+	)
+
+	tc.validatePrometheusNamespaceProxyResourcesCommon(t)
+}
+
+func (tc *MonitoringTestCtx) ValidatePrometheusSecureProxyAuthentication(t *testing.T) {
+	t.Helper()
+
+	tc.validatePrometheusNamespaceProxyResourcesCommon(t)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      "data-science-prometheus-namespace-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.template.spec.containers[0].name == "kube-rbac-proxy"`),
+			jq.Match(`(.spec.template.spec.containers[0].image | contains("kube-rbac-proxy")) or (.spec.template.spec.containers[0].image | contains("kube-auth-proxy"))`),
+		)),
+		WithCustomErrorMsg("data-science-prometheus-namespace-proxy deployment should contain kube-rbac-proxy container"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "data-science-prometheus-namespace-proxy-auth-delegator",
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.name == "system:auth-delegator"`),
+			jq.Match(`.subjects[0].name == "data-science-prometheus-namespace-proxy"`),
+			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
+		)),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ConfigMap, types.NamespacedName{
+			Name:      "data-science-prometheus-namespace-proxy-config",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.data."kube-rbac-proxy.yaml" | contains("authorization")`)),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      "data-science-prometheus-namespace-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream="))) | length == 1`),
+			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream=http://127.0.0.1:9091/"))) | length == 1`),
+			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--secure-listen-address=0.0.0.0:8443"))) | length == 1`),
+		)),
+		WithCustomErrorMsg("kube-rbac-proxy should be configured with correct upstream and secure listen address"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "data-science-prometheus-namespace-proxy-auth-delegator",
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.name == "system:auth-delegator"`),
+			jq.Match(`.subjects[0].name == "data-science-prometheus-namespace-proxy"`),
+		)),
+		WithCustomErrorMsg("ClusterRoleBinding should reference system:auth-delegator for authentication and authorization"),
+	)
+}
+
+func (tc *MonitoringTestCtx) ValidateNodeMetricsEndpointDeployment(t *testing.T) {
+	t.Helper()
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(And(
+			jq.Match(`.spec.metrics != null`),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, common.ConditionTypeReady, metav1.ConditionTrue),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionNodeMetricsEndpointAvailable, metav1.ConditionTrue),
+		)),
+		WithCustomErrorMsg("Monitoring resource should be updated with metrics configuration and NodeMetricsEndpoint should be available"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      "data-science-prometheus-cluster-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.status.readyReplicas == 1`),
+			jq.Match(`.spec.template.spec.containers | length == 1`),
+			jq.Match(`.spec.template.spec.containers[0].name == "kube-rbac-proxy"`),
+		)),
+		WithCustomErrorMsg("data-science-prometheus-cluster-proxy deployment should be created and ready with kube-rbac-proxy"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ServiceAccount, types.NamespacedName{
+			Name:      "data-science-prometheus-cluster-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      "data-science-prometheus-cluster-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.ports[0].port == 8443`),
+			jq.Match(`.spec.ports[0].name == "https"`),
+			jq.Match(`.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == "data-science-prometheus-cluster-proxy-tls"`),
+		)),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Route, types.NamespacedName{
+			Name:      "data-science-prometheus-cluster-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.to.name == "data-science-prometheus-cluster-proxy"`),
+			jq.Match(`.spec.tls.termination == "reencrypt"`),
+			jq.Match(`.spec.tls.insecureEdgeTerminationPolicy == "Redirect"`),
+		)),
+	)
+}
+
+func (tc *MonitoringTestCtx) ValidateNodeMetricsEndpointRBACConfiguration(t *testing.T) {
+	t.Helper()
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "data-science-prometheus-cluster-proxy",
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.name == "cluster-monitoring-view"`),
+			jq.Match(`.subjects[0].name == "data-science-prometheus-cluster-proxy"`),
+			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("ClusterRoleBinding should use cluster-monitoring-view role for NodeMetrics access"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "data-science-prometheus-cluster-proxy-auth-delegator",
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.name == "system:auth-delegator"`),
+			jq.Match(`.subjects[0].name == "data-science-prometheus-cluster-proxy"`),
+			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
+		)),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Secret, types.NamespacedName{
+			Name:      "data-science-prometheus-cluster-proxy-kube-rbac-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.data."config.yaml" | @base64d | contains("authorization")`),
+			jq.Match(`.data."config.yaml" | @base64d | contains("metrics.k8s.io")`),
+			jq.Match(`.data."config.yaml" | @base64d | contains("resource: nodes")`),
+		)),
+		WithCustomErrorMsg("kube-rbac-proxy config should enforce NodeMetrics access (metrics.k8s.io/nodes)"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      "data-science-prometheus-cluster-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream="))) | length == 1`),
+			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream=https://prometheus-operated"))) | length == 1`),
+			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--secure-listen-address=0.0.0.0:8443"))) | length == 1`),
+			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--config-file=/etc/kube-rbac-proxy/config.yaml"))) | length == 1`),
+			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream-ca-file=/etc/prometheus-ca/service-ca.crt"))) | length == 1`),
+			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream-client-cert-file=/etc/prometheus-client/tls.crt"))) | length == 1`),
+			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream-client-key-file=/etc/prometheus-client/tls.key"))) | length == 1`),
+		)),
+		WithCustomErrorMsg("kube-rbac-proxy should be configured with correct upstream (HTTPS to prometheus-operated) and mTLS client certificates"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      "data-science-prometheus-cluster-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.template.spec.containers[0].name == "kube-rbac-proxy"`),
+			jq.Match(`(.spec.template.spec.containers[0].image | contains("kube-rbac-proxy")) or (.spec.template.spec.containers[0].image | contains("kube-auth-proxy"))`),
+		)),
+		WithCustomErrorMsg("data-science-prometheus-cluster-proxy deployment should contain kube-rbac-proxy container"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      "data-science-prometheus-cluster-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.template.spec.volumes[] | select(.name == "prometheus-ca") | .configMap.name == "prometheus-web-tls-ca"`),
+			jq.Match(`.spec.template.spec.volumes[] | select(.name == "prometheus-client-cert") | .secret.secretName == "prometheus-operated-tls"`),
+			jq.Match(`.spec.template.spec.containers[0].volumeMounts[] | select(.name == "prometheus-ca") | .mountPath == "/etc/prometheus-ca"`),
+			jq.Match(`.spec.template.spec.containers[0].volumeMounts[] | select(.name == "prometheus-client-cert") | .mountPath == "/etc/prometheus-client"`),
+		)),
+		WithCustomErrorMsg("deployment should have volumes and mounts for mTLS to Prometheus"),
+	)
+}
+
+// ========================================================================
+// Disabled / Cleanup
+// ========================================================================
+
+func (tc *MonitoringTestCtx) runDisabledTests(t *testing.T) {
+	t.Helper()
+
+	t.Run("Disabled: Monitoring Service Disabled", func(t *testing.T) {
+		t.Run("Validate monitoring service disabled", tc.ValidateMonitoringServiceDisabled)
+	})
+}
+
+func (tc *MonitoringTestCtx) ValidateMonitoringServiceDisabled(t *testing.T) {
+	t.Helper()
+
+	tc.ensureMonitoringCleanSlate(t, "")
+
+	tc.resetMonitoringConfigToRemoved()
+
+	for _, resource := range []struct {
+		gvk                schema.GroupVersionKind
+		name               string
+		forceWithFinalizer bool
+	}{
+		{gvk: gvk.Monitoring, name: MonitoringCRName},
+		{gvk: gvk.MonitoringStack, name: MonitoringStackName, forceWithFinalizer: true},
+		{gvk: gvk.TempoStack, name: TempoStackName, forceWithFinalizer: true},
+		{gvk: gvk.TempoMonolithic, name: TempoMonolithicName, forceWithFinalizer: true},
+		{gvk: gvk.OpenTelemetryCollector, name: OpenTelemetryCollectorName},
+		{gvk: gvk.Instrumentation, name: InstrumentationName},
+		{gvk: gvk.Perses, name: PersesName},
+		{gvk: gvk.PersesDatasource, name: PersesDatasourceName},
+		{gvk: gvk.PersesDatasource, name: ClusterPrometheusDatasourceName},
+	} {
+		if resource.forceWithFinalizer {
+			tc.DeleteResource(
+				WithMinimalObject(resource.gvk, types.NamespacedName{
+					Name:      resource.name,
+					Namespace: tc.MonitoringNamespace,
+				}),
+				WithWaitForDeletion(true),
+				WithRemoveFinalizersOnDelete(true),
+				WithIgnoreNotFound(true),
+			)
+		} else {
+			tc.EnsureResourceGone(
+				WithMinimalObject(resource.gvk, types.NamespacedName{
+					Name:      resource.name,
+					Namespace: tc.MonitoringNamespace,
+				}),
+			)
+		}
+	}
 }
