@@ -168,4 +168,92 @@ var (
 		Version: "v1",
 		Kind:    "ValidatingAdmissionPolicyBinding",
 	}
+
+	// Subscription (operators.coreos.com/v1alpha1).
+	Subscription = schema.GroupVersionKind{
+		Group:   "operators.coreos.com",
+		Version: "v1alpha1",
+		Kind:    "Subscription",
+	}
+
+	// ClusterServiceVersion (operators.coreos.com/v1alpha1).
+	ClusterServiceVersion = schema.GroupVersionKind{
+		Group:   "operators.coreos.com",
+		Version: "v1alpha1",
+		Kind:    "ClusterServiceVersion",
+	}
+
+	// Core Kubernetes types used in e2e tests.
+
+	Secret = schema.GroupVersionKind{
+		Group:   "",
+		Version: "v1",
+		Kind:    "Secret",
+	}
+
+	Deployment = schema.GroupVersionKind{
+		Group:   "apps",
+		Version: "v1",
+		Kind:    "Deployment",
+	}
+
+	Service = schema.GroupVersionKind{
+		Group:   "",
+		Version: "v1",
+		Kind:    "Service",
+	}
+
+	ConfigMap = schema.GroupVersionKind{
+		Group:   "",
+		Version: "v1",
+		Kind:    "ConfigMap",
+	}
+
+	Namespace = schema.GroupVersionKind{
+		Group:   "",
+		Version: "v1",
+		Kind:    "Namespace",
+	}
+
+	// Route (route.openshift.io/v1).
+	Route = schema.GroupVersionKind{
+		Group:   "route.openshift.io",
+		Version: "v1",
+		Kind:    "Route",
+	}
+
+	// NetworkPolicy (networking.k8s.io/v1).
+	NetworkPolicy = schema.GroupVersionKind{
+		Group:   "networking.k8s.io",
+		Version: "v1",
+		Kind:    "NetworkPolicy",
+	}
+
+	// ClusterRole (rbac.authorization.k8s.io/v1).
+	ClusterRole = schema.GroupVersionKind{
+		Group:   "rbac.authorization.k8s.io",
+		Version: "v1",
+		Kind:    "ClusterRole",
+	}
+
+	// ClusterRoleBinding (rbac.authorization.k8s.io/v1).
+	ClusterRoleBinding = schema.GroupVersionKind{
+		Group:   "rbac.authorization.k8s.io",
+		Version: "v1",
+		Kind:    "ClusterRoleBinding",
+	}
+
+	// ServiceAccount (v1).
+	ServiceAccount = schema.GroupVersionKind{
+		Group:   "",
+		Version: "v1",
+		Kind:    "ServiceAccount",
+	}
+
+	// DaemonSet (apps/v1).
+	DaemonSet = schema.GroupVersionKind{
+		Group:   "apps",
+		Version: "v1",
+		Kind:    "DaemonSet",
+	}
 )
