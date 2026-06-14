@@ -62,28 +62,6 @@ var monitoringOwnerReferencesCondition = And(
 	jq.Match(`.metadata.ownerReferences[0].name == "%s"`, MonitoringCRName),
 )
 
-// monitoringTestSuite orchestrates all monitoring e2e test groups.
-func monitoringTestSuite(t *testing.T) {
-	t.Helper()
-
-	tc, err := NewTestContext(t)
-	require.NoError(t, err)
-
-	expectedReplicas := detectExpectedReplicas(t, tc)
-
-	monitoringServiceCtx := MonitoringTestCtx{
-		TestContext:             tc,
-		expectedDefaultReplicas: expectedReplicas,
-	}
-
-	tc.DefaultResourceOpts = []ResourceOpts{
-		WithEventuallyTimeout(5 * time.Minute),
-		WithEventuallyPollingInterval(2 * time.Second),
-	}
-
-	_ = monitoringServiceCtx // tests will be added in subsequent commits
-}
-
 // updateMonitoringConfig patches the Monitoring CR with the given transforms
 // and waits for the CR to reach Ready status.
 func (tc *MonitoringTestCtx) updateMonitoringConfig(transforms ...jq.TransformFn) {

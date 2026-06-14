@@ -96,18 +96,12 @@ func (tc *TestContext) fetchResource(
 	return u, nil
 }
 
-func (tc *TestContext) FetchResource(
-	t *testing.T,
-	gvk schema.GroupVersionKind,
-	nn types.NamespacedName,
-) *unstructured.Unstructured {
-	t.Helper()
-
-	g := gomega.NewWithT(t)
+func (tc *TestContext) FetchResource(opts ...ResourceOpts) *unstructured.Unstructured {
+	ro := tc.NewResourceOptions(opts...)
 	var result *unstructured.Unstructured
 
-	g.Eventually(func() error {
-		u, err := tc.fetchResource(t, gvk, nn)
+	tc.g.Eventually(func() error {
+		u, err := tc.fetchResource(ro.t, ro.GVK, ro.NN)
 		if err != nil {
 			return err
 		}
