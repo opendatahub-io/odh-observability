@@ -256,4 +256,23 @@ var (
 		Version: "v1",
 		Kind:    "DaemonSet",
 	}
+
+	// StatefulSet (apps/v1).
+	StatefulSet = schema.GroupVersionKind{
+		Group:   "apps",
+		Version: "v1",
+		Kind:    "StatefulSet",
+	}
+
+	// Pod (v1).
+	Pod = schema.GroupVersionKind{
+		Group:   "",
+		Version: "v1",
+		Kind:    "Pod",
+	}
+
+	// Convenience aliases matching the latest API version.
+
+	Perses          = PersesV1Alpha2
+	PersesDatasource = PersesDatasourceV1Alpha2
 )

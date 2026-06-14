@@ -461,5 +461,4 @@ var (
 	_ = withNamespace
 	_ = withEmptyMetrics
 	_ = withNoCollectorReplicas
-	_ = withReservedTracesExporter
 )
