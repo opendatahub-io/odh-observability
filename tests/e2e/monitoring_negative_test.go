@@ -44,6 +44,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringMetricsNegativeConditions(t *test
 			jq.Match(`[.status.conditions[] | select(.type=="%s" and .reason=="%s")] | length==1`,
 				conditions.ConditionThanosQuerierAvailable, conditions.MetricsNotConfiguredReason),
 		)),
+		WithCustomErrorMsg("MonitoringStack and ThanosQuerier should report MetricsNotConfigured when metrics are disabled"),
 	)
 }
 
@@ -64,6 +65,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringTracesNegativeConditions(t *testi
 			jq.Match(`[.status.conditions[] | select(.type=="%s" and .reason=="%s")] | length==1`,
 				conditions.ConditionInstrumentationAvailable, conditions.TracesNotConfiguredReason),
 		)),
+		WithCustomErrorMsg("Tempo and Instrumentation should report TracesNotConfigured when traces are disabled"),
 	)
 }
 
@@ -80,6 +82,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringAlertingNegativeConditions(t *tes
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
 		WithCondition(jq.Match(`[.status.conditions[] | select(.type=="%s" and .reason=="%s")] | length==1`,
 			conditions.ConditionAlertingAvailable, conditions.AlertingNotConfiguredReason)),
+		WithCustomErrorMsg("Alerting should report AlertingNotConfigured when alerting is disabled"),
 	)
 }
 
@@ -105,6 +108,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringPersesNegativeConditions(t *testi
 			jq.Match(`[.status.conditions[] | select(.type=="%s" and .reason=="%s")] | length==1`,
 				conditions.ConditionPersesPrometheusDataSourceAvailable, conditions.MetricsNotConfiguredReason),
 		)),
+		WithCustomErrorMsg("Perses and datasources should report not-configured when both metrics and traces are disabled"),
 	)
 }
 
@@ -125,6 +129,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringNodeMetricsNegativeConditions(t *
 			jq.Match(`[.status.conditions[] | select(.type=="%s" and .reason=="%s")] | length==1`,
 				conditions.ConditionNodeMetricsEndpointAvailable, conditions.MetricsNotConfiguredReason),
 		)),
+		WithCustomErrorMsg("NodeMetricsEndpoint should report MetricsNotConfigured when metrics are disabled"),
 	)
 }
 
@@ -146,5 +151,6 @@ func (tc *MonitoringTestCtx) ValidateMonitoringOpenTelemetryNegativeConditions(t
 			jq.Match(`[.status.conditions[] | select(.type=="%s" and .reason=="%s")] | length==1`,
 				conditions.ConditionOpenTelemetryCollectorAvailable, conditions.MetricsAndTracesNotConfiguredReason),
 		)),
+		WithCustomErrorMsg("OpenTelemetryCollector should report MetricsAndTracesNotConfigured when both are disabled"),
 	)
 }
