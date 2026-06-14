@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	gTypes "github.com/onsi/gomega/types"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -37,6 +38,9 @@ func monitoringTestSuite(t *testing.T) {
 
 	monitoringServiceCtx.runBaseConfigurationTests(t)
 	monitoringServiceCtx.runMetricsAndMonitoringStackTests(t)
+	monitoringServiceCtx.runCollectorTests(t)
+	monitoringServiceCtx.runTargetAllocatorTests(t)
+	monitoringServiceCtx.runThanosQuerierTests(t)
 }
 
 // ========================================================================
@@ -314,4 +318,594 @@ func (tc *MonitoringTestCtx) ValidateReconciliationStability(t *testing.T) {
 			}
 		}
 	}).WithTimeout(1 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+}
+
+// ========================================================================
+// Group 3: OpenTelemetry Collector
+// ========================================================================
+
+func (tc *MonitoringTestCtx) runCollectorTests(t *testing.T) {
+	t.Helper()
+
+	t.Run("Group 3: OpenTelemetry Collector", func(t *testing.T) {
+		tc.setupMetrics(t)
+
+		t.Cleanup(func() {
+			tc.cleanupGroup(t, "")
+		})
+
+		t.Run("Test OpenTelemetry Collector Configurations", tc.ValidateOpenTelemetryCollectorConfigurations)
+		t.Run("Test OpenTelemetry Collector replicas", tc.ValidateMonitoringCRCollectorReplicas)
+		t.Run("Test Metrics TLS is always enabled for Prometheus exporter", tc.ValidateMetricsTLSAlwaysEnabled)
+	})
+}
+
+// ValidateOpenTelemetryCollectorConfigurations consolidates all OpenTelemetry Collector configuration tests.
+func (tc *MonitoringTestCtx) ValidateOpenTelemetryCollectorConfigurations(t *testing.T) {
+	t.Helper()
+
+	testCases := []struct {
+		name                string
+		transforms          []jq.TransformFn
+		monitoringCondition gTypes.GomegaMatcher
+		validation          gTypes.GomegaMatcher
+	}{
+		{
+			name: "Basic Traces Configuration",
+			transforms: []jq.TransformFn{
+				withManagementState(common.Managed),
+				withMonitoringTraces(TracesStorageBackendPV, "", "", DefaultRetention),
+			},
+			monitoringCondition: jq.Match(`.spec.traces != null`),
+			validation:          jq.Match(`.spec.config.service.pipelines | has("traces")`),
+		},
+		{
+			name: "Trace Ingestion always uses TLS via gateway",
+			transforms: []jq.TransformFn{
+				withManagementState(common.Managed),
+				withMonitoringTraces(TracesStorageBackendPV, "", "", DefaultRetention),
+			},
+			monitoringCondition: jq.Match(`.spec.traces != null`),
+			validation: jq.Match(`
+				(.spec.config.exporters."otlp/tempo".tls.ca_file == "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt") and
+				(.spec.config.exporters."otlp/tempo".auth.authenticator == "bearertokenauth")
+			`),
+		},
+		{
+			name: "Custom Metrics Exporters",
+			transforms: []jq.TransformFn{
+				withManagementState(common.Managed),
+				tc.withMetricsConfig(),
+				withCustomMetricsExporters(),
+			},
+			monitoringCondition: jq.Match(`.spec.metrics != null`),
+			validation: jq.Match(`
+				(.spec.config.exporters | has("prometheus") and has("debug") and has("%s")) and
+				(.spec.config.service.pipelines.metrics.exporters | length == 3 and contains(["prometheus", "debug", "%s"]))
+			`, OtlpCustomExporter, OtlpCustomExporter),
+		},
+		{
+			name: "Custom Traces Exporters",
+			transforms: []jq.TransformFn{
+				withManagementState(common.Managed),
+				withMonitoringTraces(TracesStorageBackendPV, "", "", ""),
+				withCustomTracesExporters(),
+			},
+			monitoringCondition: jq.Match(`.spec.traces != null`),
+			validation: jq.Match(`
+				(.spec.config.exporters | has("debug") and has("%s") and has("%s")) and
+				(.spec.config.service.pipelines.traces.exporters | contains(["debug", "%s", "%s"]))
+			`, OtlpHttpCustomExporter, OtlpTempoExporter, OtlpHttpCustomExporter, OtlpTempoExporter),
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Helper()
+			t.Cleanup(tc.resetMonitoringConfigToManaged)
+
+			tc.updateMonitoringConfig(testCase.transforms...)
+
+			monitoringReadyCondition := And(
+				jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, common.ConditionTypeReady, metav1.ConditionTrue),
+				testCase.monitoringCondition,
+			)
+
+			tc.EnsureResourceExists(
+				WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+				WithCondition(monitoringReadyCondition),
+				WithCustomErrorMsg("Monitoring service should be ready with expected configuration before validating OpenTelemetry Collector"),
+			)
+
+			tc.ensureOpenTelemetryCollectorReady(t)
+
+			tc.EnsureResourceExists(
+				WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+					Name:      OpenTelemetryCollectorName,
+					Namespace: tc.MonitoringNamespace,
+				}),
+				WithCondition(testCase.validation),
+			)
+		})
+	}
+}
+
+// ValidateMonitoringCRCollectorReplicas tests that collectorReplicas is respected.
+func (tc *MonitoringTestCtx) ValidateMonitoringCRCollectorReplicas(t *testing.T) {
+	t.Helper()
+
+	defaultReplicas := tc.expectedDefaultReplicas
+	testReplicas := defaultReplicas + 1
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	monitoringCR := WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName})
+
+	tc.EnsureResourceExists(
+		monitoringCR,
+		WithCondition(jq.Match(`.spec.collectorReplicas == %d`, defaultReplicas)),
+		WithCustomErrorMsg("CollectorReplicas should be set to the default value of %d", defaultReplicas),
+	)
+
+	tc.updateMonitoringConfig(jq.Transform(`.spec.collectorReplicas = %d`, testReplicas))
+
+	tc.EnsureResourceExists(
+		monitoringCR,
+		WithCondition(jq.Match(`.spec.collectorReplicas == %d`, testReplicas)),
+		WithCustomErrorMsg("CollectorReplicas should be updated to %d", testReplicas),
+	)
+}
+
+// ValidateMetricsTLSAlwaysEnabled validates that TLS is always enabled for the OpenTelemetry Collector Prometheus exporter.
+func (tc *MonitoringTestCtx) ValidateMetricsTLSAlwaysEnabled(t *testing.T) {
+	t.Helper()
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.ensureOpenTelemetryCollectorReady(t)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      "data-science-collector-prometheus",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == "data-science-collector-tls"`),
+			jq.Match(`.spec.ports[0].name == "prometheus"`),
+			jq.Match(`.spec.ports[0].port == 8889`),
+		)),
+		WithCustomErrorMsg("TLS Service for Prometheus exporter should exist with service-ca annotation"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Secret, types.NamespacedName{
+			Name:      "data-science-collector-tls",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.type == "kubernetes.io/tls"`),
+			jq.Match(`.data."tls.crt" != null`),
+			jq.Match(`.data."tls.key" != null`),
+		)),
+		WithCustomErrorMsg("TLS Secret should be created by service-ca with certificate and key"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+			Name:      OpenTelemetryCollectorName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.config.exporters.prometheus.tls.cert_file == "/etc/otel-collector/tls/tls.crt"`),
+			jq.Match(`.spec.config.exporters.prometheus.tls.key_file == "/etc/otel-collector/tls/tls.key"`),
+			jq.Match(`.spec.volumes[] | select(.name == "tls-certs") | .secret.secretName == "data-science-collector-tls"`),
+		)),
+		WithCustomErrorMsg("OpenTelemetryCollector should have TLS configured for Prometheus exporter"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
+			Name:      "data-science-prometheus-monitor",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.endpoints[0].scheme == "https"`),
+			jq.Match(`.spec.endpoints[0].tlsConfig.serverName == "data-science-collector-prometheus.%s.svc"`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("ServiceMonitor should always use HTTPS to scrape Prometheus exporter"),
+	)
+}
+
+// ========================================================================
+// Group 4: Target Allocator
+// ========================================================================
+
+func (tc *MonitoringTestCtx) runTargetAllocatorTests(t *testing.T) {
+	t.Helper()
+
+	t.Run("Group 4: Target Allocator", func(t *testing.T) {
+		tc.cleanupGroup(t, "")
+
+		t.Cleanup(func() {
+			tc.cleanupGroup(t, "")
+		})
+
+		t.Run("Test Target Allocator not deployed without metrics", tc.ValidateTargetAllocatorNotDeployedWithoutMetrics)
+
+		t.Run("With Metrics", func(t *testing.T) {
+			tc.setupMetrics(t)
+
+			t.Run("Test Target Allocator deployment with metrics", tc.ValidateTargetAllocatorDeploymentWithMetrics)
+			t.Run("Test Target Allocator Service and ConfigMap", tc.ValidateTargetAllocatorServiceAndConfigMap)
+			t.Run("Test Target Allocator lifecycle", tc.ValidateTargetAllocatorLifecycle)
+			t.Run("Test Target Allocator RBAC configuration", tc.ValidateTargetAllocatorRBACConfiguration)
+		})
+	})
+}
+
+// ValidateTargetAllocatorNotDeployedWithoutMetrics tests that the Target Allocator is not deployed when metrics are not configured.
+func (tc *MonitoringTestCtx) ValidateTargetAllocatorNotDeployedWithoutMetrics(t *testing.T) {
+	t.Helper()
+	t.Cleanup(tc.resetMonitoringConfigToManaged)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		withNoMetrics(),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(And(
+			jq.Match(`.spec.metrics == null`),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, common.ConditionTypeReady, metav1.ConditionTrue),
+		)),
+		WithCustomErrorMsg("Monitoring resource should be created without metrics configuration"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(jq.Match(
+			`[.status.conditions[] | select(.type=="%s" and .status=="False")] | length==1`,
+			conditions.ConditionOpenTelemetryCollectorAvailable,
+		)),
+		WithCustomErrorMsg("OpenTelemetryCollectorAvailable condition should be False when metrics are not configured"),
+	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+			Name:      OpenTelemetryCollectorName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      TargetAllocatorDeploymentName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+	)
+}
+
+// ValidateTargetAllocatorDeploymentWithMetrics tests that the Target Allocator is deployed and ready when metrics are configured.
+func (tc *MonitoringTestCtx) ValidateTargetAllocatorDeploymentWithMetrics(t *testing.T) {
+	t.Helper()
+	t.Cleanup(tc.resetMonitoringConfigToManaged)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(And(
+			jq.Match(`.spec.metrics != null`),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, common.ConditionTypeReady, metav1.ConditionTrue),
+		)),
+		WithCustomErrorMsg("Monitoring resource should be updated with metrics configuration"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+			Name:      OpenTelemetryCollectorName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.targetAllocator.enabled == true`),
+			jq.Match(`.spec.targetAllocator.serviceAccount == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.spec.targetAllocator.prometheusCR.enabled == true`),
+			jq.Match(`.spec.targetAllocator.prometheusCR.podMonitorSelector.matchLabels."monitoring.opendatahub.io/scrape" == "true"`),
+			jq.Match(`.spec.targetAllocator.prometheusCR.serviceMonitorSelector.matchLabels."monitoring.opendatahub.io/scrape" == "true"`),
+		)),
+		WithCustomErrorMsg("OpenTelemetryCollector should have targetAllocator enabled with correct configuration"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      TargetAllocatorDeploymentName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.status.readyReplicas >= 1`),
+			jq.Match(`.status.conditions[] | select(.type == "Available") | .status == "True"`),
+		)),
+		WithCustomErrorMsg("Target Allocator Deployment should be created and available"),
+	)
+}
+
+// ValidateTargetAllocatorServiceAndConfigMap tests that the Target Allocator Service and ConfigMap are created correctly.
+func (tc *MonitoringTestCtx) ValidateTargetAllocatorServiceAndConfigMap(t *testing.T) {
+	t.Helper()
+	t.Cleanup(tc.resetMonitoringConfigToManaged)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      TargetAllocatorDeploymentName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(
+			jq.Match(`.spec.ports[] | select(.name == "targetallocation") | .port == 80`),
+		),
+		WithCustomErrorMsg("Target Allocator Service should be created"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ConfigMap, types.NamespacedName{
+			Name:      TargetAllocatorDeploymentName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCustomErrorMsg("Target Allocator ConfigMap should be created by OpenTelemetry Operator"),
+	)
+}
+
+// ValidateTargetAllocatorLifecycle tests the complete lifecycle of Target Allocator deployment and cleanup.
+func (tc *MonitoringTestCtx) ValidateTargetAllocatorLifecycle(t *testing.T) {
+	t.Helper()
+	t.Cleanup(tc.resetMonitoringConfigToManaged)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      TargetAllocatorDeploymentName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.status.readyReplicas >= 1`)),
+		WithCustomErrorMsg("Target Allocator should be deployed when metrics are enabled"),
+	)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		withNoMetrics(),
+	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      TargetAllocatorDeploymentName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+	)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      TargetAllocatorDeploymentName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.status.readyReplicas >= 1`)),
+		WithCustomErrorMsg("Target Allocator should be recreated when metrics are re-enabled"),
+	)
+}
+
+// ValidateTargetAllocatorRBACConfiguration tests that Target Allocator has correct RBAC permissions.
+func (tc *MonitoringTestCtx) ValidateTargetAllocatorRBACConfiguration(t *testing.T) {
+	t.Helper()
+	t.Cleanup(tc.resetMonitoringConfigToManaged)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ServiceAccount, types.NamespacedName{
+			Name:      TargetAllocatorServiceAccount,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCustomErrorMsg("ServiceAccount for Target Allocator should exist"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{
+			Name: "generate-processors-role",
+		}),
+		WithCondition(And(
+			jq.Match(`.rules[] | select(.apiGroups[] == "monitoring.coreos.com") | .resources | contains(["podmonitors", "servicemonitors"])`),
+			jq.Match(`.rules[] | select(.apiGroups[] == "monitoring.coreos.com") | .verbs | contains(["get", "list", "watch"])`),
+			jq.Match(`.rules[] | select(.apiGroups[] == "") | .resources | contains(["endpoints"])`),
+			jq.Match(`.rules[] | select(.apiGroups[] == "") | .verbs | contains(["get", "list", "watch"])`),
+			jq.Match(`.rules[] | select(.apiGroups[] == "discovery.k8s.io") | .resources | contains(["endpointslices"])`),
+			jq.Match(`.rules[] | select(.apiGroups[] == "discovery.k8s.io") | .verbs | contains(["get", "list", "watch"])`),
+		)),
+		WithCustomErrorMsg("ClusterRole should grant Target Allocator permissions to watch ServiceMonitors, PodMonitors, Endpoints, and EndpointSlices"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "generate-processors-collector-rolebinding",
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.name == "generate-processors-role"`),
+			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("ClusterRoleBinding should bind Target Allocator ClusterRole to ServiceAccount"),
+	)
+}
+
+// ========================================================================
+// Group 5: Thanos Querier
+// ========================================================================
+
+func (tc *MonitoringTestCtx) runThanosQuerierTests(t *testing.T) {
+	t.Helper()
+
+	t.Run("Group 5: Thanos Querier", func(t *testing.T) {
+		tc.cleanupGroup(t, "")
+
+		t.Cleanup(func() {
+			tc.cleanupGroup(t, "")
+		})
+
+		t.Run("Test ThanosQuerier not deployed without metrics", tc.ValidateThanosQuerierNotDeployedWithoutMetrics)
+		t.Run("Test ThanosQuerier deployment with metrics", tc.ValidateThanosQuerierDeployment)
+		t.Run("Test Prometheus NetworkPolicy allows Thanos Querier on gRPC port", tc.ValidatePrometheusNetworkPolicyAllowsThanosQuerier)
+	})
+}
+
+// ValidateThanosQuerierNotDeployedWithoutMetrics tests that ThanosQuerier is not deployed when metrics are not configured.
+func (tc *MonitoringTestCtx) ValidateThanosQuerierNotDeployedWithoutMetrics(t *testing.T) {
+	t.Helper()
+	t.Cleanup(tc.resetMonitoringConfigToManaged)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		withNoMetrics(),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(And(
+			jq.Match(`.spec.metrics == null`),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, common.ConditionTypeReady, metav1.ConditionTrue),
+		)),
+		WithCustomErrorMsg("Monitoring resource should be created without metrics configuration"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(jq.Match(
+			`[.status.conditions[] | select(.type=="%s" and .status=="False" and .reason=="%s")] | length==1`,
+			conditions.ConditionThanosQuerierAvailable,
+			conditions.MetricsNotConfiguredReason,
+		)),
+		WithCustomErrorMsg("ThanosQuerier condition should be False with reason MetricsNotConfigured when metrics are not configured"),
+	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.ThanosQuerier, types.NamespacedName{Name: ThanosQuerierName, Namespace: tc.MonitoringNamespace}),
+	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.Route, types.NamespacedName{Name: ThanosQuerierRouteName, Namespace: tc.MonitoringNamespace}),
+	)
+}
+
+// ValidateThanosQuerierDeployment tests that ThanosQuerier CR and Route are created when metrics are configured.
+func (tc *MonitoringTestCtx) ValidateThanosQuerierDeployment(t *testing.T) {
+	t.Helper()
+	t.Cleanup(tc.resetMonitoringConfigToManaged)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(And(
+			jq.Match(`.spec.metrics != null`),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, common.ConditionTypeReady, metav1.ConditionTrue),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionThanosQuerierAvailable, metav1.ConditionTrue),
+		)),
+		WithCustomErrorMsg("Monitoring resource should be updated with metrics configuration and ThanosQuerier should be available"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ThanosQuerier, types.NamespacedName{Name: ThanosQuerierName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(And(
+			jq.Match(`.spec.selector.matchLabels."platform.opendatahub.io/part-of" == "monitoring"`),
+			jq.Match(`.spec.namespaceSelector.matchNames | contains(["%s"])`, tc.MonitoringNamespace),
+			jq.Match(`.spec.replicaLabels | contains(["prometheus_replica", "rule_replica"])`),
+			monitoringOwnerReferencesCondition,
+		)),
+		WithCustomErrorMsg("ThanosQuerier CR should be created when metrics are configured"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Route, types.NamespacedName{Name: ThanosQuerierRouteName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(And(
+			jq.Match(`.spec.to.name == "thanos-querier-data-science-thanos-querier"`),
+			jq.Match(`.spec.tls.termination == "edge"`),
+			jq.Match(`.spec.tls.insecureEdgeTerminationPolicy == "Redirect"`),
+			jq.Match(`.metadata.labels.app == "thanos-querier"`),
+			jq.Match(`.metadata.labels."app.kubernetes.io/name" == "thanos-querier"`),
+			jq.Match(`.metadata.labels."app.kubernetes.io/component" == "querier"`),
+			jq.Match(`.metadata.labels."app.kubernetes.io/part-of" == "data-science-monitoring"`),
+			monitoringOwnerReferencesCondition,
+		)),
+		WithCustomErrorMsg("ThanosQuerier Route should be created when metrics are configured"),
+	)
+}
+
+// ValidatePrometheusNetworkPolicyAllowsThanosQuerier tests that the Prometheus instance NetworkPolicy
+// includes an ingress rule allowing the Thanos Querier to reach the Thanos Sidecar on gRPC port 10901.
+func (tc *MonitoringTestCtx) ValidatePrometheusNetworkPolicyAllowsThanosQuerier(t *testing.T) {
+	t.Helper()
+	t.Cleanup(tc.resetMonitoringConfigToManaged)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(And(
+			jq.Match(`.spec.metrics != null`),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, common.ConditionTypeReady, metav1.ConditionTrue),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionMonitoringStackAvailable, metav1.ConditionTrue),
+		)),
+		WithCustomErrorMsg("Monitoring resource should be ready with MonitoringStack available before checking NetworkPolicy"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+			Name:      "data-science-prometheus-instance-ingress",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.metadata.labels["platform.opendatahub.io/part-of"] == "monitoring"`),
+			jq.Match(`.spec.podSelector.matchLabels["app.kubernetes.io/name"] == "prometheus"`),
+			jq.Match(`.spec.podSelector.matchLabels["app.kubernetes.io/instance"] == "data-science-monitoringstack"`),
+			jq.Match(`.spec.policyTypes[0] == "Ingress"`),
+			jq.Match(`.spec.ingress[0].from[0].podSelector.matchLabels.app == "data-science-prometheus-namespace-proxy"`),
+			jq.Match(`.spec.ingress[0].from[1].podSelector.matchLabels.app == "data-science-prometheus-cluster-proxy"`),
+			jq.Match(`.spec.ingress[0].ports[0].protocol == "TCP"`),
+			jq.Match(`.spec.ingress[0].ports[0].port == 9090`),
+			jq.Match(`.spec.ingress[1].from[0].podSelector.matchLabels["app.kubernetes.io/part-of"] == "ThanosQuerier"`),
+			jq.Match(`.spec.ingress[1].from[0].podSelector.matchLabels["app.kubernetes.io/managed-by"] == "observability-operator"`),
+			jq.Match(`.spec.ingress[1].ports[0].protocol == "TCP"`),
+			jq.Match(`.spec.ingress[1].ports[0].port == 10901`),
+		)),
+		WithCustomErrorMsg("Prometheus NetworkPolicy should allow Thanos Querier ingress on gRPC port 10901"),
+	)
 }

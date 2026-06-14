@@ -460,14 +460,6 @@ func withMonitoringTraces(backend, secret, size, retention string) jq.TransformF
 var (
 	_ = withNamespace
 	_ = withEmptyMetrics
-	_ = withEmptyAlerting
-	_ = withNoMetrics
-	_ = withNoAlerting
-	_ = withNoTraces
 	_ = withNoCollectorReplicas
-	_ = withCustomMetricsExporters
-	_ = withCustomTracesExporters
 	_ = withReservedTracesExporter
-	_ = withMetricsReplicas
-	_ = monitoringOwnerReferencesCondition
 )
