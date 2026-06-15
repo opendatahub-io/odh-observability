@@ -21,7 +21,7 @@ const (
 	TestPodMonitorName     = "test-podmonitor"
 	TestServiceMonitorName = "test-servicemonitor"
 
-	ODHLabelMonitoring = "monitoring.opendatahub.io/scrape"
+	ODHLabelMonitoring = "opendatahub.io/monitoring"
 )
 
 func (tc *MonitoringTestCtx) runWebhookTests(t *testing.T) {
@@ -266,7 +266,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjection(t *testing.T) {
 			Namespace: TestNamespaceName,
 		}),
 		WithCondition(jq.Match(`.metadata.labels."%s" == "true"`, ODHLabelMonitoring)),
-		WithCustomErrorMsg("Mutating webhook should inject monitoring.opendatahub.io/scrape=true label into PodMonitor"),
+		WithCustomErrorMsg("Mutating webhook should inject opendatahub.io/monitoring=true label into PodMonitor"),
 	)
 
 	tc.EnsureResourceExists(
@@ -275,7 +275,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjection(t *testing.T) {
 			Namespace: TestNamespaceName,
 		}),
 		WithCondition(jq.Match(`.metadata.labels."%s" == "true"`, ODHLabelMonitoring)),
-		WithCustomErrorMsg("Mutating webhook should inject monitoring.opendatahub.io/scrape=true label into ServiceMonitor"),
+		WithCustomErrorMsg("Mutating webhook should inject opendatahub.io/monitoring=true label into ServiceMonitor"),
 	)
 }
 
@@ -605,11 +605,13 @@ func (tc *MonitoringTestCtx) ValidateWebhookSkipsWhenMonitoringDisabled(t *testi
 
 	tc.updateMonitoringConfig(withManagementState(common.Removed))
 
-	tc.EnsureResourceGone(
+	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(jq.Match(`.status.phase == "%s"`, common.PhaseNotReady)),
+		WithCustomErrorMsg("Monitoring CR should reach Not Ready phase after setting managementState=Removed"),
 	)
 
-	t.Logf("Monitoring disabled and Monitoring CR deleted, proceeding to test webhook behavior")
+	t.Logf("Monitoring disabled (phase=Not Ready), proceeding to test webhook behavior")
 
 	nsLabels := map[string]string{
 		ODHLabelMonitoring: "true",

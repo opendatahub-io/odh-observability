@@ -175,13 +175,32 @@ func (tc *MonitoringTestCtx) resetMonitoringConfigToManaged() {
 			Namespace: tc.MonitoringNamespace,
 		}),
 	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.MonitoringStack, types.NamespacedName{
+			Name:      MonitoringStackName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.ThanosQuerier, types.NamespacedName{
+			Name:      ThanosQuerierName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+	)
 }
 
 // resetMonitoringConfigToRemoved deletes optional config fields and sets managementState=Removed.
 func (tc *MonitoringTestCtx) resetMonitoringConfigToRemoved() {
-	tc.updateMonitoringConfig(
-		withManagementState(common.Removed),
-		jq.Transform(`del(.spec.metrics, .spec.traces, .spec.alerting, .spec.collectorReplicas)`),
+	tc.updateMonitoringConfigWithOptions(
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			return jq.TransformPipeline(
+				withManagementState(common.Removed),
+				jq.Transform(`del(.spec.metrics, .spec.traces, .spec.alerting, .spec.collectorReplicas)`),
+			)(u)
+		}),
+		WithCondition(jq.Match(`.status.phase == "%s"`, common.PhaseNotReady)),
 	)
 
 	tc.EnsureResourcesGone(

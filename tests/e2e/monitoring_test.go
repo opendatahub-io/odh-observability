@@ -190,7 +190,7 @@ func (tc *MonitoringTestCtx) ValidatePrometheusRulesLifecycle(t *testing.T) {
 		WithMinimalObject(gvk.PrometheusRule, types.NamespacedName{Name: "operator-prometheusrules", Namespace: tc.MonitoringNamespace}),
 	)
 
-	tc.updateMonitoringConfig(withNoAlerting())
+	tc.updateMonitoringConfig(withManagementState(common.Managed), withNoAlerting())
 }
 
 // ValidatePrometheusSelfServiceMonitorTLSFix tests the prometheus-self-fixed ServiceMonitor TLS configuration.
@@ -449,22 +449,26 @@ func (tc *MonitoringTestCtx) ValidateMonitoringCRCollectorReplicas(t *testing.T)
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
 		tc.withMetricsConfig(),
+		withNoCollectorReplicas(),
 	)
 
-	monitoringCR := WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName})
+	collectorCR := WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+		Name:      OpenTelemetryCollectorName,
+		Namespace: tc.MonitoringNamespace,
+	})
 
 	tc.EnsureResourceExists(
-		monitoringCR,
-		WithCondition(jq.Match(`.spec.collectorReplicas == %d`, defaultReplicas)),
-		WithCustomErrorMsg("CollectorReplicas should be set to the default value of %d", defaultReplicas),
+		collectorCR,
+		WithCondition(jq.Match(`.spec.replicas == %d`, defaultReplicas)),
+		WithCustomErrorMsg("OTel Collector should default to %d replicas based on node count", defaultReplicas),
 	)
 
 	tc.updateMonitoringConfig(jq.Transform(`.spec.collectorReplicas = %d`, testReplicas))
 
 	tc.EnsureResourceExists(
-		monitoringCR,
-		WithCondition(jq.Match(`.spec.collectorReplicas == %d`, testReplicas)),
-		WithCustomErrorMsg("CollectorReplicas should be updated to %d", testReplicas),
+		collectorCR,
+		WithCondition(jq.Match(`.spec.replicas == %d`, testReplicas)),
+		WithCustomErrorMsg("OTel Collector replicas should be updated to %d", testReplicas),
 	)
 }
 
@@ -629,8 +633,8 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorDeploymentWithMetrics(t *tes
 			jq.Match(`.spec.targetAllocator.enabled == true`),
 			jq.Match(`.spec.targetAllocator.serviceAccount == "%s"`, TargetAllocatorServiceAccount),
 			jq.Match(`.spec.targetAllocator.prometheusCR.enabled == true`),
-			jq.Match(`.spec.targetAllocator.prometheusCR.podMonitorSelector.matchLabels."monitoring.opendatahub.io/scrape" == "true"`),
-			jq.Match(`.spec.targetAllocator.prometheusCR.serviceMonitorSelector.matchLabels."monitoring.opendatahub.io/scrape" == "true"`),
+			jq.Match(`.spec.targetAllocator.prometheusCR.podMonitorSelector.matchLabels."opendatahub.io/monitoring" == "true"`),
+			jq.Match(`.spec.targetAllocator.prometheusCR.serviceMonitorSelector.matchLabels."opendatahub.io/monitoring" == "true"`),
 		)),
 		WithCustomErrorMsg("OpenTelemetryCollector should have targetAllocator enabled with correct configuration"),
 	)
@@ -705,6 +709,13 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorLifecycle(t *testing.T) {
 	tc.EnsureResourceGone(
 		WithMinimalObject(gvk.Deployment, types.NamespacedName{
 			Name:      TargetAllocatorDeploymentName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+			Name:      OpenTelemetryCollectorName,
 			Namespace: tc.MonitoringNamespace,
 		}),
 	)
@@ -1111,7 +1122,7 @@ func (tc *MonitoringTestCtx) ValidateInstrumentationCRTracesLifecycle(t *testing
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
 		WithCondition(And(
 			jq.Match(`.spec.traces != null`),
-			jq.Match(`.spec.traces.storage.retention == "%s"`, FormattedRetention),
+			jq.Match(`.spec.traces.storage.retention == "%s"`, DefaultRetention),
 		)),
 		WithCustomErrorMsg("Monitoring resource should be updated with traces configuration"),
 	)
@@ -1900,13 +1911,18 @@ func (tc *MonitoringTestCtx) ValidateMonitoringServiceDisabled(t *testing.T) {
 
 	tc.resetMonitoringConfigToRemoved()
 
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: MonitoringCRName}),
+		WithCondition(jq.Match(`.status.phase == "%s"`, common.PhaseNotReady)),
+		WithCustomErrorMsg("Monitoring CR should be in Not Ready phase after setting managementState=Removed"),
+	)
+
 	for _, resource := range []struct {
 		gvk                schema.GroupVersionKind
 		name               string
 		namespace          string
 		forceWithFinalizer bool
 	}{
-		{gvk: gvk.Monitoring, name: MonitoringCRName},
 		{gvk: gvk.MonitoringStack, name: MonitoringStackName, namespace: tc.MonitoringNamespace, forceWithFinalizer: true},
 		{gvk: gvk.TempoStack, name: TempoStackName, namespace: tc.MonitoringNamespace, forceWithFinalizer: true},
 		{gvk: gvk.TempoMonolithic, name: TempoMonolithicName, namespace: tc.MonitoringNamespace, forceWithFinalizer: true},
