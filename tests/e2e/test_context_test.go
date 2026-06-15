@@ -18,6 +18,7 @@ import (
 )
 
 type TestContext struct {
+	t                   *testing.T
 	client              client.Client
 	ctx                 context.Context
 	g                   *gomega.WithT
@@ -56,6 +57,7 @@ func NewTestContext(t *testing.T) (*TestContext, error) {
 	g.SetDefaultConsistentlyPollingInterval(testOpts.Timeouts.defaultConsistentlyPollInterval)
 
 	return &TestContext{
+		t:                   t,
 		client:              ctrlCli,
 		ctx:                 context.Background(),
 		g:                   g,
@@ -66,7 +68,7 @@ func NewTestContext(t *testing.T) (*TestContext, error) {
 }
 
 func (tc *TestContext) NewResourceOptions(opts ...ResourceOpts) *ResourceOptions {
-	ro := &ResourceOptions{tc: tc}
+	ro := &ResourceOptions{tc: tc, t: tc.t}
 
 	for _, opt := range tc.DefaultResourceOpts {
 		opt(ro)
