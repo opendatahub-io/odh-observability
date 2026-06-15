@@ -288,7 +288,7 @@ func detectExpectedReplicas(t *testing.T, tc *TestContext) int {
 		}
 	}
 
-	if schedulable == 1 {
+	if schedulable <= 1 {
 		t.Logf("detected single schedulable node — expecting 1 replica")
 		return 1
 	}

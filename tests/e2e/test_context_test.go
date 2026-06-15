@@ -384,6 +384,8 @@ func (tc *TestContext) ConsistentlyResourceCreatedOrPatched(opts ...ResourceOpts
 
 	if ro.Condition != nil {
 		consistently.Should(And(Not(BeNil()), ro.Condition), ro.errorMsg("resource should consistently match condition"))
+	} else {
+		consistently.Should(Not(BeNil()), ro.errorMsg("resource should consistently exist"))
 	}
 
 	return result
@@ -407,9 +409,7 @@ func (tc *TestContext) DeleteResource(opts ...ResourceOpts) {
 		if k8serr.IsNotFound(err) && ro.IgnoreNotFound {
 			return
 		}
-		if !ro.IgnoreNotFound {
-			ro.tc.g.Expect(err).ToNot(HaveOccurred(), ro.errorMsg("failed to delete resource"))
-		}
+		ro.tc.g.Expect(err).ToNot(HaveOccurred(), ro.errorMsg("failed to delete resource"))
 		return
 	}
 
@@ -452,7 +452,10 @@ func (tc *TestContext) tryRemoveFinalizers(ro *ResourceOptions) {
 	original := u.DeepCopy()
 	u.SetFinalizers(nil)
 	patch := client.MergeFrom(original)
-	_ = tc.client.Patch(tc.ctx, u, patch)
+	ro.tc.g.Expect(tc.client.Patch(tc.ctx, u, patch)).To(
+		Succeed(),
+		ro.errorMsg("failed to remove finalizers before delete"),
+	)
 }
 
 func (tc *TestContext) EnsureDeploymentReady(opts ...ResourceOpts) {

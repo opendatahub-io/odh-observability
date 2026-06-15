@@ -1903,23 +1903,24 @@ func (tc *MonitoringTestCtx) ValidateMonitoringServiceDisabled(t *testing.T) {
 	for _, resource := range []struct {
 		gvk                schema.GroupVersionKind
 		name               string
+		namespace          string
 		forceWithFinalizer bool
 	}{
 		{gvk: gvk.Monitoring, name: MonitoringCRName},
-		{gvk: gvk.MonitoringStack, name: MonitoringStackName, forceWithFinalizer: true},
-		{gvk: gvk.TempoStack, name: TempoStackName, forceWithFinalizer: true},
-		{gvk: gvk.TempoMonolithic, name: TempoMonolithicName, forceWithFinalizer: true},
-		{gvk: gvk.OpenTelemetryCollector, name: OpenTelemetryCollectorName},
-		{gvk: gvk.Instrumentation, name: InstrumentationName},
-		{gvk: gvk.Perses, name: PersesName},
-		{gvk: gvk.PersesDatasource, name: PersesDatasourceName},
-		{gvk: gvk.PersesDatasource, name: ClusterPrometheusDatasourceName},
+		{gvk: gvk.MonitoringStack, name: MonitoringStackName, namespace: tc.MonitoringNamespace, forceWithFinalizer: true},
+		{gvk: gvk.TempoStack, name: TempoStackName, namespace: tc.MonitoringNamespace, forceWithFinalizer: true},
+		{gvk: gvk.TempoMonolithic, name: TempoMonolithicName, namespace: tc.MonitoringNamespace, forceWithFinalizer: true},
+		{gvk: gvk.OpenTelemetryCollector, name: OpenTelemetryCollectorName, namespace: tc.MonitoringNamespace},
+		{gvk: gvk.Instrumentation, name: InstrumentationName, namespace: tc.MonitoringNamespace},
+		{gvk: gvk.Perses, name: PersesName, namespace: tc.MonitoringNamespace},
+		{gvk: gvk.PersesDatasource, name: PersesDatasourceName, namespace: tc.MonitoringNamespace},
+		{gvk: gvk.PersesDatasource, name: ClusterPrometheusDatasourceName, namespace: tc.MonitoringNamespace},
 	} {
 		if resource.forceWithFinalizer {
 			tc.DeleteResource(
 				WithMinimalObject(resource.gvk, types.NamespacedName{
 					Name:      resource.name,
-					Namespace: tc.MonitoringNamespace,
+					Namespace: resource.namespace,
 				}),
 				WithWaitForDeletion(true),
 				WithRemoveFinalizersOnDelete(true),
@@ -1929,7 +1930,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringServiceDisabled(t *testing.T) {
 			tc.EnsureResourceGone(
 				WithMinimalObject(resource.gvk, types.NamespacedName{
 					Name:      resource.name,
-					Namespace: tc.MonitoringNamespace,
+					Namespace: resource.namespace,
 				}),
 			)
 		}

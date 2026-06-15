@@ -35,16 +35,16 @@ func (c *TestContextConfig) applyDefaults() {
 	if c.monitoringCRName == "" {
 		c.monitoringCRName = "default-monitoring"
 	}
-	if c.Timeouts.defaultEventuallyTimeout == 0 {
+	if c.Timeouts.defaultEventuallyTimeout <= 0 {
 		c.Timeouts.defaultEventuallyTimeout = 5 * time.Minute
 	}
-	if c.Timeouts.defaultEventuallyPollInterval == 0 {
+	if c.Timeouts.defaultEventuallyPollInterval <= 0 {
 		c.Timeouts.defaultEventuallyPollInterval = 2 * time.Second
 	}
-	if c.Timeouts.defaultConsistentlyTimeout == 0 {
+	if c.Timeouts.defaultConsistentlyTimeout <= 0 {
 		c.Timeouts.defaultConsistentlyTimeout = 30 * time.Second
 	}
-	if c.Timeouts.defaultConsistentlyPollInterval == 0 {
+	if c.Timeouts.defaultConsistentlyPollInterval <= 0 {
 		c.Timeouts.defaultConsistentlyPollInterval = 2 * time.Second
 	}
 }
