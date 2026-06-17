@@ -37,6 +37,10 @@ func monitoringTestSuite(t *testing.T) {
 		WithEventuallyPollingInterval(2 * time.Second),
 	}
 
+	if testOpts.installOperators {
+		monitoringServiceCtx.ensureDependentOperatorsInstalled(t)
+	}
+
 	monitoringServiceCtx.ensureMonitoringCRExists(t)
 	monitoringServiceCtx.runBaseConfigurationTests(t)
 	monitoringServiceCtx.runMetricsAndMonitoringStackTests(t)

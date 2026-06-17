@@ -7,11 +7,7 @@ End-to-end tests for the odh-observability monitoring module. These tests run ag
 - An OpenShift cluster with `KUBECONFIG` set
 - The odh-observability operator deployed and running
 - The test suite creates the `Monitoring` CR automatically if it does not already exist
-- Dependent operators installed via OLM:
-  - Cluster Observability Operator (provides MonitoringStack, ThanosQuerier)
-  - Tempo Operator (provides TempoMonolithic, TempoStack)
-  - OpenTelemetry Operator (provides OpenTelemetryCollector, Instrumentation)
-  - Perses Operator (provides Perses, PersesDatasource)
+- Dependent OLM operators (Cluster Observability Operator, Tempo Operator, OpenTelemetry Operator) are installed automatically by the test suite by default. To skip automatic installation (e.g. when operators are already present), pass `-install-operators=false`
 
 ## Running
 
@@ -39,6 +35,8 @@ All configuration is via test flags, passed through `E2E_TEST_FLAGS`:
 | `-eventually-poll-interval` | `2s` | Default poll interval for Eventually assertions |
 | `-consistently-timeout` | `30s` | Default timeout for Consistently assertions |
 | `-consistently-poll-interval` | `2s` | Default poll interval for Consistently assertions |
+| `-install-operators` | `true` | Install dependent OLM operators before running tests |
+| `-olm-timeout` | `5m` | Timeout for OLM operator installation |
 
 Example:
 

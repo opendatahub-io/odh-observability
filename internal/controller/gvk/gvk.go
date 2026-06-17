@@ -169,6 +169,13 @@ var (
 		Kind:    "ValidatingAdmissionPolicyBinding",
 	}
 
+	// OperatorGroup (operators.coreos.com/v1).
+	OperatorGroup = schema.GroupVersionKind{
+		Group:   "operators.coreos.com",
+		Version: "v1",
+		Kind:    "OperatorGroup",
+	}
+
 	// Subscription (operators.coreos.com/v1alpha1).
 	Subscription = schema.GroupVersionKind{
 		Group:   "operators.coreos.com",
@@ -181,6 +188,13 @@ var (
 		Group:   "operators.coreos.com",
 		Version: "v1alpha1",
 		Kind:    "ClusterServiceVersion",
+	}
+
+	// InstallPlan (operators.coreos.com/v1alpha1).
+	InstallPlan = schema.GroupVersionKind{
+		Group:   "operators.coreos.com",
+		Version: "v1alpha1",
+		Kind:    "InstallPlan",
 	}
 
 	// Core Kubernetes types used in e2e tests.

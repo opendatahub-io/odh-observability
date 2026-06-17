@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/onsi/gomega"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
@@ -15,6 +16,9 @@ import (
 	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	. "github.com/onsi/gomega"
+
+	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
+	jq "github.com/opendatahub-io/odh-observability/tests/e2e/matchers/jq"
 )
 
 type TestContext struct {
@@ -528,6 +532,90 @@ func StopErr(err error, format string, args ...any) error {
 	}
 
 	return gomega.StopTrying(msg).Wrap(err)
+}
+
+// OLM operator installation helpers.
+
+func (tc *TestContext) ensureNamespaceExists(name string) {
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: name}),
+		WithCustomErrorMsg("namespace %s should exist", name),
+	)
+}
+
+func (tc *TestContext) ensureOperatorGroupExists(namespace, name string) {
+	items := &unstructured.UnstructuredList{}
+	items.SetGroupVersionKind(gvk.OperatorGroup)
+
+	err := tc.client.List(tc.ctx, items, client.InNamespace(namespace))
+	if err == nil && len(items.Items) > 0 {
+		return
+	}
+
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.OperatorGroup, types.NamespacedName{Name: name, Namespace: namespace}),
+		WithCustomErrorMsg("OperatorGroup %s/%s should exist", namespace, name),
+	)
+}
+
+func (tc *TestContext) ensureSubscriptionExists(namespace, name, channel string) {
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.Subscription, types.NamespacedName{Name: name, Namespace: namespace}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			if err := unstructured.SetNestedField(u.Object, name, "spec", "name"); err != nil {
+				return err
+			}
+			if err := unstructured.SetNestedField(u.Object, channel, "spec", "channel"); err != nil {
+				return err
+			}
+			if err := unstructured.SetNestedField(u.Object, name, "spec", "package"); err != nil {
+				return err
+			}
+			if err := unstructured.SetNestedField(u.Object, "redhat-operators", "spec", "source"); err != nil {
+				return err
+			}
+			if err := unstructured.SetNestedField(u.Object, "openshift-marketplace", "spec", "sourceNamespace"); err != nil {
+				return err
+			}
+			return unstructured.SetNestedField(u.Object, "Automatic", "spec", "installPlanApproval")
+		}),
+		WithCondition(jq.Match(`.status | has("installPlanRef")`)),
+		WithEventuallyTimeout(tc.Timeouts.olmOperationTimeout),
+		WithCustomErrorMsg("Subscription %s/%s should have an installPlanRef", namespace, name),
+	)
+}
+
+func (tc *TestContext) ensureCSVSucceeded(namespace string, subscriptionNN types.NamespacedName) {
+	tc.g.Eventually(func(g Gomega) {
+		sub, err := tc.fetchResource(tc.t, gvk.Subscription, subscriptionNN)
+		g.Expect(err).NotTo(HaveOccurred(), "failed to fetch Subscription %s", subscriptionNN)
+
+		csvName, _, _ := unstructured.NestedString(sub.Object, "status", "currentCSV")
+		if csvName == "" {
+			csvName, _, _ = unstructured.NestedString(sub.Object, "status", "installedCSV")
+		}
+		g.Expect(csvName).NotTo(BeEmpty(), "Subscription %s has no currentCSV or installedCSV", subscriptionNN)
+
+		csv, err := tc.fetchResource(tc.t, gvk.ClusterServiceVersion, types.NamespacedName{
+			Name:      csvName,
+			Namespace: namespace,
+		})
+		g.Expect(err).NotTo(HaveOccurred(), "failed to fetch CSV %s/%s", namespace, csvName)
+
+		phase, _, _ := unstructured.NestedString(csv.Object, "status", "phase")
+		g.Expect(phase).To(Equal("Succeeded"), "CSV %s phase is %s, expected Succeeded", csvName, phase)
+	}).WithTimeout(tc.Timeouts.olmOperationTimeout).
+		WithPolling(10 * time.Second).
+		Should(Succeed())
+}
+
+func (tc *TestContext) EnsureOperatorInstalled(namespace, name, channel string) {
+	tc.ensureNamespaceExists(namespace)
+	tc.ensureOperatorGroupExists(namespace, name)
+
+	nn := types.NamespacedName{Name: name, Namespace: namespace}
+	tc.ensureSubscriptionExists(namespace, name, channel)
+	tc.ensureCSVSucceeded(namespace, nn)
 }
 
 

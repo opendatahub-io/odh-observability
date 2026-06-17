@@ -36,6 +36,21 @@ const (
 	ClusterPrometheusDatasourceSecret = "cluster-prometheus-datasource-secret"
 )
 
+// OLM operator constants for dependent operators.
+const (
+	observabilityOpName      = "cluster-observability-operator"
+	observabilityOpNamespace = "openshift-cluster-observability-operator"
+	observabilityOpChannel   = "stable"
+
+	tempoOpName      = "tempo-product"
+	tempoOpNamespace = "openshift-tempo-operator"
+	tempoOpChannel   = "stable"
+
+	opentelemetryOpName      = "opentelemetry-product"
+	opentelemetryOpNamespace = "openshift-opentelemetry-operator"
+	opentelemetryOpChannel   = "stable"
+)
+
 // Constants for common test values.
 const (
 	DefaultRetention       = "5m"
@@ -487,6 +502,33 @@ func withMonitoringTraces(backend, secret, size, retention string) jq.TransformF
 	}
 
 	return jq.TransformPipeline(transforms...)
+}
+
+// ensureDependentOperatorsInstalled installs the three required OLM operators
+// in parallel sub-tests. Each operator gets its own namespace + OperatorGroup + Subscription.
+func (tc *MonitoringTestCtx) ensureDependentOperatorsInstalled(t *testing.T) {
+	t.Helper()
+
+	type operator struct {
+		namespace string
+		name      string
+		channel   string
+	}
+
+	operators := []operator{
+		{observabilityOpNamespace, observabilityOpName, observabilityOpChannel},
+		{tempoOpNamespace, tempoOpName, tempoOpChannel},
+		{opentelemetryOpNamespace, opentelemetryOpName, opentelemetryOpChannel},
+	}
+
+	t.Run("install-dependent-operators", func(t *testing.T) {
+		for _, op := range operators {
+			t.Run(op.name, func(t *testing.T) {
+				t.Parallel()
+				tc.EnsureOperatorInstalled(op.namespace, op.name, op.channel)
+			})
+		}
+	})
 }
 
 // Suppress unused warnings for transform functions used in later commits.
