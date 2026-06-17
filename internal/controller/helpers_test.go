@@ -121,8 +121,8 @@ func TestSyncPrometheusWebTLSCA_ConfigMapPresent(t *testing.T) {
 	}
 
 	labels := secret.GetLabels()
-	if labels[odhLabels.PlatformPartOf] != "monitoring" {
-		t.Errorf("Secret label: want %q=%q, got %v", odhLabels.PlatformPartOf, "monitoring", labels)
+	if _, found := labels[odhLabels.PlatformPartOf]; found {
+		t.Errorf("Secret should not have %q label (causes GC to delete it every reconcile), got %v", odhLabels.PlatformPartOf, labels)
 	}
 
 	data, _, _ := unstructured.NestedStringMap(secret.Object, "data")
