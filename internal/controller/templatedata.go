@@ -357,11 +357,19 @@ func getEnvOrDefault(envVar, defaultVal string) string {
 	return defaultVal
 }
 
+// getPersesImage returns the Perses image from environment variable or default.
+// For RHOAI deployments, this is set via the CSV (via RHOAI-Build-Config/bundle/additional-images-patch.yaml).
+// For ODH deployments, this uses the default value below.
+//
+// This image version must stay compatible with the Cluster Observability Operator (COO) version
+// that we depend on. When upgrading COO, verify Perses image compatibility and update accordingly.
+// The current image is compatible with COO 1.5.0.
 func getPersesImage() string {
 	if image := os.Getenv("RELATED_IMAGE_PERSES_IMAGE"); image != "" {
 		return image
 	}
-	return "registry.redhat.io/cluster-observability-operator/perses-rhel9:1.3.1-1765876130"
+
+	return "registry.redhat.io/cluster-observability-operator/perses-rhel9:1.5.0-1781116652@sha256:27553fd6d4b4983475a0d9a4ccc7d7fa63b1bd4b48f0e5cb2d18963fe232cfd5"
 }
 
 // resolvePersesAPIVersion probes the cluster for the installed Perses CRD API version.

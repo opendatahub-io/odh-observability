@@ -52,6 +52,10 @@ unit-test: ## Run unit tests (no codegen prerequisites).
 test-verbose: ## Run unit tests with verbose output.
 	go test -v ./...
 
+.PHONY: e2e-test
+e2e-test: ## Run e2e tests against a cluster (requires KUBECONFIG).
+	go test ./tests/e2e/ -v -timeout 120m -count=1 $(E2E_TEST_FLAGS)
+
 ##@ Build
 
 .PHONY: build
@@ -59,7 +63,10 @@ build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
 
 .PHONY: run
-run: manifests generate fmt vet ## Run a controller from your host.
+run: manifests generate fmt vet ## Run controller locally (requires POD_NAMESPACE, e.g. POD_NAMESPACE=opendatahub make run).
+ifndef POD_NAMESPACE
+	$(error POD_NAMESPACE is not set. Usage: POD_NAMESPACE=opendatahub make run)
+endif
 	go run ./cmd/main.go
 
 .PHONY: docker-build
@@ -75,26 +82,21 @@ image: docker-build docker-push ## Build and push image with the manager.
 
 ##@ Deployment
 
-ifndef ignore-not-found
-  ignore-not-found = false
-endif
-
-.PHONY: install
-install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
-	$(KUSTOMIZE) build config/crd | kubectl apply -f -
-
-.PHONY: uninstall
-uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	$(KUSTOMIZE) build config/crd | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
+HELM_RELEASE ?= odh-observability
+HELM_CHART   ?= charts/odh-observability
+NAMESPACE    ?= opendatahub
 
 .PHONY: deploy
-deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build config/default | kubectl apply -f -
+deploy: manifests helm-update-crds ## Deploy operator to cluster via Helm chart.
+	helm upgrade --install $(HELM_RELEASE) $(HELM_CHART) \
+		-n $(NAMESPACE) --create-namespace \
+		--set operatorNamespace=$(NAMESPACE) \
+		--set image.repository=$(firstword $(subst :, ,$(IMG))) \
+		--set image.tag=$(lastword $(subst :, ,$(IMG)))
 
 .PHONY: undeploy
-undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	$(KUSTOMIZE) build config/default | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
+undeploy: ## Remove operator from cluster.
+	helm uninstall $(HELM_RELEASE) -n $(NAMESPACE) --ignore-not-found
 
 .PHONY: helm-update-crds
 helm-update-crds: manifests ## Copy generated CRDs into the Helm chart crds/ directory.
@@ -116,14 +118,8 @@ $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
 
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
-KUSTOMIZE ?= $(LOCALBIN)/kustomize
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
 $(CONTROLLER_GEN): $(LOCALBIN)
 	test -s $(LOCALBIN)/controller-gen || GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@latest
-
-.PHONY: kustomize
-kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
-$(KUSTOMIZE): $(LOCALBIN)
-	test -s $(LOCALBIN)/kustomize || GOBIN=$(LOCALBIN) go install sigs.k8s.io/kustomize/kustomize/v5@latest
