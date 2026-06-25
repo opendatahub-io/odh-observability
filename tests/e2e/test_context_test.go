@@ -535,6 +535,23 @@ func StopErr(err error, format string, args ...any) error {
 	return gomega.StopTrying(msg).Wrap(err)
 }
 
+// detectMonitoringNamespace reads spec.namespace from the Monitoring CR.
+func (tc *TestContext) detectMonitoringNamespace(t *testing.T) string {
+	t.Helper()
+
+	u, err := tc.fetchResource(t, gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName})
+	if err != nil {
+		t.Fatalf("failed to fetch Monitoring CR to detect namespace: %v", err)
+	}
+
+	ns, _, _ := unstructured.NestedString(u.Object, "spec", "namespace")
+	if ns == "" {
+		t.Fatalf("Monitoring CR %s has no spec.namespace set", tc.MonitoringCRName)
+	}
+
+	return ns
+}
+
 // ensureOperatorPodRunning verifies that at least one odh-observability
 // operator pod is Running on the cluster. Fails immediately if not found.
 func (tc *TestContext) ensureOperatorPodRunning(t *testing.T) {

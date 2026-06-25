@@ -21,7 +21,7 @@ type TestContextConfig struct {
 }
 
 func (c *TestContextConfig) registerFlags() {
-	flag.StringVar(&c.monitoringNamespace, "monitoring-namespace", "", "namespace where monitoring operands are deployed")
+	flag.StringVar(&c.monitoringNamespace, "monitoring-namespace", "", "namespace where monitoring operands are deployed (auto-detected from CR if omitted)")
 	flag.StringVar(&c.monitoringCRName, "monitoring-cr-name", "", "name of the Monitoring CR")
 	flag.BoolVar(&c.installOperators, "install-operators", true, "install dependent OLM operators before running tests")
 
@@ -33,9 +33,6 @@ func (c *TestContextConfig) registerFlags() {
 }
 
 func (c *TestContextConfig) applyDefaults() {
-	if c.monitoringNamespace == "" {
-		c.monitoringNamespace = "redhat-ods-monitoring"
-	}
 	if c.monitoringCRName == "" {
 		c.monitoringCRName = "default-monitoring"
 	}
