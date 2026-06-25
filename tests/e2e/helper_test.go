@@ -510,6 +510,7 @@ func withMonitoringTraces(backend, secret, size, retention string) jq.TransformF
 func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 	t.Helper()
 
+	tc.ensureOperatorPodRunning(t)
 	tc.ensureCRDExists(t, gvk.Monitoring)
 	tc.ensureNamespaceExists(tc.MonitoringNamespace)
 

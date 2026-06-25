@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -532,6 +533,31 @@ func StopErr(err error, format string, args ...any) error {
 	}
 
 	return gomega.StopTrying(msg).Wrap(err)
+}
+
+// ensureOperatorPodRunning verifies that at least one odh-observability
+// operator pod is Running on the cluster. Fails immediately if not found.
+func (tc *TestContext) ensureOperatorPodRunning(t *testing.T) {
+	t.Helper()
+
+	pods := &unstructured.UnstructuredList{}
+	pods.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("PodList"))
+
+	err := tc.client.List(tc.ctx, pods,
+		client.MatchingLabels{"app.kubernetes.io/name": "odh-observability"},
+	)
+	if err != nil {
+		t.Fatalf("failed to list operator pods: %v", err)
+	}
+
+	for i := range pods.Items {
+		phase, _, _ := unstructured.NestedString(pods.Items[i].Object, "status", "phase")
+		if phase == "Running" {
+			return
+		}
+	}
+
+	t.Fatalf("no running odh-observability operator pod found on cluster — run 'make deploy' first")
 }
 
 // ensureCRDExists verifies that a CRD is registered on the cluster and fails
