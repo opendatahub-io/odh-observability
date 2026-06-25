@@ -477,9 +477,11 @@ func deployWebhookInfrastructure(
 	}
 
 	if !issuerExists {
-		cm.MarkFalse(conditions.ConditionWebhookAvailable,
-			"CertManagerNotAvailable",
-			"cert-manager CRDs not found; webhook TLS cannot be provisioned")
+		// cert-manager is optional infrastructure. Its absence does not
+		// degrade the core monitoring functionality (metrics, traces).
+		cm.MarkNotConfigured(conditions.ConditionWebhookAvailable,
+			conditions.WebhookCertManagerNotAvailableReason,
+			conditions.WebhookCertManagerNotAvailableMessage)
 		return nil
 	}
 
@@ -498,8 +500,9 @@ func deployWebhookInfrastructure(
 	if err != nil {
 		if k8serr.IsNotFound(err) {
 			log.Info("webhook TLS secret not yet provisioned by cert-manager, waiting", "secret", secretName)
-			cm.MarkFalse(conditions.ConditionWebhookAvailable,
-				"TLSSecretPending",
+			// TLS secret pending is a normal startup state, not a hard failure.
+			cm.MarkNotConfigured(conditions.ConditionWebhookAvailable,
+				conditions.WebhookTLSPendingReason,
 				fmt.Sprintf("Waiting for cert-manager to provision TLS secret %s/%s", operatorNamespace, secretName))
 			return nil
 		}
@@ -508,8 +511,8 @@ func deployWebhookInfrastructure(
 
 	if len(secret.Data["tls.crt"]) == 0 || len(secret.Data["tls.key"]) == 0 {
 		log.Info("webhook TLS secret exists but certificate data not yet populated", "secret", secretName)
-		cm.MarkFalse(conditions.ConditionWebhookAvailable,
-			"TLSSecretPending",
+		cm.MarkNotConfigured(conditions.ConditionWebhookAvailable,
+			conditions.WebhookTLSPendingReason,
 			"TLS secret exists but certificate data not yet populated by cert-manager")
 		return nil
 	}
@@ -527,10 +530,10 @@ func deployWebhookInfrastructure(
 }
 
 const (
-	webhookArgEnabled  = "--enable-webhook=true"
-	webhookVolumeName  = "webhook-certs"
+	webhookArgEnabled    = "--enable-webhook=true"
+	webhookVolumeName    = "webhook-certs"
 	webhookCertMountPath = "/tmp/k8s-webhook-server/serving-certs"
-	webhookPort        = int32(9443)
+	webhookPort          = int32(9443)
 )
 
 // ensureWebhookEnabled patches the operator Deployment to enable the webhook

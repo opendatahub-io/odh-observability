@@ -73,6 +73,15 @@ const (
 	AlertingNotConfiguredReason          = "AlertingNotConfigured"
 	MetricsAndTracesNotConfiguredReason  = "MetricsAndTracesNotConfigured"
 	MetricsAndTracesNotConfiguredMessage = "Metrics and traces are not configured in Monitoring CR"
+
+	// WebhookCertManagerNotAvailableReason is used when cert-manager is not
+	// installed. The webhook is optional infrastructure; its absence does not
+	// degrade core monitoring functionality.
+	WebhookCertManagerNotAvailableReason = "CertManagerNotAvailable"
+
+	// WebhookTLSPendingReason is used when cert-manager is installed but has
+	// not yet provisioned the TLS secret. This is a normal startup state.
+	WebhookTLSPendingReason = "TLSSecretPending"
 )
 
 // Message constants.
@@ -81,22 +90,24 @@ const (
 	TracesNotConfiguredMessage   = "Traces not configured in Monitoring CR"
 	AlertingNotConfiguredMessage = "Alerting not configured in Monitoring CR"
 
-	TempoOperatorMissingMessage                 = "Tempo operator must be installed for traces configuration"
-	COOMissingMessage                           = "ClusterObservability operator must be installed for metrics configuration"
+	TempoOperatorMissingMessage                  = "Tempo operator must be installed for traces configuration"
+	COOMissingMessage                            = "ClusterObservability operator must be installed for metrics configuration"
 	OpenTelemetryCollectorOperatorMissingMessage = "OpenTelemetryCollector operator must be installed for OpenTelemetry configuration"
+
+	WebhookCertManagerNotAvailableMessage = "cert-manager not installed; webhook TLS cannot be provisioned"
 )
 
 // featureConditionTypes lists the feature-specific condition types that
 // participate in the Ready/Degraded aggregation.
 var featureConditionTypes = map[string]bool{
-	ConditionMonitoringStackAvailable:           true,
-	ConditionThanosQuerierAvailable:             true,
-	ConditionTempoAvailable:                     true,
-	ConditionInstrumentationAvailable:           true,
+	ConditionMonitoringStackAvailable:            true,
+	ConditionThanosQuerierAvailable:              true,
+	ConditionTempoAvailable:                      true,
+	ConditionInstrumentationAvailable:            true,
 	ConditionOpenTelemetryCollectorAvailable:     true,
-	ConditionAlertingAvailable:                  true,
-	ConditionPersesAvailable:                    true,
-	ConditionPersesTempoDataSourceAvailable:     true,
+	ConditionAlertingAvailable:                   true,
+	ConditionPersesAvailable:                     true,
+	ConditionPersesTempoDataSourceAvailable:      true,
 	ConditionPersesPrometheusDataSourceAvailable: true,
 	ConditionNodeMetricsEndpointAvailable:        true,
 	ConditionWebhookAvailable:                    true,
