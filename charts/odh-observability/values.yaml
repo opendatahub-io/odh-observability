@@ -36,7 +36,7 @@ webhook:
 certManager:
   enabled: true
   certificateName: odh-observability-webhook-cert
-  secretName: odh-observability-webhook-tls
+  secretName: odh-observability-webhook-cert
 
 # Extra environment variables injected into the controller container.
 # Use for RELATED_IMAGE_* overrides.

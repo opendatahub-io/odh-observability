@@ -125,26 +125,27 @@ const thanosQuerierRouteName = "data-science-thanos-querier-route"
 
 // syncStatusURL fetches the Thanos Querier route and updates monitoring.Status.URL.
 // When metrics are not configured the URL is cleared.
-func syncStatusURL(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) {
+func syncStatusURL(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) error {
 	if monitoring.Spec.Metrics == nil {
 		monitoring.Status.URL = ""
-		return
+		return nil
 	}
 
-	log := logf.FromContext(ctx).WithName("syncStatusURL")
 	route := &routev1.Route{}
 	if err := c.Get(ctx, client.ObjectKey{
 		Namespace: monitoring.Spec.Namespace,
 		Name:      thanosQuerierRouteName,
 	}, route); err != nil {
-		if !errors.IsNotFound(err) {
-			log.Error(err, "Failed to fetch Thanos Querier route for status URL")
-		}
 		monitoring.Status.URL = ""
-		return
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to fetch Thanos Querier route for status URL: %w", err)
 	}
 
 	if len(route.Status.Ingress) > 0 && route.Status.Ingress[0].Host != "" {
 		monitoring.Status.URL = "https://" + route.Status.Ingress[0].Host
 	}
+
+	return nil
 }

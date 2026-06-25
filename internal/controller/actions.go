@@ -534,8 +534,9 @@ const (
 )
 
 // ensureWebhookEnabled patches the operator Deployment to enable the webhook
-// server if it isn't already configured. It adds the --enable-webhook=true
-// argument, the TLS secret volume mount, and the webhook port.
+// server if it isn't already configured. It uses a strategic merge patch to
+// add the webhook arg, port, volume mount, and volume without clobbering
+// fields managed by Helm or other controllers.
 func ensureWebhookEnabled(
 	ctx context.Context,
 	c client.Client,
@@ -592,6 +593,8 @@ func ensureWebhookEnabled(
 	log.Info("Patching operator Deployment to enable webhook",
 		"deployment", operatorName, "namespace", operatorNamespace)
 
+	patch := client.StrategicMergeFrom(dep.DeepCopy())
+
 	if !hasWebhookArg {
 		container.Args = append(container.Args, webhookArgEnabled)
 	}
@@ -623,5 +626,5 @@ func ensureWebhookEnabled(
 		})
 	}
 
-	return c.Update(ctx, dep)
+	return c.Patch(ctx, dep, patch)
 }
