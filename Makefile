@@ -56,10 +56,6 @@ test-verbose: ## Run unit tests with verbose output.
 e2e-test: ## Run e2e tests against a cluster (requires KUBECONFIG).
 	go test ./tests/e2e/ -v -timeout 120m -count=1 $(E2E_TEST_FLAGS)
 
-.PHONY: e2e-test
-e2e-test: ## Run e2e tests against a cluster (requires KUBECONFIG).
-	go test ./tests/e2e/ -v -timeout 120m -count=1 $(E2E_TEST_FLAGS)
-
 ##@ Build
 
 .PHONY: build

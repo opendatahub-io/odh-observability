@@ -179,7 +179,9 @@ func TestSyncStatusURL_RoutePresent_MultipleIngress(t *testing.T) {
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(m, route).WithStatusSubresource(route).Build()
-	syncStatusURL(context.Background(), cli, m)
+	if err := syncStatusURL(context.Background(), cli, m); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	// Should use the first ingress host.
 	if m.Status.URL != "https://primary.example.com" {
@@ -204,7 +206,9 @@ func TestSyncStatusURL_EmptyHost(t *testing.T) {
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(m, route).WithStatusSubresource(route).Build()
-	syncStatusURL(context.Background(), cli, m)
+	if err := syncStatusURL(context.Background(), cli, m); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	// When the route exists but the host is empty (ingress not ready), the
 	// function preserves the existing URL. It will be updated on the next
@@ -229,7 +233,9 @@ func TestSyncStatusURL_NoIngress(t *testing.T) {
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(m, route).WithStatusSubresource(route).Build()
-	syncStatusURL(context.Background(), cli, m)
+	if err := syncStatusURL(context.Background(), cli, m); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	// When the route exists but has no ingress entries yet, the function
 	// preserves the existing URL.
