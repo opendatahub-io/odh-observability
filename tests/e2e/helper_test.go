@@ -504,18 +504,25 @@ func withMonitoringTraces(backend, secret, size, retention string) jq.TransformF
 	return jq.TransformPipeline(transforms...)
 }
 
-// ensurePrerequisites verifies that the Monitoring CRD is registered and the
-// monitoring namespace exists before any tests run.
+// ensurePrerequisites verifies that the Monitoring CRD is registered, creates
+// the monitoring namespace, installs dependent operators (when enabled), and
+// ensures the Monitoring CR exists before any test groups run.
 func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 	t.Helper()
 
 	tc.ensureCRDExists(t, gvk.Monitoring)
 	tc.ensureNamespaceExists(tc.MonitoringNamespace)
+
+	if testOpts.installOperators {
+		tc.installDependentOperators(t)
+	}
+
+	tc.ensureMonitoringCRExists(t)
 }
 
-// ensureDependentOperatorsInstalled installs the three required OLM operators
+// installDependentOperators installs the three required OLM operators
 // in parallel sub-tests. Each operator gets its own namespace + OperatorGroup + Subscription.
-func (tc *MonitoringTestCtx) ensureDependentOperatorsInstalled(t *testing.T) {
+func (tc *MonitoringTestCtx) installDependentOperators(t *testing.T) {
 	t.Helper()
 
 	type operator struct {

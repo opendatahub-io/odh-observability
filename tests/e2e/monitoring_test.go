@@ -38,12 +38,6 @@ func monitoringTestSuite(t *testing.T) {
 	}
 
 	monitoringServiceCtx.ensurePrerequisites(t)
-
-	if testOpts.installOperators {
-		monitoringServiceCtx.ensureDependentOperatorsInstalled(t)
-	}
-
-	monitoringServiceCtx.ensureMonitoringCRExists(t)
 	monitoringServiceCtx.runBaseConfigurationTests(t)
 	monitoringServiceCtx.runMetricsAndMonitoringStackTests(t)
 	monitoringServiceCtx.runCollectorTests(t)
