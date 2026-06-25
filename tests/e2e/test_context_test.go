@@ -534,6 +534,20 @@ func StopErr(err error, format string, args ...any) error {
 	return gomega.StopTrying(msg).Wrap(err)
 }
 
+// ensureCRDExists verifies that a CRD is registered on the cluster and fails
+// the test immediately if it is not.
+func (tc *TestContext) ensureCRDExists(t *testing.T, g schema.GroupVersionKind) {
+	t.Helper()
+
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(g)
+
+	err := tc.client.List(tc.ctx, list, client.Limit(1))
+	if err != nil {
+		t.Fatalf("CRD %s/%s not found on cluster — is the operator deployed? (%v)", g.Group, g.Kind, err)
+	}
+}
+
 // OLM operator installation helpers.
 
 func (tc *TestContext) ensureNamespaceExists(name string) {

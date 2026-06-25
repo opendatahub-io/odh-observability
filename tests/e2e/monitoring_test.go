@@ -37,6 +37,9 @@ func monitoringTestSuite(t *testing.T) {
 		WithEventuallyPollingInterval(2 * time.Second),
 	}
 
+	tc.ensureCRDExists(t, gvk.Monitoring)
+	tc.ensureNamespaceExists(tc.MonitoringNamespace)
+
 	if testOpts.installOperators {
 		monitoringServiceCtx.ensureDependentOperatorsInstalled(t)
 	}
