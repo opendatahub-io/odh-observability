@@ -28,8 +28,8 @@ type testAccessor struct {
 	conditions []platformcommon.Condition
 }
 
-func (a *testAccessor) GetConditions() []platformcommon.Condition     { return a.conditions }
-func (a *testAccessor) SetConditions(c []platformcommon.Condition)    { a.conditions = c }
+func (a *testAccessor) GetConditions() []platformcommon.Condition  { return a.conditions }
+func (a *testAccessor) SetConditions(c []platformcommon.Condition) { a.conditions = c }
 
 func newTestCM() (*ConditionsManager, *testAccessor) {
 	acc := &testAccessor{}

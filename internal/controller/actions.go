@@ -527,10 +527,10 @@ func deployWebhookInfrastructure(
 }
 
 const (
-	webhookArgEnabled  = "--enable-webhook=true"
-	webhookVolumeName  = "webhook-certs"
+	webhookArgEnabled    = "--enable-webhook=true"
+	webhookVolumeName    = "webhook-certs"
 	webhookCertMountPath = "/tmp/k8s-webhook-server/serving-certs"
-	webhookPort        = int32(9443)
+	webhookPort          = int32(9443)
 )
 
 // ensureWebhookEnabled patches the operator Deployment to enable the webhook
