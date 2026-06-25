@@ -477,7 +477,7 @@ func deployWebhookInfrastructure(
 	}
 
 	if !issuerExists {
-		cm.MarkFalse(conditions.ConditionWebhookAvailable,
+		cm.MarkNotConfigured(conditions.ConditionWebhookAvailable,
 			"CertManagerNotAvailable",
 			"cert-manager CRDs not found; webhook TLS cannot be provisioned")
 		return nil
@@ -498,7 +498,7 @@ func deployWebhookInfrastructure(
 	if err != nil {
 		if k8serr.IsNotFound(err) {
 			log.Info("webhook TLS secret not yet provisioned by cert-manager, waiting", "secret", secretName)
-			cm.MarkFalse(conditions.ConditionWebhookAvailable,
+			cm.MarkNotConfigured(conditions.ConditionWebhookAvailable,
 				"TLSSecretPending",
 				fmt.Sprintf("Waiting for cert-manager to provision TLS secret %s/%s", operatorNamespace, secretName))
 			return nil
@@ -508,7 +508,7 @@ func deployWebhookInfrastructure(
 
 	if len(secret.Data["tls.crt"]) == 0 || len(secret.Data["tls.key"]) == 0 {
 		log.Info("webhook TLS secret exists but certificate data not yet populated", "secret", secretName)
-		cm.MarkFalse(conditions.ConditionWebhookAvailable,
+		cm.MarkNotConfigured(conditions.ConditionWebhookAvailable,
 			"TLSSecretPending",
 			"TLS secret exists but certificate data not yet populated by cert-manager")
 		return nil

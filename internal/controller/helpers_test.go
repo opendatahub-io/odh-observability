@@ -121,8 +121,8 @@ func TestSyncPrometheusWebTLSCA_ConfigMapPresent(t *testing.T) {
 	}
 
 	labels := secret.GetLabels()
-	if labels[odhLabels.PlatformPartOf] != "monitoring" {
-		t.Errorf("Secret label: want %q=%q, got %v", odhLabels.PlatformPartOf, "monitoring", labels)
+	if _, found := labels[odhLabels.PlatformPartOf]; found {
+		t.Errorf("Secret should not have %q label (causes GC to delete it every reconcile), got %v", odhLabels.PlatformPartOf, labels)
 	}
 
 	data, _, _ := unstructured.NestedStringMap(secret.Object, "data")
@@ -179,7 +179,9 @@ func TestSyncStatusURL_RoutePresent_MultipleIngress(t *testing.T) {
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(m, route).WithStatusSubresource(route).Build()
-	syncStatusURL(context.Background(), cli, m)
+	if err := syncStatusURL(context.Background(), cli, m); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	// Should use the first ingress host.
 	if m.Status.URL != "https://primary.example.com" {
@@ -204,7 +206,9 @@ func TestSyncStatusURL_EmptyHost(t *testing.T) {
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(m, route).WithStatusSubresource(route).Build()
-	syncStatusURL(context.Background(), cli, m)
+	if err := syncStatusURL(context.Background(), cli, m); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	// When the route exists but the host is empty (ingress not ready), the
 	// function preserves the existing URL. It will be updated on the next
@@ -229,7 +233,9 @@ func TestSyncStatusURL_NoIngress(t *testing.T) {
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(m, route).WithStatusSubresource(route).Build()
-	syncStatusURL(context.Background(), cli, m)
+	if err := syncStatusURL(context.Background(), cli, m); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	// When the route exists but has no ingress entries yet, the function
 	// preserves the existing URL.

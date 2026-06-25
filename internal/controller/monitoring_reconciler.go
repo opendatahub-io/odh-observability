@@ -29,6 +29,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -189,7 +190,10 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	// Build template data.
 	data, err := buildTemplateData(ctx, r.Client, monitoring, persesVersion)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("building template data: %w", err)
+		cm.MarkFalse(string(platformcommon.ConditionTypeProvisioningSucceeded), "ConfigurationError", err.Error())
+		cm.MarkFalse(string(platformcommon.ConditionTypeReady), "ConfigurationError", err.Error())
+		cm.MarkFalse(string(platformcommon.ConditionTypeDegraded), "NotDegraded", "")
+		return ctrl.Result{}, nil
 	}
 
 	// Run non-Perses action functions to collect template sources.
@@ -281,9 +285,9 @@ func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v
 	}
 
 	collector := gc.New(
-		gc.WithOnlyCollectOwned(false),
 		gc.WithLabel(odhLabels.PlatformPartOf, "monitoring"),
 		gc.InNamespace(monitoring.Spec.Namespace),
+		gc.WithDeletePropagationPolicy(metav1.DeletePropagationBackground),
 		gc.WithObjectPredicate(func(_ gc.RunParams, obj unstructured.Unstructured) (bool, error) {
 			k := resourceKey{
 				gvk:       obj.GroupVersionKind(),
@@ -312,12 +316,9 @@ func (r *MonitoringReconciler) deleteAllOwned(ctx context.Context, monitoring *v
 	}
 
 	collector := gc.New(
-		gc.WithOnlyCollectOwned(false),
 		gc.WithLabel(odhLabels.PlatformPartOf, "monitoring"),
 		gc.InNamespace(monitoring.Spec.Namespace),
-		gc.WithObjectPredicate(func(_ gc.RunParams, _ unstructured.Unstructured) (bool, error) {
-			return true, nil
-		}),
+		gc.WithDeletePropagationPolicy(metav1.DeletePropagationBackground),
 	)
 
 	return collector.Run(ctx, gc.RunParams{

@@ -42,15 +42,15 @@ vet: ## Run go vet against code.
 
 .PHONY: test
 test: manifests generate fmt vet ## Run tests with coverage (full pipeline).
-	go test ./... -coverprofile cover.out
+	go test $(shell go list ./... | grep -v /tests/e2e) -coverprofile cover.out
 
 .PHONY: unit-test
 unit-test: ## Run unit tests (no codegen prerequisites).
-	go test ./...
+	go test $(shell go list ./... | grep -v /tests/e2e)
 
 .PHONY: test-verbose
 test-verbose: ## Run unit tests with verbose output.
-	go test -v ./...
+	go test -v $(shell go list ./... | grep -v /tests/e2e)
 
 .PHONY: e2e-test
 e2e-test: ## Run e2e tests against a cluster (requires KUBECONFIG).
