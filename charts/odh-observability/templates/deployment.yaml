@@ -48,7 +48,7 @@ spec:
               protocol: TCP
             {{- if .Values.webhook.enabled }}
             - name: webhook
-              containerPort: {{ .Values.webhook.port }}
+              containerPort: 9443
               protocol: TCP
             {{- end }}
           livenessProbe:
