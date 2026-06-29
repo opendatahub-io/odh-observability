@@ -1,0 +1,78 @@
+apiVersion: monitoring.rhobs/v1
+  kind: PrometheusRule
+  metadata:
+    name: module-performance-alerts
+    namespace: {{.Namespace}}
+  spec:
+    groups:
+      - name: Module Reconcile Health
+        interval: 1m
+        rules:
+          - alert: ModuleReconcileErrorRateHigh
+            expr: |
+              (
+                rate(odh_module_reconcile_total{result="error"}[5m])
+                /
+                rate(odh_module_reconcile_total[5m])
+              ) > 0.05
+            for: 10m
+            labels:
+              severity: warning
+              namespace: "{{ .Namespace }}"
+            annotations:
+              summary: "Module {{`{{`}} $labels.module {{`}}`}} reconcile error rate is above 5%"
+              description: "Module {{`{{`}} $labels.module {{`}}`}} has a reconcile error rate of 
+  {{`{{`}} $value | humanizePercentage {{`}}`}} over the last 5 minutes."
+
+          - alert: ModuleReconcileSlow
+            expr: |
+              histogram_quantile(0.99,
+                rate(odh_module_reconcile_duration_seconds_bucket[5m])
+              severity: warning
+              namespace: "{{ .Namespace }}"
+            annotations:
+              summary: "Module {{`{{`}} $labels.module {{`}}`}} reconcile p99 latency is above 30s"
+              description: "Module {{`{{`}} $labels.module {{`}}`}} p99 reconcile duration exceeds 30 
+  seconds." 
+              
+      - name: Module Pod Health
+        interval: 1m
+        rules:
+          - alert: ModulePodMemoryHigh
+            expr: |
+              (
+                container_memory_working_set_bytes{
+                  namespace="{{ .OperatorNamespace }}",
+                  container!="",
+                  pod=~"odh-.*"
+                }
+                /
+                kube_pod_container_resource_limits{
+                  namespace="{{ .OperatorNamespace }}",
+                  resource="memory",
+                  pod=~"odh-.*"
+                }
+              ) > 0.8
+            for: 15m
+            labels:
+              severity: warning
+              namespace: "{{ .OperatorNamespace }}"
+            annotations:
+              summary: "Pod {{`{{`}} $labels.pod {{`}}`}} memory usage above 80% of limit"
+              description: "Pod {{`{{`}} $labels.pod {{`}}`}} in namespace {{`{{`}} $labels.namespace 
+  {{`}}`}} is using more than 80% of its memory limit for 15 minutes."
+              
+          - alert: ModulePodRestartingFrequently
+            expr: |
+              increase(kube_pod_container_status_restarts_total{
+                namespace="{{ .OperatorNamespace }}",
+                pod=~"odh-.*"
+              }[5m]) > 3
+            for: 2m
+            labels:
+              severity: warning
+              namespace: "{{ .OperatorNamespace }}"
+            annotations:
+              summary: "Module pod {{`{{`}} $labels.pod {{`}}`}} is restarting frequently"
+              description: "Pod {{`{{`}} $labels.pod {{`}}`}} has restarted {{`{{`}} $value {{`}}`}} 
+  times in the last 5 minutes."

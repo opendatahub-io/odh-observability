@@ -73,6 +73,15 @@ const (
 	AlertingNotConfiguredReason          = "AlertingNotConfigured"
 	MetricsAndTracesNotConfiguredReason  = "MetricsAndTracesNotConfigured"
 	MetricsAndTracesNotConfiguredMessage = "Metrics and traces are not configured in Monitoring CR"
+
+	// WebhookCertManagerNotAvailableReason is used when cert-manager is not
+	// installed. The webhook is optional infrastructure; its absence does not
+	// degrade core monitoring functionality.
+	WebhookCertManagerNotAvailableReason = "CertManagerNotAvailable"
+
+	// WebhookTLSPendingReason is used when cert-manager is installed but has
+	// not yet provisioned the TLS secret. This is a normal startup state.
+	WebhookTLSPendingReason = "TLSSecretPending"
 )
 
 // Message constants.
@@ -84,6 +93,8 @@ const (
 	TempoOperatorMissingMessage                  = "Tempo operator must be installed for traces configuration"
 	COOMissingMessage                            = "ClusterObservability operator must be installed for metrics configuration"
 	OpenTelemetryCollectorOperatorMissingMessage = "OpenTelemetryCollector operator must be installed for OpenTelemetry configuration"
+
+	WebhookCertManagerNotAvailableMessage = "cert-manager not installed; webhook TLS cannot be provisioned"
 )
 
 // featureConditionTypes lists the feature-specific condition types that
