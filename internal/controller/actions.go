@@ -136,6 +136,7 @@ func deployMonitoringStackWithQuerierAndRestrictions(
 		src(PrometheusWebTLSServiceTemplate),
 		src(MonitoringStackTemplate),
 		src(PrometheusSelfServiceMonitorTemplate),
+		src(ModuleOperatorServiceMonitorTemplate),
 		src(MonitoringStackAlertmanagerRBACTemplate),
 		src(PrometheusRouteTemplate),
 		src(PrometheusServiceOverrideTemplate),
@@ -267,7 +268,10 @@ func deployAlerting(
 	}
 
 	cm.MarkTrue(conditions.ConditionAlertingAvailable)
-	*sources = append(*sources, src(OperatorPrometheusRulesTemplate))
+	*sources = append(*sources,
+	    src(OperatorPrometheusRulesTemplate),
+	     src(ModulePerformanceAlertsTemplate),
+	)
 	return nil
 }
 

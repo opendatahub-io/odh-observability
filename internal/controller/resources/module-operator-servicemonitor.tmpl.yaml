@@ -1,0 +1,18 @@
+apiVersion: monitoring.rhobs/v1
+  kind: ServiceMonitor
+  metadata:
+    name: odh-observability-operator-metrics
+    namespace: {{.Namespace}}
+  spec:
+    endpoints:
+      - port: https
+        scheme: https
+        tlsConfig:
+          insecureSkipVerify: true
+        bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    namespaceSelector:
+      matchNames:
+        - {{.OperatorNamespace}}
+    selector:
+      matchLabels:
+        app.kubernetes.io/name: odh-observability

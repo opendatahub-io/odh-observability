@@ -47,6 +47,7 @@ import (
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/controller/gc"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
 	odhLabels "github.com/opendatahub-io/odh-platform-utilities/pkg/metadata/labels"
+	odhmetrics "github.com/opendatahub-io/odh-observability/internal/metrics"
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
 	routev1 "github.com/openshift/api/route/v1"
 
@@ -110,7 +111,9 @@ func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	return result, reconcileErr
 }
 
-func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alpha1.Monitoring) (ctrl.Result, error) {
+func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alpha1.Monitoring) (result ctrl.Result, err error) {
+	defer odhmetrics.ReconcileTimer("monitoring", &err)()
+
 	log := logf.FromContext(ctx)
 	cm := conditions.NewConditionsManager(monitoring, monitoring.Generation)
 

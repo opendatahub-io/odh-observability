@@ -43,6 +43,7 @@ import (
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 	moncontroller "github.com/opendatahub-io/odh-observability/internal/controller"
 	monwebhook "github.com/opendatahub-io/odh-observability/internal/webhook"
+	odhmetrics "github.com/opendatahub-io/odh-platform-utilities/pkg/metrics"
 )
 
 var scheme = runtime.NewScheme()
@@ -76,6 +77,7 @@ func main() {
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+	odhmetrics.RegisterOperatorsMetrics()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	setupLog := ctrl.Log.WithName("setup")
