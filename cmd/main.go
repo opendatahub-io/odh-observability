@@ -79,6 +79,7 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	setupLog := ctrl.Log.WithName("setup")
+	setupLog.Info("odh-observability", "version", os.Getenv("OPERATOR_VERSION"))
 
 	cfg := ctrl.GetConfigOrDie()
 
