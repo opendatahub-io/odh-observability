@@ -55,10 +55,7 @@ import (
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 )
 
-const (
-	monitoringFinalizer = "monitoring.opendatahub.io/cleanup"
-	platformType        = "OpenDataHub"
-)
+const monitoringFinalizer = "monitoring.opendatahub.io/cleanup"
 
 func operatorVersion() string {
 	return os.Getenv("OPERATOR_VERSION")
@@ -236,7 +233,7 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	if err := r.Deployer.Deploy(ctx, deploy.DeployInput{
 		Client:    r.Client,
 		Owner:     monitoring,
-		Release:   deploy.ReleaseInfo{Type: platformType, Version: operatorVersion()},
+		Release:   deploy.ReleaseInfo{Type: "OpenDataHub", Version: operatorVersion()},
 		Resources: desired,
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("applying resources: %w", err)
@@ -308,7 +305,7 @@ func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v
 		DiscoveryClient: r.DiscoveryClient,
 		Owner:           monitoring,
 		Version:         operatorVersion(),
-		PlatformType:    platformType,
+		PlatformType:    "OpenDataHub",
 	})
 }
 
@@ -333,7 +330,7 @@ func (r *MonitoringReconciler) deleteAllOwned(ctx context.Context, monitoring *v
 		DiscoveryClient: r.DiscoveryClient,
 		Owner:           monitoring,
 		Version:         operatorVersion(),
-		PlatformType:    platformType,
+		PlatformType:    "OpenDataHub",
 	})
 }
 
