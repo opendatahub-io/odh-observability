@@ -373,11 +373,11 @@ func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces,
 func addImageURLs(templateData map[string]any) {
 	templateData["KubeRBACProxyImage"] = getEnvOrDefault(
 		"RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE",
-		"quay.io/brancz/kube-rbac-proxy:v0.20.0",
+		"quay.io/brancz/kube-rbac-proxy@sha256:147cb28fea35473b2cf8697892d375bbe0aec237c5740b0368719b4c0d71b290",
 	)
 	templateData["PromLabelProxyImage"] = getEnvOrDefault(
 		"RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE",
-		"quay.io/prometheuscommunity/prom-label-proxy:v0.12.1",
+		"quay.io/prometheuscommunity/prom-label-proxy@sha256:28f81efb6574556011e7914851faaccce4a64b1b72a338aaaf3cc9d45e66fd96",
 	)
 }
 
