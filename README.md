@@ -40,7 +40,7 @@ POD_NAMESPACE=opendatahub make run
 ### Deploy to a Cluster
 
 ```bash
-make deploy NAMESPACE=opendatahub IMG=quay.io/opendatahub/odh-observability:odh-stable
+make deploy NAMESPACE=opendatahub IMG=quay.io/opendatahub/odh-observability@sha256:3dce083e5446feac95246eb1bfd46d53df47a1a253874ea3d2f5167ccccbe330
 ```
 
 ### Remove from Cluster
@@ -142,7 +142,7 @@ make helm-template     # Render templates locally
 
 ## Architecture
 
-```
+```text
 cmd/main.go                     Operator entrypoint
 api/v1alpha1/                   CRD type definitions (Monitoring)
 internal/
