@@ -39,10 +39,8 @@ POD_NAMESPACE=opendatahub make run
 
 ### Deploy to a Cluster
 
-Find the latest image digest from the [container registry](https://quay.io/repository/opendatahub/odh-observability?tab=tags), then deploy:
-
 ```bash
-make deploy NAMESPACE=opendatahub IMG=quay.io/opendatahub/odh-observability@sha256:<latest-digest>
+make deploy NAMESPACE=opendatahub IMG=quay.io/opendatahub/odh-observability:odh-stable
 ```
 
 ### Remove from Cluster
