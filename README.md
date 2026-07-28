@@ -143,17 +143,10 @@ make helm-template     # Render templates locally
 ## Architecture
 
 ```text
-cmd/main.go                     Operator entrypoint
-api/v1alpha1/                   CRD type definitions (Monitoring)
-internal/
-  controller/
-    monitoring_reconciler.go    Main reconciliation loop
-    actions.go                  Per-subsystem deploy functions
-    templatedata.go             Template data builder + validation
-    helpers.go                  CRD detection, GVK registry
-    conditions/                 Status condition management
-    resources/*.tmpl.yaml       Go templates for operand manifests
-  webhook/                      Mutating admission webhook
+cmd/                            Operator entrypoint
+api/                            CRD type definitions (Monitoring)
+internal/controller/            Reconciliation loop, actions, templates
+internal/webhook/               Mutating admission webhook
 charts/odh-observability/       Helm chart for deployment
 config/                         Generated manifests (CRDs, RBAC, webhook)
 tests/e2e/                      End-to-end test suite
