@@ -1,26 +1,26 @@
-# Service for OpenTelemetry Collector Prometheus exporter with TLS support.
-# This service is separate from the auto-generated collector service to enable
-# TLS via OpenShift's service-ca operator through the serving-cert-secret-name annotation.
-# The service-ca operator automatically provisions and rotates TLS certificates for this endpoint.
+# Service for collector internal telemetry metrics re-exported with TLS.
+# The self-scrape workaround routes internal metrics through a TLS-enabled
+# pipeline exporter on :8890 because the Go SDK prometheus pull exporter
+# (service.telemetry.metrics) does not support TLS natively.
 apiVersion: v1
 kind: Service
 metadata:
-  name: data-science-collector-prometheus
+  name: data-science-collector-monitoring
   namespace: {{.Namespace}}
   annotations:
-    service.beta.openshift.io/serving-cert-secret-name: data-science-collector-tls
+    service.beta.openshift.io/serving-cert-secret-name: data-science-collector-monitoring-tls
   labels:
     app.kubernetes.io/component: opentelemetry-collector
     app.kubernetes.io/instance: {{.Namespace}}.data-science-collector
     app.kubernetes.io/managed-by: opentelemetry-operator
-    app.kubernetes.io/name: data-science-collector-prometheus
+    app.kubernetes.io/name: data-science-collector-monitoring
     app.kubernetes.io/part-of: opentelemetry
 spec:
   ports:
-  - name: prometheus
-    port: 8889
+  - name: monitoring
+    port: 8890
     protocol: TCP
-    targetPort: 8889
+    targetPort: 8890
   selector:
     app.kubernetes.io/component: opentelemetry-collector
     app.kubernetes.io/instance: {{.Namespace}}.data-science-collector
