@@ -217,7 +217,7 @@ func TestHandle_InjectsLabelOnServiceMonitor(t *testing.T) {
 
 	hasLabelPatch := false
 	for _, p := range resp.Patches {
-		if p.Path == "/metadata/labels" || p.Path == "/metadata/labels/opendatahub.io~1monitoring" {
+		if p.Path == "/metadata/labels" || p.Path == "/metadata/labels/monitoring.opendatahub.io~1scrape" {
 			hasLabelPatch = true
 			break
 		}

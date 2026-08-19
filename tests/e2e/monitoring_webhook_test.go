@@ -21,7 +21,7 @@ const (
 	TestPodMonitorName     = "test-podmonitor"
 	TestServiceMonitorName = "test-servicemonitor"
 
-	ODHLabelMonitoring = "opendatahub.io/monitoring"
+	ODHLabelMonitoring = "monitoring.opendatahub.io/scrape"
 )
 
 func (tc *MonitoringTestCtx) runWebhookTests(t *testing.T) {
@@ -273,7 +273,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjection(t *testing.T) {
 			Namespace: TestNamespaceName,
 		}),
 		WithCondition(jq.Match(`.metadata.labels."%s" == "true"`, ODHLabelMonitoring)),
-		WithCustomErrorMsg("Mutating webhook should inject opendatahub.io/monitoring=true label into PodMonitor"),
+		WithCustomErrorMsg("Mutating webhook should inject monitoring.opendatahub.io/scrape=true label into PodMonitor"),
 	)
 
 	tc.EnsureResourceExists(
@@ -282,7 +282,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjection(t *testing.T) {
 			Namespace: TestNamespaceName,
 		}),
 		WithCondition(jq.Match(`.metadata.labels."%s" == "true"`, ODHLabelMonitoring)),
-		WithCustomErrorMsg("Mutating webhook should inject opendatahub.io/monitoring=true label into ServiceMonitor"),
+		WithCustomErrorMsg("Mutating webhook should inject monitoring.opendatahub.io/scrape=true label into ServiceMonitor"),
 	)
 }
 

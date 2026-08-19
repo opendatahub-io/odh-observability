@@ -21,6 +21,7 @@ import (
 	"os"
 
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
+	configv1 "github.com/openshift/api/config/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -49,6 +50,7 @@ var scheme = runtime.NewScheme()
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(v1alpha1.AddToScheme(scheme))
+	utilruntime.Must(configv1.Install(scheme))
 	utilruntime.Must(routev1.Install(scheme))
 	utilruntime.Must(extv1.AddToScheme(scheme))
 	utilruntime.Must(appsv1.AddToScheme(scheme))

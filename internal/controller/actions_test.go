@@ -260,9 +260,34 @@ func TestDeployOpenTelemetryCollector_TracesOnly_CRDPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// 3 base sources only (no prometheus service since metrics nil)
-	if len(sources) != 3 {
-		t.Errorf("expected 3 sources for traces-only+OTel, got %d", len(sources))
+	// 3 base sources + 2 traces RBAC (MLflow + Tempo)
+	if len(sources) != 5 {
+		t.Errorf("expected 5 sources for traces-only+OTel, got %d", len(sources))
+	}
+}
+
+func TestDeployOpenTelemetryCollector_MetricsAndTraces_CRDPresent(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Traces = &v1alpha1.Traces{
+		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+	}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployOpenTelemetryCollector(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// 3 base sources + 1 prometheus service + 2 traces RBAC (MLflow + Tempo)
+	if len(sources) != 6 {
+		t.Errorf("expected 6 sources for metrics+traces+OTel, got %d", len(sources))
 	}
 }
 
@@ -478,8 +503,8 @@ func TestDeployPersesPrometheusIntegration_CRDPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 2 {
-		t.Errorf("expected 2 sources (prometheus + cluster prometheus datasource), got %d", len(sources))
+	if len(sources) != 3 {
+		t.Errorf("expected 3 sources (prometheus + cluster prometheus + tenancy datasource), got %d", len(sources))
 	}
 
 	c := findCondition(m, conditions.ConditionPersesPrometheusDataSourceAvailable)

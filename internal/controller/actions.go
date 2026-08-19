@@ -39,41 +39,44 @@ import (
 )
 
 const (
-	MonitoringStackTemplate                       = "resources/monitoring-stack.tmpl.yaml"
-	MonitoringAdmissionPoliciesTemplate           = "resources/monitoring-admission-policies.tmpl.yaml"
-	MonitoringStackAlertmanagerRBACTemplate       = "resources/monitoringstack-alertmanager-rbac.tmpl.yaml"
-	TempoMonolithicTemplate                       = "resources/tempo-monolithic.tmpl.yaml"
-	TempoStackTemplate                            = "resources/tempo-stack.tmpl.yaml"
-	OpenTelemetryCollectorTemplate                = "resources/opentelemetry-collector.tmpl.yaml"
-	CollectorServiceMonitorsTemplate              = "resources/collector-servicemonitors.tmpl.yaml"
-	CollectorPrometheusServiceTemplate            = "resources/collector-prometheus-service.tmpl.yaml"
-	CollectorRBACTemplate                         = "resources/collector-rbac.tmpl.yaml"
-	PrometheusRouteTemplate                       = "resources/data-science-prometheus-route.tmpl.yaml"
-	InstrumentationTemplate                       = "resources/instrumentation.tmpl.yaml"
-	PrometheusNamespaceProxyTemplate              = "resources/data-science-prometheus-namespace-proxy.tmpl.yaml"
-	PrometheusNamespaceProxyNetworkPolicyTemplate = "resources/data-science-prometheus-namespace-proxy-network-policy.tmpl.yaml"
-	PrometheusServiceOverrideTemplate             = "resources/data-science-prometheus-service-override.tmpl.yaml"
-	PrometheusNetworkPolicyTemplate               = "resources/data-science-prometheus-network-policy.tmpl.yaml"
-	PrometheusWebTLSServiceTemplate               = "resources/prometheus-web-tls-service.tmpl.yaml"
-	PrometheusSelfServiceMonitorTemplate          = "resources/prometheus-self-servicemonitor.tmpl.yaml"
-	ThanosQuerierTemplate                         = "resources/thanos-querier-cr.tmpl.yaml"
-	ThanosQuerierRouteTemplate                    = "resources/thanos-querier-route.tmpl.yaml"
-	PersesTemplate                                = "resources/perses.tmpl.yaml"
-	PersesTempoDatasourceTemplate                 = "resources/perses-tempo-datasource.tmpl.yaml"
-	PersesTempoDashboardV1Alpha1Template          = "resources/perses-tempo-dashboard-v1alpha1.tmpl.yaml"
-	PersesTempoDashboardV1Alpha2Template          = "resources/perses-tempo-dashboard-v1alpha2.tmpl.yaml"
-	PersesDatasourcePrometheusTemplate            = "resources/perses-datasource-prometheus.tmpl.yaml"
-	PersesDatasourceClusterPrometheusTemplate     = "resources/perses-datasource-cluster-prometheus.tmpl.yaml"
-	PrometheusClusterProxyTemplate                = "resources/data-science-prometheus-cluster-proxy.tmpl.yaml"
-	TempoServiceCAConfigMapTemplate               = "resources/tempo-service-ca-configmap.tmpl.yaml"
-	PersesOperatorAccessNetworkPolicyTemplate     = "resources/perses-operator-access-network-policy.tmpl.yaml"
-	OperatorPrometheusRulesTemplate               = "monitoring/operator-prometheusrules.tmpl.yaml"
-	WebhookServiceTemplate                        = "resources/webhook-service.tmpl.yaml"
-	WebhookCertManagerTemplate                    = "resources/webhook-cert-manager.tmpl.yaml"
-	WebhookConfigurationTemplate                  = "resources/webhook-configuration.tmpl.yaml"
-	UsageLogsOpenTelemetryCollectorTemplate       = "resources/usage-logs-opentelemetry-collector.tmpl.yaml"
-	UsageLogsOpenTelemetryCollectorRBACTemplate   = "resources/usage-logs-opentelemetry-collector-rbac.tmpl.yaml"
-	LokiStackTemplate                             = "resources/loki-stack.tmpl.yaml"
+	MonitoringStackTemplate                          = "resources/monitoring-stack.tmpl.yaml"
+	MonitoringAdmissionPoliciesTemplate              = "resources/monitoring-admission-policies.tmpl.yaml"
+	MonitoringStackAlertmanagerRBACTemplate          = "resources/monitoringstack-alertmanager-rbac.tmpl.yaml"
+	TempoMonolithicTemplate                          = "resources/tempo-monolithic.tmpl.yaml"
+	TempoStackTemplate                               = "resources/tempo-stack.tmpl.yaml"
+	OpenTelemetryCollectorTemplate                   = "resources/opentelemetry-collector.tmpl.yaml"
+	CollectorServiceMonitorsTemplate                 = "resources/collector-servicemonitors.tmpl.yaml"
+	CollectorPrometheusServiceTemplate               = "resources/collector-prometheus-service.tmpl.yaml"
+	CollectorRBACTemplate                            = "resources/collector-rbac.tmpl.yaml"
+	CollectorMLflowRBACTemplate                      = "resources/collector-mlflow-rbac.tmpl.yaml"
+	CollectorTempoRBACTemplate                       = "resources/collector-tempo-rbac.tmpl.yaml"
+	PrometheusRouteTemplate                          = "resources/data-science-prometheus-route.tmpl.yaml"
+	InstrumentationTemplate                          = "resources/instrumentation.tmpl.yaml"
+	PrometheusNamespaceProxyTemplate                 = "resources/data-science-prometheus-namespace-proxy.tmpl.yaml"
+	PrometheusNamespaceProxyNetworkPolicyTemplate    = "resources/data-science-prometheus-namespace-proxy-network-policy.tmpl.yaml"
+	PrometheusServiceOverrideTemplate                = "resources/data-science-prometheus-service-override.tmpl.yaml"
+	PrometheusNetworkPolicyTemplate                  = "resources/data-science-prometheus-network-policy.tmpl.yaml"
+	PrometheusWebTLSServiceTemplate                  = "resources/prometheus-web-tls-service.tmpl.yaml"
+	PrometheusSelfServiceMonitorTemplate             = "resources/prometheus-self-servicemonitor.tmpl.yaml"
+	ThanosQuerierTemplate                            = "resources/thanos-querier-cr.tmpl.yaml"
+	ThanosQuerierRouteTemplate                       = "resources/thanos-querier-route.tmpl.yaml"
+	PersesTemplate                                   = "resources/perses.tmpl.yaml"
+	PersesTempoDatasourceTemplate                    = "resources/perses-tempo-datasource.tmpl.yaml"
+	PersesTempoDashboardV1Alpha1Template             = "resources/perses-tempo-dashboard-v1alpha1.tmpl.yaml"
+	PersesTempoDashboardV1Alpha2Template             = "resources/perses-tempo-dashboard-v1alpha2.tmpl.yaml"
+	PersesDatasourcePrometheusTemplate               = "resources/perses-datasource-prometheus.tmpl.yaml"
+	PersesDatasourceClusterPrometheusTemplate        = "resources/perses-datasource-cluster-prometheus.tmpl.yaml"
+	PersesDatasourceClusterPrometheusTenancyTemplate = "resources/perses-datasource-cluster-prometheus-tenancy.tmpl.yaml"
+	PrometheusClusterProxyTemplate                   = "resources/data-science-prometheus-cluster-proxy.tmpl.yaml"
+	TempoServiceCAConfigMapTemplate                  = "resources/tempo-service-ca-configmap.tmpl.yaml"
+	PersesOperatorAccessNetworkPolicyTemplate        = "resources/perses-operator-access-network-policy.tmpl.yaml"
+	OperatorPrometheusRulesTemplate                  = "monitoring/operator-prometheusrules.tmpl.yaml"
+	WebhookServiceTemplate                           = "resources/webhook-service.tmpl.yaml"
+	WebhookCertManagerTemplate                       = "resources/webhook-cert-manager.tmpl.yaml"
+	WebhookConfigurationTemplate                     = "resources/webhook-configuration.tmpl.yaml"
+	UsageLogsOpenTelemetryCollectorTemplate          = "resources/usage-logs-opentelemetry-collector.tmpl.yaml"
+	UsageLogsOpenTelemetryCollectorRBACTemplate      = "resources/usage-logs-opentelemetry-collector-rbac.tmpl.yaml"
+	LokiStackTemplate                                = "resources/loki-stack.tmpl.yaml"
 
 	PersesTempoDatasourceName = "tempo-datasource"
 	PersesTempoDashboardName  = "data-science-tempo-traces"
@@ -241,6 +244,13 @@ func deployOpenTelemetryCollector(
 
 	if monitoring.Spec.Metrics != nil {
 		*sources = append(*sources, src(CollectorPrometheusServiceTemplate))
+	}
+
+	if monitoring.Spec.Traces != nil {
+		*sources = append(*sources,
+			src(CollectorMLflowRBACTemplate),
+			src(CollectorTempoRBACTemplate),
+		)
 	}
 
 	return nil
@@ -435,6 +445,7 @@ func deployPersesPrometheusIntegration(
 	*sources = append(*sources,
 		src(PersesDatasourcePrometheusTemplate),
 		src(PersesDatasourceClusterPrometheusTemplate),
+		src(PersesDatasourceClusterPrometheusTenancyTemplate),
 	)
 	return nil
 }

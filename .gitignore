@@ -4,6 +4,7 @@ vendor/
 
 # Go test/coverage output
 cover.out
+*-alerting.rules.yaml
 e2e-artifacts/
 covmeta*
 covcounters*

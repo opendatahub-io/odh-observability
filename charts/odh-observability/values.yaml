@@ -13,7 +13,7 @@ replicaCount: 1
 resources:
   limits:
     cpu: 500m
-    memory: 256Mi
+    memory: 512Mi
   requests:
     cpu: 100m
     memory: 128Mi
@@ -28,15 +28,6 @@ imagePullSecrets: []
 nodeSelector: {}
 tolerations: []
 affinity: {}
-
-webhook:
-  enabled: true
-  port: 9443
-
-certManager:
-  enabled: true
-  certificateName: odh-observability-webhook-cert
-  secretName: odh-observability-webhook-cert
 
 # Extra environment variables injected into the controller container.
 # Use for RELATED_IMAGE_* overrides.

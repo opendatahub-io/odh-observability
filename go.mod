@@ -9,7 +9,8 @@ require (
 	github.com/itchyny/gojq v0.12.19
 	github.com/onsi/gomega v1.42.0
 	github.com/opendatahub-io/odh-platform-utilities v0.1.0
-	github.com/openshift/api v0.0.0-20230823114715-5fdd7511b790
+	github.com/openshift/api v0.0.0-20260212193555-c06ab675261f
+	github.com/openshift/library-go v0.0.0-20260213153706-03f1709971c5
 	github.com/stretchr/testify v1.11.1
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.35.2
@@ -107,6 +108,7 @@ require (
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gotest.tools/gotestsum v1.13.0 // indirect
 	helm.sh/helm/v4 v4.1.1 // indirect
+	k8s.io/apiserver v0.35.2 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20260414162039-ec9c827d403f // indirect
 	k8s.io/utils v0.0.0-20260319190234-28399d86e0b5 // indirect

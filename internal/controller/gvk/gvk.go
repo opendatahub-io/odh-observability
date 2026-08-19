@@ -243,6 +243,13 @@ var (
 		Kind:    "Namespace",
 	}
 
+	// OpenshiftAPIServer (config.openshift.io/v1).
+	OpenshiftAPIServer = schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "APIServer",
+	}
+
 	// Route (route.openshift.io/v1).
 	Route = schema.GroupVersionKind{
 		Group:   "route.openshift.io",

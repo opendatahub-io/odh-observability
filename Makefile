@@ -68,13 +68,13 @@ E2E_IMG ?= quay.io/opendatahub/odh-observability-e2e:latest
 
 .PHONY: e2e-image-build
 e2e-image-build: ## Build e2e test container image.
-	$(IMAGE_BUILDER) build --platform $(PLATFORM) \
+	$(IMAGE_BUILDER) build --platform "$(PLATFORM)" \
 		-f Dockerfiles/e2e-tests/e2e-tests.Dockerfile \
-		-t ${E2E_IMG} .
+		-t "$(E2E_IMG)" .
 
 .PHONY: e2e-image-push
 e2e-image-push: ## Push e2e test container image.
-	$(IMAGE_BUILDER) push ${E2E_IMG}
+	$(IMAGE_BUILDER) push "$(E2E_IMG)"
 
 .PHONY: e2e-image
 e2e-image: e2e-image-build e2e-image-push ## Build and push e2e test image.
@@ -95,7 +95,7 @@ e2e-test-container: ## Run containerized e2e tests in module mode (standalone op
 		-e E2E_TEST_API_MODE=module \
 		-e E2E_TEST_INSTALL_OPERATORS=true \
 		-e E2E_TEST_MONITORING_CR_NAME=default-monitoring \
-		$(E2E_IMG)
+		"$(E2E_IMG)"
 
 .PHONY: e2e-test-container-dsc
 e2e-test-container-dsc: ## Run containerized e2e tests in DSC mode (via ODH platform operator).
@@ -109,7 +109,49 @@ e2e-test-container-dsc: ## Run containerized e2e tests in DSC mode (via ODH plat
 		-e E2E_TEST_API_MODE=dsc \
 		-e E2E_TEST_INSTALL_OPERATORS=false \
 		-e E2E_TEST_MONITORING_CR_NAME=default-monitoring \
-		$(E2E_IMG)
+		"$(E2E_IMG)"
+
+##@ Prometheus Rules
+
+PROMETHEUS_RULES_DIR = ./internal/controller
+PROMETHEUS_RULE_TEMPLATES = $(shell find $(PROMETHEUS_RULES_DIR) -name "*-prometheusrules.tmpl.yaml" 2>/dev/null)
+PROMETHEUS_ALERT_TESTS = $(shell find $(PROMETHEUS_RULES_DIR) -name "*-alerting.unit-tests.yaml" 2>/dev/null)
+PROMETHEUS_ALERT_RULES := $(PROMETHEUS_ALERT_TESTS:.unit-tests.yaml=.rules.yaml)
+
+%.rules.yaml: %.unit-tests.yaml $(YQ)
+	@RULE_FILE=$$(dirname $<)/$$(basename $< -alerting.unit-tests.yaml)-prometheusrules.tmpl.yaml; \
+	if [ ! -f "$$RULE_FILE" ]; then \
+		echo "Error: PrometheusRule template file not found: $$RULE_FILE"; \
+		exit 1; \
+	fi; \
+	echo "Generating $@ from $$RULE_FILE (alerts only, excluding recording rules)"; \
+	sed 's/{{\.Namespace}}/redhat-ods-monitoring/g; s/{{ \.OperatorNamespace }}/redhat-ods-operator/g; s/{{ \.OperatorPodPrefix }}/odh-observability/g; s/{{`{{`}}/{{/g; s/{{`}}`}}/}}/g' "$$RULE_FILE" | \
+		$(YQ) eval '.spec.groups' - | \
+		$(YQ) eval 'del(.[] | .rules[] | select(.alert == null))' - | \
+		$(YQ) eval '{"groups": .}' - > $@
+
+.PHONY: validate-prometheus-rules
+validate-prometheus-rules: $(YQ) ## Validate PrometheusRule template syntax.
+	@echo "Validating PrometheusRule templates syntax..."
+	@for tmpl_file in $(PROMETHEUS_RULE_TEMPLATES); do \
+		echo "  Checking $$tmpl_file..."; \
+		sed 's/{{\.Namespace}}/redhat-ods-monitoring/g; s/{{ \.OperatorNamespace }}/redhat-ods-operator/g; s/{{ \.OperatorPodPrefix }}/odh-observability/g; s/{{`{{`}}/{{/g; s/{{`}}`}}/}}/g' "$$tmpl_file" | \
+			$(YQ) eval '.spec.groups' - | \
+			$(YQ) eval '{"groups": .}' - | \
+			promtool check rules --lint=none /dev/stdin > /dev/null || exit 1; \
+	done
+	@echo "All PrometheusRule templates are syntactically valid"
+
+.PHONY: test-alerts
+test-alerts: validate-prometheus-rules $(PROMETHEUS_ALERT_RULES) ## Run Prometheus alert unit tests.
+	@echo "Running Prometheus alert unit tests..."
+	@for test_file in $(PROMETHEUS_ALERT_TESTS); do \
+		echo "  Testing $$test_file..."; \
+		promtool test rules $$test_file || exit 1; \
+	done
+	@echo "All Prometheus alert tests passed!"
+
+CLEANFILES += $(PROMETHEUS_ALERT_RULES)
 
 ##@ Build
 
@@ -174,6 +216,7 @@ $(LOCALBIN):
 
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
+YQ ?= $(LOCALBIN)/yq
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
@@ -184,3 +227,8 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	test -s "$(GOLANGCI_LINT)" || GOBIN="$(LOCALBIN)" go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+.PHONY: yq
+yq: $(YQ) ## Download yq locally if necessary.
+$(YQ): $(LOCALBIN)
+	test -s $(LOCALBIN)/yq || GOBIN=$(LOCALBIN) go install github.com/mikefarah/yq/v4@v4.53.2

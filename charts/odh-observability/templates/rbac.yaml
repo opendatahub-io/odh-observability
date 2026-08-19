@@ -25,7 +25,7 @@ rules:
     verbs: ["get", "list", "watch"]
   # OpenShift infrastructure (SNO detection + granted via generate-processors-role)
   - apiGroups: ["config.openshift.io"]
-    resources: ["infrastructures", "infrastructures/status", "endpoints", "pods", "namespaces", "services"]
+    resources: ["apiservers", "infrastructures", "infrastructures/status", "endpoints", "pods", "namespaces", "services"]
     verbs: ["get", "list", "watch"]
   # Tempo
   - apiGroups: ["tempo.grafana.com"]
@@ -108,6 +108,14 @@ rules:
   - apiGroups: ["authorization.k8s.io"]
     resources: ["subjectaccessreviews"]
     verbs: ["create"]
+  # Metrics API (operator must hold this to grant it via data-science-metrics-view ClusterRole)
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list", "create"]
+  # MLflow (operator must hold this to grant it via collector-mlflow-trace-export ClusterRole)
+  - apiGroups: ["mlflow.kubeflow.org"]
+    resources: ["experiments"]
+    verbs: ["update"]
   # Non-resource URLs (granted via collector RBAC for k8s API discovery)
   - nonResourceURLs: ["/api", "/metrics", "/apis/*"]
     verbs: ["get"]

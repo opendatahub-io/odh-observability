@@ -690,8 +690,8 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorDeploymentWithMetrics(t *tes
 			jq.Match(`.spec.targetAllocator.enabled == true`),
 			jq.Match(`.spec.targetAllocator.serviceAccount == "%s"`, TargetAllocatorServiceAccount),
 			jq.Match(`.spec.targetAllocator.prometheusCR.enabled == true`),
-			jq.Match(`.spec.targetAllocator.prometheusCR.podMonitorSelector.matchLabels."opendatahub.io/monitoring" == "true"`),
-			jq.Match(`.spec.targetAllocator.prometheusCR.serviceMonitorSelector.matchLabels."opendatahub.io/monitoring" == "true"`),
+			jq.Match(`.spec.targetAllocator.prometheusCR.podMonitorSelector.matchLabels."monitoring.opendatahub.io/scrape" == "true"`),
+			jq.Match(`.spec.targetAllocator.prometheusCR.serviceMonitorSelector.matchLabels."monitoring.opendatahub.io/scrape" == "true"`),
 		)),
 		WithCustomErrorMsg("OpenTelemetryCollector should have targetAllocator enabled with correct configuration"),
 	)
@@ -1010,6 +1010,8 @@ func (tc *MonitoringTestCtx) runTracesWithPVBackendTests(t *testing.T) {
 		})
 
 		t.Run("Test TempoMonolithic CR Creation with PV backend", tc.ValidateTempoMonolithicCRCreation)
+		t.Run("Test Collector MLflow integration RBAC", tc.ValidateCollectorMLflowIntegrationRBAC)
+		t.Run("Test Collector Tempo trace export RBAC", tc.ValidateCollectorTempoTraceExportRBAC)
 	})
 }
 
@@ -1041,6 +1043,130 @@ func (tc *MonitoringTestCtx) ValidateTempoMonolithicCRCreation(t *testing.T) {
 			jq.Match(`.spec.extraConfig.tempo.compactor.compaction.block_retention == "%s"`, FormattedRetention),
 		)),
 		WithCustomErrorMsg("TempoMonolithic CR should be created by controller when traces are configured"),
+	)
+}
+
+// ValidateCollectorMLflowIntegrationRBAC tests that the collector SA has the MLflow trace export ClusterRole and ClusterRoleBinding.
+func (tc *MonitoringTestCtx) ValidateCollectorMLflowIntegrationRBAC(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+	t.Cleanup(tc.resetMonitoringConfigToManaged)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		withMonitoringTraces(TracesStorageBackendPV, "", TracesStorageSize1Gi, DefaultRetention),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{
+			Name: "data-science-collector-mlflow-trace-export",
+		}),
+		WithCondition(And(
+			jq.Match(`.rules | length == 1`),
+			jq.Match(`(.rules[0].apiGroups | length) == 1`),
+			jq.Match(`.rules[0].apiGroups[0] == "mlflow.kubeflow.org"`),
+			jq.Match(`(.rules[0].resources | length) == 1`),
+			jq.Match(`.rules[0].resources[0] == "experiments"`),
+			jq.Match(`(.rules[0].verbs | length) == 1`),
+			jq.Match(`.rules[0].verbs[0] == "update"`),
+		)),
+		WithCustomErrorMsg("ClusterRole should grant only experiments update on mlflow.kubeflow.org"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "data-science-collector-mlflow-trace-export",
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.apiGroup == "rbac.authorization.k8s.io"`),
+			jq.Match(`.roleRef.kind == "ClusterRole"`),
+			jq.Match(`.roleRef.name == "data-science-collector-mlflow-trace-export"`),
+			jq.Match(`(.subjects | length) == 1`),
+			jq.Match(`.subjects[0].kind == "ServiceAccount"`),
+			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("ClusterRoleBinding should bind collector SA to MLflow trace export ClusterRole"),
+	)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		withNoTraces(),
+	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{
+			Name: "data-science-collector-mlflow-trace-export",
+		}),
+	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "data-science-collector-mlflow-trace-export",
+		}),
+	)
+}
+
+// ValidateCollectorTempoTraceExportRBAC tests that the collector SA has the Tempo trace export ClusterRole and ClusterRoleBinding.
+func (tc *MonitoringTestCtx) ValidateCollectorTempoTraceExportRBAC(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+	t.Cleanup(tc.resetMonitoringConfigToManaged)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		withMonitoringTraces(TracesStorageBackendPV, "", TracesStorageSize1Gi, DefaultRetention),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{
+			Name: "data-science-collector-tempo-trace-export",
+		}),
+		WithCondition(And(
+			jq.Match(`.rules | length == 1`),
+			jq.Match(`(.rules[0].apiGroups | length) == 1`),
+			jq.Match(`.rules[0].apiGroups[0] == "tempo.grafana.com"`),
+			jq.Match(`(.rules[0].resources | length) == 1`),
+			jq.Match(`.rules[0].resources[0] == "%s"`, tc.MonitoringNamespace),
+			jq.Match(`(.rules[0].resourceNames | length) == 1`),
+			jq.Match(`.rules[0].resourceNames[0] == "traces"`),
+			jq.Match(`(.rules[0].verbs | length) == 1`),
+			jq.Match(`.rules[0].verbs[0] == "create"`),
+		)),
+		WithCustomErrorMsg("ClusterRole should grant traces create on tempo.grafana.com for the monitoring namespace"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "data-science-collector-tempo-trace-export",
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.apiGroup == "rbac.authorization.k8s.io"`),
+			jq.Match(`.roleRef.kind == "ClusterRole"`),
+			jq.Match(`.roleRef.name == "data-science-collector-tempo-trace-export"`),
+			jq.Match(`(.subjects | length) == 1`),
+			jq.Match(`.subjects[0].kind == "ServiceAccount"`),
+			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("ClusterRoleBinding should bind collector SA to Tempo trace export ClusterRole"),
+	)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		withNoTraces(),
+	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{
+			Name: "data-science-collector-tempo-trace-export",
+		}),
+	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "data-science-collector-tempo-trace-export",
+		}),
 	)
 }
 

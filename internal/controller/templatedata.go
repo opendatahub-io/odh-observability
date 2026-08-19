@@ -42,6 +42,7 @@ import (
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
+	pkgtls "github.com/opendatahub-io/odh-observability/pkg/tls"
 )
 
 const (
@@ -117,6 +118,10 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 
 	addResourceData(templateData)
 	addImageURLs(templateData)
+
+	if err := addTLSData(ctx, c, templateData); err != nil {
+		return nil, err
+	}
 
 	if metrics := monitoring.Spec.Metrics; metrics != nil {
 		if err := addMetricsData(metrics, isSNO, templateData); err != nil {
@@ -373,12 +378,22 @@ func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces,
 func addImageURLs(templateData map[string]any) {
 	templateData["KubeRBACProxyImage"] = getEnvOrDefault(
 		"RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE",
-		"quay.io/brancz/kube-rbac-proxy@sha256:147cb28fea35473b2cf8697892d375bbe0aec237c5740b0368719b4c0d71b290",
+		"quay.io/opendatahub/odh-kube-rbac-proxy@sha256:f9cad8a1389ba747f412620525328ccebda1409eab55ea80e4818349b37cbdeb",
 	)
 	templateData["PromLabelProxyImage"] = getEnvOrDefault(
 		"RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE",
 		"quay.io/prometheuscommunity/prom-label-proxy@sha256:28f81efb6574556011e7914851faaccce4a64b1b72a338aaaf3cc9d45e66fd96",
 	)
+}
+
+func addTLSData(ctx context.Context, c client.Client, templateData map[string]any) error {
+	minVersion, cipherSuites, err := pkgtls.FromAPIServer(ctx, c, pkgtls.FormatGo)
+	if err != nil {
+		return err
+	}
+	templateData["TLSMinVersion"] = minVersion
+	templateData["TLSCipherSuites"] = cipherSuites
+	return nil
 }
 
 func getEnvOrDefault(envVar, defaultVal string) string {
