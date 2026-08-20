@@ -69,6 +69,9 @@ const (
 
 	// ConditionLokiStackAvailable indicates the LokiStack CR is deployed.
 	ConditionLokiStackAvailable = "LokiStackAvailable"
+
+	// ConditionClusterLogForwarderAvailable indicates the ClusterLogForwarder CR is deployed.
+	ConditionClusterLogForwarderAvailable = "ClusterLogForwarderAvailable"
 )
 
 // Reason constants.
@@ -108,6 +111,7 @@ var featureConditionTypes = map[string]bool{
 	ConditionWebhookAvailable:                    true,
 	ConditionUsageLogsCollectorAvailable:         true,
 	ConditionLokiStackAvailable:                  true,
+	ConditionClusterLogForwarderAvailable:        true,
 }
 
 // ConditionsManager manages the set of conditions for a Monitoring CR reconcile cycle.

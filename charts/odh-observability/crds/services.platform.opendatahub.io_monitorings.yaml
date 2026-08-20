@@ -62,6 +62,17 @@ spec:
                 format: int32
                 minimum: 0
                 type: integer
+              logs:
+                description: Logs configures cluster log forwarding via the ClusterLogForwarder
+                  operator.
+                properties:
+                  inferenceNamespaces:
+                    description: InferenceNamespaces lists the namespaces whose application
+                      logs should be forwarded to Loki.
+                    items:
+                      type: string
+                    type: array
+                type: object
               managementState:
                 default: Managed
                 description: |-

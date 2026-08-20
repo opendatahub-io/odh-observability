@@ -134,6 +134,7 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	lokiStackName := "data-science-lokistack"
 	templateData["LokiStackName"] = lokiStackName
 
+
 	templateData["UsageLogsCollectorName"] = "usage-logs"
 	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
 		templateData["LokiStorageCredentialMode"] = usageLogs.Storage.CredentialMode
@@ -162,6 +163,21 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		templateData["LokiStorageSecretName"] = ""
 		templateData["LokiStorageType"] = ""
 		templateData["LokiStorageClassName"] = ""
+	}
+
+	// Cluster log forwarding configuration
+	clusterLogForwarderName := "data-science-cluster-log-forwarder"
+	templateData["ClusterLogForwarderName"] = clusterLogForwarderName
+	templateData["ClusterLogForwarderServiceAccount"] = clusterLogForwarderName + "-collector"
+
+	if logs := monitoring.Spec.Logs; logs != nil {
+		namespaces, err := discoverInferenceNamespaces(ctx, c)
+		if err != nil {
+			return nil, fmt.Errorf("discovering inference namespaces: %w", err)
+		}
+		templateData["InferenceNamespaces"] = namespaces
+	} else {
+		templateData["InferenceNamespaces"] = []string{}
 	}
 
 	// Apply SNO-aware defaulting when CollectorReplicas is unset.

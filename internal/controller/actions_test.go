@@ -487,3 +487,61 @@ func TestDeployPersesPrometheusIntegration_CRDPresent(t *testing.T) {
 		t.Error("PersesPrometheusDataSourceAvailable should be True")
 	}
 }
+
+// --- deployClusterLogForwarder ---
+
+func TestDeployClusterLogForwarder_NoLogs(t *testing.T) {
+	s := newActionsTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Logs = nil
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployClusterLogForwarder(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 0 {
+		t.Errorf("expected no sources when logs is nil, got %d", len(sources))
+	}
+
+	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
+	if c == nil || c.Status != metav1.ConditionFalse || c.Severity != platformcommon.ConditionSeverityInfo {
+		t.Errorf("ClusterLogForwarderAvailable: expected False+Info, got %v", c)
+	}
+}
+
+func TestDeployClusterLogForwarder_CRDPresent(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.ClusterLogForwarder, gvk.LokiStack)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Logs = &v1alpha1.Logs{}
+
+	readyLoki := &unstructured.Unstructured{}
+	readyLoki.SetGroupVersionKind(gvk.LokiStack)
+	readyLoki.SetName("data-science-lokistack")
+	readyLoki.SetNamespace(m.Spec.Namespace)
+	_ = unstructured.SetNestedSlice(readyLoki.Object, []interface{}{
+		map[string]interface{}{
+			"type":   "Ready",
+			"status": "True",
+		},
+	}, "status", "conditions")
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(readyLoki).WithStatusSubresource(readyLoki).Build()
+	err := deployClusterLogForwarder(context.Background(), cli, m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 2 {
+		t.Errorf("expected 2 sources (CLF + RBAC), got %d", len(sources))
+	}
+}

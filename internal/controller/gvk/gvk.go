@@ -50,6 +50,20 @@ var (
 		Kind:    "ThanosQuerier",
 	}
 
+	// InferenceService (serving.kserve.io/v1beta1).
+	InferenceService = schema.GroupVersionKind{
+		Group:   "serving.kserve.io",
+		Version: "v1beta1",
+		Kind:    "InferenceService",
+	}
+
+	// LLMInferenceService (serving.kserve.io/v1alpha1).
+	LLMInferenceService = schema.GroupVersionKind{
+		Group:   "serving.kserve.io",
+		Version: "v1alpha1",
+		Kind:    "LLMInferenceService",
+	}
+
 	// TempoMonolithic (tempo.grafana.com/v1alpha1).
 	TempoMonolithic = schema.GroupVersionKind{
 		Group:   "tempo.grafana.com",
@@ -167,6 +181,13 @@ var (
 		Group:   "cert-manager.io",
 		Version: "v1",
 		Kind:    "Certificate",
+	}
+
+	// ClusterLogForwarder (observability.openshift.io/v1).
+	ClusterLogForwarder = schema.GroupVersionKind{
+		Group:   "observability.openshift.io",
+		Version: "v1",
+		Kind:    "ClusterLogForwarder",
 	}
 
 	// ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1).

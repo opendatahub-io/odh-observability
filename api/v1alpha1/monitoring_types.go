@@ -59,6 +59,9 @@ type MonitoringSpec struct {
 	// Alerting configures Prometheus alerting rules.
 	Alerting *Alerting `json:"alerting,omitempty"`
 
+	// Logs configures cluster log forwarding via the ClusterLogForwarder operator.
+	Logs *Logs `json:"logs,omitempty"`
+
 	// CollectorReplicas specifies the number of replicas in the OpenTelemetry collector.
 	// Defaults to 1 on single-node clusters and 2 on multi-node clusters.
 	// +kubebuilder:validation:Minimum=0
@@ -113,6 +116,12 @@ type TracesTLS struct {
 	CertificateSecret string `json:"certificateSecret,omitempty"`
 	// CAConfigMap is the name of the ConfigMap containing the CA certificate.
 	CAConfigMap string `json:"caConfigMap,omitempty"`
+}
+
+// Logs defines the configuration for cluster log forwarding via the ClusterLogForwarder operator.
+type Logs struct {
+	// InferenceNamespaces lists the namespaces whose application logs should be forwarded to Loki.
+	InferenceNamespaces []string `json:"inferenceNamespaces,omitempty"`
 }
 
 // Storage backend type constants.

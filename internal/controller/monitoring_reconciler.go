@@ -81,6 +81,8 @@ type MonitoringReconciler struct {
 // +kubebuilder:rbac:groups=monitoring.rhobs,resources=monitoringstacks;thanosqueriers;servicemonitors;prometheusrules,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=tempo.grafana.com,resources=tempomonolithics;tempostacks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=loki.grafana.com,resources=lokistacks,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=observability.openshift.io,resources=clusterlogforwarders,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=logging.openshift.io;observability.openshift.io,resources=logs,resourceNames=application,verbs=collect
 // +kubebuilder:rbac:groups=opentelemetry.io,resources=opentelemetrycollectors;instrumentations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=perses.dev,resources=perses;persesdatasources;persesdashboards,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings;mutatingwebhookconfigurations,verbs=get;list;watch;create;update;patch;delete
@@ -217,6 +219,7 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		deployLokiStack,
 		deployAlerting,
 		deployNodeMetricsEndpoint,
+		deployClusterLogForwarder,
 	} {
 		if err := action(ctx, r.Client, monitoring, cm, &sources); err != nil {
 			return ctrl.Result{}, err
