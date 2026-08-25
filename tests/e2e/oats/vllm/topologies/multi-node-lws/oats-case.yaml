@@ -1,0 +1,11 @@
+name: Topology Test - Multi-Node LeaderWorkerSet LLMInferenceService
+tags: ["topology", "multi-node-lws", "vllm"]
+
+fixture:
+  remote:
+    endpoint: default
+
+expected:
+  metrics:
+    - promql: 'vllm:prompt_tokens_total{topology="multi-node-lws"}'
+      value: ">= 0"

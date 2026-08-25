@@ -1,0 +1,11 @@
+name: Crash Recovery
+tags: ["crash", "vllm"]
+
+fixture:
+  remote:
+    endpoint: default
+
+expected:
+  metrics:
+    - promql: 'up'
+      value: ">= 0"

@@ -1,0 +1,11 @@
+name: Topology Test - Disaggregated Prefill Decode LLMInferenceService
+tags: ["topology", "disaggregated", "prefill", "decode", "vllm"]
+
+fixture:
+  remote:
+    endpoint: default
+
+expected:
+  metrics:
+    - promql: 'vllm:prompt_tokens_total{topology="disaggregated"}'
+      value: ">= 0"

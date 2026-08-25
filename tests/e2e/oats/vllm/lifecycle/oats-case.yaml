@@ -1,0 +1,11 @@
+name: Lifecycle VLLM test
+tags: ["lifecycle", "vllm"]
+
+fixture:
+  remote:
+    endpoint: default
+
+expected:
+  metrics:
+    - promql: 'up'
+      value: ">= 0"
