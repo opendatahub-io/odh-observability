@@ -46,7 +46,17 @@ spec:
             key: kubernetes_namespace_name
             from_attribute: service.namespace
 
-      # 3. Enrich logs with Kubernetes pod/node/deployment metadata
+      # 3. Generically strip leading/trailing quotes from ALL attribute values
+      # also sets the k8s pod ip resource attribute tobe accessed later and provide addional k8s context to the log - whilst not being whiltelsited strema label in loki
+      transform:
+        error_mode: ignore
+        log_statements:
+          - context: log
+            statements:
+              - set(resource.attributes["k8s.pod.ip"], Split(attributes["upstream_host"], ":")[0]) where attributes["upstream_host"] != nil
+              - replace_all_patterns(attributes, "value", "^\"|\"$", "")
+
+      # 4. Enrich logs with Kubernetes pod/node/deployment metadata
       k8sattributes:
         auth_type: "serviceAccount"
         passthrough: false
@@ -60,17 +70,8 @@ spec:
         pod_association:
           - sources:
             - from: resource_attribute
-              name: k8s.pod.name
-            - from: resource_attribute
-              name: k8s.namespace.name
+              name: k8s.pod.ip
 
-      # 4. Generically strip leading/trailing quotes from ALL attribute values
-      transform:
-        error_mode: ignore
-        log_statements:
-          - context: log
-            statements:
-              - replace_all_patterns(attributes, "value", "^\"|\"$", "")
 
       # 5. Group logs by core attributes
       groupbyattrs/maas:
@@ -108,7 +109,7 @@ spec:
       pipelines:
         logs:
           receivers: [otlp]
-          processors: [memory_limiter, resource, k8sattributes, transform, groupbyattrs/maas, batch]
+          processors: [memory_limiter, resource, transform, k8sattributes, groupbyattrs/maas, batch]
           exporters:
 {{- if .UsageLogs}}
             - otlphttp/loki
