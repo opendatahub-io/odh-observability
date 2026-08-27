@@ -8,6 +8,10 @@ spec:
     global:
       queries:
         queryTimeout: 3m
+      otlp:
+        streamLabels:
+          resourceAttributes:
+            - name: service.name
     tenants:
       application:
         otlp:

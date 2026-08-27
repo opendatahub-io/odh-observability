@@ -30,8 +30,23 @@ spec:
             endpoint: '0.0.0.0:4318'
 
     processors:
-      batch: {}
+      # 1. Protect pod against OOM kills under heavy log spikes
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 200
+        spike_limit_mib: 50
 
+      # 2. Add resource attributes
+      resource:
+        attributes:
+          - action: upsert
+            key: log_type
+            value: application
+          - action: upsert
+            key: kubernetes_namespace_name
+            from_attribute: service.namespace
+
+      # 3. Enrich logs with Kubernetes pod/node/deployment metadata
       k8sattributes:
         auth_type: "serviceAccount"
         passthrough: false
@@ -46,24 +61,26 @@ spec:
           - sources:
             - from: resource_attribute
               name: k8s.pod.name
-          - sources:
             - from: resource_attribute
               name: k8s.namespace.name
 
-      resource:
-        attributes:
-          - action: upsert
-            key: log_type
-            value: application
-          - action: upsert
-            key: kubernetes_namespace_name
-            value: {{.GatewayNamespace}}
+      # 4. Generically strip leading/trailing quotes from ALL attribute values
+      transform:
+        error_mode: ignore
+        log_statements:
+          - context: log
+            statements:
+              - replace_all_patterns(attributes, "value", "^\"|\"$", "")
 
+      # 5. Group logs by core attributes
       groupbyattrs/maas:
         keys:
           - model
           - subscription
           - response_type
+
+      # 6. Batch logs for optimal export performance
+      batch: {}
 
     exporters:
 {{- if .UsageLogs}}
@@ -91,7 +108,7 @@ spec:
       pipelines:
         logs:
           receivers: [otlp]
-          processors: [resource, k8sattributes, groupbyattrs/maas, batch]
+          processors: [memory_limiter, resource, k8sattributes, transform, groupbyattrs/maas, batch]
           exporters:
 {{- if .UsageLogs}}
             - otlphttp/loki
