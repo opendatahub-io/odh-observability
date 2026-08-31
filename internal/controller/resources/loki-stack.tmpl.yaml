@@ -38,5 +38,3 @@ spec:
   storageClassName: {{.LokiStorageClassName}}
   tenants:
     mode: openshift-logging
-    openshift:
-      userFieldName: user_id
