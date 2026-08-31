@@ -47,7 +47,8 @@ spec:
             from_attribute: log_name
           - action: upsert
             key: kubernetes_namespace_name
-            from_attribute: service.namespace
+            # from_attribute: service.namespace
+            value: opendatahub
 
       # 3. Generically strip leading/trailing quotes from ALL attribute values
       # also sets the k8s upstream pod ip resource attribute to be accessed later and provide addional k8s context to the log - whilst not being whiltelsited strema label in loki
