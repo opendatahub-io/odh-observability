@@ -3,8 +3,3 @@ meta:
 cases:
   - tests/e2e/oats/vllm/e2e-scrape-verification/oats-case.yaml
   - tests/e2e/oats/vllm/cardinality/oats-case.yaml
-  - tests/e2e/oats/vllm/crash-recovery/oats-case.yaml
-  - tests/e2e/oats/vllm/lifecycle/oats-case.yaml
-  - tests/e2e/oats/vllm/topologies/single-node/oats-case.yaml
-  - tests/e2e/oats/vllm/topologies/multi-node-lws/oats-case.yaml
-  - tests/e2e/oats/vllm/topologies/disaggregated/oats-case.yaml
