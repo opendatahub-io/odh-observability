@@ -7,12 +7,14 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -52,7 +54,7 @@ func findProjectRoot() (string, error) {
 		}
 		dir = parent
 	}
-	return "", fmt.Errorf("go.mod file not found in parent directories")
+	return "", errors.New("go.mod file not found in parent directories")
 }
 
 func ensureOatsBinaries(t *testing.T, projectRoot string) (string, string) {
@@ -86,7 +88,7 @@ func ensureOatsBinaries(t *testing.T, projectRoot string) (string, string) {
 			args = append(args, "github.com/grafana/gcx/cmd/gcx")
 		}
 
-		cmd := exec.Command("go", args...)
+		cmd := exec.CommandContext(t.Context(), "go", args...)
 		cmd.Dir = projectRoot
 		cmd.Env = append(os.Environ(), "GOBIN="+localBin)
 		if out, err := cmd.CombinedOutput(); err != nil {
@@ -117,7 +119,7 @@ func buildOatsEnv(t *testing.T) []string {
 	}
 
 	if envMap["GRAFANA_SERVER"] == "" {
-		cmd := exec.Command("oc", "get", "route", "lgtm", "-n", "redhat-ods-monitoring", "-o", "jsonpath={.spec.host}")
+		cmd := exec.CommandContext(t.Context(), "oc", "get", "route", "lgtm", "-n", "redhat-ods-monitoring", "-o", "jsonpath={.spec.host}")
 		out, err := cmd.Output()
 		if err == nil {
 			host := strings.TrimSpace(string(out))
@@ -131,7 +133,7 @@ func buildOatsEnv(t *testing.T) []string {
 	}
 
 	if envMap["GRAFANA_TOKEN"] == "" {
-		cmd := exec.Command("oc", "whoami", "-t")
+		cmd := exec.CommandContext(t.Context(), "oc", "whoami", "-t")
 		out, err := cmd.Output()
 		if err == nil {
 			token := strings.TrimSpace(string(out))
@@ -144,7 +146,7 @@ func buildOatsEnv(t *testing.T) []string {
 		}
 	}
 
-	var envList []string
+	envList := make([]string, 0, len(envMap))
 	for k, v := range envMap {
 		envList = append(envList, fmt.Sprintf("%s=%s", k, v))
 	}
@@ -170,7 +172,7 @@ func getClusterDomain(tc *TestContext) (string, error) {
 		}
 	}
 
-	cmd := exec.Command("oc", "get", "ingresses.config.openshift.io", "cluster", "-o", "jsonpath={.spec.domain}")
+	cmd := exec.CommandContext(tc.Context(), "oc", "get", "ingresses.config.openshift.io", "cluster", "-o", "jsonpath={.spec.domain}")
 	out, err := cmd.Output()
 	if err == nil {
 		domain := strings.TrimSpace(string(out))
@@ -179,15 +181,15 @@ func getClusterDomain(tc *TestContext) (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("failed to discover cluster domain")
+	return "", errors.New("failed to discover cluster domain")
 }
 
-func getOCToken() (string, error) {
+func getOCToken(ctx context.Context) (string, error) {
 	if token := os.Getenv("OC_TOKEN"); token != "" {
 		return token, nil
 	}
 
-	cmd := exec.Command("oc", "whoami", "-t")
+	cmd := exec.CommandContext(ctx, "oc", "whoami", "-t")
 	out, err := cmd.Output()
 	if err == nil {
 		token := strings.TrimSpace(string(out))
@@ -196,10 +198,10 @@ func getOCToken() (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("failed to obtain OpenShift authentication token")
+	return "", errors.New("failed to obtain OpenShift authentication token")
 }
 
-func sendCompletion(routeHost, ocToken string) error {
+func sendCompletion(ctx context.Context, routeHost, ocToken string) error {
 	payload := map[string]any{
 		"model":       "facebook/opt-125m",
 		"prompt":      "San Francisco is a",
@@ -212,10 +214,11 @@ func sendCompletion(routeHost, ocToken string) error {
 	}
 
 	httpClient := &http.Client{
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+		// The test route uses a cluster-generated certificate that is not trusted locally.
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec // required for the test route's cluster certificate
 		Timeout:   30 * time.Second,
 	}
-	req, err := http.NewRequest("POST", "https://"+routeHost+"/v1/completions", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+routeHost+"/v1/completions", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -229,17 +232,17 @@ func sendCompletion(routeHost, ocToken string) error {
 	if resp.StatusCode != http.StatusOK {
 		responseBody, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
-			return fmt.Errorf("completions request to %s failed with status %d (read response body: %v)", req.URL, resp.StatusCode, readErr)
+			return fmt.Errorf("completions request to %s failed with status %d (read response body: %w)", req.URL, resp.StatusCode, readErr)
 		}
 		return fmt.Errorf("completions request to %s failed with status %d: %s", req.URL, resp.StatusCode, strings.TrimSpace(string(responseBody)))
 	}
 	return nil
 }
 
-func runOatsCase(t *testing.T, oatsBin, topology, gcxBin string, oatsEnv []string, projectRoot string) error {
+func runOatsCase(ctx context.Context, t *testing.T, oatsBin, topology, gcxBin string, oatsEnv []string, projectRoot string) error {
 	t.Helper()
 
-	cmd := exec.Command(oatsBin, "-vv", "--gcx", gcxBin, "--tags", topology, "--gcx-context", "default")
+	cmd := exec.CommandContext(ctx, oatsBin, "-vv", "--gcx", gcxBin, "--tags", topology, "--gcx-context", "default")
 	cmd.Dir = projectRoot
 	cmd.Env = oatsEnv
 
@@ -249,7 +252,7 @@ func runOatsCase(t *testing.T, oatsBin, topology, gcxBin string, oatsEnv []strin
 
 	err := cmd.Run()
 	if err != nil {
-		return fmt.Errorf("OATS topology %s failed: %v\nOutput: %s", topology, err, outBuf.String())
+		return fmt.Errorf("OATS topology %s failed: %w\nOutput: %s", topology, err, outBuf.String())
 	}
 	return nil
 }
@@ -393,6 +396,7 @@ func discoverInferenceService(tc *TestContext, llmSvcName string) (string, int64
 	return candidates[0].GetName(), port, nil
 }
 
+//nolint:maintidx // topology setup intentionally keeps the end-to-end workflow together.
 func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology, projectRoot, oatsBin, gcxBin string, oatsEnv []string) {
 	t.Helper()
 	g := gomega.NewWithT(t)
@@ -463,7 +467,8 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		},
 	}
 
-	if topology == "multi-node" {
+	switch topology {
+	case "multi-node":
 		// A worker requires explicit data or pipeline parallelism.
 		// deployment provides the worker data-parallel preset.
 		spec["parallelism"] = map[string]any{"data": int64(2), "dataLocal": int64(1)}
@@ -483,7 +488,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 				},
 			},
 		}
-	} else if topology == "disaggregated" {
+	case "disaggregated":
 		spec["prefill"] = map[string]any{
 			"template": map[string]any{
 				"containers": []map[string]any{
@@ -510,7 +515,8 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 			return nil
 		}),
 	}
-	if topology == "multi-node" {
+	switch topology {
+	case "multi-node":
 		// Validate the object returned by the API server, not just the local
 		// object passed to Create/Patch. This catches CRD field pruning during
 		// create or update instead of failing later as an unexplained readiness
@@ -519,7 +525,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 			WithCondition(jq.Match(`.spec.worker.containers[0].image == %q`, "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811")),
 			WithCustomErrorMsg("multi-node LLMInferenceService should retain worker container configuration"),
 		)
-	} else if topology == "disaggregated" {
+	case "disaggregated":
 		// prefill has its own template, unlike the worker PodSpec above.
 		llmSvcOpts = append(llmSvcOpts,
 			WithCondition(jq.Match(`.spec.prefill.template.containers[0].image == %q`, "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811")),
@@ -542,16 +548,19 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		return discoveryErr
 	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "generated inference Service should become discoverable")
 	t.Logf("[%s] Using inference Service %s on port %d", topology, inferenceService, inferencePort)
-	ocToken, err := getOCToken()
+	ocToken, err := getOCToken(tc.Context())
 	require.NoError(t, err, "failed to obtain OpenShift authentication token")
 
 	routeHost := llmSvcName + "." + clusterDomain
 
 	t.Logf("[%s] Creating OAuth proxy ServiceAccount and delegated-auth RBAC", topology)
-	tc.EventuallyResourceCreatedOrPatched(WithMinimalObject(gvk.ServiceAccount, types.NamespacedName{Name: saName, Namespace: "default"}), WithMutateFunc(func(u *unstructured.Unstructured) error {
-		u.SetAnnotations(map[string]string{"serviceaccounts.openshift.io/oauth-redirecturi." + proxyName: "https://" + routeHost + "/oauth2/callback"})
-		return nil
-	}))
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.ServiceAccount, types.NamespacedName{Name: saName, Namespace: "default"}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			u.SetAnnotations(map[string]string{"serviceaccounts.openshift.io/oauth-redirecturi." + proxyName: "https://" + routeHost + "/oauth2/callback"})
+			return nil
+		}),
+	)
 	tc.EventuallyResourceCreatedOrPatched(WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{Name: bindingName}), WithMutateFunc(func(u *unstructured.Unstructured) error {
 		u.Object["roleRef"] = map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:auth-delegator"}
 		u.Object["subjects"] = []any{map[string]any{"kind": "ServiceAccount", "name": saName, "namespace": "default"}}
@@ -561,18 +570,21 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	var sessionSecret [32]byte
 	_, err = rand.Read(sessionSecret[:])
 	require.NoError(t, err, "failed to generate OAuth session secret")
-	tc.EventuallyResourceCreatedOrPatched(WithMinimalObject(gvk.Secret, types.NamespacedName{Name: cookieSecretName, Namespace: "default"}), WithMutateFunc(func(u *unstructured.Unstructured) error {
-		u.Object["type"] = "Opaque"
-		u.Object["stringData"] = map[string]any{"session_secret": base64.StdEncoding.EncodeToString(sessionSecret[:])}
-		return nil
-	}))
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.Secret, types.NamespacedName{Name: cookieSecretName, Namespace: "default"}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			u.Object["type"] = "Opaque"
+			u.Object["stringData"] = map[string]any{"session_secret": base64.StdEncoding.EncodeToString(sessionSecret[:])}
+			return nil
+		}),
+	)
 	tc.EventuallyResourceCreatedOrPatched(WithMinimalObject(gvk.Service, proxyNN), WithMutateFunc(func(u *unstructured.Unstructured) error {
 		u.SetAnnotations(map[string]string{"service.beta.openshift.io/serving-cert-secret-name": tlsSecretName})
 		u.Object["spec"] = map[string]any{"selector": map[string]any{"app": proxyName}, "ports": []any{map[string]any{"name": "https", "port": int64(8443), "targetPort": int64(8443)}}}
 		return nil
 	}))
 	t.Logf("[%s] Creating OAuth proxy Deployment with upstream %s", topology, inferenceService)
-	upstream := "https://" + inferenceService + ".default.svc.cluster.local:" + fmt.Sprint(inferencePort)
+	upstream := "https://" + inferenceService + ".default.svc.cluster.local:" + strconv.FormatInt(inferencePort, 10)
 	proxyArgs := []any{
 		"--provider=openshift", "--https-address=:8443", "--http-address=", "--upstream=" + upstream,
 		"--tls-cert=/etc/proxy/tls/tls.crt", "--tls-key=/etc/proxy/tls/tls.key",
@@ -605,12 +617,23 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		return nil
 	}))
 	t.Logf("[%s] Creating Route %s", topology, routeHost)
-	tc.EventuallyResourceCreatedOrPatched(WithMinimalObject(gvk.Route, types.NamespacedName{Name: proxyName, Namespace: "default"}), WithMutateFunc(func(u *unstructured.Unstructured) error {
-		u.Object["spec"] = map[string]any{"host": routeHost, "to": map[string]any{"kind": "Service", "name": proxyName, "weight": int64(100)}, "port": map[string]any{"targetPort": "https"}, "tls": map[string]any{"termination": "reencrypt", "insecureEdgeTerminationPolicy": "Redirect"}}
-		return nil
-	}))
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.Route, types.NamespacedName{Name: proxyName, Namespace: "default"}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			u.Object["spec"] = map[string]any{
+				"host": routeHost,
+				"to":   map[string]any{"kind": "Service", "name": proxyName, "weight": int64(100)},
+				"port": map[string]any{"targetPort": "https"},
+				"tls":  map[string]any{"termination": "reencrypt", "insecureEdgeTerminationPolicy": "Redirect"},
+			}
+			return nil
+		}),
+	)
 	t.Logf("[%s] Waiting for service-ca TLS Secret", topology)
-	tc.EnsureResourceExists(WithMinimalObject(gvk.Secret, types.NamespacedName{Name: tlsSecretName, Namespace: "default"}), WithCondition(jq.Match(`.data["tls.crt"] != null and .data["tls.key"] != null`)))
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Secret, types.NamespacedName{Name: tlsSecretName, Namespace: "default"}),
+		WithCondition(jq.Match(`.data["tls.crt"] != null and .data["tls.key"] != null`)),
+	)
 	t.Logf("[%s] Waiting for OAuth proxy Deployment availability", topology)
 	tc.EnsureResourceConditionMet(gvk.Deployment, proxyNN, "Available", metav1.ConditionTrue)
 	t.Logf("[%s] Waiting for Route admission", topology)
@@ -622,11 +645,11 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		}
 		ingress, found, err := unstructured.NestedSlice(route.Object, "status", "ingress")
 		if err != nil || !found || len(ingress) == 0 {
-			return fmt.Errorf("route has not been admitted yet")
+			return errors.New("route has not been admitted yet")
 		}
 		entry, ok := ingress[0].(map[string]any)
 		if !ok {
-			return fmt.Errorf("route admission status is malformed")
+			return errors.New("route admission status is malformed")
 		}
 		conditions, _, _ := unstructured.NestedSlice(entry, "conditions")
 		for _, raw := range conditions {
@@ -647,13 +670,13 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		WithEventuallyTimeout(10*time.Minute),
 	)
 	t.Logf("[%s] LLMInferenceService is Ready; sending authenticated completion request", topology)
-	send := func() error { return sendCompletion(routeHost, ocToken) }
+	send := func() error { return sendCompletion(tc.Context(), routeHost, ocToken) }
 	g.Eventually(send, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Should successfully send completion request through OAuth proxy")
 
 	// 3. Verification via OATS
 	t.Logf("[%s] Running OATS verification", topology)
 	g.Eventually(func() error {
-		return runOatsCase(t, oatsBin, topology, gcxBin, oatsEnv, projectRoot)
+		return runOatsCase(tc.Context(), t, oatsBin, topology, gcxBin, oatsEnv, projectRoot)
 	}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "OATS verification should succeed within 2 minutes")
 
 	// 4. Pod Termination & Scrape Recovery
@@ -666,7 +689,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Second completion request should succeed after pod restart")
 
 	g.Eventually(func() error {
-		return runOatsCase(t, oatsBin, topology, gcxBin, oatsEnv, projectRoot)
+		return runOatsCase(tc.Context(), t, oatsBin, topology, gcxBin, oatsEnv, projectRoot)
 	}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "Scrape recovery verification should succeed after pod restart")
 
 	// 5. Teardown & PodMonitor Cleanup
@@ -761,7 +784,10 @@ func setupInferencePrerequisites(t *testing.T, projectRoot string) {
 
 	t.Log("Setting up LGTM and remaining inference prerequisites")
 	applyManifest("lwsoperator.yaml")
-	waitFor("CRD leaderworkersets.leaderworkerset.x-k8s.io should be established", "wait", "--for=condition=Established", "crd/leaderworkersets.leaderworkerset.x-k8s.io", "--timeout=300s")
+	waitFor(
+		"CRD leaderworkersets.leaderworkerset.x-k8s.io should be established",
+		"wait", "--for=condition=Established", "crd/leaderworkersets.leaderworkerset.x-k8s.io", "--timeout=300s",
+	)
 	waitFor("CRD llminferenceservices.serving.kserve.io should be established", "wait", "--for=condition=Established", "crd/llminferenceservices.serving.kserve.io", "--timeout=300s")
 	if err := ensureOAuthProxySecret(ctx); err != nil {
 		t.Fatalf("failed to ensure OAuth proxy cookie Secret: %v", err)
@@ -779,7 +805,12 @@ func setupInferencePrerequisites(t *testing.T, projectRoot string) {
 		{"lgtm", "redhat-ods-monitoring"},
 	} {
 		g.Eventually(func() bool {
-			cmd := exec.CommandContext(ctx, "oc", "get", "endpoints", endpoint.service, "-n", endpoint.namespace, "-o", "jsonpath={.subsets[*].addresses[*].ip}")
+			// endpoint values come from a fixed test list.
+			//nolint:gosec // endpoint values come from a fixed test list.
+			cmd := exec.CommandContext(
+				ctx, "oc", "get", "endpoints", endpoint.service, "-n", endpoint.namespace,
+				"-o", "jsonpath={.subsets[*].addresses[*].ip}",
+			)
 			output, err := cmd.Output()
 			return err == nil && strings.TrimSpace(string(output)) != ""
 		}, 5*time.Minute, 2*time.Second).Should(gomega.BeTrue(), "endpoints for %s/%s should be ready", endpoint.namespace, endpoint.service)

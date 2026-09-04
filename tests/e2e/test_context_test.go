@@ -362,7 +362,10 @@ func (tc *TestContext) EventuallyResourceCreatedOrPatched(opts ...ResourceOpts) 
 				}
 				return nil, err
 			}
-			ro.t.Logf("[%s] resource attempt %d: create completed in %s (resourceVersion=%q)", ro.t.Name(), attempt, time.Since(createStarted).Round(time.Millisecond), u.GetResourceVersion())
+			ro.t.Logf(
+				"[%s] resource attempt %d: create completed in %s (resourceVersion=%q)",
+				ro.t.Name(), attempt, time.Since(createStarted).Round(time.Millisecond), u.GetResourceVersion(),
+			)
 			result = u
 			return u, nil
 		}
@@ -385,7 +388,10 @@ func (tc *TestContext) EventuallyResourceCreatedOrPatched(opts ...ResourceOpts) 
 				}
 				return nil, err
 			}
-			ro.t.Logf("[%s] resource attempt %d: patch completed in %s (resourceVersion=%q)", ro.t.Name(), attempt, time.Since(patchStarted).Round(time.Millisecond), existing.GetResourceVersion())
+			ro.t.Logf(
+				"[%s] resource attempt %d: patch completed in %s (resourceVersion=%q)",
+				ro.t.Name(), attempt, time.Since(patchStarted).Round(time.Millisecond), existing.GetResourceVersion(),
+			)
 		}
 
 		result = existing
