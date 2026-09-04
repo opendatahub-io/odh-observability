@@ -1,0 +1,17 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-traces-from-any-namespace
+  namespace: redhat-ods-monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app: data-science-collector
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 4317

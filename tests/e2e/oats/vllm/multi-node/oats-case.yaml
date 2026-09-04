@@ -1,0 +1,22 @@
+name: multi-node topology llmisvc
+tags: ["e2e", "vllm", "multi-node"]
+
+fixture:
+  remote:
+    endpoint: default
+
+expected:
+  metrics:
+    # expected vLLM metrics for multi-node llmisvc tests
+    - promql: 'vllm:prompt_tokens_total{llm_isvc_name=~".*multi-node.*"}'
+      value: ">= 0"
+    - promql: 'vllm:generation_tokens_total{llm_isvc_name=~".*multi-node.*"}'
+      value: ">= 0"
+    - promql: 'vllm:time_to_first_token_seconds_bucket{llm_isvc_name=~".*multi-node.*"}'
+      value: ">= 0"
+    - promql: 'vllm:e2e_request_latency_seconds_bucket{llm_isvc_name=~".*multi-node.*"}'
+      value: ">= 0"
+
+    # Ensure no vLLM metric produces more than 20 time series per metric name
+    - promql: 'max by (__name__) (count by (__name__) ({__name__=~"vllm:.*|vllm_.*",llm_isvc_name=~".*multi-node.*"}))'
+      value: "<= 20"

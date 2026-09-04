@@ -1,5 +1,4 @@
 meta:
   version: 3
 cases:
-  - tests/e2e/oats/vllm/e2e-scrape-verification/oats-case.yaml
-  - tests/e2e/oats/vllm/cardinality/oats-case.yaml
+  - "tests/e2e/oats/*/*/oats-case.yaml"
