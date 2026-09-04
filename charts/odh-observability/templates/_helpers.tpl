@@ -47,3 +47,12 @@ Chart label
 {{- define "odh-observability.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
+
+{{/*
+Namespace where Monitoring operands (Tempo, collector) are deployed.
+Tempo write ACL treats this namespace name as the RBAC resource.
+Falls back to operatorNamespace when monitoringNamespace is unset.
+*/}}
+{{- define "odh-observability.monitoringNamespace" -}}
+{{- default .Values.operatorNamespace .Values.monitoringNamespace }}
+{{- end }}

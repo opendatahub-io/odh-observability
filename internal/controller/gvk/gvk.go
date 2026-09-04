@@ -22,6 +22,13 @@ import "k8s.io/apimachinery/pkg/runtime/schema"
 
 //nolint:gochecknoglobals
 var (
+	// DSCInitialization (dscinitialization.opendatahub.io/v1) — ODH platform CR.
+	DSCInitialization = schema.GroupVersionKind{
+		Group:   "dscinitialization.opendatahub.io",
+		Version: "v1",
+		Kind:    "DSCInitialization",
+	}
+
 	// Monitoring CR (services.platform.opendatahub.io/v1alpha1).
 	Monitoring = schema.GroupVersionKind{
 		Group:   "services.platform.opendatahub.io",
@@ -41,6 +48,20 @@ var (
 		Group:   "monitoring.rhobs",
 		Version: "v1alpha1",
 		Kind:    "ThanosQuerier",
+	}
+
+	// InferenceService (serving.kserve.io/v1beta1).
+	InferenceService = schema.GroupVersionKind{
+		Group:   "serving.kserve.io",
+		Version: "v1beta1",
+		Kind:    "InferenceService",
+	}
+
+	// LLMInferenceService (serving.kserve.io/v1alpha1).
+	LLMInferenceService = schema.GroupVersionKind{
+		Group:   "serving.kserve.io",
+		Version: "v1alpha1",
+		Kind:    "LLMInferenceService",
 	}
 
 	// TempoMonolithic (tempo.grafana.com/v1alpha1).
@@ -162,6 +183,13 @@ var (
 		Kind:    "Certificate",
 	}
 
+	// ClusterLogForwarder (observability.openshift.io/v1).
+	ClusterLogForwarder = schema.GroupVersionKind{
+		Group:   "observability.openshift.io",
+		Version: "v1",
+		Kind:    "ClusterLogForwarder",
+	}
+
 	// ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1).
 	ValidatingAdmissionPolicy = schema.GroupVersionKind{
 		Group:   "admissionregistration.k8s.io",
@@ -234,6 +262,13 @@ var (
 		Group:   "",
 		Version: "v1",
 		Kind:    "Namespace",
+	}
+
+	// OpenshiftAPIServer (config.openshift.io/v1).
+	OpenshiftAPIServer = schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "APIServer",
 	}
 
 	// Route (route.openshift.io/v1).

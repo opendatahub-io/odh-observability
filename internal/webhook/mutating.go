@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package webhook implements the mutating admission webhook that injects
-// the opendatahub.io/monitoring=true label on ServiceMonitor and PodMonitor
+// the monitoring.opendatahub.io/scrape=true label on ServiceMonitor and PodMonitor
 // resources created in namespaces that opt in to monitoring.
 package webhook
 
@@ -46,7 +46,7 @@ import (
 
 const (
 	// labelMonitoring is the opt-in label on namespaces and the injected label on monitors.
-	labelMonitoring = "opendatahub.io/monitoring"
+	labelMonitoring = "monitoring.opendatahub.io/scrape"
 	// webhookPath is the path registered with the webhook server.
 	webhookPath = "/mutate-prometheus-monitors"
 )

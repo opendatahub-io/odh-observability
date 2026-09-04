@@ -30,8 +30,51 @@ spec:
             endpoint: '0.0.0.0:4318'
 
     processors:
-      batch: {}
+      # 1. Protect pod against OOM kills under heavy log spikes
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 200
+        spike_limit_mib: 50
 
+      # 2. manage loki and loki-openshift known stream labels
+      # - log type if exists from source keep as is and if not get from resource attribute log_name (used by envoy access logger)
+      # - maas envoy filter uses service.namespace to provide the ai tenant namespace which is the one used for rbac in lokistack openshift-logging via the kubernetes_namespace_name - again update if not sent - allowing standard service.namespace naming from components 
+      # (possbily a mistake to allow service.namespace becuase of k8s services naming and otel spec but this is what maas has right now along service.name as well)
+      resource:
+        attributes:
+          - action: upsert
+            key: log_type
+            from_attribute: log_name
+          - action: upsert
+            key: kubernetes_namespace_name
+            # from_attribute: service.namespace
+            value: {{.GatewayNamespace}}
+
+      # separate resource logs blocks so no overrides of the shared block upstream host value for k8s attributes correct information
+      groupbyattrs/upstream_host:
+        keys:
+          - upstream_host
+
+      # 3. Generically strip leading/trailing quotes from ALL attribute values
+      # also sets the k8s upstream pod ip resource attribute to be accessed later and provide addional k8s context to the log - whilst not being whiltelsited strema label in loki
+      transform:
+        error_mode: ignore
+        log_statements:
+          - context: log
+            statements:
+              # 1. Copy raw upstream_host to target resource attribute
+              - set(resource.attributes["k8s.pod.ip"], resource.attributes["upstream_host"]) where resource.attributes["upstream_host"] != nil
+
+              # 2a. For IPv6 ([addr]:port): strip brackets and port from k8s.pod.ip
+              - replace_pattern(resource.attributes["k8s.pod.ip"], "^\\[([^\\]]+)\\].*$", "$1") where resource.attributes["upstream_host"] != nil and IsMatch(resource.attributes["upstream_host"], "^\\[")
+
+              # 2b. For IPv4 (addr:port): extract clean IP before trailing port
+              - set(resource.attributes["k8s.pod.ip"], Split(resource.attributes["upstream_host"], ":")[0]) where resource.attributes["upstream_host"] != nil and IsMatch(resource.attributes["upstream_host"], "^\\[") == false
+
+              # 3. Clean quotes from all log attributes
+              - replace_all_patterns(attributes, "value", "^\"|\"$", "")
+
+      # 4. Enrich logs with Kubernetes pod/node/deployment Gateway metadata - if no gateway then will be general connection means wont require upstrea_host info as well
       k8sattributes:
         auth_type: "serviceAccount"
         passthrough: false
@@ -39,31 +82,84 @@ spec:
           metadata:
             - k8s.namespace.name
             - k8s.pod.name
-            - k8s.pod.uid
+            - k8s.deployment.name
+            - k8s.node.name
+        pod_association:
+          - sources: 
+            - from: connection
+
+      # 4. map gateway k8sattributes metadata to attributes with gateway_ prefix in field names - some possibly indexed and others not intended to be from otel.
+      # usually as this is the log creator this would remain otel native naming of k8s attributes but becuase loki with openshift-logging mode uses the k8s_namespace_name and its intended to be for rbac we cannot base access to logs on access to gateway namespace.
+      # also doesnt work for maas tenancy model.
+      transform/gateway_k8sattributes:
+        error_mode: ignore
+        log_statements:
+          - context: log
+            statements:
+              - set(resource.attributes["gateway_namespace_name"], resource.attributes["k8s.namespace.name"]) where resource.attributes["k8s.namespace.name"] != nil
+              - set(resource.attributes["gateway_deployment_name"], resource.attributes["k8s.deployment.name"]) where resource.attributes["k8s.deployment.name"] != nil
+              - set(attributes["gateway_pod_name"], resource.attributes["k8s.pod.name"]) where resource.attributes["k8s.pod.name"] != nil
+              - set(attributes["gateway_node_name"], resource.attributes["k8s.node.name"]) where resource.attributes["k8s.node.name"] != nil
+              - delete_key(resource.attributes, "k8s.namespace.name")
+              - delete_key(resource.attributes, "k8s.deployment.name")
+              - delete_key(resource.attributes, "k8s.pod.name")
+              - delete_key(resource.attributes, "k8s.node.name")
+
+      # 4. Enrich logs with Kubernetes pod/node/deployment upstream pod metadata - if doesnt exist then wont do anything
+      k8sattributes/upstream_pod:
+        auth_type: "serviceAccount"
+        passthrough: false
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.pod.name
             - k8s.deployment.name
             - k8s.node.name
         pod_association:
           - sources:
             - from: resource_attribute
-              name: k8s.pod.name
-          - sources:
-            - from: resource_attribute
-              name: k8s.namespace.name
+              name: k8s.pod.ip
 
-      resource:
-        attributes:
-          - action: upsert
-            key: log_type
-            value: application
-          - action: upsert
-            key: kubernetes_namespace_name
-            value: {{.GatewayNamespace}}
+      # 4. map upstream pod k8sattributes metadata to attributes with upstream_ prefix in field names - some possibly indexed and others not intended to be from otel.
+      transform/upstream_pod_k8sattributes:
+        error_mode: ignore
+        log_statements:
+          - context: log
+            statements:
+              # Move k8s.namespace.name -> llm_namespace_name
+              - set(resource.attributes["upstream_namespace_name"], resource.attributes["k8s.namespace.name"]) where resource.attributes["k8s.namespace.name"] != nil
+              - set(resource.attributes["upstream_deployment_name"], resource.attributes["k8s.deployment.name"]) where resource.attributes["k8s.deployment.name"] != nil
+              - set(attributes["upstream_pod_name"], resource.attributes["k8s.pod.name"]) where resource.attributes["k8s.pod.name"] != nil
+              - set(attributes["upstream_node_name"], resource.attributes["k8s.node.name"]) where resource.attributes["k8s.node.name"] != nil
+              - delete_key(resource.attributes, "k8s.namespace.name")
+              - delete_key(resource.attributes, "k8s.deployment.name")
+              - delete_key(resource.attributes, "k8s.pod.name")
+              - delete_key(resource.attributes, "k8s.node.name")
 
+      # 5. Group logs by core attributes - puts them at resource attributes level instead of log attributes
+      # Meaning if whitelisted in loki they will be stream labels instead of structured metadata - meaning indexed
       groupbyattrs/maas:
         keys:
           - model
           - subscription
           - response_type
+
+      # 6. Clean up temporary and redundant fields before export
+      transform/cleanup:
+        error_mode: ignore
+        log_statements:
+          - context: log
+            statements:
+              - delete_key(resource.attributes, "upstream_host")
+              - delete_key(resource.attributes, "k8s.pod.ip")
+              - delete_key(resource.attributes, "log_name")
+              - delete_key(resource.attributes, "service.namespace")
+              # envoy specific replaced by gateway k8sattributes
+              - delete_key(resource.attributes, "cluster_name") 
+              - delete_key(resource.attributes, "node_name")
+
+      # 7. Batch logs for optimal export performance
+      batch: {}
 
     exporters:
 {{- if .UsageLogs}}
@@ -91,7 +187,7 @@ spec:
       pipelines:
         logs:
           receivers: [otlp]
-          processors: [resource, k8sattributes, groupbyattrs/maas, batch]
+          processors: [memory_limiter, resource, groupbyattrs/upstream_host, transform, k8sattributes, transform/gateway_k8sattributes, k8sattributes/upstream_pod, transform/upstream_pod_k8sattributes, transform/cleanup, groupbyattrs/maas, batch]
           exporters:
 {{- if .UsageLogs}}
             - otlphttp/loki

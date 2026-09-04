@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,24 +15,27 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 
-	. "github.com/onsi/gomega"
-
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 	jq "github.com/opendatahub-io/odh-observability/tests/e2e/matchers/jq"
+
+	. "github.com/onsi/gomega" //nolint:revive // dot import is idiomatic for gomega matchers
 )
 
 type TestContext struct {
 	t                   *testing.T
 	client              client.Client
-	ctx                 context.Context
-	g                   *gomega.WithT
+	ctx                 context.Context //nolint:containedctx // TestContext carries a long-lived background context for the entire test suite
+	g                   *WithT
 	Timeouts            TestTimeouts
 	MonitoringNamespace string
 	MonitoringCRName    string
+	ApiMode             string
+	DSCICRName          string
 
 	DefaultResourceOpts []ResourceOpts
 }
 
+//nolint:ireturn // returning client.Client interface is the intended design
 func (tc *TestContext) Client() client.Client {
 	return tc.client
 }
@@ -55,7 +57,7 @@ func NewTestContext(t *testing.T) (*TestContext, error) {
 		return nil, fmt.Errorf("failed to initialize client: %w", err)
 	}
 
-	g := gomega.NewWithT(t)
+	g := NewWithT(t)
 	g.SetDefaultEventuallyTimeout(testOpts.Timeouts.defaultEventuallyTimeout)
 	g.SetDefaultEventuallyPollingInterval(testOpts.Timeouts.defaultEventuallyPollInterval)
 	g.SetDefaultConsistentlyDuration(testOpts.Timeouts.defaultConsistentlyTimeout)
@@ -69,6 +71,8 @@ func NewTestContext(t *testing.T) (*TestContext, error) {
 		Timeouts:            testOpts.Timeouts,
 		MonitoringNamespace: testOpts.monitoringNamespace,
 		MonitoringCRName:    testOpts.monitoringCRName,
+		ApiMode:             testOpts.apiMode,
+		DSCICRName:          testOpts.dsciCRName,
 	}, nil
 }
 
@@ -317,11 +321,13 @@ func (tc *TestContext) EventuallyResourcePatched(opts ...ResourceOpts) *unstruct
 	}
 
 	if ro.Condition != nil {
-		ensureOpts := []ResourceOpts{
+		timeoutOpts := ro.withTimeoutOpts()
+		ensureOpts := make([]ResourceOpts, 0, 2+len(timeoutOpts))
+		ensureOpts = append(ensureOpts,
 			WithMinimalObject(ro.GVK, ro.NN),
 			WithCondition(ro.Condition),
-		}
-		ensureOpts = append(ensureOpts, ro.withTimeoutOpts()...)
+		)
+		ensureOpts = append(ensureOpts, timeoutOpts...)
 		tc.EnsureResourceExists(ensureOpts...)
 	}
 
@@ -440,8 +446,10 @@ func (tc *TestContext) DeleteResource(opts ...ResourceOpts) {
 	}
 
 	if ro.WaitForDeletion {
-		goneOpts := []ResourceOpts{WithMinimalObject(ro.GVK, ro.NN)}
-		goneOpts = append(goneOpts, ro.withTimeoutOpts()...)
+		timeoutOpts := ro.withTimeoutOpts()
+		goneOpts := make([]ResourceOpts, 0, 1+len(timeoutOpts))
+		goneOpts = append(goneOpts, WithMinimalObject(ro.GVK, ro.NN))
+		goneOpts = append(goneOpts, timeoutOpts...)
 		tc.EnsureResourceGone(goneOpts...)
 	}
 }
@@ -452,10 +460,8 @@ func (tc *TestContext) DeleteResources(opts ...ResourceOpts) {
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(ro.GVK)
 
-	deleteOpts := []client.DeleteAllOfOption{}
-	for _, o := range ro.DeleteAllOfOptions {
-		deleteOpts = append(deleteOpts, o)
-	}
+	deleteOpts := make([]client.DeleteAllOfOption, 0, len(ro.DeleteAllOfOptions))
+	deleteOpts = append(deleteOpts, ro.DeleteAllOfOptions...)
 
 	err := tc.client.DeleteAllOf(tc.ctx, u, deleteOpts...)
 	if err != nil && !k8serr.IsNotFound(err) {
@@ -539,10 +545,42 @@ func (tc *TestContext) EnsureResourceConditionMet(
 	tc.EnsureResourceExists(mergedOpts...)
 }
 
+func (tc *TestContext) WithT(t *testing.T) *TestContext {
+	t.Helper()
+
+	g := NewWithT(t)
+	g.SetDefaultEventuallyTimeout(tc.Timeouts.defaultEventuallyTimeout)
+	g.SetDefaultEventuallyPollingInterval(tc.Timeouts.defaultEventuallyPollInterval)
+	g.SetDefaultConsistentlyDuration(tc.Timeouts.defaultConsistentlyTimeout)
+	g.SetDefaultConsistentlyPollingInterval(tc.Timeouts.defaultConsistentlyPollInterval)
+
+	return &TestContext{
+		t:                   t,
+		client:              tc.client,
+		ctx:                 tc.ctx,
+		g:                   g,
+		Timeouts:            tc.Timeouts,
+		MonitoringNamespace: tc.MonitoringNamespace,
+		MonitoringCRName:    tc.MonitoringCRName,
+		ApiMode:             tc.ApiMode,
+		DSCICRName:          tc.DSCICRName,
+		DefaultResourceOpts: tc.DefaultResourceOpts,
+	}
+}
+
 type MonitoringTestCtx struct {
 	*TestContext
 
 	expectedDefaultReplicas int
+}
+
+func (tc *MonitoringTestCtx) WithT(t *testing.T) *MonitoringTestCtx {
+	t.Helper()
+
+	return &MonitoringTestCtx{
+		TestContext:             tc.TestContext.WithT(t),
+		expectedDefaultReplicas: tc.expectedDefaultReplicas,
+	}
 }
 
 func StopErr(err error, format string, args ...any) error {
@@ -551,7 +589,7 @@ func StopErr(err error, format string, args ...any) error {
 		msg = fmt.Sprintf(format, args...)
 	}
 
-	return gomega.StopTrying(msg).Wrap(err)
+	return StopTrying(msg).Wrap(err)
 }
 
 // detectMonitoringNamespace reads spec.namespace from the Monitoring CR.

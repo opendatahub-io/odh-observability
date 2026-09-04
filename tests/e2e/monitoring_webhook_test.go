@@ -4,6 +4,7 @@ import (
 	"maps"
 	"testing"
 
+	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -11,9 +12,8 @@ import (
 
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 	jq "github.com/opendatahub-io/odh-observability/tests/e2e/matchers/jq"
-	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
 
-	. "github.com/onsi/gomega"
+	. "github.com/onsi/gomega" //nolint:revive // dot import is idiomatic for gomega matchers
 )
 
 const (
@@ -21,11 +21,12 @@ const (
 	TestPodMonitorName     = "test-podmonitor"
 	TestServiceMonitorName = "test-servicemonitor"
 
-	ODHLabelMonitoring = "opendatahub.io/monitoring"
+	ODHLabelMonitoring = "monitoring.opendatahub.io/scrape"
 )
 
 func (tc *MonitoringTestCtx) runWebhookTests(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Run("Group 10: Webhooks", func(t *testing.T) {
 		t.Run("Setup", tc.ValidateMonitoringWebhookTestsSetup)
@@ -45,6 +46,7 @@ func (tc *MonitoringTestCtx) runWebhookTests(t *testing.T) {
 
 func (tc *MonitoringTestCtx) createMonitorsEnvironment(t *testing.T, namespaceLabels map[string]string, monitorLabels map[string]string) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Logf("Pre-test cleanup: removing %s namespace and monitors if they exist", TestNamespaceName)
 	tc.DeleteResource(
@@ -121,6 +123,7 @@ func (tc *MonitoringTestCtx) createMonitorsEnvironment(t *testing.T, namespaceLa
 
 func (tc *MonitoringTestCtx) cleanupMonitoringAdmissionResources(t *testing.T, podMonitorName, serviceMonitorName string) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Cleanup(func() {
 		if podMonitorName != "" {
@@ -147,6 +150,7 @@ func (tc *MonitoringTestCtx) cleanupMonitoringAdmissionResources(t *testing.T, p
 
 func (tc *MonitoringTestCtx) ValidateMonitoringWebhookTestsSetup(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Logf("Setting up webhook tests: enabling monitoring and waiting for ready state")
 
@@ -169,6 +173,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringWebhookTestsSetup(t *testing.T) {
 
 func (tc *MonitoringTestCtx) ValidateMonitoringLabelValueEnforcementOnNamespace(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.DeleteResource(
 		WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: TestNamespaceName}),
@@ -194,6 +199,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringLabelValueEnforcementOnNamespace(
 
 func (tc *MonitoringTestCtx) ValidateMonitoringLabelValueEnforcementOnMonitors(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.DeleteResource(
 		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{Name: "test-invalid-podmonitor", Namespace: TestNamespaceName}),
@@ -253,6 +259,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringLabelValueEnforcementOnMonitors(t
 
 func (tc *MonitoringTestCtx) ValidateMonitorLabelInjection(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	nsLabels := map[string]string{
 		ODHLabelMonitoring: "true",
@@ -266,7 +273,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjection(t *testing.T) {
 			Namespace: TestNamespaceName,
 		}),
 		WithCondition(jq.Match(`.metadata.labels."%s" == "true"`, ODHLabelMonitoring)),
-		WithCustomErrorMsg("Mutating webhook should inject opendatahub.io/monitoring=true label into PodMonitor"),
+		WithCustomErrorMsg("Mutating webhook should inject monitoring.opendatahub.io/scrape=true label into PodMonitor"),
 	)
 
 	tc.EnsureResourceExists(
@@ -275,12 +282,13 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjection(t *testing.T) {
 			Namespace: TestNamespaceName,
 		}),
 		WithCondition(jq.Match(`.metadata.labels."%s" == "true"`, ODHLabelMonitoring)),
-		WithCustomErrorMsg("Mutating webhook should inject opendatahub.io/monitoring=true label into ServiceMonitor"),
+		WithCustomErrorMsg("Mutating webhook should inject monitoring.opendatahub.io/scrape=true label into ServiceMonitor"),
 	)
 }
 
 func (tc *MonitoringTestCtx) ValidateMonitorsCreationWithCustomLabels(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	nsLabels := map[string]string{
 		ODHLabelMonitoring: "true",
@@ -322,6 +330,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorsCreationWithCustomLabels(t *testing
 
 func (tc *MonitoringTestCtx) ValidateMonitorLabelInjectionOnUpdate(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	nsLabels := map[string]string{
 		"temp-label": "temp-value",
@@ -386,6 +395,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjectionOnUpdate(t *testing.T)
 
 func (tc *MonitoringTestCtx) ValidateMonitorLabelInjectionOnUpdateWithCustomLabels(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	nsLabels := map[string]string{
 		"temp-label": "temp-value",
@@ -467,6 +477,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjectionOnUpdateWithCustomLabe
 
 func (tc *MonitoringTestCtx) ValidateWebhookSkipsNonMonitoredNamespace(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	nsLabels := map[string]string{
 		"some-other-label": "value",
@@ -495,6 +506,7 @@ func (tc *MonitoringTestCtx) ValidateWebhookSkipsNonMonitoredNamespace(t *testin
 
 func (tc *MonitoringTestCtx) ValidateWebhookSkipsExplicitlyOptedOutNamespace(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	nsLabels := map[string]string{
 		ODHLabelMonitoring: "false",
@@ -523,6 +535,7 @@ func (tc *MonitoringTestCtx) ValidateWebhookSkipsExplicitlyOptedOutNamespace(t *
 
 func (tc *MonitoringTestCtx) ValidateWebhookRespectsUserOptOut(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	nsLabels := map[string]string{
 		ODHLabelMonitoring: "true",
@@ -555,6 +568,7 @@ func (tc *MonitoringTestCtx) ValidateWebhookRespectsUserOptOut(t *testing.T) {
 
 func (tc *MonitoringTestCtx) ValidateWebhookIdempotency(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	nsLabels := map[string]string{
 		ODHLabelMonitoring: "true",
@@ -587,6 +601,7 @@ func (tc *MonitoringTestCtx) ValidateWebhookIdempotency(t *testing.T) {
 
 func (tc *MonitoringTestCtx) ValidateWebhookSkipsWhenMonitoringDisabled(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Cleanup(func() {
 		tc.updateMonitoringConfig(

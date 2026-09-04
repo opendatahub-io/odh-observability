@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/itchyny/gojq"
@@ -56,6 +57,7 @@ func Transform(format string, args ...any) TransformFn {
 	}
 }
 
+//nolint:ireturn // generic helper intentionally returns type parameter T
 func ExtractValue[T any](in any, expression string) (T, error) {
 	var result T
 
@@ -108,8 +110,8 @@ func formattedMessage(comparisonMessage string, failurePath []any) string {
 func formattedFailurePath(failurePath []any) string {
 	formattedPaths := make([]string, 0)
 
-	for i := len(failurePath) - 1; i >= 0; i-- {
-		switch p := failurePath[i].(type) {
+	for i, v := range slices.Backward(failurePath) {
+		switch p := v.(type) {
 		case int:
 			val := fmt.Sprintf(`[%d]`, p)
 			formattedPaths = append(formattedPaths, val)
@@ -132,7 +134,7 @@ func toType(in any) (any, error) {
 	if !valof.IsValid() {
 		return nil, nil
 	}
-	if valof.Kind() == reflect.Ptr && valof.IsNil() {
+	if valof.Kind() == reflect.Pointer && valof.IsNil() {
 		return nil, nil
 	}
 

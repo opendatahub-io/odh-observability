@@ -3,19 +3,20 @@ package e2e_test
 import (
 	"testing"
 
+	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 	jq "github.com/opendatahub-io/odh-observability/tests/e2e/matchers/jq"
-	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
 
-	. "github.com/onsi/gomega"
+	. "github.com/onsi/gomega" //nolint:revive // dot import is idiomatic for gomega matchers
 )
 
 func (tc *MonitoringTestCtx) runNegativeConditionTests(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Run("Group 12: Negative Conditions", func(t *testing.T) {
 		t.Run("Metrics negative conditions", tc.ValidateMonitoringMetricsNegativeConditions)
@@ -30,6 +31,7 @@ func (tc *MonitoringTestCtx) runNegativeConditionTests(t *testing.T) {
 
 func (tc *MonitoringTestCtx) ValidateMonitoringMetricsNegativeConditions(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -51,6 +53,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringMetricsNegativeConditions(t *test
 
 func (tc *MonitoringTestCtx) ValidateMonitoringTracesNegativeConditions(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -72,6 +75,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringTracesNegativeConditions(t *testi
 
 func (tc *MonitoringTestCtx) ValidateMonitoringAlertingNegativeConditions(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -89,6 +93,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringAlertingNegativeConditions(t *tes
 
 func (tc *MonitoringTestCtx) ValidateMonitoringPersesNegativeConditions(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -115,6 +120,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringPersesNegativeConditions(t *testi
 
 func (tc *MonitoringTestCtx) ValidateMonitoringNodeMetricsNegativeConditions(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -136,6 +142,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringNodeMetricsNegativeConditions(t *
 
 func (tc *MonitoringTestCtx) ValidateMonitoringOpenTelemetryNegativeConditions(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -158,6 +165,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringOpenTelemetryNegativeConditions(t
 
 func (tc *MonitoringTestCtx) ValidateMonitoringUsageLogsNegativeConditions(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -170,7 +178,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringUsageLogsNegativeConditions(t *te
 		WithCondition(And(
 			jq.Match(`[.status.conditions[] | select(.type=="%s" and .status=="False" and .reason=="UsageLogsNotConfigured")] | length==1`,
 				conditions.ConditionUsageLogsCollectorAvailable),
-			jq.Match(`[.status.conditions[] | select(.type=="%s" and .status=="False" and .reason=="UsageLogsStorageNotConfigured")] | length==1`,
+			jq.Match(`[.status.conditions[] | select(.type=="%s" and .status=="False" and .reason=="LokiNotRequired")] | length==1`,
 				conditions.ConditionLokiStackAvailable),
 		)),
 		WithCustomErrorMsg("UsageLogsCollectorAvailable and LokiStackAvailable should report not configured when usage logs are disabled"),

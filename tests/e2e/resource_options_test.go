@@ -2,6 +2,7 @@ package e2e_test
 
 import (
 	"fmt"
+	"maps"
 	"testing"
 	"time"
 
@@ -85,9 +86,7 @@ func (ro *ResourceOptions) buildObject() *unstructured.Unstructured {
 	u.SetNamespace(ro.NN.Namespace)
 
 	if ro.ObjectContent != nil {
-		for k, v := range ro.ObjectContent {
-			u.Object[k] = v
-		}
+		maps.Copy(u.Object, ro.ObjectContent)
 	}
 
 	return u
@@ -175,12 +174,16 @@ func WithRemoveFinalizersOnDelete(remove bool) ResourceOpts {
 }
 
 func WithCleanup(t *testing.T) ResourceOpts {
+	t.Helper()
+
 	return func(ro *ResourceOptions) {
 		ro.CleanupT = t
 	}
 }
 
 func WithTest(t *testing.T) ResourceOpts {
+	t.Helper()
+
 	return func(ro *ResourceOptions) {
 		ro.t = t
 	}

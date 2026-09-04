@@ -1,0 +1,134 @@
+version: "2"
+linters:
+  default: all
+  disable:
+    - cyclop
+    - depguard
+    - err113
+    - exhaustruct
+    - forbidigo
+    - funlen
+    - gochecknoglobals
+    - gochecknoinits
+    - gocognit
+    - godox
+    - gomoddirectives
+    - mnd
+    - nestif
+    - nilnil
+    - nlreturn
+    - paralleltest
+    - tagliatelle
+    - varnamelen
+    - wrapcheck
+    - wsl
+    - wsl_v5
+    - funcorder
+    - godoclint
+    - gomodguard
+    - noinlineerr
+  settings:
+    errcheck:
+      check-type-assertions: true
+    exhaustive:
+      check:
+        - switch
+      default-signifies-exhaustive: true
+    funlen:
+      lines: 100
+      statements: 100
+      ignore-comments: true
+    goconst:
+      ignore-string-values:
+        - "true"
+        - "false"
+    gocritic:
+      enabled-checks:
+        - deferInLoop
+        - unnecessaryDefer
+    gocyclo:
+      min-complexity: 30
+    importas:
+      alias:
+        - pkg: k8s.io/apimachinery/pkg/api/errors
+          alias: k8serr
+        - pkg: k8s.io/api/(\w+)/(v[\w\d]+)
+          alias: $1$2
+        - pkg: github.com/openshift/api/(\w+)/(v[\w\d]+)
+          alias: $1$2
+    lll:
+      line-length: 180
+    nolintlint:
+      require-specific: true
+      allow-no-explanation:
+        - funlen
+        - lll
+    perfsprint:
+      sprintf1: false
+      strconcat: false
+    revive:
+      rules:
+        - name: dot-imports
+          arguments:
+            - allowedPackages: []
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - dupl
+          - goconst
+          - unparam
+        path: (.+)_test\.go
+      - linters:
+          - testpackage
+        path: (.+)_test\.go
+      - linters:
+          - lll
+        source: "^//\\+?kubebuilder:"
+      - linters:
+          - gosec
+        text: "G101:"
+        path: (.+)_test\.go
+      - linters:
+          - goconst
+        path: internal/controller/(gvk|templatedata)
+      - linters:
+          - lll
+        source: "^// \\+kubebuilder:rbac:"
+      - linters:
+          - staticcheck
+        text: "ST1005:"
+      - linters:
+          - staticcheck
+        text: "SA1019:.*client\\.Apply"
+    paths:
+      - api
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - goimports
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/opendatahub-io/odh-observability)
+        - blank
+        - dot
+      custom-order: true
+  exclusions:
+    generated: lax
+    paths:
+      - api
+      - third_party$
+      - builtin$
+      - examples$

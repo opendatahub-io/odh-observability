@@ -166,6 +166,8 @@ tests/e2e/                      End-to-end test suite
 - **Label-based ownership** — the cluster-scoped CR cannot use OwnerReferences for namespace-scoped resources, so `platform.opendatahub.io/part-of=monitoring` labels are used instead
 - **Embedded templates** — resource templates are embedded via `//go:embed`
 - **Condition aggregation** — per-feature conditions are aggregated into top-level Ready/Degraded status
+- **TLS-only collector scraping** — the OTel Collector's internal telemetry is re-exported through a TLS-enabled pipeline exporter on `:8890` (service `data-science-collector-monitoring`, cert via OpenShift service-CA) because the Go SDK Prometheus pull exporter does not support TLS natively. Prometheus scrapes this endpoint over HTTPS.
+- **NetworkPolicy-guarded collector ingress** — `data-science-collector-monitoring-ingress` is the only policy selecting the collector pods, so it acts as the collector's sole ingress gate on clusters with NetworkPolicy enforcement. It allows Prometheus to scrape `:8889`/`:8890` and permits OTLP on `:4317`/`:4318`; OTLP is intentionally restricted to the monitoring namespace.
 
 ## Environment Variables
 

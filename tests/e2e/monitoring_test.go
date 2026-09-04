@@ -6,6 +6,7 @@ import (
 	"time"
 
 	gTypes "github.com/onsi/gomega/types"
+	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -14,9 +15,8 @@ import (
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 	jq "github.com/opendatahub-io/odh-observability/tests/e2e/matchers/jq"
-	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
 
-	. "github.com/onsi/gomega"
+	. "github.com/onsi/gomega" //nolint:revive // dot import is idiomatic for gomega
 )
 
 func monitoringTestSuite(t *testing.T) {
@@ -38,19 +38,20 @@ func monitoringTestSuite(t *testing.T) {
 	}
 
 	monitoringServiceCtx.ensurePrerequisites(t)
-	monitoringServiceCtx.runBaseConfigurationTests(t)
-	monitoringServiceCtx.runMetricsAndMonitoringStackTests(t)
-	monitoringServiceCtx.runCollectorTests(t)
-	monitoringServiceCtx.runTargetAllocatorTests(t)
-	monitoringServiceCtx.runThanosQuerierTests(t)
-	monitoringServiceCtx.runTracesWithPVBackendTests(t)
-	monitoringServiceCtx.runTracesWithCloudStorageTests(t)
-	monitoringServiceCtx.runPersesTests(t)
-	monitoringServiceCtx.runNetworkingTests(t)
-	monitoringServiceCtx.runWebhookTests(t)
-	monitoringServiceCtx.runUsageLogsCollectionTests(t)
-	monitoringServiceCtx.runNegativeConditionTests(t)
-	monitoringServiceCtx.runDisabledTests(t)
+
+	t.Run("Base Configuration", monitoringServiceCtx.runBaseConfigurationTests)
+	t.Run("Metrics & MonitoringStack", monitoringServiceCtx.runMetricsAndMonitoringStackTests)
+	t.Run("OpenTelemetry Collector", monitoringServiceCtx.runCollectorTests)
+	t.Run("Target Allocator", monitoringServiceCtx.runTargetAllocatorTests)
+	t.Run("Thanos Querier", monitoringServiceCtx.runThanosQuerierTests)
+	t.Run("Traces with PV Backend", monitoringServiceCtx.runTracesWithPVBackendTests)
+	t.Run("Traces with Cloud Storage", monitoringServiceCtx.runTracesWithCloudStorageTests)
+	t.Run("Perses", monitoringServiceCtx.runPersesTests)
+	t.Run("Networking and RBAC", monitoringServiceCtx.runNetworkingTests)
+	t.Run("Webhooks", monitoringServiceCtx.runWebhookTests)
+	t.Run("Usage Logs Collection", monitoringServiceCtx.runUsageLogsCollectionTests)
+	t.Run("Negative Conditions", monitoringServiceCtx.runNegativeConditionTests)
+	t.Run("Disabled", monitoringServiceCtx.runDisabledTests)
 }
 
 // ========================================================================
@@ -59,8 +60,10 @@ func monitoringTestSuite(t *testing.T) {
 
 func (tc *MonitoringTestCtx) runBaseConfigurationTests(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Run("Group 1: Base Configuration", func(t *testing.T) {
+		tc = tc.WithT(t)
 		tc.setupBaseMonitoring(t)
 
 		t.Cleanup(func() {
@@ -74,6 +77,7 @@ func (tc *MonitoringTestCtx) runBaseConfigurationTests(t *testing.T) {
 // ValidateMonitoringCRDefaultTracesContent verifies that traces stanza is omitted by default.
 func (tc *MonitoringTestCtx) ValidateMonitoringCRDefaultTracesContent(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(withManagementState(common.Managed))
 
@@ -93,8 +97,10 @@ func (tc *MonitoringTestCtx) ValidateMonitoringCRDefaultTracesContent(t *testing
 
 func (tc *MonitoringTestCtx) runMetricsAndMonitoringStackTests(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Run("Group 2: Metrics & MonitoringStack", func(t *testing.T) {
+		tc = tc.WithT(t)
 		tc.setupMetrics(t)
 
 		t.Cleanup(func() {
@@ -113,6 +119,7 @@ func (tc *MonitoringTestCtx) runMetricsAndMonitoringStackTests(t *testing.T) {
 // ValidateMonitoringStackCRMetricsWhenSet validates that MonitoringStack CR is created when metrics are set.
 func (tc *MonitoringTestCtx) ValidateMonitoringStackCRMetricsWhenSet(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -134,6 +141,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringStackCRMetricsWhenSet(t *testing.
 // ValidateMonitoringStackCRMetricsConfiguration verifies MonitoringStack CR storage, retention, resources, and replicas.
 func (tc *MonitoringTestCtx) ValidateMonitoringStackCRMetricsConfiguration(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.MonitoringStack, types.NamespacedName{Name: MonitoringStackName, Namespace: tc.MonitoringNamespace}),
@@ -152,6 +160,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringStackCRMetricsConfiguration(t *te
 // ValidateMonitoringStackCRMetricsReplicasUpdate tests that replicas are updated when metrics replicas change.
 func (tc *MonitoringTestCtx) ValidateMonitoringStackCRMetricsReplicasUpdate(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	replicasTransforms := []jq.TransformFn{
 		jq.Transform(`.spec.metrics.storage.size = "%s"`, MetricsStorageSize),
@@ -174,6 +183,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringStackCRMetricsReplicasUpdate(t *t
 // based on monitoring and alerting configuration.
 func (tc *MonitoringTestCtx) ValidatePrometheusRulesLifecycle(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -197,6 +207,7 @@ func (tc *MonitoringTestCtx) ValidatePrometheusRulesLifecycle(t *testing.T) {
 // ValidatePrometheusSelfServiceMonitorTLSFix tests the prometheus-self-fixed ServiceMonitor TLS configuration.
 func (tc *MonitoringTestCtx) ValidatePrometheusSelfServiceMonitorTLSFix(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -248,6 +259,7 @@ func (tc *MonitoringTestCtx) ValidatePrometheusSelfServiceMonitorTLSFix(t *testi
 // across multiple reconcile loops, detecting potential reconciliation loops.
 func (tc *MonitoringTestCtx) ValidateReconciliationStability(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	g := NewWithT(t)
 
@@ -369,8 +381,10 @@ func (tc *MonitoringTestCtx) ValidateReconciliationStability(t *testing.T) {
 
 func (tc *MonitoringTestCtx) runCollectorTests(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Run("Group 3: OpenTelemetry Collector", func(t *testing.T) {
+		tc = tc.WithT(t)
 		tc.setupMetrics(t)
 
 		t.Cleanup(func() {
@@ -380,12 +394,14 @@ func (tc *MonitoringTestCtx) runCollectorTests(t *testing.T) {
 		t.Run("Test OpenTelemetry Collector Configurations", tc.ValidateOpenTelemetryCollectorConfigurations)
 		t.Run("Test OpenTelemetry Collector replicas", tc.ValidateMonitoringCRCollectorReplicas)
 		t.Run("Test Metrics TLS is always enabled for Prometheus exporter", tc.ValidateMetricsTLSAlwaysEnabled)
+		t.Run("Test Monitoring TLS is always enabled for internal telemetry exporter", tc.ValidateMonitoringTLSAlwaysEnabled)
 	})
 }
 
 // ValidateOpenTelemetryCollectorConfigurations consolidates all OpenTelemetry Collector configuration tests.
 func (tc *MonitoringTestCtx) ValidateOpenTelemetryCollectorConfigurations(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	testCases := []struct {
 		name                string
@@ -445,6 +461,7 @@ func (tc *MonitoringTestCtx) ValidateOpenTelemetryCollectorConfigurations(t *tes
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Helper()
+			tc = tc.WithT(t)
 			t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 			tc.updateMonitoringConfig(testCase.transforms...)
@@ -476,6 +493,7 @@ func (tc *MonitoringTestCtx) ValidateOpenTelemetryCollectorConfigurations(t *tes
 // ValidateMonitoringCRCollectorReplicas tests that collectorReplicas is respected.
 func (tc *MonitoringTestCtx) ValidateMonitoringCRCollectorReplicas(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	defaultReplicas := tc.expectedDefaultReplicas
 	testReplicas := defaultReplicas + 1
@@ -509,6 +527,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringCRCollectorReplicas(t *testing.T)
 // ValidateMetricsTLSAlwaysEnabled validates that TLS is always enabled for the OpenTelemetry Collector Prometheus exporter.
 func (tc *MonitoringTestCtx) ValidateMetricsTLSAlwaysEnabled(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -569,14 +588,85 @@ func (tc *MonitoringTestCtx) ValidateMetricsTLSAlwaysEnabled(t *testing.T) {
 	)
 }
 
+// ValidateMonitoringTLSAlwaysEnabled validates that TLS is always enabled for the
+// collector's internal telemetry (:8890) monitoring path.
+func (tc *MonitoringTestCtx) ValidateMonitoringTLSAlwaysEnabled(t *testing.T) {
+	t.Helper()
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.ensureOpenTelemetryCollectorReady(t)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      "data-science-collector-monitoring",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == "data-science-collector-monitoring-tls"`),
+			jq.Match(`.spec.ports[0].name == "monitoring"`),
+			jq.Match(`.spec.ports[0].port == 8890`),
+		)),
+		WithCustomErrorMsg("TLS Service for internal telemetry exporter should exist with service-ca annotation"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Secret, types.NamespacedName{
+			Name:      "data-science-collector-monitoring-tls",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.type == "kubernetes.io/tls"`),
+			jq.Match(`.data."tls.crt" != null`),
+			jq.Match(`.data."tls.key" != null`),
+		)),
+		WithCustomErrorMsg("TLS Secret should be created by service-ca with certificate and key"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+			Name:      OpenTelemetryCollectorName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.config.exporters."prometheus/monitoring".endpoint == "0.0.0.0:8890"`),
+			jq.Match(`.spec.config.exporters."prometheus/monitoring".tls.cert_file == "/etc/otel-collector/monitoring-tls/tls.crt"`),
+			jq.Match(`.spec.config.exporters."prometheus/monitoring".tls.key_file == "/etc/otel-collector/monitoring-tls/tls.key"`),
+			jq.Match(`.spec.config.receivers."prometheus/self".config.scrape_configs[0].static_configs[0].targets[0] == "127.0.0.1:8888"`),
+			jq.Match(`.spec.config.service.pipelines."metrics/internal".receivers | contains(["prometheus/self"])`),
+			jq.Match(`.spec.config.service.pipelines."metrics/internal".exporters | contains(["prometheus/monitoring"])`),
+			jq.Match(`.spec.volumes[] | select(.name == "monitoring-tls-certs") | .secret.secretName == "data-science-collector-monitoring-tls"`),
+		)),
+		WithCustomErrorMsg("OpenTelemetryCollector should self-scrape internal telemetry and re-export it over TLS on :8890"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
+			Name:      "data-science-collector-monitor",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.endpoints[0].port == "monitoring"`),
+			jq.Match(`.spec.endpoints[0].scheme == "https"`),
+			jq.Match(`.spec.endpoints[0].tlsConfig.serverName == "data-science-collector-monitoring.%s.svc"`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("ServiceMonitor should always use HTTPS to scrape the internal telemetry exporter"),
+	)
+}
+
 // ========================================================================
 // Group 4: Target Allocator
 // ========================================================================
 
 func (tc *MonitoringTestCtx) runTargetAllocatorTests(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Run("Group 4: Target Allocator", func(t *testing.T) {
+		tc = tc.WithT(t)
 		tc.cleanupGroup(t, "")
 
 		t.Cleanup(func() {
@@ -586,6 +676,7 @@ func (tc *MonitoringTestCtx) runTargetAllocatorTests(t *testing.T) {
 		t.Run("Test Target Allocator not deployed without metrics", tc.ValidateTargetAllocatorNotDeployedWithoutMetrics)
 
 		t.Run("With Metrics", func(t *testing.T) {
+			tc = tc.WithT(t)
 			tc.setupMetrics(t)
 
 			t.Run("Test Target Allocator deployment with metrics", tc.ValidateTargetAllocatorDeploymentWithMetrics)
@@ -599,6 +690,7 @@ func (tc *MonitoringTestCtx) runTargetAllocatorTests(t *testing.T) {
 // ValidateTargetAllocatorNotDeployedWithoutMetrics tests that the Target Allocator is not deployed when metrics are not configured.
 func (tc *MonitoringTestCtx) ValidateTargetAllocatorNotDeployedWithoutMetrics(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -642,6 +734,7 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorNotDeployedWithoutMetrics(t 
 // ValidateTargetAllocatorDeploymentWithMetrics tests that the Target Allocator is deployed and ready when metrics are configured.
 func (tc *MonitoringTestCtx) ValidateTargetAllocatorDeploymentWithMetrics(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -667,8 +760,8 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorDeploymentWithMetrics(t *tes
 			jq.Match(`.spec.targetAllocator.enabled == true`),
 			jq.Match(`.spec.targetAllocator.serviceAccount == "%s"`, TargetAllocatorServiceAccount),
 			jq.Match(`.spec.targetAllocator.prometheusCR.enabled == true`),
-			jq.Match(`.spec.targetAllocator.prometheusCR.podMonitorSelector.matchLabels."opendatahub.io/monitoring" == "true"`),
-			jq.Match(`.spec.targetAllocator.prometheusCR.serviceMonitorSelector.matchLabels."opendatahub.io/monitoring" == "true"`),
+			jq.Match(`.spec.targetAllocator.prometheusCR.podMonitorSelector.matchLabels."monitoring.opendatahub.io/scrape" == "true"`),
+			jq.Match(`.spec.targetAllocator.prometheusCR.serviceMonitorSelector.matchLabels."monitoring.opendatahub.io/scrape" == "true"`),
 		)),
 		WithCustomErrorMsg("OpenTelemetryCollector should have targetAllocator enabled with correct configuration"),
 	)
@@ -689,6 +782,7 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorDeploymentWithMetrics(t *tes
 // ValidateTargetAllocatorServiceAndConfigMap tests that the Target Allocator Service and ConfigMap are created correctly.
 func (tc *MonitoringTestCtx) ValidateTargetAllocatorServiceAndConfigMap(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -719,6 +813,7 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorServiceAndConfigMap(t *testi
 // ValidateTargetAllocatorLifecycle tests the complete lifecycle of Target Allocator deployment and cleanup.
 func (tc *MonitoringTestCtx) ValidateTargetAllocatorLifecycle(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -772,6 +867,7 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorLifecycle(t *testing.T) {
 // ValidateTargetAllocatorRBACConfiguration tests that Target Allocator has correct RBAC permissions.
 func (tc *MonitoringTestCtx) ValidateTargetAllocatorRBACConfiguration(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -821,8 +917,10 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorRBACConfiguration(t *testing
 
 func (tc *MonitoringTestCtx) runThanosQuerierTests(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Run("Group 5: Thanos Querier", func(t *testing.T) {
+		tc = tc.WithT(t)
 		tc.cleanupGroup(t, "")
 
 		t.Cleanup(func() {
@@ -838,6 +936,7 @@ func (tc *MonitoringTestCtx) runThanosQuerierTests(t *testing.T) {
 // ValidateThanosQuerierNotDeployedWithoutMetrics tests that ThanosQuerier is not deployed when metrics are not configured.
 func (tc *MonitoringTestCtx) ValidateThanosQuerierNotDeployedWithoutMetrics(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -876,6 +975,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierNotDeployedWithoutMetrics(t *t
 // ValidateThanosQuerierDeployment tests that ThanosQuerier CR and Route are created when metrics are configured.
 func (tc *MonitoringTestCtx) ValidateThanosQuerierDeployment(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -924,6 +1024,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierDeployment(t *testing.T) {
 // includes an ingress rule allowing the Thanos Querier to reach the Thanos Sidecar on gRPC port 10901.
 func (tc *MonitoringTestCtx) ValidatePrometheusNetworkPolicyAllowsThanosQuerier(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -970,19 +1071,24 @@ func (tc *MonitoringTestCtx) ValidatePrometheusNetworkPolicyAllowsThanosQuerier(
 
 func (tc *MonitoringTestCtx) runTracesWithPVBackendTests(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Run("Group 6: Traces with PV Backend", func(t *testing.T) {
+		tc = tc.WithT(t)
 		t.Cleanup(func() {
 			tc.cleanupGroup(t, "")
 		})
 
 		t.Run("Test TempoMonolithic CR Creation with PV backend", tc.ValidateTempoMonolithicCRCreation)
+		t.Run("Test Collector MLflow integration RBAC", tc.ValidateCollectorMLflowIntegrationRBAC)
+		t.Run("Test Collector Tempo trace export RBAC", tc.ValidateCollectorTempoTraceExportRBAC)
 	})
 }
 
 // ValidateTempoMonolithicCRCreation tests creation of TempoMonolithic CR with PV backend and custom retention.
 func (tc *MonitoringTestCtx) ValidateTempoMonolithicCRCreation(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -1010,14 +1116,140 @@ func (tc *MonitoringTestCtx) ValidateTempoMonolithicCRCreation(t *testing.T) {
 	)
 }
 
+// ValidateCollectorMLflowIntegrationRBAC tests that the collector SA has the MLflow trace export ClusterRole and ClusterRoleBinding.
+func (tc *MonitoringTestCtx) ValidateCollectorMLflowIntegrationRBAC(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+	t.Cleanup(tc.resetMonitoringConfigToManaged)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		withMonitoringTraces(TracesStorageBackendPV, "", TracesStorageSize1Gi, DefaultRetention),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{
+			Name: "data-science-collector-mlflow-trace-export",
+		}),
+		WithCondition(And(
+			jq.Match(`.rules | length == 1`),
+			jq.Match(`(.rules[0].apiGroups | length) == 1`),
+			jq.Match(`.rules[0].apiGroups[0] == "mlflow.kubeflow.org"`),
+			jq.Match(`(.rules[0].resources | length) == 1`),
+			jq.Match(`.rules[0].resources[0] == "experiments"`),
+			jq.Match(`(.rules[0].verbs | length) == 1`),
+			jq.Match(`.rules[0].verbs[0] == "update"`),
+		)),
+		WithCustomErrorMsg("ClusterRole should grant only experiments update on mlflow.kubeflow.org"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "data-science-collector-mlflow-trace-export",
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.apiGroup == "rbac.authorization.k8s.io"`),
+			jq.Match(`.roleRef.kind == "ClusterRole"`),
+			jq.Match(`.roleRef.name == "data-science-collector-mlflow-trace-export"`),
+			jq.Match(`(.subjects | length) == 1`),
+			jq.Match(`.subjects[0].kind == "ServiceAccount"`),
+			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("ClusterRoleBinding should bind collector SA to MLflow trace export ClusterRole"),
+	)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		withNoTraces(),
+	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{
+			Name: "data-science-collector-mlflow-trace-export",
+		}),
+	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "data-science-collector-mlflow-trace-export",
+		}),
+	)
+}
+
+// ValidateCollectorTempoTraceExportRBAC tests that the collector SA has the Tempo trace export ClusterRole and ClusterRoleBinding.
+func (tc *MonitoringTestCtx) ValidateCollectorTempoTraceExportRBAC(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+	t.Cleanup(tc.resetMonitoringConfigToManaged)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		withMonitoringTraces(TracesStorageBackendPV, "", TracesStorageSize1Gi, DefaultRetention),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{
+			Name: "data-science-collector-tempo-trace-export",
+		}),
+		WithCondition(And(
+			jq.Match(`.rules | length == 1`),
+			jq.Match(`(.rules[0].apiGroups | length) == 1`),
+			jq.Match(`.rules[0].apiGroups[0] == "tempo.grafana.com"`),
+			jq.Match(`(.rules[0].resources | length) == 1`),
+			jq.Match(`.rules[0].resources[0] == "%s"`, tc.MonitoringNamespace),
+			jq.Match(`(.rules[0].resourceNames | length) == 1`),
+			jq.Match(`.rules[0].resourceNames[0] == "traces"`),
+			jq.Match(`(.rules[0].verbs | length) == 1`),
+			jq.Match(`.rules[0].verbs[0] == "create"`),
+		)),
+		WithCustomErrorMsg("ClusterRole should grant traces create on tempo.grafana.com for the monitoring namespace"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "data-science-collector-tempo-trace-export",
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.apiGroup == "rbac.authorization.k8s.io"`),
+			jq.Match(`.roleRef.kind == "ClusterRole"`),
+			jq.Match(`.roleRef.name == "data-science-collector-tempo-trace-export"`),
+			jq.Match(`(.subjects | length) == 1`),
+			jq.Match(`.subjects[0].kind == "ServiceAccount"`),
+			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("ClusterRoleBinding should bind collector SA to Tempo trace export ClusterRole"),
+	)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		withNoTraces(),
+	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{
+			Name: "data-science-collector-tempo-trace-export",
+		}),
+	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "data-science-collector-tempo-trace-export",
+		}),
+	)
+}
+
 // ========================================================================
 // Group 7: Traces with Cloud Storage (S3 & GCS)
 // ========================================================================
 
 func (tc *MonitoringTestCtx) runTracesWithCloudStorageTests(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Run("Group 7: Traces with Cloud Storage", func(t *testing.T) {
+		tc = tc.WithT(t)
 		t.Cleanup(func() {
 			tc.cleanupGroup(t, "s3-secret")
 			tc.cleanupGroup(t, "gcs-secret")
@@ -1032,6 +1264,7 @@ func (tc *MonitoringTestCtx) runTracesWithCloudStorageTests(t *testing.T) {
 // ValidateTempoStackCRCreationWithCloudStorage tests creation of TempoStack CR with cloud storage backends.
 func (tc *MonitoringTestCtx) ValidateTempoStackCRCreationWithCloudStorage(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	testCases := []struct {
 		name                string
@@ -1055,6 +1288,7 @@ func (tc *MonitoringTestCtx) ValidateTempoStackCRCreationWithCloudStorage(t *tes
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
+			tc = tc.WithT(t)
 			tc.validateTempoStackCreationAndPersesTLS(
 				t,
 				testCase.backend,
@@ -1069,6 +1303,7 @@ func (tc *MonitoringTestCtx) ValidateTempoStackCRCreationWithCloudStorage(t *tes
 // AND PersesDatasource TLS configuration in a single TempoStack lifecycle.
 func (tc *MonitoringTestCtx) validateTempoStackCreationAndPersesTLS(t *testing.T, backend string, monitoringCondition gTypes.GomegaMatcher, monitoringErrorMsg string) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	secretName := fmt.Sprintf("%s-secret", backend)
 
@@ -1083,6 +1318,7 @@ func (tc *MonitoringTestCtx) validateTempoStackCreationAndPersesTLS(t *testing.T
 // and waits until the TempoStack is ready with the correct configuration.
 func (tc *MonitoringTestCtx) validateTempoStackCreation(t *testing.T, backend, secretName string, monitoringCondition gTypes.GomegaMatcher, monitoringErrorMsg string) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.ensureMonitoringCleanSlate(t, secretName)
 
@@ -1119,6 +1355,7 @@ func (tc *MonitoringTestCtx) validateTempoStackCreation(t *testing.T, backend, s
 // that the PersesDatasource is updated with the correct TLS settings.
 func (tc *MonitoringTestCtx) validatePersesDatasourceTLS(t *testing.T, backend, secretName string) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -1146,6 +1383,7 @@ func (tc *MonitoringTestCtx) validatePersesDatasourceTLS(t *testing.T, backend, 
 // ValidateInstrumentationCRTracesLifecycle tests the Instrumentation CR lifecycle with traces.
 func (tc *MonitoringTestCtx) ValidateInstrumentationCRTracesLifecycle(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -1182,6 +1420,7 @@ func (tc *MonitoringTestCtx) ValidateInstrumentationCRTracesLifecycle(t *testing
 // ValidateTracesExportersReservedNameValidation tests that reserved exporter names are rejected.
 func (tc *MonitoringTestCtx) ValidateTracesExportersReservedNameValidation(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -1204,13 +1443,16 @@ func (tc *MonitoringTestCtx) ValidateTracesExportersReservedNameValidation(t *te
 
 func (tc *MonitoringTestCtx) runPersesTests(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Run("Group 8: Perses", func(t *testing.T) {
+		tc = tc.WithT(t)
 		t.Cleanup(func() {
 			tc.cleanupGroup(t, "")
 		})
 
 		t.Run("Perses Lifecycle", func(t *testing.T) {
+			tc = tc.WithT(t)
 			tc.setupMetrics(t)
 
 			t.Run("Test Perses deployment when monitoring is managed", tc.ValidatePersesCRCreation)
@@ -1232,6 +1474,7 @@ func (tc *MonitoringTestCtx) runPersesTests(t *testing.T) {
 // ValidatePersesCRCreation tests that Perses CR is created when monitoring is managed with metrics.
 func (tc *MonitoringTestCtx) ValidatePersesCRCreation(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -1263,6 +1506,7 @@ func (tc *MonitoringTestCtx) ValidatePersesCRCreation(t *testing.T) {
 // ValidatePersesCRConfiguration tests Perses CR configuration details.
 func (tc *MonitoringTestCtx) ValidatePersesCRConfiguration(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -1313,6 +1557,7 @@ func (tc *MonitoringTestCtx) ValidatePersesCRConfiguration(t *testing.T) {
 // ValidatePersesLifecycle tests the Perses CR lifecycle (create, delete, recreate).
 func (tc *MonitoringTestCtx) ValidatePersesLifecycle(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -1358,6 +1603,7 @@ func (tc *MonitoringTestCtx) ValidatePersesLifecycle(t *testing.T) {
 // ValidatePersesNotDeployedWithoutMetricsOrTraces tests that Perses is not deployed when neither metrics nor traces are configured.
 func (tc *MonitoringTestCtx) ValidatePersesNotDeployedWithoutMetricsOrTraces(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
@@ -1393,6 +1639,7 @@ func (tc *MonitoringTestCtx) ValidatePersesNotDeployedWithoutMetricsOrTraces(t *
 // ValidatePersesNetworkPolicy tests the Perses NetworkPolicy creation.
 func (tc *MonitoringTestCtx) ValidatePersesNetworkPolicy(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -1417,6 +1664,7 @@ func (tc *MonitoringTestCtx) ValidatePersesNetworkPolicy(t *testing.T) {
 // ValidatePersesDatasourceCreationWithTraces tests that Perses datasource is created when traces are configured.
 func (tc *MonitoringTestCtx) ValidatePersesDatasourceCreationWithTraces(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -1457,6 +1705,7 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceCreationWithTraces(t *testi
 // ValidatePersesDatasourceConfiguration tests the configuration of the Perses datasource.
 func (tc *MonitoringTestCtx) ValidatePersesDatasourceConfiguration(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -1498,6 +1747,7 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceConfiguration(t *testing.T)
 // ValidatePersesDatasourceWithPrometheus validates that Prometheus datasource is created when both Perses and MonitoringStack are deployed.
 func (tc *MonitoringTestCtx) ValidatePersesDatasourceWithPrometheus(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -1545,6 +1795,7 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceWithPrometheus(t *testing.T
 // ValidatePersesDatasourceLifecycle tests the complete lifecycle of PersesDatasource deployment and cleanup.
 func (tc *MonitoringTestCtx) ValidatePersesDatasourceLifecycle(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -1608,8 +1859,10 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceLifecycle(t *testing.T) {
 
 func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Run("Group 9: Networking and RBAC", func(t *testing.T) {
+		tc = tc.WithT(t)
 		tc.setupMetrics(t)
 
 		t.Cleanup(func() {
@@ -1625,6 +1878,7 @@ func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 
 func (tc *MonitoringTestCtx) waitForPrometheusNamespaceProxyPrerequisites(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.MonitoringStack, types.NamespacedName{
@@ -1640,6 +1894,7 @@ func (tc *MonitoringTestCtx) waitForPrometheusNamespaceProxyPrerequisites(t *tes
 
 func (tc *MonitoringTestCtx) validatePrometheusNamespaceProxyResourcesCommon(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.waitForPrometheusNamespaceProxyPrerequisites(t)
 
@@ -1700,6 +1955,7 @@ func (tc *MonitoringTestCtx) validatePrometheusNamespaceProxyResourcesCommon(t *
 
 func (tc *MonitoringTestCtx) ValidatePrometheusRestrictedResourceConfiguration(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -1716,6 +1972,7 @@ func (tc *MonitoringTestCtx) ValidatePrometheusRestrictedResourceConfiguration(t
 
 func (tc *MonitoringTestCtx) ValidatePrometheusSecureProxyAuthentication(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.validatePrometheusNamespaceProxyResourcesCommon(t)
 
@@ -1777,6 +2034,7 @@ func (tc *MonitoringTestCtx) ValidatePrometheusSecureProxyAuthentication(t *test
 
 func (tc *MonitoringTestCtx) ValidateNodeMetricsEndpointDeployment(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -1840,6 +2098,7 @@ func (tc *MonitoringTestCtx) ValidateNodeMetricsEndpointDeployment(t *testing.T)
 
 func (tc *MonitoringTestCtx) ValidateNodeMetricsEndpointRBACConfiguration(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -1932,6 +2191,7 @@ func (tc *MonitoringTestCtx) ValidateNodeMetricsEndpointRBACConfiguration(t *tes
 
 func (tc *MonitoringTestCtx) runDisabledTests(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	t.Run("Disabled: Monitoring Service Disabled", func(t *testing.T) {
 		t.Run("Validate monitoring service disabled", tc.ValidateMonitoringServiceDisabled)
@@ -1940,6 +2200,7 @@ func (tc *MonitoringTestCtx) runDisabledTests(t *testing.T) {
 
 func (tc *MonitoringTestCtx) ValidateMonitoringServiceDisabled(t *testing.T) {
 	t.Helper()
+	tc = tc.WithT(t)
 
 	tc.ensureMonitoringCleanSlate(t, "")
 

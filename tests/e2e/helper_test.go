@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -13,9 +14,8 @@ import (
 
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 	jq "github.com/opendatahub-io/odh-observability/tests/e2e/matchers/jq"
-	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
 
-	. "github.com/onsi/gomega"
+	. "github.com/onsi/gomega" //nolint:revive // dot import is idiomatic for gomega matchers
 )
 
 // Constants for monitoring resource names.
@@ -79,9 +79,57 @@ var monitoringOwnerReferencesCondition = And(
 	jq.Match(`.metadata.ownerReferences[0].name == "%s"`, MonitoringCRName),
 )
 
+// rebaseForDSCI wraps transforms so they operate on DSCI's .spec.monitoring
+// as if it were .spec on a Monitoring CR. This lets every existing transform
+// function work unchanged in DSC mode.
+func rebaseForDSCI(transforms ...jq.TransformFn) jq.TransformFn {
+	return func(dsci *unstructured.Unstructured) error {
+		monitoring, _, _ := unstructured.NestedMap(dsci.Object, "spec", "monitoring")
+		if monitoring == nil {
+			monitoring = map[string]any{}
+		}
+
+		temp := &unstructured.Unstructured{
+			Object: map[string]any{"spec": monitoring},
+		}
+
+		for _, t := range transforms {
+			if err := t(temp); err != nil {
+				return err
+			}
+		}
+
+		return unstructured.SetNestedField(dsci.Object, temp.Object["spec"], "spec", "monitoring")
+	}
+}
+
+// patchViaDSCI patches the DSCI's .spec.monitoring using rebaseForDSCI and waits
+// for the Monitoring CR to reach the expected phase. This is the single entry
+// point for all DSC-mode DSCI mutations.
+func (tc *MonitoringTestCtx) patchViaDSCI(expectedPhase common.Phase, transforms ...jq.TransformFn) {
+	tc.EventuallyResourcePatched(
+		WithMinimalObject(gvk.DSCInitialization, types.NamespacedName{Name: tc.DSCICRName}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			return rebaseForDSCI(transforms...)(u)
+		}),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(jq.Match(`.status.phase == "%s"`, expectedPhase)),
+	)
+}
+
 // ensureMonitoringCRExists creates the Monitoring CR if it does not already exist.
+// In DSC mode, it patches the DSCI to enable monitoring and waits for the
+// module handler to create the Monitoring CR.
 func (tc *MonitoringTestCtx) ensureMonitoringCRExists(t *testing.T) {
 	t.Helper()
+
+	if tc.ApiMode == APIModeDSC {
+		tc.patchViaDSCI(common.PhaseReady, withManagementState(common.Managed))
+		return
+	}
 
 	tc.EventuallyResourceCreatedOrPatched(
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
@@ -95,7 +143,14 @@ func (tc *MonitoringTestCtx) ensureMonitoringCRExists(t *testing.T) {
 
 // updateMonitoringConfig patches the Monitoring CR with the given transforms
 // and waits for the CR to reach Ready status.
+// In DSC mode, it patches the DSCI instead and waits for the module handler
+// to propagate changes to the Monitoring CR.
 func (tc *MonitoringTestCtx) updateMonitoringConfig(transforms ...jq.TransformFn) {
+	if tc.ApiMode == APIModeDSC {
+		tc.patchViaDSCI(common.PhaseReady, transforms...)
+		return
+	}
+
 	tc.updateMonitoringConfigWithOptions(WithMutateFunc(func(u *unstructured.Unstructured) error {
 		return jq.TransformPipeline(transforms...)(u)
 	}))
@@ -123,21 +178,6 @@ func (tc *MonitoringTestCtx) setupMetrics(t *testing.T) {
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
 		tc.withMetricsConfig(),
-	)
-}
-
-// setupTraces enables traces with the specified backend and optional secret.
-func (tc *MonitoringTestCtx) setupTraces(t *testing.T, backend, secretName string) {
-	t.Helper()
-
-	size := ""
-	if backend == TracesStorageBackendPV {
-		size = TracesStorageSize1Gi
-	}
-
-	tc.updateMonitoringConfig(
-		withManagementState(common.Managed),
-		withMonitoringTraces(backend, secretName, size, DefaultRetention),
 	)
 }
 
@@ -209,7 +249,24 @@ func (tc *MonitoringTestCtx) resetMonitoringConfigToManaged() {
 }
 
 // resetMonitoringConfigToRemoved deletes optional config fields and sets managementState=Removed.
+// In DSC mode, it patches the DSCI and waits for the Monitoring CR to reflect NotReady.
 func (tc *MonitoringTestCtx) resetMonitoringConfigToRemoved() {
+	if tc.ApiMode == APIModeDSC {
+		tc.patchViaDSCI(common.PhaseNotReady,
+			withManagementState(common.Removed),
+			jq.Transform(`del(.spec.metrics, .spec.traces, .spec.alerting, .spec.collectorReplicas, .spec.usageLogs)`),
+		)
+
+		tc.EnsureResourcesGone(
+			WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+				Name:      OpenTelemetryCollectorName,
+				Namespace: tc.MonitoringNamespace,
+			}),
+		)
+
+		return
+	}
+
 	tc.updateMonitoringConfigWithOptions(
 		WithMutateFunc(func(u *unstructured.Unstructured) error {
 			return jq.TransformPipeline(
@@ -370,6 +427,7 @@ func detectExpectedReplicas(t *testing.T, tc *TestContext) int {
 
 // createDummySecret creates a test secret for the specified backend type.
 // For Tempo backends, this routes to tempo-specific helpers.
+//
 // Deprecated: Use createTempoS3Secret, createTempoGCSSecret, or createLokiS3Secret directly.
 func (tc *MonitoringTestCtx) createDummySecret(t *testing.T, backendType, secretName, namespace string) {
 	t.Helper()
@@ -617,6 +675,10 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 
 	tc.ensureOperatorPodRunning(t)
 	tc.ensureCRDExists(t, gvk.Monitoring)
+
+	if tc.ApiMode == APIModeDSC {
+		tc.ensureCRDExists(t, gvk.DSCInitialization)
+	}
 
 	if testOpts.installOperators {
 		tc.installDependentOperators(t)

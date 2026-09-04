@@ -20,6 +20,9 @@ import (
 	"flag"
 	"os"
 
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
+	configv1 "github.com/openshift/api/config/v1"
+	routev1 "github.com/openshift/api/route/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -37,9 +40,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
-	routev1 "github.com/openshift/api/route/v1"
-
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 	moncontroller "github.com/opendatahub-io/odh-observability/internal/controller"
 	monwebhook "github.com/opendatahub-io/odh-observability/internal/webhook"
@@ -50,6 +50,7 @@ var scheme = runtime.NewScheme()
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(v1alpha1.AddToScheme(scheme))
+	utilruntime.Must(configv1.Install(scheme))
 	utilruntime.Must(routev1.Install(scheme))
 	utilruntime.Must(extv1.AddToScheme(scheme))
 	utilruntime.Must(appsv1.AddToScheme(scheme))
@@ -79,6 +80,7 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	setupLog := ctrl.Log.WithName("setup")
+	setupLog.Info("odh-observability", "version", os.Getenv("OPERATOR_VERSION"))
 
 	cfg := ctrl.GetConfigOrDie()
 

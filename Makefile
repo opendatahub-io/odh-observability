@@ -2,6 +2,7 @@
 IMG ?= quay.io/opendatahub/odh-observability:odh-stable
 PLATFORM ?= linux/amd64
 CGO_ENABLED ?= 1
+IMAGE_BUILDER ?= podman
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -52,6 +53,10 @@ unit-test: ## Run unit tests (no codegen prerequisites).
 test-verbose: ## Run unit tests with verbose output.
 	go test -v $(shell go list ./... | grep -v /tests/e2e)
 
+.PHONY: lint
+lint: golangci-lint ## Run golangci-lint against code.
+	$(GOLANGCI_LINT) run
+
 .PHONY: e2e-test
 e2e-test: ## Run e2e tests against a cluster (requires KUBECONFIG).
 	go test ./tests/e2e/ -v -timeout 120m -count=1 $(E2E_TEST_FLAGS)
@@ -74,6 +79,98 @@ oats: oats-bin gcx-bin ## Run OATS tests against a cluster via oats CLI.
 	GRAFANA_ORG_ID="$${GRAFANA_ORG_ID:-1}" \
 	GRAFANA_TOKEN="$${GRAFANA_TOKEN:-$$(oc whoami -t)}" \
 	$(OATS_BIN) --gcx $(GCX_BIN) --gcx-context default $(OATS_FLAGS) -vvv
+
+##@ E2E Test Image
+
+# E2E Test Image
+E2E_IMG ?= quay.io/opendatahub/odh-observability-e2e:latest
+
+.PHONY: e2e-image-build
+e2e-image-build: ## Build e2e test container image.
+	$(IMAGE_BUILDER) build --platform "$(PLATFORM)" \
+		-f Dockerfiles/e2e-tests/e2e-tests.Dockerfile \
+		-t "$(E2E_IMG)" .
+
+.PHONY: e2e-image-push
+e2e-image-push: ## Push e2e test container image.
+	$(IMAGE_BUILDER) push "$(E2E_IMG)"
+
+.PHONY: e2e-image
+e2e-image: e2e-image-build e2e-image-push ## Build and push e2e test image.
+
+KUBECONFIG ?= $(HOME)/.kube/config
+
+E2E_ARTIFACTS ?= $(shell pwd)/e2e-artifacts
+
+.PHONY: e2e-test-container
+e2e-test-container: ## Run containerized e2e tests in module mode (standalone operator).
+	mkdir -p "$(E2E_ARTIFACTS)"
+	$(IMAGE_BUILDER) run --rm \
+		--userns=keep-id \
+		--user "$(shell id -u):$(shell id -g)" \
+		-v "$(KUBECONFIG):/tmp/kubeconfig:ro,z" \
+		-v "$(E2E_ARTIFACTS):/artifacts:Z" \
+		-e KUBECONFIG=/tmp/kubeconfig \
+		-e E2E_TEST_API_MODE=module \
+		-e E2E_TEST_INSTALL_OPERATORS=true \
+		-e E2E_TEST_MONITORING_CR_NAME=default-monitoring \
+		"$(E2E_IMG)"
+
+.PHONY: e2e-test-container-dsc
+e2e-test-container-dsc: ## Run containerized e2e tests in DSC mode (via ODH platform operator).
+	mkdir -p "$(E2E_ARTIFACTS)"
+	$(IMAGE_BUILDER) run --rm \
+		--userns=keep-id \
+		--user "$(shell id -u):$(shell id -g)" \
+		-v "$(KUBECONFIG):/tmp/kubeconfig:ro,z" \
+		-v "$(E2E_ARTIFACTS):/artifacts:Z" \
+		-e KUBECONFIG=/tmp/kubeconfig \
+		-e E2E_TEST_API_MODE=dsc \
+		-e E2E_TEST_INSTALL_OPERATORS=false \
+		-e E2E_TEST_MONITORING_CR_NAME=default-monitoring \
+		"$(E2E_IMG)"
+
+##@ Prometheus Rules
+
+PROMETHEUS_RULES_DIR = ./internal/controller
+PROMETHEUS_RULE_TEMPLATES = $(shell find $(PROMETHEUS_RULES_DIR) -name "*-prometheusrules.tmpl.yaml" 2>/dev/null)
+PROMETHEUS_ALERT_TESTS = $(shell find $(PROMETHEUS_RULES_DIR) -name "*-alerting.unit-tests.yaml" 2>/dev/null)
+PROMETHEUS_ALERT_RULES := $(PROMETHEUS_ALERT_TESTS:.unit-tests.yaml=.rules.yaml)
+
+%.rules.yaml: %.unit-tests.yaml $(YQ)
+	@RULE_FILE=$$(dirname $<)/$$(basename $< -alerting.unit-tests.yaml)-prometheusrules.tmpl.yaml; \
+	if [ ! -f "$$RULE_FILE" ]; then \
+		echo "Error: PrometheusRule template file not found: $$RULE_FILE"; \
+		exit 1; \
+	fi; \
+	echo "Generating $@ from $$RULE_FILE (alerts only, excluding recording rules)"; \
+	sed 's/{{\.Namespace}}/redhat-ods-monitoring/g; s/{{ \.OperatorNamespace }}/redhat-ods-operator/g; s/{{ \.OperatorPodPrefix }}/odh-observability/g; s/{{`{{`}}/{{/g; s/{{`}}`}}/}}/g' "$$RULE_FILE" | \
+		$(YQ) eval '.spec.groups' - | \
+		$(YQ) eval 'del(.[] | .rules[] | select(.alert == null))' - | \
+		$(YQ) eval '{"groups": .}' - > $@
+
+.PHONY: validate-prometheus-rules
+validate-prometheus-rules: $(YQ) ## Validate PrometheusRule template syntax.
+	@echo "Validating PrometheusRule templates syntax..."
+	@for tmpl_file in $(PROMETHEUS_RULE_TEMPLATES); do \
+		echo "  Checking $$tmpl_file..."; \
+		sed 's/{{\.Namespace}}/redhat-ods-monitoring/g; s/{{ \.OperatorNamespace }}/redhat-ods-operator/g; s/{{ \.OperatorPodPrefix }}/odh-observability/g; s/{{`{{`}}/{{/g; s/{{`}}`}}/}}/g' "$$tmpl_file" | \
+			$(YQ) eval '.spec.groups' - | \
+			$(YQ) eval '{"groups": .}' - | \
+			promtool check rules --lint=none /dev/stdin > /dev/null || exit 1; \
+	done
+	@echo "All PrometheusRule templates are syntactically valid"
+
+.PHONY: test-alerts
+test-alerts: validate-prometheus-rules $(PROMETHEUS_ALERT_RULES) ## Run Prometheus alert unit tests.
+	@echo "Running Prometheus alert unit tests..."
+	@for test_file in $(PROMETHEUS_ALERT_TESTS); do \
+		echo "  Testing $$test_file..."; \
+		promtool test rules $$test_file || exit 1; \
+	done
+	@echo "All Prometheus alert tests passed!"
+
+CLEANFILES += $(PROMETHEUS_ALERT_RULES)
 
 ##@ Build
 
@@ -103,13 +200,15 @@ image: docker-build docker-push ## Build and push image with the manager.
 
 HELM_RELEASE ?= odh-observability
 HELM_CHART   ?= charts/odh-observability
-NAMESPACE    ?= opendatahub
+NAMESPACE              ?= opendatahub
+MONITORING_NAMESPACE   ?= $(NAMESPACE)
 
 .PHONY: deploy
 deploy: manifests helm-update-crds ## Deploy operator to cluster via Helm chart.
 	helm upgrade --install $(HELM_RELEASE) $(HELM_CHART) \
 		-n $(NAMESPACE) --create-namespace \
 		--set operatorNamespace=$(NAMESPACE) \
+		--set monitoringNamespace=$(MONITORING_NAMESPACE) \
 		--set image.repository=$(firstword $(subst :, ,$(IMG))) \
 		--set image.tag=$(lastword $(subst :, ,$(IMG)))
 
@@ -137,8 +236,20 @@ $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
 
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
+GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
+YQ ?= $(LOCALBIN)/yq
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
 $(CONTROLLER_GEN): $(LOCALBIN)
-	test -s $(LOCALBIN)/controller-gen || GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@latest
+	test -s $(LOCALBIN)/controller-gen || GOBIN=$(LOCALBIN) go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.21.0
+
+.PHONY: golangci-lint
+golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
+$(GOLANGCI_LINT): $(LOCALBIN)
+	test -s "$(GOLANGCI_LINT)" || GOBIN="$(LOCALBIN)" go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+.PHONY: yq
+yq: $(YQ) ## Download yq locally if necessary.
+$(YQ): $(LOCALBIN)
+	test -s $(LOCALBIN)/yq || GOBIN=$(LOCALBIN) go install github.com/mikefarah/yq/v4@v4.53.2

@@ -66,6 +66,65 @@ func TestHasCRD_MultipleCRDsRegistered(t *testing.T) {
 	}
 }
 
+// --- discoverInferenceNamespaces ---
+
+// CRDs exist, CRs exist in different namespaces → returns those namespaces.
+func TestDiscoverInferenceNamespaces(t *testing.T) {
+	s := newTestScheme(t)
+	registerCRDs(s, gvk.InferenceService, gvk.LLMInferenceService)
+
+	isvc := &unstructured.Unstructured{}
+	isvc.SetGroupVersionKind(gvk.InferenceService)
+	isvc.SetName("model-a")
+	isvc.SetNamespace("team-a")
+
+	llm := &unstructured.Unstructured{}
+	llm.SetGroupVersionKind(gvk.LLMInferenceService)
+	llm.SetName("model-b")
+	llm.SetNamespace("team-b")
+
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(isvc, llm).Build()
+
+	namespaces, err := discoverInferenceNamespaces(context.Background(), cli)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(namespaces) != 2 {
+		t.Errorf("expected 2 namespaces, got %d: %v", len(namespaces), namespaces)
+	}
+}
+
+// CRDs not installed → returns empty, no error.
+func TestDiscoverInferenceNamespaces_NoCRDs(t *testing.T) {
+	s := newTestScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+
+	namespaces, err := discoverInferenceNamespaces(context.Background(), cli)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(namespaces) != 0 {
+		t.Errorf("expected empty namespaces, got %v", namespaces)
+	}
+}
+
+// CRDs registered but no CRs exist → returns empty.
+func TestDiscoverInferenceNamespaces_NoCRs(t *testing.T) {
+	s := newTestScheme(t)
+	registerCRDs(s, gvk.InferenceService, gvk.LLMInferenceService)
+
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+
+	namespaces, err := discoverInferenceNamespaces(context.Background(), cli)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(namespaces) != 0 {
+		t.Errorf("expected empty namespaces, got %v", namespaces)
+	}
+}
+
 // --- syncPrometheusWebTLSCA ---
 
 func TestSyncPrometheusWebTLSCA_NoMetrics(t *testing.T) {

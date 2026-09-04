@@ -36,6 +36,7 @@ var _ platformcommon.PlatformObject = (*Monitoring)(nil)
 // MonitoringSpec defines the desired state of Monitoring.
 // +kubebuilder:validation:XValidation:rule="has(self.alerting) ? (has(self.metrics) && has(self.metrics.storage)) : true",message="Alerting configuration requires metrics.storage to be configured"
 // +kubebuilder:validation:XValidation:rule="!has(self.collectorReplicas) || (self.collectorReplicas > 0 && ((has(self.metrics) && self.metrics.storage != null) || self.traces != null))",message="CollectorReplicas can only be set when metrics.storage or traces are configured, and must be > 0"
+// +kubebuilder:validation:XValidation:rule="has(self.logs) ? has(self.logs.storage) : true",message="Log forwarding requires logs.storage to be configured for the LokiStack instance"
 type MonitoringSpec struct {
 	// ManagementState controls whether the operator actively manages the module (Managed) or removes it (Removed).
 	platformcommon.ManagementSpec `json:",inline"`
@@ -58,6 +59,9 @@ type MonitoringSpec struct {
 
 	// Alerting configures Prometheus alerting rules.
 	Alerting *Alerting `json:"alerting,omitempty"`
+
+	// Logs configures cluster log forwarding via the ClusterLogForwarder operator.
+	Logs *Logs `json:"logs,omitempty"`
 
 	// CollectorReplicas specifies the number of replicas in the OpenTelemetry collector.
 	// Defaults to 1 on single-node clusters and 2 on multi-node clusters.
@@ -113,6 +117,19 @@ type TracesTLS struct {
 	CertificateSecret string `json:"certificateSecret,omitempty"`
 	// CAConfigMap is the name of the ConfigMap containing the CA certificate.
 	CAConfigMap string `json:"caConfigMap,omitempty"`
+}
+
+// Logs defines the configuration for cluster log forwarding via the ClusterLogForwarder operator.
+type Logs struct {
+	// Storage configures the LokiStack storage backend for log forwarding.
+	// Required: the operator deploys a shared LokiStack used by both log forwarding and usage logs.
+	// +kubebuilder:validation:Required
+	Storage *LokiStorageConfig `json:"storage"`
+
+	// InferenceNamespaces lists the namespaces whose application logs should be forwarded to Loki.
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?$`
+	// +kubebuilder:validation:items:MaxLength=63
+	InferenceNamespaces []string `json:"inferenceNamespaces,omitempty"`
 }
 
 // Storage backend type constants.

@@ -16,6 +16,7 @@ RUN go mod download
 
 COPY cmd/main.go cmd/main.go
 COPY api/ api/
+COPY pkg/ pkg/
 COPY internal/ internal/
 
 RUN CGO_ENABLED=${CGO_ENABLED} GOEXPERIMENT=${GOEXPERIMENT} GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -trimpath -ldflags="-s -w" -o manager cmd/main.go

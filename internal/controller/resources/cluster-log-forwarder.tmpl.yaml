@@ -1,0 +1,40 @@
+apiVersion: observability.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: {{.ClusterLogForwarderName}}
+  namespace: {{.Namespace}}
+spec:
+  serviceAccount:
+    name: {{.ClusterLogForwarderServiceAccount}}
+  inputs:
+  - name: inference-app-logs
+    type: application
+    application:
+      includes:
+{{- if .InferenceNamespaces}}
+{{- range .InferenceNamespaces}}
+      - namespace: {{.}}
+{{- end}}
+{{- else}}
+      - namespace: {{.Namespace}}
+{{- end}}
+  outputs:
+  - name: data-science-lokistack
+    type: lokiStack
+    lokiStack:
+      target:
+        name: {{.LokiStackName}}
+        namespace: {{.Namespace}}
+      authentication:
+        token:
+          from: serviceAccount
+    tls:
+      ca:
+        configMapName: {{.LokiStackName}}-gateway-ca-bundle
+        key: service-ca.crt
+  pipelines:
+  - name: inference-logs-to-loki
+    inputRefs:
+    - inference-app-logs
+    outputRefs:
+    - data-science-lokistack

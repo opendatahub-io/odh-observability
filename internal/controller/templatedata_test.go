@@ -205,3 +205,39 @@ func TestValidateExporters_UnknownExporterTypePassesSecurityOnly(t *testing.T) {
 		t.Error("expected custom_exporter in result")
 	}
 }
+
+// --- DNS-1123 namespace validation ---
+
+func TestDNS1123LabelRe(t *testing.T) {
+	valid := []string{
+		"default",
+		"my-namespace",
+		"ns123",
+		"a",
+		"a-b-c-d",
+		strings.Repeat("a", 63),
+	}
+	for _, v := range valid {
+		if !dns1123LabelRe.MatchString(v) {
+			t.Errorf("expected %q to be valid DNS-1123 label", v)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"-starts-with-dash",
+		"ends-with-dash-",
+		"UPPERCASE",
+		"has space",
+		"has.dot",
+		"new\nline",
+		"has\ttab",
+		"injection\n---\napiVersion: v1",
+		strings.Repeat("a", 64),
+	}
+	for _, v := range invalid {
+		if dns1123LabelRe.MatchString(v) {
+			t.Errorf("expected %q to be invalid DNS-1123 label", v)
+		}
+	}
+}

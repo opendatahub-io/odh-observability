@@ -29,6 +29,7 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-multierror"
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/openshift"
 	"gopkg.in/yaml.v3"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -41,7 +42,7 @@ import (
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
-	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/openshift"
+	pkgtls "github.com/opendatahub-io/odh-observability/pkg/tls"
 )
 
 const (
@@ -82,6 +83,9 @@ const (
 	maxTotalExporterSize = 51200 // Maximum total size for all exporters combined (50KB).
 )
 
+// dns1123LabelRe matches valid DNS-1123 labels (Kubernetes namespace names).
+var dns1123LabelRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?$`)
+
 var componentIDRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*(?:/[A-Za-z0-9][A-Za-z0-9_-]*)?$`)
 
 // buildTemplateData constructs the data map passed to all YAML templates.
@@ -118,6 +122,10 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	addResourceData(templateData)
 	addImageURLs(templateData)
 
+	if err := addTLSData(ctx, c, templateData); err != nil {
+		return nil, err
+	}
+
 	if metrics := monitoring.Spec.Metrics; metrics != nil {
 		if err := addMetricsData(metrics, isSNO, templateData); err != nil {
 			return nil, err
@@ -134,20 +142,34 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	lokiStackName := "data-science-lokistack"
 	templateData["LokiStackName"] = lokiStackName
 
-	templateData["UsageLogsCollectorName"] = "usage-logs"
-	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
-		templateData["LokiStorageCredentialMode"] = usageLogs.Storage.CredentialMode
-		templateData["LokiStorageSecretName"] = usageLogs.Storage.SecretName
-		templateData["LokiStorageType"] = usageLogs.Storage.Type
+	// Resolve Loki storage: logs.Storage takes precedence, then usageLogs.Storage
+	var lokiStorage *v1alpha1.LokiStorageConfig
+	if logs := monitoring.Spec.Logs; logs != nil && logs.Storage != nil {
+		lokiStorage = logs.Storage
+	} else if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
+		lokiStorage = usageLogs.Storage
+	}
 
-		// Default to gp3-csi if explicitly set to "" -> otherwise it would add an extra required manual created PV with "" storageclass
-		storageClassName := usageLogs.Storage.StorageClassName
+	if lokiStorage != nil {
+		templateData["LokiStorageCredentialMode"] = lokiStorage.CredentialMode
+		templateData["LokiStorageSecretName"] = lokiStorage.SecretName
+		templateData["LokiStorageType"] = lokiStorage.Type
+
+		storageClassName := lokiStorage.StorageClassName
 		if storageClassName == "" {
 			storageClassName = "gp3-csi"
 		}
 		templateData["LokiStorageClassName"] = storageClassName
+	} else {
+		templateData["LokiStorageCredentialMode"] = ""
+		templateData["LokiStorageSecretName"] = ""
+		templateData["LokiStorageType"] = ""
+		templateData["LokiStorageClassName"] = ""
+	}
 
-		// Auto-configure the usage logs collector endpoint to point to the LokiStack gateway
+	// Usage logs collector configuration (independent of Loki storage resolution)
+	templateData["UsageLogsCollectorName"] = "usage-logs"
+	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
 		namespace := monitoring.Spec.Namespace
 		if namespace == "" {
 			namespace = "opendatahub"
@@ -158,10 +180,35 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	} else {
 		templateData["UsageLogs"] = false
 		templateData["UsageLogsEndpoint"] = ""
-		templateData["LokiStorageCredentialMode"] = ""
-		templateData["LokiStorageSecretName"] = ""
-		templateData["LokiStorageType"] = ""
-		templateData["LokiStorageClassName"] = ""
+	}
+
+	// Cluster log forwarding configuration
+	clusterLogForwarderName := "data-science-cluster-log-forwarder"
+	templateData["ClusterLogForwarderName"] = clusterLogForwarderName
+	templateData["ClusterLogForwarderServiceAccount"] = clusterLogForwarderName + "-collector"
+
+	if logs := monitoring.Spec.Logs; logs != nil {
+		var namespaces []string
+		if len(logs.InferenceNamespaces) > 0 {
+			for _, ns := range logs.InferenceNamespaces {
+				if dns1123LabelRe.MatchString(ns) {
+					namespaces = append(namespaces, ns)
+				} else {
+					log.Info("Skipping invalid namespace in spec.logs.inferenceNamespaces", "namespace", ns)
+				}
+			}
+			if len(namespaces) == 0 {
+				log.Error(nil, "All configured inferenceNamespaces are invalid, CLF will use operator namespace only")
+			}
+		} else {
+			var err error
+			namespaces, err = discoverInferenceNamespaces(ctx, c)
+			if err != nil {
+				log.Error(err, "Failed to discover inference namespaces, using fallback")
+				namespaces = nil
+			}
+		}
+		templateData["InferenceNamespaces"] = namespaces
 	}
 
 	// Apply SNO-aware defaulting when CollectorReplicas is unset.
@@ -373,12 +420,22 @@ func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces,
 func addImageURLs(templateData map[string]any) {
 	templateData["KubeRBACProxyImage"] = getEnvOrDefault(
 		"RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE",
-		"quay.io/brancz/kube-rbac-proxy@sha256:147cb28fea35473b2cf8697892d375bbe0aec237c5740b0368719b4c0d71b290",
+		"quay.io/opendatahub/odh-kube-rbac-proxy@sha256:f9cad8a1389ba747f412620525328ccebda1409eab55ea80e4818349b37cbdeb",
 	)
 	templateData["PromLabelProxyImage"] = getEnvOrDefault(
 		"RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE",
 		"quay.io/prometheuscommunity/prom-label-proxy@sha256:28f81efb6574556011e7914851faaccce4a64b1b72a338aaaf3cc9d45e66fd96",
 	)
+}
+
+func addTLSData(ctx context.Context, c client.Client, templateData map[string]any) error {
+	minVersion, cipherSuites, err := pkgtls.FromAPIServer(ctx, c, pkgtls.FormatGo)
+	if err != nil {
+		return err
+	}
+	templateData["TLSMinVersion"] = minVersion
+	templateData["TLSCipherSuites"] = cipherSuites
+	return nil
 }
 
 func getEnvOrDefault(envVar, defaultVal string) string {

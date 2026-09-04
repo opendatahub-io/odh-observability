@@ -8,6 +8,10 @@ spec:
     global:
       queries:
         queryTimeout: 3m
+      otlp:
+        streamLabels:
+          resourceAttributes:
+            - name: service.name
     tenants:
       application:
         otlp:
@@ -17,6 +21,10 @@ spec:
             - name: model
             - name: subscription
             - name: response_type
+            - name: gateway_namespace_name
+            - name: gateway_deployment_name
+            - name: upstream_namespace_name
+            - name: upstream_deployment_name
   managementState: Managed
   size: 1x.extra-small
   storage:

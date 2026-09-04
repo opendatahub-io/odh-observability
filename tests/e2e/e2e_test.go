@@ -2,6 +2,8 @@ package e2e_test
 
 import (
 	"flag"
+	"fmt"
+	"os"
 	"testing"
 
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -13,6 +15,12 @@ var testOpts = TestContextConfig{}
 func TestMain(m *testing.M) {
 	testOpts.registerFlags()
 	flag.Parse()
+
+	if err := testOpts.validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid test configuration: %v\n", err)
+		os.Exit(1)
+	}
+
 	testOpts.applyDefaults()
 
 	logf.SetLogger(zap.New(zap.UseDevMode(true)))

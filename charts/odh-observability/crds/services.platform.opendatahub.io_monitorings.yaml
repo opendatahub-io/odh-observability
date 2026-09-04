@@ -62,6 +62,58 @@ spec:
                 format: int32
                 minimum: 0
                 type: integer
+              logs:
+                description: Logs configures cluster log forwarding via the ClusterLogForwarder
+                  operator.
+                properties:
+                  inferenceNamespaces:
+                    description: InferenceNamespaces lists the namespaces whose application
+                      logs should be forwarded to Loki.
+                    items:
+                      maxLength: 63
+                      pattern: ^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?$
+                      type: string
+                    type: array
+                  storage:
+                    description: |-
+                      Storage configures the LokiStack storage backend for log forwarding.
+                      Required: the operator deploys a shared LokiStack used by both log forwarding and usage logs.
+                    properties:
+                      credentialMode:
+                        default: static
+                        description: |-
+                          CredentialMode specifies how credentials are provided to LokiStack.
+                          Valid values: "static", "token", "token-cco".
+                        enum:
+                        - static
+                        - token
+                        - token-cco
+                        type: string
+                      secretName:
+                        description: |-
+                          SecretName is the name of the Secret containing storage credentials.
+                          For S3: must contain keys: access_key_id, access_key_secret, bucketnames, endpoint, region, insecure, s3ForcePathStyle
+                        maxLength: 253
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
+                      storageClassName:
+                        default: gp3-csi
+                        description: StorageClassName specifies the storage class
+                          for LokiStack PVCs.
+                        maxLength: 253
+                        type: string
+                      type:
+                        description: 'Type specifies the storage backend: "s3".'
+                        enum:
+                        - s3
+                        type: string
+                    required:
+                    - secretName
+                    - type
+                    type: object
+                required:
+                - storage
+                type: object
               managementState:
                 default: Managed
                 description: |-
@@ -252,6 +304,9 @@ spec:
               rule: '!has(self.collectorReplicas) || (self.collectorReplicas > 0 &&
                 ((has(self.metrics) && self.metrics.storage != null) || self.traces
                 != null))'
+            - message: Log forwarding requires logs.storage to be configured for the
+                LokiStack instance
+              rule: 'has(self.logs) ? has(self.logs.storage) : true'
           status:
             description: MonitoringStatus defines the observed state of Monitoring.
             properties:
