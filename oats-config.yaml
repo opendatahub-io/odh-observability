@@ -1,0 +1,4 @@
+meta:
+  version: 3
+cases:
+  - "tests/e2e/oats/*/*/oats-case.yaml"

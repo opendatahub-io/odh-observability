@@ -1,0 +1,181 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lgtm
+  namespace: redhat-ods-monitoring
+  labels:
+    app: lgtm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lgtm
+  template:
+    metadata:
+      name: lgtm
+      labels:
+        app: lgtm
+    spec:
+      containers:
+        - name: lgtm
+          image: docker.io/grafana/otel-lgtm
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+              name: http
+              protocol: TCP
+            - containerPort: 4317
+              name: otlp-grpc
+              protocol: TCP
+            - containerPort: 4318
+              name: otlp-http
+              protocol: TCP
+          volumeMounts:
+            - mountPath: /data
+              name: data
+            - mountPath: /var/tempo
+              name: tempo
+          env:
+            - name: ENABLE_LOGS_ALL
+              value: "true"
+      restartPolicy: Always
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: tempo
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lgtm
+  namespace: redhat-ods-monitoring
+  labels:
+    app: lgtm
+spec:
+  selector:
+    app: lgtm
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+      protocol: TCP
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+      protocol: TCP
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: oauth-proxy
+  namespace: redhat-ods-monitoring
+  labels:
+    app: oauth-proxy
+  annotations:
+    serviceaccounts.openshift.io/oauth-redirectreference.primary: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"lgtm"}}'
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: oauth-proxy-lgtm-auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: oauth-proxy
+    namespace: redhat-ods-monitoring
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth-proxy
+  namespace: redhat-ods-monitoring
+  labels:
+    app: oauth-proxy
+  annotations:
+    service.alpha.openshift.io/serving-cert-secret-name: oauth-proxy-tls
+spec:
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+      protocol: TCP
+  selector:
+    app: oauth-proxy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth-proxy
+  namespace: redhat-ods-monitoring
+  labels:
+    app: oauth-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oauth-proxy
+  template:
+    metadata:
+      labels:
+        app: oauth-proxy
+    spec:
+      serviceAccountName: oauth-proxy
+      containers:
+        - name: oauth-proxy
+          image: quay.io/openshift/origin-oauth-proxy:4.22.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8443
+              name: https
+              protocol: TCP
+          args:
+            - -provider=openshift
+            - -https-address=:8443
+            - -http-address=
+            - -upstream=http://lgtm:3000
+            - -tls-cert=/etc/tls/private/tls.crt
+            - -tls-key=/etc/tls/private/tls.key
+            - -cookie-secret-file=/etc/proxy/secrets/session_secret
+            - -openshift-service-account=oauth-proxy
+            - -openshift-ca=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            - -openshift-ca=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
+            - -skip-auth-regex=^/metrics
+            - -openshift-delegate-urls={"/":{}}
+          volumeMounts:
+            - mountPath: /etc/tls/private
+              name: tls-certificates
+            - mountPath: /etc/proxy/secrets
+              name: secret-oauth-proxy
+      volumes:
+        - name: tls-certificates
+          secret:
+            secretName: oauth-proxy-tls
+        - name: secret-oauth-proxy
+          secret:
+            secretName: oauth-proxy-secrets
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: lgtm
+  namespace: redhat-ods-monitoring
+  labels:
+    app: oauth-proxy
+spec:
+  to:
+    kind: Service
+    name: oauth-proxy
+    weight: 100
+  port:
+    targetPort: https
+  tls:
+    termination: reencrypt
+    insecureEdgeTerminationPolicy: Redirect

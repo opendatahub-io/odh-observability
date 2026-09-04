@@ -61,6 +61,25 @@ lint: golangci-lint ## Run golangci-lint against code.
 e2e-test: ## Run e2e tests against a cluster (requires KUBECONFIG).
 	go test ./tests/e2e/ -v -timeout 120m -count=1 $(E2E_TEST_FLAGS)
 
+OATS_BIN ?= $(LOCALBIN)/oats
+GCX_BIN  ?= $(LOCALBIN)/gcx
+
+.PHONY: oats-bin
+oats-bin: $(LOCALBIN) ## Install oats binary locally if necessary.
+	@test -s $(LOCALBIN)/oats || GOBIN=$(LOCALBIN) go install github.com/grafana/oats
+
+.PHONY: gcx-bin
+gcx-bin: $(LOCALBIN) ## Install gcx binary locally if necessary.
+	@test -s $(LOCALBIN)/gcx || GOBIN=$(LOCALBIN) go install github.com/grafana/gcx/cmd/gcx
+
+.PHONY: oats
+oats: oats-bin gcx-bin ## Run OATS tests against a cluster via oats CLI.
+	@GCX_TELEMETRY="$${GCX_TELEMETRY:-disabled}" \
+	GRAFANA_SERVER="$${GRAFANA_SERVER:-https://$$(oc get route lgtm -n redhat-ods-monitoring -o jsonpath='{.spec.host}')}" \
+	GRAFANA_ORG_ID="$${GRAFANA_ORG_ID:-1}" \
+	GRAFANA_TOKEN="$${GRAFANA_TOKEN:-$$(oc whoami -t)}" \
+	$(OATS_BIN) --gcx $(GCX_BIN) --gcx-context default $(OATS_FLAGS) -vvv
+
 ##@ E2E Test Image
 
 # E2E Test Image
