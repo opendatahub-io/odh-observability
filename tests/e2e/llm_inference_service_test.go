@@ -37,6 +37,11 @@ var (
 		Version: "v1alpha2",
 		Kind:    "LLMInferenceService",
 	}
+	gvkPodMonitor = schema.GroupVersionKind{
+		Group:   "monitoring.coreos.com",
+		Version: "v1",
+		Kind:    "PodMonitor",
+	}
 )
 
 func findProjectRoot() (string, error) {
@@ -214,8 +219,8 @@ func sendCompletion(ctx context.Context, routeHost, ocToken string) error {
 	}
 
 	httpClient := &http.Client{
-		// The test route uses a cluster-generated certificate that is not trusted locally.
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, //nolint:gosec // required for the test route's cluster certificate
+		// ROSA route certificates are trusted by the runner's system CA bundle.
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}},
 		Timeout:   30 * time.Second,
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+routeHost+"/v1/completions", bytes.NewReader(body))
@@ -261,26 +266,11 @@ func restartVLLMPod(t *testing.T, tc *TestContext, namespace, llmSvcName string)
 	t.Helper()
 	g := gomega.NewWithT(t)
 
-	podList := &unstructured.UnstructuredList{}
-	podList.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "PodList"})
+	podSelector, err := vllmPodSelector(tc, namespace, llmSvcName)
+	g.Expect(err).NotTo(gomega.HaveOccurred(), "failed to find the LLMInferenceService workload selector")
 
-	err := tc.Client().List(tc.Context(), podList, client.InNamespace(namespace))
-	g.Expect(err).NotTo(gomega.HaveOccurred(), "failed to list pods in namespace %s", namespace)
-
-	var targetPod *unstructured.Unstructured
-	for i := range podList.Items {
-		p := &podList.Items[i]
-		if strings.Contains(p.GetName(), llmSvcName) || strings.Contains(p.GetName(), "vllm") {
-			targetPod = p
-			break
-		}
-	}
-
-	if targetPod == nil && len(podList.Items) > 0 {
-		targetPod = &podList.Items[0]
-	}
-
-	g.Expect(targetPod).NotTo(gomega.BeNil(), "expected to find a vLLM pod to terminate")
+	targetPod, err := readyPodForSelector(tc, namespace, podSelector, "")
+	g.Expect(err).NotTo(gomega.HaveOccurred(), "failed to find a ready LLMInferenceService workload pod")
 
 	podName := targetPod.GetName()
 	t.Logf("Deleting pod %s in namespace %s for scrape recovery test...", podName, namespace)
@@ -289,28 +279,76 @@ func restartVLLMPod(t *testing.T, tc *TestContext, namespace, llmSvcName string)
 	g.Expect(err).NotTo(gomega.HaveOccurred(), "failed to delete pod %s", podName)
 
 	g.Eventually(func() bool {
-		newPodList := &unstructured.UnstructuredList{}
-		newPodList.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "PodList"})
-		if err := tc.Client().List(tc.Context(), newPodList, client.InNamespace(namespace)); err != nil {
-			return false
-		}
-		for i := range newPodList.Items {
-			p := &newPodList.Items[i]
-			if p.GetName() != podName && (strings.Contains(p.GetName(), llmSvcName) || strings.Contains(p.GetName(), "vllm")) {
-				conditions, found, _ := unstructured.NestedSlice(p.Object, "status", "conditions")
-				if !found {
-					continue
-				}
-				for _, c := range conditions {
-					cMap, ok := c.(map[string]any)
-					if ok && cMap["type"] == "Ready" && cMap["status"] == "True" {
-						return true
-					}
-				}
+		replacement, findErr := readyPodForSelector(tc, namespace, podSelector, podName)
+		return findErr == nil && replacement != nil
+	}, 3*time.Minute, 5*time.Second).Should(gomega.BeTrue(), "New LLMInferenceService workload pod should be recreated and reach Ready state")
+}
+
+func vllmPodSelector(tc *TestContext, namespace, llmSvcName string) (map[string]string, error) {
+	podMonitors := &unstructured.UnstructuredList{}
+	podMonitors.SetGroupVersionKind(gvkPodMonitor.GroupVersion().WithKind(gvkPodMonitor.Kind))
+	if err := tc.Client().List(tc.Context(), podMonitors, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("list PodMonitors in namespace %s: %w", namespace, err)
+	}
+
+	for i := range podMonitors.Items {
+		podMonitor := &podMonitors.Items[i]
+		associated := false
+		for _, owner := range podMonitor.GetOwnerReferences() {
+			if owner.Kind == "LLMInferenceService" && owner.Name == llmSvcName {
+				associated = true
+				break
 			}
 		}
+		if !associated {
+			labels := podMonitor.GetLabels()
+			associated = labels["serving.kserve.io/llminferenceservice"] == llmSvcName ||
+				labels["serving.kserve.io/inferenceservice"] == llmSvcName
+		}
+		if !associated {
+			continue
+		}
+
+		selector, found, err := unstructured.NestedStringMap(podMonitor.Object, "spec", "selector", "matchLabels")
+		if err != nil {
+			return nil, fmt.Errorf("read PodMonitor %s selector: %w", podMonitor.GetName(), err)
+		}
+		if found && len(selector) > 0 {
+			return selector, nil
+		}
+	}
+
+	return nil, fmt.Errorf("no PodMonitor with a workload selector found for LLMInferenceService %s", llmSvcName)
+}
+
+func readyPodForSelector(tc *TestContext, namespace string, selector map[string]string, excludedName string) (*unstructured.Unstructured, error) {
+	podList := &unstructured.UnstructuredList{}
+	podList.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "PodList"})
+	if err := tc.Client().List(tc.Context(), podList, client.InNamespace(namespace), client.MatchingLabels(selector)); err != nil {
+		return nil, err
+	}
+
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.GetName() != excludedName && pod.GetDeletionTimestamp() == nil && isReadyPod(pod) {
+			return pod, nil
+		}
+	}
+	return nil, errors.New("no ready pod matched the LLMInferenceService workload selector")
+}
+
+func isReadyPod(pod *unstructured.Unstructured) bool {
+	conditions, found, _ := unstructured.NestedSlice(pod.Object, "status", "conditions")
+	if !found {
 		return false
-	}, 3*time.Minute, 5*time.Second).Should(gomega.BeTrue(), "New vLLM pod should be recreated and reach Ready state")
+	}
+	for _, condition := range conditions {
+		conditionMap, ok := condition.(map[string]any)
+		if ok && conditionMap["type"] == "Ready" && conditionMap["status"] == "True" {
+			return true
+		}
+	}
+	return false
 }
 
 func randomServiceName(base string) (string, error) {
@@ -792,7 +830,7 @@ func setupInferencePrerequisites(t *testing.T, projectRoot string) {
 	if err := ensureOAuthProxySecret(ctx); err != nil {
 		t.Fatalf("failed to ensure OAuth proxy cookie Secret: %v", err)
 	}
-	for _, name := range []string{"lgtm.yaml", "networkpolicy.yaml"} {
+	for _, name := range []string{"lgtm.yaml"} {
 		applyManifest(name)
 	}
 	waitFor("RHOAI operator should be Available", "wait", "--for=condition=Available", "deployment/rhods-operator", "-n", "redhat-ods-operator", "--timeout=300s")

@@ -17,6 +17,9 @@ expected:
     - promql: 'vllm:e2e_request_latency_seconds_bucket{llm_isvc_name=~".*disaggregated.*"}'
       value: ">= 0"
 
-    # Ensure no vLLM metric produces more than 20 time series per metric name
-    - promql: 'max by (__name__) (count by (__name__) ({__name__=~"vllm:.*|vllm_.*",llm_isvc_name=~".*disaggregated.*"}))'
+    # Ensure non-bucket vLLM metrics stay below the per-metric series budget.
+    - promql: 'max by (__name__) (count by (__name__) ({__name__=~"vllm:.*|vllm_.*",__name__!~".*_bucket",llm_isvc_name=~".*disaggregated.*"}))'
       value: "<= 20"
+    # Histogram buckets have a larger budget to accommodate their bucket boundaries and labels.
+    - promql: 'max by (__name__) (count by (__name__) ({__name__=~"vllm:.*|vllm_.*",__name__=~".*_bucket",llm_isvc_name=~".*disaggregated.*"}))'
+      value: "<= 50"

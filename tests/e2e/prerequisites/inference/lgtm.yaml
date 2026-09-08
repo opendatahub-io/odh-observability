@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
         - name: lgtm
-          image: docker.io/grafana/otel-lgtm
+          image: docker.io/grafana/otel-lgtm:0.32.1@sha256:7fd8eaad6bb64897ad5f644c8e15ee67c3204c97168f4bdba122adbf8f60e3c4
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 3000
@@ -141,6 +141,7 @@ spec:
             - -https-address=:8443
             - -http-address=
             - -upstream=http://lgtm:3000
+            - -pass-user-headers=false
             - -tls-cert=/etc/tls/private/tls.crt
             - -tls-key=/etc/tls/private/tls.key
             - -cookie-secret-file=/etc/proxy/secrets/session_secret
