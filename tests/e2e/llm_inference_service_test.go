@@ -37,11 +37,6 @@ var (
 		Version: "v1alpha2",
 		Kind:    "LLMInferenceService",
 	}
-	gvkPodMonitor = schema.GroupVersionKind{
-		Group:   "monitoring.coreos.com",
-		Version: "v1",
-		Kind:    "PodMonitor",
-	}
 )
 
 func findProjectRoot() (string, error) {
@@ -62,46 +57,28 @@ func findProjectRoot() (string, error) {
 	return "", errors.New("go.mod file not found in parent directories")
 }
 
-func ensureOatsBinaries(t *testing.T, projectRoot string) (string, string) {
+func ensureOatsBinary(t *testing.T, projectRoot string) string {
 	t.Helper()
 
 	localBin := filepath.Join(projectRoot, "bin")
 	oatsBin := filepath.Join(localBin, "oats")
-	gcxBin := filepath.Join(localBin, "gcx")
-
-	needOats := false
-	needGcx := false
-
-	if _, err := os.Stat(oatsBin); os.IsNotExist(err) {
-		needOats = true
-	}
-	if _, err := os.Stat(gcxBin); os.IsNotExist(err) {
-		needGcx = true
+	if _, err := os.Stat(oatsBin); err == nil {
+		return oatsBin
 	}
 
-	if needOats || needGcx {
-		t.Logf("Installing tool dependencies into %s...", localBin)
-		if err := os.MkdirAll(localBin, 0755); err != nil {
-			t.Fatalf("Failed to create bin directory %s: %v", localBin, err)
-		}
-
-		args := []string{"install"}
-		if needOats {
-			args = append(args, "github.com/grafana/oats")
-		}
-		if needGcx {
-			args = append(args, "github.com/grafana/gcx/cmd/gcx")
-		}
-
-		cmd := exec.CommandContext(t.Context(), "go", args...)
-		cmd.Dir = projectRoot
-		cmd.Env = append(os.Environ(), "GOBIN="+localBin)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("Failed to install oats/gcx tools: %v\nOutput: %s", err, string(out))
-		}
+	t.Logf("Installing OATS into %s...", localBin)
+	if err := os.MkdirAll(localBin, 0755); err != nil {
+		t.Fatalf("Failed to create bin directory %s: %v", localBin, err)
 	}
 
-	return oatsBin, gcxBin
+	cmd := exec.CommandContext(t.Context(), "go", "install", "github.com/grafana/oats@v0.10.0")
+	cmd.Dir = projectRoot
+	cmd.Env = append(os.Environ(), "GOBIN="+localBin)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to install OATS: %v\nOutput: %s", err, string(out))
+	}
+
+	return oatsBin
 }
 
 func buildOatsEnv(t *testing.T) []string {
@@ -244,10 +221,11 @@ func sendCompletion(ctx context.Context, routeHost, ocToken string) error {
 	return nil
 }
 
-func runOatsCase(ctx context.Context, t *testing.T, oatsBin, topology, gcxBin string, oatsEnv []string, projectRoot string) error {
+func runOatsCase(ctx context.Context, t *testing.T, oatsBin, topology string, oatsEnv []string, projectRoot string) error {
 	t.Helper()
 
-	cmd := exec.CommandContext(ctx, oatsBin, "-vv", "--gcx", gcxBin, "--tags", topology, "--gcx-context", "default")
+	args := []string{"-vv", "--gcx-download", "auto", "--gcx-version", "v1.2.0", "--tags", topology, "--gcx-context", "default"}
+	cmd := exec.CommandContext(ctx, oatsBin, args...)
 	cmd.Dir = projectRoot
 	cmd.Env = oatsEnv
 
@@ -255,6 +233,7 @@ func runOatsCase(ctx context.Context, t *testing.T, oatsBin, topology, gcxBin st
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &outBuf
 
+	t.Logf("Running OATS topology %s: %s", topology, formatOatsCommand(oatsEnv, append([]string{oatsBin}, args...)))
 	err := cmd.Run()
 	if err != nil {
 		return fmt.Errorf("OATS topology %s failed: %w\nOutput: %s", topology, err, outBuf.String())
@@ -262,13 +241,45 @@ func runOatsCase(ctx context.Context, t *testing.T, oatsBin, topology, gcxBin st
 	return nil
 }
 
+func formatOatsCommand(env []string, args []string) string {
+	wanted := map[string]bool{
+		"GCX_TELEMETRY":  true,
+		"GRAFANA_SERVER": true,
+		"GRAFANA_ORG_ID": true,
+		"GRAFANA_TOKEN":  true,
+	}
+	assignments := make([]string, 0, len(wanted))
+	for _, entry := range env {
+		name, value, found := strings.Cut(entry, "=")
+		if !found || !wanted[name] {
+			continue
+		}
+		if name == "GRAFANA_TOKEN" {
+			assignments = append(assignments, "GRAFANA_TOKEN=$(oc whoami -t)")
+			continue
+		}
+		assignments = append(assignments, name+"="+shellQuote(value))
+	}
+	command := make([]string, 0, len(assignments)+len(args))
+	command = append(command, assignments...)
+	for _, arg := range args {
+		command = append(command, shellQuote(arg))
+	}
+	return strings.Join(command, " ")
+}
+
+func shellQuote(value string) string {
+	if value != "" && !strings.ContainsAny(value, " \t\n'\"\\$`") {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
 func restartVLLMPod(t *testing.T, tc *TestContext, namespace, llmSvcName string) {
 	t.Helper()
 	g := gomega.NewWithT(t)
 
-	podSelector, err := vllmPodSelector(tc, namespace, llmSvcName)
-	g.Expect(err).NotTo(gomega.HaveOccurred(), "failed to find the LLMInferenceService workload selector")
-
+	podSelector := vllmPodSelector()
 	targetPod, err := readyPodForSelector(tc, namespace, podSelector, "")
 	g.Expect(err).NotTo(gomega.HaveOccurred(), "failed to find a ready LLMInferenceService workload pod")
 
@@ -284,41 +295,8 @@ func restartVLLMPod(t *testing.T, tc *TestContext, namespace, llmSvcName string)
 	}, 3*time.Minute, 5*time.Second).Should(gomega.BeTrue(), "New LLMInferenceService workload pod should be recreated and reach Ready state")
 }
 
-func vllmPodSelector(tc *TestContext, namespace, llmSvcName string) (map[string]string, error) {
-	podMonitors := &unstructured.UnstructuredList{}
-	podMonitors.SetGroupVersionKind(gvkPodMonitor.GroupVersion().WithKind(gvkPodMonitor.Kind))
-	if err := tc.Client().List(tc.Context(), podMonitors, client.InNamespace(namespace)); err != nil {
-		return nil, fmt.Errorf("list PodMonitors in namespace %s: %w", namespace, err)
-	}
-
-	for i := range podMonitors.Items {
-		podMonitor := &podMonitors.Items[i]
-		associated := false
-		for _, owner := range podMonitor.GetOwnerReferences() {
-			if owner.Kind == "LLMInferenceService" && owner.Name == llmSvcName {
-				associated = true
-				break
-			}
-		}
-		if !associated {
-			labels := podMonitor.GetLabels()
-			associated = labels["serving.kserve.io/llminferenceservice"] == llmSvcName ||
-				labels["serving.kserve.io/inferenceservice"] == llmSvcName
-		}
-		if !associated {
-			continue
-		}
-
-		selector, found, err := unstructured.NestedStringMap(podMonitor.Object, "spec", "selector", "matchLabels")
-		if err != nil {
-			return nil, fmt.Errorf("read PodMonitor %s selector: %w", podMonitor.GetName(), err)
-		}
-		if found && len(selector) > 0 {
-			return selector, nil
-		}
-	}
-
-	return nil, fmt.Errorf("no PodMonitor with a workload selector found for LLMInferenceService %s", llmSvcName)
+func vllmPodSelector() map[string]string {
+	return map[string]string{"app.kubernetes.io/part-of": "llminferenceservice"}
 }
 
 func readyPodForSelector(tc *TestContext, namespace string, selector map[string]string, excludedName string) (*unstructured.Unstructured, error) {
@@ -435,7 +413,7 @@ func discoverInferenceService(tc *TestContext, llmSvcName string) (string, int64
 }
 
 //nolint:maintidx // topology setup intentionally keeps the end-to-end workflow together.
-func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology, projectRoot, oatsBin, gcxBin string, oatsEnv []string) {
+func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology, projectRoot, oatsBin string, oatsEnv []string) {
 	t.Helper()
 	g := gomega.NewWithT(t)
 
@@ -448,6 +426,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	cookieSecretName := proxyName + "-cookie"
 	saName := proxyName
 	bindingName := proxyName + "-auth-delegator"
+	noCleanup := os.Getenv("NO_CLEANUP") == "1"
 	t.Logf("Starting %s topology with LLMInferenceService %s", topology, llmSvcNN)
 	if topology == "multi-node" {
 		checkCtx, cancel := context.WithTimeout(tc.Context(), 10*time.Second)
@@ -458,19 +437,24 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		}
 	}
 
+	cleanupResources := []struct {
+		gvk  schema.GroupVersionKind
+		name string
+		ns   string
+	}{
+		{gvk.Route, proxyName, "default"}, {gvk.Deployment, proxyName, "default"}, {gvk.Service, proxyName, "default"},
+		{gvk.Secret, tlsSecretName, "default"}, {gvk.Secret, cookieSecretName, "default"}, {gvk.ClusterRoleBinding, bindingName, ""}, {gvk.ServiceAccount, saName, "default"},
+		{gvkLLMInferenceService, llmSvcName, "default"},
+	}
 	// Register cleanup before creating anything so failures or aborted subtests
-	// do not leave topology-specific resources behind.
+	// do not leave topology-specific resources behind unless NO_CLEANUP=1.
 	t.Cleanup(func() {
+		if noCleanup {
+			logManualCleanupCommands(t, topology, llmSvcName, proxyName, tlsSecretName, cookieSecretName, bindingName, saName)
+			return
+		}
 		t.Logf("[%s] Cleaning up topology resources", topology)
-		for _, resource := range []struct {
-			gvk  schema.GroupVersionKind
-			name string
-			ns   string
-		}{
-			{gvk.Route, proxyName, "default"}, {gvk.Deployment, proxyName, "default"}, {gvk.Service, proxyName, "default"},
-			{gvk.Secret, tlsSecretName, "default"}, {gvk.Secret, cookieSecretName, "default"}, {gvk.ClusterRoleBinding, bindingName, ""}, {gvk.ServiceAccount, saName, "default"},
-			{gvkLLMInferenceService, llmSvcName, "default"},
-		} {
+		for _, resource := range cleanupResources {
 			tc.DeleteResource(WithMinimalObject(resource.gvk, types.NamespacedName{Name: resource.name, Namespace: resource.ns}), WithIgnoreNotFound(true), WithWaitForDeletion(true))
 		}
 	})
@@ -714,7 +698,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	// 3. Verification via OATS
 	t.Logf("[%s] Running OATS verification", topology)
 	g.Eventually(func() error {
-		return runOatsCase(tc.Context(), t, oatsBin, topology, gcxBin, oatsEnv, projectRoot)
+		return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
 	}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "OATS verification should succeed within 2 minutes")
 
 	// 4. Pod Termination & Scrape Recovery
@@ -727,10 +711,14 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Second completion request should succeed after pod restart")
 
 	g.Eventually(func() error {
-		return runOatsCase(tc.Context(), t, oatsBin, topology, gcxBin, oatsEnv, projectRoot)
+		return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
 	}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "Scrape recovery verification should succeed after pod restart")
 
 	// 5. Teardown & PodMonitor Cleanup
+	if noCleanup {
+		t.Logf("[%s] NO_CLEANUP=1; leaving LLMInferenceService and generated resources in place", topology)
+		return
+	}
 	t.Logf("[%s] Deleting LLMInferenceService and waiting for PodMonitor cleanup", topology)
 	tc.DeleteResource(WithMinimalObject(gvkLLMInferenceService, llmSvcNN), WithIgnoreNotFound(true), WithWaitForDeletion(true))
 
@@ -747,6 +735,22 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		}
 		return true
 	}, 1*time.Minute, 2*time.Second).Should(gomega.BeTrue(), "Associated PodMonitor should be deleted within 1 reconciliation cycle of LLMInferenceService deletion")
+}
+
+func logManualCleanupCommands(t *testing.T, topology, llmSvcName, proxyName, tlsSecretName, cookieSecretName, bindingName, saName string) {
+	t.Helper()
+	t.Logf("[%s] NO_CLEANUP=1; manually clean up the retained resources with:", topology)
+	for _, command := range []string{
+		fmt.Sprintf("oc delete llminferenceservice.serving.kserve.io/%s -n default --ignore-not-found", llmSvcName),
+		fmt.Sprintf("oc delete route/%s -n default --ignore-not-found", proxyName),
+		fmt.Sprintf("oc delete deployment/%s -n default --ignore-not-found", proxyName),
+		fmt.Sprintf("oc delete service/%s -n default --ignore-not-found", proxyName),
+		fmt.Sprintf("oc delete secret/%s secret/%s -n default --ignore-not-found", tlsSecretName, cookieSecretName),
+		fmt.Sprintf("oc delete serviceaccount/%s -n default --ignore-not-found", saName),
+		fmt.Sprintf("oc delete clusterrolebinding/%s --ignore-not-found", bindingName),
+	} {
+		t.Log(command)
+	}
 }
 
 func runOC(ctx context.Context, args ...string) error {
@@ -830,9 +834,7 @@ func setupInferencePrerequisites(t *testing.T, projectRoot string) {
 	if err := ensureOAuthProxySecret(ctx); err != nil {
 		t.Fatalf("failed to ensure OAuth proxy cookie Secret: %v", err)
 	}
-	for _, name := range []string{"lgtm.yaml"} {
-		applyManifest(name)
-	}
+	applyManifest("lgtm.yaml")
 	waitFor("RHOAI operator should be Available", "wait", "--for=condition=Available", "deployment/rhods-operator", "-n", "redhat-ods-operator", "--timeout=300s")
 	waitFor("LGTM should be Available", "wait", "--for=condition=Available", "deployment/lgtm", "-n", "redhat-ods-monitoring", "--timeout=300s")
 	waitFor("LGTM Route should have a host", "wait", "--for=jsonpath={.spec.host}", "route/lgtm", "-n", "redhat-ods-monitoring", "--timeout=300s")
@@ -868,14 +870,14 @@ func TestLLMInferenceService(t *testing.T) {
 	require.NoError(t, err)
 
 	setupInferencePrerequisites(t, projectRoot)
-	oatsBin, gcxBin := ensureOatsBinaries(t, projectRoot)
+	oatsBin := ensureOatsBinary(t, projectRoot)
 	oatsEnv := buildOatsEnv(t)
 
 	topologies := []string{"single-node", "multi-node", "disaggregated"}
 
 	for _, topology := range topologies {
 		t.Run(topology, func(t *testing.T) {
-			runLLMInferenceServiceTopologyTest(t, tc, topology, projectRoot, oatsBin, gcxBin, oatsEnv)
+			runLLMInferenceServiceTopologyTest(t, tc, topology, projectRoot, oatsBin, oatsEnv)
 		})
 	}
 }

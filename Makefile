@@ -63,25 +63,19 @@ e2e-test: ## Run e2e tests against a cluster (requires KUBECONFIG).
 
 BIN_DIR  ?= $(LOCALBIN)
 OATS_BIN ?= $(BIN_DIR)/oats
-GCX_BIN  ?= $(BIN_DIR)/gcx
 
 .PHONY: oats-bin
 oats-bin: ## Install oats binary locally if necessary.
 	@mkdir -p "$(BIN_DIR)"
-	@test -s "$(OATS_BIN)" || GOBIN="$(BIN_DIR)" go install github.com/grafana/oats
-
-.PHONY: gcx-bin
-gcx-bin: ## Install gcx binary locally if necessary.
-	@mkdir -p "$(BIN_DIR)"
-	@test -s "$(GCX_BIN)" || GOBIN="$(BIN_DIR)" go install github.com/grafana/gcx/cmd/gcx
+	@test -s "$(OATS_BIN)" || GOBIN="$(BIN_DIR)" go install github.com/grafana/oats@v0.10.0
 
 .PHONY: oats
-oats: oats-bin gcx-bin ## Run OATS tests against a cluster via oats CLI.
+oats: oats-bin ## Run OATS tests against a cluster via oats CLI.
 	@GCX_TELEMETRY="$${GCX_TELEMETRY:-disabled}" \
 	GRAFANA_SERVER="$${GRAFANA_SERVER:-https://$$(oc get route lgtm -n redhat-ods-monitoring -o jsonpath='{.spec.host}')}" \
 	GRAFANA_ORG_ID="$${GRAFANA_ORG_ID:-1}" \
 	GRAFANA_TOKEN="$${GRAFANA_TOKEN:-$$(oc whoami -t)}" \
-	"$(OATS_BIN)" --gcx "$(GCX_BIN)" --gcx-context default $(OATS_FLAGS) -vvv
+	"$(OATS_BIN)" --gcx-download auto --gcx-version v1.2.0 --gcx-context default $(OATS_FLAGS) -vvv
 
 ##@ E2E Test Image
 
