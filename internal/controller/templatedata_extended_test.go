@@ -576,6 +576,20 @@ func TestGetPersesImage_Override(t *testing.T) {
 	}
 }
 
+func TestGetKorrel8rImage_Default(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_KORREL8R_IMAGE", "")
+	if got := getKorrel8rImage(); got != "registry.redhat.io/cluster-observability-operator/korrel8r-rhel9@sha256:90cc70741585b3a555888cc119c1ad630e988513dd2065158b26f6fa33dc8a22" {
+		t.Errorf("unexpected default Korrel8r image: %q", got)
+	}
+}
+
+func TestGetKorrel8rImage_Override(t *testing.T) {
+	t.Setenv("RELATED_IMAGE_KORREL8R_IMAGE", "custom-korrel8r:1.0")
+	if got := getKorrel8rImage(); got != "custom-korrel8r:1.0" {
+		t.Errorf("want custom-korrel8r:1.0, got %q", got)
+	}
+}
+
 // --- buildTemplateData ---
 
 func TestBuildTemplateData_BasicNoFeatures(t *testing.T) {
@@ -599,6 +613,38 @@ func TestBuildTemplateData_BasicNoFeatures(t *testing.T) {
 	}
 	if data["PersesAPIVersion"] != "v1alpha2" {
 		t.Errorf("PersesAPIVersion: want 'v1alpha2', got %v", data["PersesAPIVersion"])
+	}
+}
+
+func TestBuildTemplateData_Korrel8rConfiguration(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Traces = &v1alpha1.Traces{
+		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+	}
+	m.Spec.Logs = &v1alpha1.Logs{}
+
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if data["Logs"] != true {
+		t.Error("Logs: want true")
+	}
+	if data["Korrel8rImage"] != "registry.redhat.io/cluster-observability-operator/korrel8r-rhel9@sha256:90cc70741585b3a555888cc119c1ad630e988513dd2065158b26f6fa33dc8a22" {
+		t.Errorf("unexpected Korrel8r image: %v", data["Korrel8rImage"])
+	}
+	if data["Korrel8rRequestTimeout"] != "30s" || data["Korrel8rSessionTimeout"] != "5m" {
+		t.Errorf("unexpected Korrel8r timeouts: request=%v session=%v", data["Korrel8rRequestTimeout"], data["Korrel8rSessionTimeout"])
+	}
+	if data["ThanosQuerierEndpoint"] != "http://thanos-querier-data-science-thanos-querier.test-ns.svc.cluster.local:10902" {
+		t.Errorf("unexpected Thanos endpoint: %v", data["ThanosQuerierEndpoint"])
+	}
+	if data["LokiTenant"] != "application" {
+		t.Errorf("unexpected Loki tenant: %v", data["LokiTenant"])
 	}
 }
 

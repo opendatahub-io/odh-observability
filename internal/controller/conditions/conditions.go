@@ -72,6 +72,9 @@ const (
 
 	// ConditionClusterLogForwarderAvailable indicates the ClusterLogForwarder CR is deployed.
 	ConditionClusterLogForwarderAvailable = "ClusterLogForwarderAvailable"
+
+	// ConditionKorrel8rAvailable indicates the Korrel8r correlation service is deployed.
+	ConditionKorrel8rAvailable = "Korrel8rAvailable"
 )
 
 // Reason constants.
@@ -112,6 +115,7 @@ var featureConditionTypes = map[string]bool{
 	ConditionUsageLogsCollectorAvailable:         true,
 	ConditionLokiStackAvailable:                  true,
 	ConditionClusterLogForwarderAvailable:        true,
+	ConditionKorrel8rAvailable:                   true,
 }
 
 // ConditionsManager manages the set of conditions for a Monitoring CR reconcile cycle.

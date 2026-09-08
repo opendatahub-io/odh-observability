@@ -33,6 +33,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -97,10 +98,17 @@ type MonitoringReconciler struct {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps;secrets;services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods;pods/log;endpoints;events;replicationcontrollers,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=daemonsets;replicasets;statefulsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
+// +kubebuilder:rbac:groups=loki.grafana.com,resources=application,resourceNames=logs,verbs=get
+// +kubebuilder:rbac:groups=tempo.grafana.com,resources=opendatahub;redhat-ods-monitoring,resourceNames=traces,verbs=get
 // +kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=operators.coreos.com,resources=operatorconditions,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 // +kubebuilder:rbac:groups=config.openshift.io,resources=apiservers,verbs=get;list;watch
+// +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
 
 func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -197,6 +205,16 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		return ctrl.Result{}, nil
 	}
 
+	if err := validateMonitoringNamespace(monitoring); err != nil {
+		message := err.Error()
+		cm.MarkFalse(conditions.ConditionMonitoringAvailable, "MonitoringNamespaceMismatch", message)
+		cm.MarkFalse(conditions.ConditionKorrel8rAvailable, "MonitoringNamespaceMismatch", message)
+		cm.MarkFalse(string(platformcommon.ConditionTypeProvisioningSucceeded), "MonitoringNamespaceMismatch", message)
+		cm.MarkFalse(string(platformcommon.ConditionTypeReady), "MonitoringNamespaceMismatch", message)
+		cm.MarkFalse(string(platformcommon.ConditionTypeDegraded), "NotDegraded", "")
+		return ctrl.Result{}, nil
+	}
+
 	// Check prerequisite operators.
 	if err := checkMonitoringPreconditions(ctx, r.Client, monitoring); err != nil {
 		cm.MarkFalse(conditions.ConditionMonitoringAvailable,
@@ -237,6 +255,7 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		deployAlerting,
 		deployNodeMetricsEndpoint,
 		deployClusterLogForwarder,
+		deployKorrel8r,
 	} {
 		if err := action(ctx, r.Client, monitoring, cm, &sources); err != nil {
 			return ctrl.Result{}, err
@@ -428,6 +447,19 @@ func (r *MonitoringReconciler) readPlatformVersion(ctx context.Context) (string,
 	return cm.Data[platformVersionKey], nil
 }
 
+// validateMonitoringNamespace ensures the controller's RBAC was installed for
+// the same operand namespace selected by the Monitoring CR. The Helm chart
+// injects MONITORING_NAMESPACE from its monitoringNamespace value; an unset
+// value keeps standalone controller tests and non-Helm development workflows
+// permissive.
+func validateMonitoringNamespace(monitoring *v1alpha1.Monitoring) error {
+	configured := os.Getenv("MONITORING_NAMESPACE")
+	if configured == "" || monitoring.Spec.Namespace == configured {
+		return nil
+	}
+	return fmt.Errorf("Monitoring spec.namespace %q does not match configured monitoring namespace %q", monitoring.Spec.Namespace, configured)
+}
+
 func singletonRequests(_ context.Context, _ client.Object) []reconcile.Request {
 	return []reconcile.Request{
 		{NamespacedName: types.NamespacedName{Name: v1alpha1.MonitoringInstanceName}},
@@ -475,6 +507,9 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(platformConfigPredicate)).
 		Watches(&corev1.Secret{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&corev1.Service{}, toSingleton, builder.WithPredicates(managedPredicate)).
+		Watches(&discoveryv1.EndpointSlice{}, toSingleton, builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			return obj.GetLabels()[discoveryv1.LabelServiceName] == Korrel8rServiceName
+		}))).
 		Watches(&corev1.ServiceAccount{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&routev1.Route{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		// Watch CRDs to react when optional operators are installed / removed.

@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{.Korrel8rServiceName}}
+  namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{.Korrel8rServiceName}}-query
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+rules:
+  # The stock k8s rules and direct log fallback are read-only. Keep this list
+  # limited to objects needed to correlate a workload and read its pod logs.
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - services
+      - endpoints
+      - configmaps
+      - events
+      - replicationcontrollers
+      - namespaces
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups: ["apps"]
+    resources:
+      - daemonsets
+      - deployments
+      - replicasets
+      - statefulsets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups: ["batch"]
+    resources:
+      - cronjobs
+      - jobs
+    verbs:
+      - get
+      - list
+      - watch
+  # OpenShift Loki/Tempo gateway SARs use these virtual tenant resources.
+  # They are intentionally restricted to the RHOAI tenants configured below.
+  - apiGroups: ["loki.grafana.com"]
+    resources:
+      - application
+    resourceNames:
+      - logs
+    verbs:
+      - get
+  - apiGroups: ["tempo.grafana.com"]
+    resources:
+      - {{.Namespace}}
+    resourceNames:
+      - traces
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{.Korrel8rServiceName}}-query
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{.Korrel8rServiceName}}-query
+subjects:
+  - kind: ServiceAccount
+    name: {{.Korrel8rServiceName}}
+    namespace: {{.Namespace}}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{.Korrel8rServiceName}}-auth-delegator
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: {{.Korrel8rServiceName}}
+    namespace: {{.Namespace}}

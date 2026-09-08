@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{.Korrel8rServiceName}}-config
+  namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+data:
+  korrel8r.yaml: |
+    stores:
+      - domain: k8s
+{{- if .Korrel8rMetricsStore}}
+      - domain: metric
+        metric: {{.ThanosQuerierEndpoint}}
+{{- end}}
+{{- if .Korrel8rTracesStore}}
+      - domain: trace
+        tempoStack: {{.TempoQueryEndpoint}}/api/search
+        certificateAuthority: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
+{{- end}}
+{{- if .Logs}}
+      - domain: log
+{{- if .Korrel8rLokiStore}}
+        lokiStack: {{.LokiQueryEndpoint}}
+{{- end}}
+        direct: true
+        certificateAuthority: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
+{{- end}}
+    include:
+      - /etc/korrel8r/rules/all.yaml
+    tuning:
+      requestTimeout: {{.Korrel8rRequestTimeout}}
+      sessionTimeout: {{.Korrel8rSessionTimeout}}

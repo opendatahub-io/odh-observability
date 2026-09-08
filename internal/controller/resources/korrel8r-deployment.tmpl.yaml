@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{.Korrel8rServiceName}}
+  namespace: {{.Namespace}}
+  labels:
+    app.kubernetes.io/name: {{.Korrel8rServiceName}}
+    app.kubernetes.io/component: correlation
+    app.kubernetes.io/part-of: monitoring
+    platform.opendatahub.io/part-of: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{.Korrel8rServiceName}}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{.Korrel8rServiceName}}
+        app.kubernetes.io/component: correlation
+        app.kubernetes.io/part-of: monitoring
+        platform.opendatahub.io/part-of: monitoring
+    spec:
+      serviceAccountName: {{.Korrel8rServiceName}}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: {{.Korrel8rServiceName}}
+          image: {{.Korrel8rImage}}
+          imagePullPolicy: IfNotPresent
+          command:
+            - korrel8r
+          args:
+            - web
+            - --http=:8080
+            - --config=/etc/korrel8r/custom/korrel8r.yaml
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: {{.Korrel8rCPURequest}}
+              memory: {{.Korrel8rMemoryRequest}}
+            limits:
+              cpu: {{.Korrel8rCPULimit}}
+              memory: {{.Korrel8rMemoryLimit}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/korrel8r/custom
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{.Korrel8rServiceName}}-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{.Korrel8rServiceName}}
+  namespace: {{.Namespace}}
+  labels:
+    app.kubernetes.io/name: {{.Korrel8rServiceName}}
+    app.kubernetes.io/component: correlation
+    app.kubernetes.io/part-of: monitoring
+    platform.opendatahub.io/part-of: monitoring
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: {{.Korrel8rServiceName}}

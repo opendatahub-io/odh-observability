@@ -61,9 +61,10 @@ Action functions run sequentially in a fixed order. Each function checks whether
 | 5 | `deployOpenTelemetryCollector` | `spec.metrics` or `spec.traces` | `OpenTelemetryCollector` | `OpenTelemetryCollectorAvailable` | collector, RBAC, ServiceMonitors, Prometheus service |
 | 6 | `deployAlerting` | `spec.alerting` | `PrometheusRule` | `AlertingAvailable` | operator-prometheusrules |
 | 7 | `deployNodeMetricsEndpoint` | `spec.metrics` | None | `NodeMetricsEndpointAvailable` | prometheus-cluster-proxy |
-| 8 | `deployPerses` | `spec.metrics` or `spec.traces` | `Perses` | `PersesAvailable` | perses, network-policy |
-| 9 | `deployPersesTempoIntegration` | `spec.traces` | `PersesDatasource`, `PersesDashboard` | `PersesTempoDataSourceAvailable` | datasource, CA ConfigMap, dashboard |
-| 10 | `deployPersesPrometheusIntegration` | `spec.metrics` | `PersesDatasource` | `PersesPrometheusDataSourceAvailable` | 2 datasource templates |
+| 8 | `deployKorrel8r` | `spec.metrics` or `spec.traces` or `spec.logs` | None | `Korrel8rAvailable` | ConfigMap, Deployment, Service, RBAC, NetworkPolicy |
+| 9 | `deployPerses` | `spec.metrics` or `spec.traces` | `Perses` | `PersesAvailable` | perses, network-policy |
+| 10 | `deployPersesTempoIntegration` | `spec.traces` | `PersesDatasource`, `PersesDashboard` | `PersesTempoDataSourceAvailable` | datasource, CA ConfigMap, dashboard |
+| 11 | `deployPersesPrometheusIntegration` | `spec.metrics` | `PersesDatasource` | `PersesPrometheusDataSourceAvailable` | 2 datasource templates |
 
 When a feature is not configured, the action calls `MarkNotConfigured` (Info severity) which prevents it from contributing to Degraded status. When a required CRD is missing, `MarkFalse` is used, which does contribute to Degraded.
 
@@ -123,6 +124,15 @@ All templates are embedded via `//go:embed` and rendered with Go's `text/templat
 | `perses-datasource-prometheus.tmpl.yaml` | PersesDatasource for namespace Prometheus |
 | `perses-datasource-cluster-prometheus.tmpl.yaml` | PersesDatasource for cluster Prometheus |
 
+### Korrel8r (Signal Correlation)
+
+| Template | Resources Created |
+|----------|-------------------|
+| `korrel8r-config.tmpl.yaml` | Operator-owned store and tuning configuration |
+| `korrel8r-deployment.tmpl.yaml` | Single-replica Deployment and ClusterIP Service |
+| `korrel8r-rbac.tmpl.yaml` | ServiceAccount and TokenReview delegation |
+| `korrel8r-network-policy.tmpl.yaml` | Ingress and backend egress policy |
+
 ### Node Metrics
 
 | Template | Resources Created |
@@ -145,7 +155,7 @@ All templates are embedded via `//go:embed` and rendered with Go's `text/templat
 
 ## Condition System
 
-The operator manages 12 feature-specific conditions that aggregate into 3 top-level conditions required by the PlatformObject contract.
+The operator manages feature-specific conditions that aggregate into 3 top-level conditions required by the PlatformObject contract.
 
 ### Feature Conditions
 
@@ -165,6 +175,7 @@ Each action function manages one or more conditions:
 | `PersesPrometheusDataSourceAvailable` | `deployPersesPrometheusIntegration` |
 | `NodeMetricsEndpointAvailable` | `deployNodeMetricsEndpoint` |
 | `WebhookAvailable` | `deployWebhookInfrastructure` |
+| `Korrel8rAvailable` | `deployKorrel8r` |
 
 ### Condition Severities
 

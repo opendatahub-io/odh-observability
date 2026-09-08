@@ -168,6 +168,31 @@ func TestReadPlatformVersion(t *testing.T) {
 	})
 }
 
+func TestValidateMonitoringNamespace(t *testing.T) {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+
+	t.Run("unset configuration is allowed", func(t *testing.T) {
+		t.Setenv("MONITORING_NAMESPACE", "")
+		if err := validateMonitoringNamespace(m); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("matching configuration is allowed", func(t *testing.T) {
+		t.Setenv("MONITORING_NAMESPACE", m.Spec.Namespace)
+		if err := validateMonitoringNamespace(m); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("mismatched configuration is rejected", func(t *testing.T) {
+		t.Setenv("MONITORING_NAMESPACE", "redhat-ods-monitoring")
+		if err := validateMonitoringNamespace(m); err == nil {
+			t.Fatal("expected namespace mismatch error")
+		}
+	})
+}
+
 // TestReconcile_Removed: Monitoring with Removed state should short-circuit, set
 // Ready=False and ProvisioningSucceeded=False, and not return an error.
 func TestReconcile_Removed(t *testing.T) {

@@ -72,6 +72,11 @@ const (
 	defaultTempoCPURequest    = "100m"
 	defaultTempoMemoryRequest = "256Mi"
 
+	defaultKorrel8rCPURequest    = "50m"
+	defaultKorrel8rMemoryRequest = "64Mi"
+	defaultKorrel8rCPULimit      = "200m"
+	defaultKorrel8rMemoryLimit   = "256Mi"
+
 	persesV1Alpha2 = "v1alpha2"
 
 	// Security limits for exporter configurations.
@@ -105,18 +110,23 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	templateData := map[string]any{
-		"Namespace":            monitoring.Spec.Namespace,
-		"GatewayNamespace":     getEnvOrDefault("GATEWAY_NAMESPACE", monitoring.Spec.Namespace),
-		"Traces":               monitoring.Spec.Traces != nil,
-		"Metrics":              monitoring.Spec.Metrics != nil,
-		"AcceleratorMetrics":   monitoring.Spec.Metrics != nil,
-		"OperatorNamespace":    operatorNamespace,
-		"OperatorName":         getEnvOrDefault("OPERATOR_NAME", "odh-observability"),
-		"OperatorPodPrefix":    getEnvOrDefault("OPERATOR_POD_PREFIX", "odh-observability"),
-		"MetricsExporters":     make(map[string]string),
-		"MetricsExporterNames": []string{},
-		"PersesImage":          getPersesImage(),
-		"PersesAPIVersion":     persesAPIVersion,
+		"Namespace":              monitoring.Spec.Namespace,
+		"GatewayNamespace":       getEnvOrDefault("GATEWAY_NAMESPACE", monitoring.Spec.Namespace),
+		"Traces":                 monitoring.Spec.Traces != nil,
+		"Metrics":                monitoring.Spec.Metrics != nil,
+		"Logs":                   monitoring.Spec.Logs != nil,
+		"AcceleratorMetrics":     monitoring.Spec.Metrics != nil,
+		"OperatorNamespace":      operatorNamespace,
+		"OperatorName":           getEnvOrDefault("OPERATOR_NAME", "odh-observability"),
+		"OperatorPodPrefix":      getEnvOrDefault("OPERATOR_POD_PREFIX", "odh-observability"),
+		"MetricsExporters":       make(map[string]string),
+		"MetricsExporterNames":   []string{},
+		"PersesImage":            getPersesImage(),
+		"PersesAPIVersion":       persesAPIVersion,
+		"Korrel8rImage":          getKorrel8rImage(),
+		"Korrel8rServiceName":    Korrel8rServiceName,
+		"Korrel8rRequestTimeout": "30s",
+		"Korrel8rSessionTimeout": "5m",
 	}
 
 	addResourceData(templateData)
@@ -140,7 +150,16 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 
 	// LokiStack configuration
 	lokiStackName := "data-science-lokistack"
+	monitoringNamespace := monitoringNamespace(monitoring)
 	templateData["LokiStackName"] = lokiStackName
+	// The RHOAI LokiStack is configured in OpenShift logging mode. Its
+	// application tenant is the pinned tenant for inference logs.
+	templateData["LokiTenant"] = "application"
+	templateData["ThanosQuerierEndpoint"] = fmt.Sprintf("http://thanos-querier-data-science-thanos-querier.%s.svc.cluster.local:10902", monitoringNamespace)
+	templateData["LokiQueryEndpoint"] = fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application", lokiStackName, monitoringNamespace)
+	if err := addKorrel8rStoreData(ctx, c, monitoring, templateData); err != nil {
+		return nil, err
+	}
 
 	// Resolve Loki storage: logs.Storage takes precedence, then usageLogs.Storage
 	var lokiStorage *v1alpha1.LokiStorageConfig
@@ -225,6 +244,43 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	return templateData, nil
 }
 
+func addKorrel8rStoreData(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring, templateData map[string]any) error {
+	templateData["Korrel8rMetricsStore"] = false
+	templateData["Korrel8rTracesStore"] = false
+	templateData["Korrel8rLokiStore"] = false
+
+	if monitoring.Spec.Metrics != nil {
+		ready, err := korrel8rServiceReady(ctx, c, monitoringNamespace(monitoring), "thanos-querier-data-science-thanos-querier")
+		if err != nil {
+			return fmt.Errorf("checking ThanosQuerier service readiness: %w", err)
+		}
+		templateData["Korrel8rMetricsStore"] = ready
+	}
+
+	if monitoring.Spec.Traces != nil {
+		serviceName := "tempo-data-science-tempostack-gateway"
+		backend := monitoring.Spec.Traces.Storage.Backend
+		if backend == "" || backend == v1alpha1.StorageBackendPV {
+			serviceName = "tempo-data-science-tempomonolithic-gateway"
+		}
+		ready, err := korrel8rServiceReady(ctx, c, monitoringNamespace(monitoring), serviceName)
+		if err != nil {
+			return fmt.Errorf("checking Tempo gateway readiness: %w", err)
+		}
+		templateData["Korrel8rTracesStore"] = ready
+	}
+
+	if monitoring.Spec.Logs != nil {
+		ready, err := korrel8rLokiReady(ctx, c, monitoring)
+		if err != nil {
+			return fmt.Errorf("checking LokiStack readiness for Korrel8r: %w", err)
+		}
+		templateData["Korrel8rLokiStore"] = ready
+	}
+
+	return nil
+}
+
 // checkMonitoringPreconditions verifies that prerequisite operators are installed.
 // Returns a multierror listing all missing operators.
 func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) error {
@@ -304,6 +360,11 @@ func addResourceData(templateData map[string]any) {
 	templateData["TempoMemoryLimit"] = defaultTempoMemoryLimit
 	templateData["TempoCPURequest"] = defaultTempoCPURequest
 	templateData["TempoMemoryRequest"] = defaultTempoMemoryRequest
+
+	templateData["Korrel8rCPURequest"] = defaultKorrel8rCPURequest
+	templateData["Korrel8rMemoryRequest"] = defaultKorrel8rMemoryRequest
+	templateData["Korrel8rCPULimit"] = defaultKorrel8rCPULimit
+	templateData["Korrel8rMemoryLimit"] = defaultKorrel8rMemoryLimit
 }
 
 func addStorageData(metrics *v1alpha1.Metrics, templateData map[string]any) {
@@ -426,6 +487,16 @@ func addImageURLs(templateData map[string]any) {
 		"RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE",
 		"quay.io/prometheuscommunity/prom-label-proxy@sha256:28f81efb6574556011e7914851faaccce4a64b1b72a338aaaf3cc9d45e66fd96",
 	)
+}
+
+// getKorrel8rImage returns the pinned Korrel8r image, allowing release
+// manifests to override it with the related-image environment contract.
+func getKorrel8rImage() string {
+	// Keep the default aligned with the supported Cluster Observability Operator
+	// image. The COO build includes the top-level tuning configuration used by
+	// the Monitoring CR; the older upstream 0.7.x image rejects that section.
+	const defaultImage = "registry.redhat.io/cluster-observability-operator/korrel8r-rhel9@sha256:90cc70741585b3a555888cc119c1ad630e988513dd2065158b26f6fa33dc8a22"
+	return getEnvOrDefault("RELATED_IMAGE_KORREL8R_IMAGE", defaultImage)
 }
 
 func addTLSData(ctx context.Context, c client.Client, templateData map[string]any) error {
