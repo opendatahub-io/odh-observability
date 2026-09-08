@@ -60,6 +60,10 @@ func findProjectRoot() (string, error) {
 func ensureOatsBinary(t *testing.T, projectRoot string) string {
 	t.Helper()
 
+	if oatsBin, err := exec.LookPath("oats"); err == nil {
+		return oatsBin
+	}
+
 	localBin := filepath.Join(projectRoot, "bin")
 	oatsBin := filepath.Join(localBin, "oats")
 	if _, err := os.Stat(oatsBin); err == nil {
