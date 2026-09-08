@@ -745,7 +745,7 @@ func logManualCleanupCommands(t *testing.T, topology, llmSvcName, proxyName, tls
 		fmt.Sprintf("oc delete route/%s -n default --ignore-not-found", proxyName),
 		fmt.Sprintf("oc delete deployment/%s -n default --ignore-not-found", proxyName),
 		fmt.Sprintf("oc delete service/%s -n default --ignore-not-found", proxyName),
-		fmt.Sprintf("oc delete secret/%s secret/%s -n default --ignore-not-found", tlsSecretName, cookieSecretName),
+		fmt.Sprintf("oc delete secrets %s %s -n default --ignore-not-found", tlsSecretName, cookieSecretName),
 		fmt.Sprintf("oc delete serviceaccount/%s -n default --ignore-not-found", saName),
 		fmt.Sprintf("oc delete clusterrolebinding/%s --ignore-not-found", bindingName),
 	} {
