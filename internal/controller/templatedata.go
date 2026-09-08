@@ -709,8 +709,8 @@ var metricsExporterSchemas = map[string]ExporterSchema{
 			"endpoint": {
 				Type:      "string",
 				Pattern:   regexp.MustCompile(`^https?://[a-zA-Z0-9.-]+(:[0-9]+)?(/.*)?$`),
-				MinLength: new(1),
-				MaxLength: new(2048),
+				MinLength: intPtr(1),
+				MaxLength: intPtr(2048),
 			},
 			"headers":     {Type: "map[string]string"},
 			"tls":         {Type: "object"},
@@ -718,7 +718,7 @@ var metricsExporterSchemas = map[string]ExporterSchema{
 			"timeout": {
 				Type:      "string",
 				Pattern:   regexp.MustCompile(`^\d+[smh]$`),
-				MaxLength: new(10),
+				MaxLength: intPtr(10),
 			},
 		},
 		FieldRules: map[string][]ValidationRule{
@@ -735,15 +735,15 @@ var metricsExporterSchemas = map[string]ExporterSchema{
 			"endpoint": {
 				Type:      "string",
 				Pattern:   regexp.MustCompile(`^https?://[a-zA-Z0-9.-]+(:[0-9]+)?(/.*)?$`),
-				MinLength: new(1),
-				MaxLength: new(2048),
+				MinLength: intPtr(1),
+				MaxLength: intPtr(2048),
 			},
 			"headers":     {Type: "map[string]string"},
 			"compression": {Type: "string", AllowedValues: []string{"gzip", "none"}},
 			"timeout": {
 				Type:      "string",
 				Pattern:   regexp.MustCompile(`^\d+[smh]$`),
-				MaxLength: new(10),
+				MaxLength: intPtr(10),
 			},
 		},
 		FieldRules: map[string][]ValidationRule{
@@ -768,15 +768,15 @@ var metricsExporterSchemas = map[string]ExporterSchema{
 			"endpoint": {
 				Type:      "string",
 				Pattern:   regexp.MustCompile(`^https?://[a-zA-Z0-9.-]+(:[0-9]+)?(/.*)?$`),
-				MinLength: new(1),
-				MaxLength: new(2048),
+				MinLength: intPtr(1),
+				MaxLength: intPtr(2048),
 			},
 			"headers": {Type: "map[string]string"},
 			"tls":     {Type: "object"},
 			"remote_timeout": {
 				Type:      "string",
 				Pattern:   regexp.MustCompile(`^\d+[smh]$`),
-				MaxLength: new(10),
+				MaxLength: intPtr(10),
 			},
 		},
 		FieldRules: map[string][]ValidationRule{
@@ -915,4 +915,8 @@ func validateFieldTypeStrict(value any, expectedType string) error {
 		return fmt.Errorf("unsupported field type: %s", expectedType)
 	}
 	return nil
+}
+
+func intPtr(i int) *int {
+	return &i
 }
