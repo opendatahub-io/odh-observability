@@ -24,6 +24,7 @@ import (
 type TestContext struct {
 	t                   *testing.T
 	client              client.Client
+	authToken           string
 	ctx                 context.Context //nolint:containedctx // TestContext carries a long-lived background context for the entire test suite
 	g                   *WithT
 	Timeouts            TestTimeouts
@@ -42,6 +43,10 @@ func (tc *TestContext) Client() client.Client {
 
 func (tc *TestContext) Context() context.Context {
 	return tc.ctx
+}
+
+func (tc *TestContext) AuthToken() string {
+	return tc.authToken
 }
 
 func NewTestContext(t *testing.T) (*TestContext, error) {
@@ -66,6 +71,7 @@ func NewTestContext(t *testing.T) (*TestContext, error) {
 	return &TestContext{
 		t:                   t,
 		client:              ctrlCli,
+		authToken:           cfg.BearerToken,
 		ctx:                 context.Background(),
 		g:                   g,
 		Timeouts:            testOpts.Timeouts,
@@ -338,19 +344,34 @@ func (tc *TestContext) EventuallyResourceCreatedOrPatched(opts ...ResourceOpts) 
 	ro := tc.NewResourceOptions(opts...)
 	var result *unstructured.Unstructured
 
+	attempt := 0
 	eventually := ro.tc.g.Eventually(func() (*unstructured.Unstructured, error) {
+		attempt++
+		started := time.Now()
+		ro.t.Logf("[%s] resource attempt %d: getting %s %s", ro.t.Name(), attempt, ro.GVK, ro.NN)
 		u := ro.buildObject()
 
 		existing, err := tc.fetchResource(ro.t, ro.GVK, ro.NN)
+		ro.t.Logf("[%s] resource attempt %d: get completed in %s (found=%t, err=%v)", ro.t.Name(), attempt, time.Since(started).Round(time.Millisecond), existing != nil, err)
 		if k8serr.IsNotFound(err) {
 			if ro.MutateFunc != nil {
 				if err := ro.MutateFunc(u); err != nil {
 					return nil, StopErr(err, "failed to apply mutation for create")
 				}
 			}
+			ro.t.Logf("[%s] resource attempt %d: creating %s %s", ro.t.Name(), attempt, ro.GVK, ro.NN)
+			createStarted := time.Now()
 			if err := tc.client.Create(tc.ctx, u); err != nil {
+				ro.t.Logf("[%s] resource attempt %d: create failed after %s: %v", ro.t.Name(), attempt, time.Since(createStarted).Round(time.Millisecond), err)
+				if k8serr.IsInvalid(err) || k8serr.IsForbidden(err) || k8serr.IsUnauthorized(err) {
+					return nil, StopErr(err, "resource create failed with a non-retryable API error")
+				}
 				return nil, err
 			}
+			ro.t.Logf(
+				"[%s] resource attempt %d: create completed in %s (resourceVersion=%q)",
+				ro.t.Name(), attempt, time.Since(createStarted).Round(time.Millisecond), u.GetResourceVersion(),
+			)
 			result = u
 			return u, nil
 		}
@@ -364,9 +385,19 @@ func (tc *TestContext) EventuallyResourceCreatedOrPatched(opts ...ResourceOpts) 
 				return nil, StopErr(err, "failed to apply mutation for patch")
 			}
 			patch := client.MergeFrom(original)
+			ro.t.Logf("[%s] resource attempt %d: patching %s %s (resourceVersion=%q)", ro.t.Name(), attempt, ro.GVK, ro.NN, existing.GetResourceVersion())
+			patchStarted := time.Now()
 			if err := tc.client.Patch(tc.ctx, existing, patch); err != nil {
+				ro.t.Logf("[%s] resource attempt %d: patch failed after %s: %v", ro.t.Name(), attempt, time.Since(patchStarted).Round(time.Millisecond), err)
+				if k8serr.IsInvalid(err) || k8serr.IsForbidden(err) || k8serr.IsUnauthorized(err) {
+					return nil, StopErr(err, "resource patch failed with a non-retryable API error")
+				}
 				return nil, err
 			}
+			ro.t.Logf(
+				"[%s] resource attempt %d: patch completed in %s (resourceVersion=%q)",
+				ro.t.Name(), attempt, time.Since(patchStarted).Round(time.Millisecond), existing.GetResourceVersion(),
+			)
 		}
 
 		result = existing

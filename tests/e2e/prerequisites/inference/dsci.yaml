@@ -1,0 +1,30 @@
+apiVersion: dscinitialization.opendatahub.io/v2
+kind: DSCInitialization
+metadata:
+  name: default-dsci
+spec:
+  applicationsNamespace: redhat-ods-applications
+  alerting: {}
+  monitoring:
+    managementState: Managed
+    metrics:
+      storage:
+        size: 5Gi
+      exporters:
+        otlp/metrics:
+          endpoint: "http://lgtm.redhat-ods-monitoring.svc.cluster.local:4317"
+          tls:
+            insecure: true
+    traces:
+      storage:
+        backend: pv
+        size: 5Gi
+      exporters:
+        otlp/traces:
+          endpoint: "http://lgtm.redhat-ods-monitoring.svc.cluster.local:4317"
+          tls:
+            insecure: true
+    namespace: redhat-ods-monitoring
+  trustedCABundle:
+    customCABundle: ""
+    managementState: Managed
