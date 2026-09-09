@@ -21,7 +21,7 @@ import (
 
 	"github.com/onsi/gomega"
 	"github.com/stretchr/testify/require"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -717,7 +717,12 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 
 func logManualCleanupCommands(t *testing.T, topology, llmSvcName, proxyName, tlsSecretName, cookieSecretName, bindingName, saName string) {
 	t.Helper()
-	t.Logf("[%s] NO_CLEANUP=1; retained resources: LLMInferenceService/%s, Route/%s, Deployment/%s, Service/%s, Secrets/%s and %s, ServiceAccount/%s, ClusterRoleBinding/%s", topology, llmSvcName, proxyName, proxyName, proxyName, tlsSecretName, cookieSecretName, saName, bindingName)
+	t.Logf(
+		"[%s] NO_CLEANUP=1; retained resources: LLMInferenceService/%s, Route/%s, Deployment/%s, "+
+			"Service/%s, Secrets/%s and %s, ServiceAccount/%s, ClusterRoleBinding/%s",
+		topology, llmSvcName, proxyName, proxyName, proxyName,
+		tlsSecretName, cookieSecretName, saName, bindingName,
+	)
 }
 
 func ensureOAuthProxySecret(tc *TestContext) error {
@@ -731,7 +736,7 @@ func ensureOAuthProxySecret(tc *TestContext) error {
 	if err == nil {
 		return nil
 	}
-	if !k8serrors.IsNotFound(err) {
+	if !k8serr.IsNotFound(err) {
 		return fmt.Errorf("get OAuth proxy session secret: %w", err)
 	}
 
@@ -786,7 +791,7 @@ func applyManifest(tc *TestContext, path string) error {
 		current := &unstructured.Unstructured{}
 		current.SetGroupVersionKind(resource.GroupVersionKind())
 		getErr := tc.Client().Get(tc.Context(), key, current)
-		if k8serrors.IsNotFound(getErr) {
+		if k8serr.IsNotFound(getErr) {
 			if err := tc.Client().Create(tc.Context(), resource); err != nil {
 				return fmt.Errorf("create %s/%s: %w", resource.GroupVersionKind(), key, err)
 			}
@@ -851,24 +856,69 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 		"datascienceclusters.datasciencecluster.opendatahub.io",
 		"uiplugins.observability.openshift.io",
 	} {
-		waitFor("CRD "+crd+" should be established", schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, types.NamespacedName{Name: crd}, "Established")
+		waitFor(
+			"CRD "+crd+" should be established",
+			schema.GroupVersionKind{
+				Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition",
+			},
+			types.NamespacedName{Name: crd},
+			"Established",
+		)
 	}
 	for _, name := range []string{"dsci.yaml", "dsc.yaml", "coo-uiplugins.yaml"} {
 		applyPrerequisite(name)
 	}
-	waitFor("DSCI default-dsci should be Ready", schema.GroupVersionKind{Group: "dscinitialization.opendatahub.io", Version: "v2", Kind: "DSCInitialization"}, types.NamespacedName{Name: "default-dsci"}, "Ready")
-	waitFor("DSC default-dsc should be Ready", schema.GroupVersionKind{Group: "datasciencecluster.opendatahub.io", Version: "v2", Kind: "DataScienceCluster"}, types.NamespacedName{Name: "default-dsc"}, "Ready")
+	waitFor(
+		"DSCI default-dsci should be Ready",
+		schema.GroupVersionKind{
+			Group: "dscinitialization.opendatahub.io", Version: "v2", Kind: "DSCInitialization",
+		},
+		types.NamespacedName{Name: "default-dsci"},
+		"Ready",
+	)
+	waitFor(
+		"DSC default-dsc should be Ready",
+		schema.GroupVersionKind{
+			Group: "datasciencecluster.opendatahub.io", Version: "v2", Kind: "DataScienceCluster",
+		},
+		types.NamespacedName{Name: "default-dsc"},
+		"Ready",
+	)
 
 	t.Log("Setting up LGTM and remaining inference prerequisites")
 	applyPrerequisite("lwsoperator.yaml")
-	waitFor("CRD leaderworkersets.leaderworkerset.x-k8s.io should be established", schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, types.NamespacedName{Name: "leaderworkersets.leaderworkerset.x-k8s.io"}, "Established")
-	waitFor("CRD llminferenceservices.serving.kserve.io should be established", schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, types.NamespacedName{Name: "llminferenceservices.serving.kserve.io"}, "Established")
+	waitFor(
+		"CRD leaderworkersets.leaderworkerset.x-k8s.io should be established",
+		schema.GroupVersionKind{
+			Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition",
+		},
+		types.NamespacedName{Name: "leaderworkersets.leaderworkerset.x-k8s.io"},
+		"Established",
+	)
+	waitFor(
+		"CRD llminferenceservices.serving.kserve.io should be established",
+		schema.GroupVersionKind{
+			Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition",
+		},
+		types.NamespacedName{Name: "llminferenceservices.serving.kserve.io"},
+		"Established",
+	)
 	if err := ensureOAuthProxySecret(tc); err != nil {
 		t.Fatalf("failed to ensure OAuth proxy cookie Secret: %v", err)
 	}
 	applyPrerequisite("lgtm.yaml")
-	waitFor("RHOAI operator should be Available", schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}, types.NamespacedName{Name: "rhods-operator", Namespace: "redhat-ods-operator"}, "Available")
-	waitFor("LGTM should be Available", schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}, types.NamespacedName{Name: "lgtm", Namespace: "redhat-ods-monitoring"}, "Available")
+	waitFor(
+		"RHOAI operator should be Available",
+		schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"},
+		types.NamespacedName{Name: "rhods-operator", Namespace: "redhat-ods-operator"},
+		"Available",
+	)
+	waitFor(
+		"LGTM should be Available",
+		schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"},
+		types.NamespacedName{Name: "lgtm", Namespace: "redhat-ods-monitoring"},
+		"Available",
+	)
 	for _, endpoint := range []struct{ service, namespace string }{
 		{"rhods-operator-service", "redhat-ods-operator"},
 		{"kserve-webhook-server-service", "redhat-ods-applications"},
