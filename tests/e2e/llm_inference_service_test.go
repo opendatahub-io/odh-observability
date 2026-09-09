@@ -21,10 +21,12 @@ import (
 
 	"github.com/onsi/gomega"
 	"github.com/stretchr/testify/require"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
@@ -85,7 +87,7 @@ func ensureOatsBinary(t *testing.T, projectRoot string) string {
 	return oatsBin
 }
 
-func buildOatsEnv(t *testing.T) []string {
+func buildOatsEnv(t *testing.T, tc *TestContext) []string {
 	t.Helper()
 
 	envMap := make(map[string]string)
@@ -105,13 +107,12 @@ func buildOatsEnv(t *testing.T) []string {
 	}
 
 	if envMap["GRAFANA_SERVER"] == "" {
-		cmd := exec.CommandContext(t.Context(), "oc", "get", "route", "lgtm", "-n", "redhat-ods-monitoring", "-o", "jsonpath={.spec.host}")
-		out, err := cmd.Output()
-		if err == nil {
-			host := strings.TrimSpace(string(out))
-			if host != "" {
-				envMap["GRAFANA_SERVER"] = "https://" + host
-			}
+		route := &unstructured.Unstructured{}
+		route.SetGroupVersionKind(gvk.Route)
+		err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: "lgtm", Namespace: "redhat-ods-monitoring"}, route)
+		host, _, hostErr := unstructured.NestedString(route.Object, "spec", "host")
+		if err == nil && hostErr == nil && host != "" {
+			envMap["GRAFANA_SERVER"] = "https://" + host
 		}
 		if envMap["GRAFANA_SERVER"] == "" {
 			t.Log("Warning: GRAFANA_SERVER is not set and could not be resolved from OpenShift route 'lgtm'")
@@ -119,16 +120,11 @@ func buildOatsEnv(t *testing.T) []string {
 	}
 
 	if envMap["GRAFANA_TOKEN"] == "" {
-		cmd := exec.CommandContext(t.Context(), "oc", "whoami", "-t")
-		out, err := cmd.Output()
-		if err == nil {
-			token := strings.TrimSpace(string(out))
-			if token != "" {
-				envMap["GRAFANA_TOKEN"] = token
-			}
+		if token := getAuthToken(tc); token != "" {
+			envMap["GRAFANA_TOKEN"] = token
 		}
 		if envMap["GRAFANA_TOKEN"] == "" {
-			t.Log("Warning: GRAFANA_TOKEN is not set and could not be resolved via 'oc whoami -t'")
+			t.Log("Warning: GRAFANA_TOKEN is not set and no Kubernetes bearer token is available")
 		}
 	}
 
@@ -158,33 +154,14 @@ func getClusterDomain(tc *TestContext) (string, error) {
 		}
 	}
 
-	cmd := exec.CommandContext(tc.Context(), "oc", "get", "ingresses.config.openshift.io", "cluster", "-o", "jsonpath={.spec.domain}")
-	out, err := cmd.Output()
-	if err == nil {
-		domain := strings.TrimSpace(string(out))
-		if domain != "" {
-			return domain, nil
-		}
-	}
-
 	return "", errors.New("failed to discover cluster domain")
 }
 
-func getOCToken(ctx context.Context) (string, error) {
+func getAuthToken(tc *TestContext) string {
 	if token := os.Getenv("OC_TOKEN"); token != "" {
-		return token, nil
+		return token
 	}
-
-	cmd := exec.CommandContext(ctx, "oc", "whoami", "-t")
-	out, err := cmd.Output()
-	if err == nil {
-		token := strings.TrimSpace(string(out))
-		if token != "" {
-			return token, nil
-		}
-	}
-
-	return "", errors.New("failed to obtain OpenShift authentication token")
+	return tc.AuthToken()
 }
 
 func sendCompletion(ctx context.Context, routeHost, ocToken string) error {
@@ -258,10 +235,7 @@ func formatOatsCommand(env []string, args []string) string {
 		if !found || !wanted[name] {
 			continue
 		}
-		if name == "GRAFANA_TOKEN" {
-			assignments = append(assignments, "GRAFANA_TOKEN=$(oc whoami -t)")
-			continue
-		}
+
 		assignments = append(assignments, name+"="+shellQuote(value))
 	}
 	command := make([]string, 0, len(assignments)+len(args))
@@ -434,7 +408,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	t.Logf("Starting %s topology with LLMInferenceService %s", topology, llmSvcNN)
 	if topology == "multi-node" {
 		checkCtx, cancel := context.WithTimeout(tc.Context(), 10*time.Second)
-		err := runOC(checkCtx, "get", "crd", "leaderworkersets.leaderworkerset.x-k8s.io")
+		err := ensureCRDExists(checkCtx, tc, "leaderworkersets.leaderworkerset.x-k8s.io")
 		cancel()
 		if err != nil {
 			t.Fatalf("multi-node LLMInferenceService requires the LeaderWorkerSet CRD/operator: %v", err)
@@ -574,8 +548,8 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		return discoveryErr
 	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "generated inference Service should become discoverable")
 	t.Logf("[%s] Using inference Service %s on port %d", topology, inferenceService, inferencePort)
-	ocToken, err := getOCToken(tc.Context())
-	require.NoError(t, err, "failed to obtain OpenShift authentication token")
+	ocToken := getAuthToken(tc)
+	require.NotEmpty(t, ocToken, "Kubernetes bearer token is required for the OAuth proxy request")
 
 	routeHost := llmSvcName + "." + clusterDomain
 
@@ -743,44 +717,33 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 
 func logManualCleanupCommands(t *testing.T, topology, llmSvcName, proxyName, tlsSecretName, cookieSecretName, bindingName, saName string) {
 	t.Helper()
-	t.Logf("[%s] NO_CLEANUP=1; manually clean up the retained resources with:", topology)
-	for _, command := range []string{
-		fmt.Sprintf("oc delete llminferenceservice.serving.kserve.io/%s -n default --ignore-not-found", llmSvcName),
-		fmt.Sprintf("oc delete route/%s -n default --ignore-not-found", proxyName),
-		fmt.Sprintf("oc delete deployment/%s -n default --ignore-not-found", proxyName),
-		fmt.Sprintf("oc delete service/%s -n default --ignore-not-found", proxyName),
-		fmt.Sprintf("oc delete secrets %s %s -n default --ignore-not-found", tlsSecretName, cookieSecretName),
-		fmt.Sprintf("oc delete serviceaccount/%s -n default --ignore-not-found", saName),
-		fmt.Sprintf("oc delete clusterrolebinding/%s --ignore-not-found", bindingName),
-	} {
-		t.Log(command)
-	}
+	t.Logf("[%s] NO_CLEANUP=1; retained resources: LLMInferenceService/%s, Route/%s, Deployment/%s, Service/%s, Secrets/%s and %s, ServiceAccount/%s, ClusterRoleBinding/%s", topology, llmSvcName, proxyName, proxyName, proxyName, tlsSecretName, cookieSecretName, saName, bindingName)
 }
 
-func runOC(ctx context.Context, args ...string) error {
-	cmd := exec.CommandContext(ctx, "oc", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("oc %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
-	}
-	return nil
-}
-
-func ensureOAuthProxySecret(ctx context.Context) error {
+func ensureOAuthProxySecret(tc *TestContext) error {
 	const (
 		secretName = "oauth-proxy-secrets"
 		namespace  = "redhat-ods-monitoring"
 	)
-	if err := runOC(ctx, "get", "secret", secretName, "-n", namespace); err == nil {
+	secret := &unstructured.Unstructured{}
+	secret.SetGroupVersionKind(gvk.Secret)
+	err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: secretName, Namespace: namespace}, secret)
+	if err == nil {
 		return nil
+	}
+	if !k8serrors.IsNotFound(err) {
+		return fmt.Errorf("get OAuth proxy session secret: %w", err)
 	}
 
 	var sessionSecret [32]byte
 	if _, err := rand.Read(sessionSecret[:]); err != nil {
 		return fmt.Errorf("generate OAuth proxy session secret: %w", err)
 	}
-	encodedSecret := base64.StdEncoding.EncodeToString(sessionSecret[:])
-	if err := runOC(ctx, "create", "secret", "generic", secretName, "-n", namespace, "--from-literal=session_secret="+encodedSecret); err != nil {
+	secret.Object["type"] = "Opaque"
+	secret.Object["data"] = map[string]any{"session_secret": base64.StdEncoding.EncodeToString(sessionSecret[:])}
+	secret.SetName(secretName)
+	secret.SetNamespace(namespace)
+	if err := tc.Client().Create(tc.Context(), secret); err != nil {
 		return fmt.Errorf("create OAuth proxy session secret: %w", err)
 	}
 	return nil
@@ -790,26 +753,94 @@ func inferencePrerequisiteDir(projectRoot string) string {
 	return filepath.Join(projectRoot, "tests", "e2e", "prerequisites", "inference")
 }
 
-func setupInferencePrerequisites(t *testing.T, projectRoot string) {
+func ensureCRDExists(ctx context.Context, tc *TestContext, name string) error {
+	crd := &unstructured.Unstructured{}
+	crd.SetGroupVersionKind(schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"})
+	if err := tc.Client().Get(ctx, types.NamespacedName{Name: name}, crd); err != nil {
+		return err
+	}
+	return nil
+}
+
+func applyManifest(tc *TestContext, path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	decoder := utilyaml.NewYAMLOrJSONDecoder(file, 4096)
+	for {
+		object := map[string]any{}
+		if err := decoder.Decode(&object); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		if len(object) == 0 {
+			continue
+		}
+		resource := &unstructured.Unstructured{Object: object}
+		key := types.NamespacedName{Name: resource.GetName(), Namespace: resource.GetNamespace()}
+		current := &unstructured.Unstructured{}
+		current.SetGroupVersionKind(resource.GroupVersionKind())
+		getErr := tc.Client().Get(tc.Context(), key, current)
+		if k8serrors.IsNotFound(getErr) {
+			if err := tc.Client().Create(tc.Context(), resource); err != nil {
+				return fmt.Errorf("create %s/%s: %w", resource.GroupVersionKind(), key, err)
+			}
+			continue
+		}
+		if getErr != nil {
+			return getErr
+		}
+		resource.SetResourceVersion(current.GetResourceVersion())
+		if err := tc.Client().Update(tc.Context(), resource); err != nil {
+			return fmt.Errorf("update %s/%s: %w", resource.GroupVersionKind(), key, err)
+		}
+	}
+}
+
+func waitForCondition(tc *TestContext, g schema.GroupVersionKind, nn types.NamespacedName, conditionType string) error {
+	resource := &unstructured.Unstructured{}
+	resource.SetGroupVersionKind(g)
+	if err := tc.Client().Get(tc.Context(), nn, resource); err != nil {
+		return err
+	}
+	conditions, found, err := unstructured.NestedSlice(resource.Object, "status", "conditions")
+	if err != nil || !found {
+		return fmt.Errorf("%s/%s has no status conditions", g.Kind, nn)
+	}
+	for _, raw := range conditions {
+		condition, ok := raw.(map[string]any)
+		if ok && condition["type"] == conditionType && condition["status"] == "True" {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s/%s condition %s is not True", g.Kind, nn, conditionType)
+}
+
+func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot string) {
 	t.Helper()
 	g := gomega.NewWithT(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	waitFor := func(description string, args ...string) {
+	waitFor := func(description string, gvk schema.GroupVersionKind, nn types.NamespacedName, condition string) {
 		t.Logf("Waiting for %s", description)
 		g.Eventually(func() error {
-			return runOC(ctx, args...)
+			return waitForCondition(tc, gvk, nn, condition)
 		}, 5*time.Minute, 2*time.Second).Should(gomega.Succeed(), description)
 		t.Logf("Completed wait: %s", description)
 	}
 	dir := inferencePrerequisiteDir(projectRoot)
-	applyManifest := func(name string) {
+	applyPrerequisite := func(name string) {
 		path := filepath.Join(dir, name)
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("inference prerequisite manifest %s is unavailable: %v", path, err)
 		}
-		if err := runOC(ctx, "apply", "-f", path); err != nil {
+		if err := applyManifest(tc, path); err != nil {
 			t.Fatalf("failed to apply inference prerequisite %s: %v", name, err)
 		}
 	}
@@ -820,28 +851,24 @@ func setupInferencePrerequisites(t *testing.T, projectRoot string) {
 		"datascienceclusters.datasciencecluster.opendatahub.io",
 		"uiplugins.observability.openshift.io",
 	} {
-		waitFor("CRD "+crd+" should be established", "wait", "--for=condition=Established", "crd/"+crd, "--timeout=300s")
+		waitFor("CRD "+crd+" should be established", schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, types.NamespacedName{Name: crd}, "Established")
 	}
 	for _, name := range []string{"dsci.yaml", "dsc.yaml", "coo-uiplugins.yaml"} {
-		applyManifest(name)
+		applyPrerequisite(name)
 	}
-	waitFor("DSCI default-dsci should be Ready", "wait", "--for=condition=Ready", "dsci/default-dsci", "--timeout=300s")
-	waitFor("DSC default-dsc should be Ready", "wait", "--for=condition=Ready", "dsc/default-dsc", "--timeout=300s")
+	waitFor("DSCI default-dsci should be Ready", schema.GroupVersionKind{Group: "dscinitialization.opendatahub.io", Version: "v2", Kind: "DSCInitialization"}, types.NamespacedName{Name: "default-dsci"}, "Ready")
+	waitFor("DSC default-dsc should be Ready", schema.GroupVersionKind{Group: "datasciencecluster.opendatahub.io", Version: "v2", Kind: "DataScienceCluster"}, types.NamespacedName{Name: "default-dsc"}, "Ready")
 
 	t.Log("Setting up LGTM and remaining inference prerequisites")
-	applyManifest("lwsoperator.yaml")
-	waitFor(
-		"CRD leaderworkersets.leaderworkerset.x-k8s.io should be established",
-		"wait", "--for=condition=Established", "crd/leaderworkersets.leaderworkerset.x-k8s.io", "--timeout=300s",
-	)
-	waitFor("CRD llminferenceservices.serving.kserve.io should be established", "wait", "--for=condition=Established", "crd/llminferenceservices.serving.kserve.io", "--timeout=300s")
-	if err := ensureOAuthProxySecret(ctx); err != nil {
+	applyPrerequisite("lwsoperator.yaml")
+	waitFor("CRD leaderworkersets.leaderworkerset.x-k8s.io should be established", schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, types.NamespacedName{Name: "leaderworkersets.leaderworkerset.x-k8s.io"}, "Established")
+	waitFor("CRD llminferenceservices.serving.kserve.io should be established", schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, types.NamespacedName{Name: "llminferenceservices.serving.kserve.io"}, "Established")
+	if err := ensureOAuthProxySecret(tc); err != nil {
 		t.Fatalf("failed to ensure OAuth proxy cookie Secret: %v", err)
 	}
-	applyManifest("lgtm.yaml")
-	waitFor("RHOAI operator should be Available", "wait", "--for=condition=Available", "deployment/rhods-operator", "-n", "redhat-ods-operator", "--timeout=300s")
-	waitFor("LGTM should be Available", "wait", "--for=condition=Available", "deployment/lgtm", "-n", "redhat-ods-monitoring", "--timeout=300s")
-	waitFor("LGTM Route should have a host", "wait", "--for=jsonpath={.spec.host}", "route/lgtm", "-n", "redhat-ods-monitoring", "--timeout=300s")
+	applyPrerequisite("lgtm.yaml")
+	waitFor("RHOAI operator should be Available", schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}, types.NamespacedName{Name: "rhods-operator", Namespace: "redhat-ods-operator"}, "Available")
+	waitFor("LGTM should be Available", schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}, types.NamespacedName{Name: "lgtm", Namespace: "redhat-ods-monitoring"}, "Available")
 	for _, endpoint := range []struct{ service, namespace string }{
 		{"rhods-operator-service", "redhat-ods-operator"},
 		{"kserve-webhook-server-service", "redhat-ods-applications"},
@@ -849,14 +876,26 @@ func setupInferencePrerequisites(t *testing.T, projectRoot string) {
 		{"lgtm", "redhat-ods-monitoring"},
 	} {
 		g.Eventually(func() bool {
-			// endpoint values come from a fixed test list.
-			//nolint:gosec // endpoint values come from a fixed test list.
-			cmd := exec.CommandContext(
-				ctx, "oc", "get", "endpoints", endpoint.service, "-n", endpoint.namespace,
-				"-o", "jsonpath={.subsets[*].addresses[*].ip}",
-			)
-			output, err := cmd.Output()
-			return err == nil && strings.TrimSpace(string(output)) != ""
+			endpoints := &unstructured.Unstructured{}
+			endpoints.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Endpoints"})
+			if err := tc.Client().Get(ctx, types.NamespacedName{Name: endpoint.service, Namespace: endpoint.namespace}, endpoints); err != nil {
+				return false
+			}
+			subsets, found, _ := unstructured.NestedSlice(endpoints.Object, "subsets")
+			if !found {
+				return false
+			}
+			for _, rawSubset := range subsets {
+				subset, ok := rawSubset.(map[string]any)
+				if !ok {
+					continue
+				}
+				addresses, _, _ := unstructured.NestedSlice(subset, "addresses")
+				if len(addresses) > 0 {
+					return true
+				}
+			}
+			return false
 		}, 5*time.Minute, 2*time.Second).Should(gomega.BeTrue(), "endpoints for %s/%s should be ready", endpoint.namespace, endpoint.service)
 	}
 }
@@ -873,9 +912,9 @@ func TestLLMInferenceService(t *testing.T) {
 	projectRoot, err := findProjectRoot()
 	require.NoError(t, err)
 
-	setupInferencePrerequisites(t, projectRoot)
+	setupInferencePrerequisites(t, tc, projectRoot)
 	oatsBin := ensureOatsBinary(t, projectRoot)
-	oatsEnv := buildOatsEnv(t)
+	oatsEnv := buildOatsEnv(t, tc)
 
 	topologies := []string{"single-node", "multi-node", "disaggregated"}
 

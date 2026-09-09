@@ -24,6 +24,7 @@ import (
 type TestContext struct {
 	t                   *testing.T
 	client              client.Client
+	authToken           string
 	ctx                 context.Context //nolint:containedctx // TestContext carries a long-lived background context for the entire test suite
 	g                   *WithT
 	Timeouts            TestTimeouts
@@ -42,6 +43,10 @@ func (tc *TestContext) Client() client.Client {
 
 func (tc *TestContext) Context() context.Context {
 	return tc.ctx
+}
+
+func (tc *TestContext) AuthToken() string {
+	return tc.authToken
 }
 
 func NewTestContext(t *testing.T) (*TestContext, error) {
@@ -66,6 +71,7 @@ func NewTestContext(t *testing.T) (*TestContext, error) {
 	return &TestContext{
 		t:                   t,
 		client:              ctrlCli,
+		authToken:           cfg.BearerToken,
 		ctx:                 context.Background(),
 		g:                   g,
 		Timeouts:            testOpts.Timeouts,
