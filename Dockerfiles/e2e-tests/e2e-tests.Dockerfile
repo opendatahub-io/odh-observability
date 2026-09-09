@@ -46,7 +46,9 @@ COPY --from=builder /oats/bin/oats /usr/local/bin/oats
 COPY --from=builder /gotestsum /usr/local/bin/gotestsum
 COPY --from=builder /test2json /usr/local/bin/test2json
 COPY --from=builder /e2e-run .
-RUN mkdir -p /artifacts && chown ${USER_ID}:${USER_ID} /artifacts
+RUN mkdir -p /artifacts /e2e/.cache /e2e/.config && \
+    chown -R ${USER_ID}:${USER_ID} /e2e /artifacts && \
+    chmod 0777 /e2e/.cache /e2e/.config
 
 USER ${USER_ID}:${USER_ID}
 
