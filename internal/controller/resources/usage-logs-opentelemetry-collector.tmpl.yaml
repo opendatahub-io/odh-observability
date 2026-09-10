@@ -47,8 +47,7 @@ spec:
             from_attribute: log_name
           - action: upsert
             key: kubernetes_namespace_name
-            # from_attribute: service.namespace
-            value: {{.GatewayNamespace}}
+            from_attribute: service.namespace
 
       # separate resource logs blocks so no overrides of the shared block upstream host value for k8s attributes correct information
       groupbyattrs/upstream_host:
@@ -152,9 +151,9 @@ spec:
             statements:
               - delete_key(resource.attributes, "upstream_host")
               - delete_key(resource.attributes, "k8s.pod.ip")
-              - delete_key(resource.attributes, "log_name")
               - delete_key(resource.attributes, "service.namespace")
               # envoy specific replaced by gateway k8sattributes
+              - delete_key(resource.attributes, "log_name")
               - delete_key(resource.attributes, "cluster_name") 
               - delete_key(resource.attributes, "node_name")
 
