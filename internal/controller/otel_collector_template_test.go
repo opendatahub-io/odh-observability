@@ -10,7 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-func TestDCGMRenameRulesInMetricRelabelConfigs(t *testing.T) {
+func TestDCGMMetricsAreRetainedWithOriginalNames(t *testing.T) {
 	templateBytes, err := resourcesFS.ReadFile(OpenTelemetryCollectorTemplate)
 	if err != nil {
 		t.Fatalf("failed to read template: %v", err)
@@ -32,7 +32,7 @@ func TestDCGMRenameRulesInMetricRelabelConfigs(t *testing.T) {
 		t.Fatal("metric_relabel_configs section must be extractable from dcgm job")
 	}
 
-	dcgmRenameMetrics := []string{
+	dcgmMetrics := []string{
 		"DCGM_FI_DEV_GPU_TEMP",
 		"DCGM_FI_DEV_GPU_UTIL",
 		"DCGM_FI_PROF_GR_ENGINE_ACTIVE",
@@ -44,34 +44,30 @@ func TestDCGMRenameRulesInMetricRelabelConfigs(t *testing.T) {
 		"DCGM_FI_DEV_MEM_CLOCK",
 	}
 
-	for _, metric := range dcgmRenameMetrics {
+	for _, metric := range dcgmMetrics {
 		if strings.Contains(relabelSection, metric) {
-			t.Errorf("rename rule for %s must not be in relabel_configs (__name__ unavailable at target-discovery stage)", metric)
+			t.Errorf("metric %s must not be referenced in relabel_configs", metric)
 		}
 		if !strings.Contains(metricRelabelSection, metric) {
-			t.Errorf("rename rule for %s must be in metric_relabel_configs (post-scrape stage)", metric)
+			t.Errorf("metric %s must be retained by metric_relabel_configs", metric)
 		}
 	}
 
 	if strings.Contains(relabelSection, "__name__") {
 		t.Error("relabel_configs must not reference __name__ (unavailable at target-discovery stage)")
 	}
-
-	engineRule := strings.Join([]string{
-		"- action: replace",
-		"                  regex: 'DCGM_FI_PROF_GR_ENGINE_ACTIVE'",
-		"                  replacement: 'nvidia_gpu_engine_active_ratio'",
-	}, "\n")
-	if !strings.Contains(metricRelabelSection, engineRule) {
-		t.Error("DCGM_FI_PROF_GR_ENGINE_ACTIVE must be renamed to nvidia_gpu_engine_active_ratio")
+	if strings.Contains(metricRelabelSection, "target_label: __name__") {
+		t.Error("DCGM metric names must not be renamed in metric_relabel_configs")
 	}
+
 	keepRuleStart := strings.LastIndex(metricRelabelSection, "- source_labels: [__name__]")
 	keepRule := ""
 	if keepRuleStart != -1 {
 		keepRule = metricRelabelSection[keepRuleStart:]
 	}
-	if !strings.Contains(keepRule, "action: keep") || !strings.Contains(keepRule, "nvidia_gpu_engine_active_ratio") {
-		t.Error("nvidia_gpu_engine_active_ratio must be included in the final keep list")
+	expectedKeepRegex := "(" + strings.Join(dcgmMetrics, "|") + ")"
+	if !strings.Contains(keepRule, "action: keep") || !strings.Contains(keepRule, "regex: '"+expectedKeepRegex+"'") {
+		t.Error("DCGM metrics must be included in the final keep list")
 	}
 }
 
@@ -90,20 +86,29 @@ func TestOpenTelemetryCollectorTemplateRendersValidGPUConfig(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("GPU metric transform processor must be present: found=%t, error=%v", found, err)
 	}
-	metricStatements := stringValue(transform["metric_statements"])
-	for _, metric := range []string{
-		"nvidia_gpu_utilization_ratio",
-		"nvidia_gpu_memory_utilization_ratio",
-	} {
-		if !strings.Contains(metricStatements, metric) {
-			t.Errorf("GPU metric transform must scale %s", metric)
+	metricStatements, ok := transform["metric_statements"].([]any)
+	if !ok || len(metricStatements) != 1 {
+		t.Fatalf("GPU metric transform must contain one metric statement block, got %v", transform["metric_statements"])
+	}
+	statementBlock, ok := metricStatements[0].(map[string]any)
+	if !ok {
+		t.Fatalf("GPU metric statement block has unexpected type: %T", metricStatements[0])
+	}
+	statements, ok := statementBlock["statements"].([]any)
+	if !ok {
+		t.Fatalf("GPU metric transform statements have unexpected type: %T", statementBlock["statements"])
+	}
+	expectedStatements := []string{
+		`set(datapoint.double_value, datapoint.double_value / 100) where metric.name == "DCGM_FI_DEV_GPU_UTIL"`,
+		`set(datapoint.double_value, datapoint.double_value / 100) where metric.name == "DCGM_FI_DEV_MEM_COPY_UTIL"`,
+	}
+	if len(statements) != len(expectedStatements) {
+		t.Fatalf("expected %d GPU scaling statements, got %d", len(expectedStatements), len(statements))
+	}
+	for index, expected := range expectedStatements {
+		if statements[index] != expected {
+			t.Errorf("GPU metric statement %d: got %v, want %s", index, statements[index], expected)
 		}
-	}
-	if !strings.Contains(metricStatements, "datapoint.double_value / 100") {
-		t.Error("GPU metric transform must scale percentage values to ratios")
-	}
-	if strings.Contains(metricStatements, "metric.name == \"nvidia_gpu_engine_active_ratio\"") {
-		t.Error("nvidia_gpu_engine_active_ratio is already a ratio and must not be rescaled")
 	}
 
 	pipelines, found, err := unstructured.NestedMap(config, "service", "pipelines", "metrics")
@@ -154,6 +159,17 @@ func TestDCGMMetricRelabelingPreservesDRAAttributionLabels(t *testing.T) {
 			}
 		}
 	}
+	keepRule, ok := metricRelabelConfigs[len(metricRelabelConfigs)-1].(map[string]any)
+	if !ok {
+		t.Fatal("final DCGM metric relabel rule has unexpected type")
+	}
+	if keepRule["action"] != "keep" {
+		t.Fatalf("final DCGM metric relabel rule must be a keep rule: %v", keepRule)
+	}
+	sourceLabels, ok := keepRule["source_labels"].([]any)
+	if !ok || len(sourceLabels) != 1 || sourceLabels[0] != "__name__" {
+		t.Fatalf("DCGM keep rule must match only __name__ so DRA labels are preserved: %v", keepRule)
+	}
 }
 
 func renderCollectorTemplate(t *testing.T) unstructured.Unstructured {
@@ -183,10 +199,6 @@ func renderCollectorTemplate(t *testing.T) unstructured.Unstructured {
 		t.Fatalf("expected one rendered collector resource, got %d", len(resources))
 	}
 	return resources[0]
-}
-
-func stringValue(value any) string {
-	return fmt.Sprint(value)
 }
 
 func containsString(value any, want string) bool {
