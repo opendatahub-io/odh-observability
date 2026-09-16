@@ -117,6 +117,11 @@ spec:
                   source_labels: [__name__]
                   target_label: __name__
                 - action: replace
+                  regex: 'DCGM_FI_PROF_GR_ENGINE_ACTIVE'
+                  replacement: 'nvidia_gpu_engine_active_ratio'
+                  source_labels: [__name__]
+                  target_label: __name__
+                - action: replace
                   regex: 'DCGM_FI_DEV_MEM_COPY_UTIL'
                   replacement: 'nvidia_gpu_memory_utilization_ratio'
                   source_labels: [__name__]
@@ -146,13 +151,8 @@ spec:
                   replacement: 'nvidia_gpu_memory_clock_mhz'
                   source_labels: [__name__]
                   target_label: __name__
-                # Convert DCGM percentage metrics to ratios (0-1 scale) for OCP compatibility
                 - source_labels: [__name__]
-                  regex: 'nvidia_gpu_(utilization|memory_utilization)_ratio'
-                  target_label: __tmp_scale_needed
-                  replacement: 'true'
-                - source_labels: [__name__]
-                  regex: '(nvidia_gpu_temperature_celsius|nvidia_gpu_utilization_ratio|nvidia_gpu_memory_utilization_ratio|nvidia_gpu_memory_used_bytes|nvidia_gpu_memory_free_bytes|nvidia_gpu_power_usage_watts|nvidia_gpu_sm_clock_mhz|nvidia_gpu_memory_clock_mhz)'
+                  regex: '(nvidia_gpu_temperature_celsius|nvidia_gpu_utilization_ratio|nvidia_gpu_engine_active_ratio|nvidia_gpu_memory_utilization_ratio|nvidia_gpu_memory_used_bytes|nvidia_gpu_memory_free_bytes|nvidia_gpu_power_usage_watts|nvidia_gpu_sm_clock_mhz|nvidia_gpu_memory_clock_mhz)'
                   action: keep
               scrape_interval: 30s
               scrape_timeout: 10s
@@ -174,6 +174,14 @@ spec:
       k8sattributes: {}
       resourcedetection:
         detectors: [openshift]
+      transform/gpu_metrics:
+        error_mode: propagate
+        metric_statements:
+          - context: datapoint
+            statements:
+              - set(datapoint.double_value, datapoint.double_value / 100) where metric.name == "nvidia_gpu_utilization_ratio"
+              - set(datapoint.double_value, datapoint.double_value / 100) where metric.name == "nvidia_gpu_engine_active_ratio"
+              - set(datapoint.double_value, datapoint.double_value / 100) where metric.name == "nvidia_gpu_memory_utilization_ratio"
     exporters:
       prometheus/monitoring:
         endpoint: 0.0.0.0:8890
@@ -237,6 +245,6 @@ spec:
       {{- if .Metrics }}
         metrics:
           receivers: [prometheus, otlp]
-          processors: [memory_limiter, k8sattributes, resourcedetection, batch]
+          processors: [memory_limiter, k8sattributes, resourcedetection, transform/gpu_metrics, batch]
           exporters: [prometheus{{- if .MetricsExporterNames }}{{- range .MetricsExporterNames }}, {{ . }}{{- end }}{{- end }}]
       {{- end }}
