@@ -21,7 +21,7 @@ The operator watches a singleton `Monitoring` CR (`services.platform.opendatahub
 
 ### Prerequisites
 
-- Go 1.25+
+- Go 1.26+
 - An OpenShift cluster with `KUBECONFIG` configured
 - One or more of: Cluster Observability Operator, Tempo Operator, OpenTelemetry Operator, cert-manager
 

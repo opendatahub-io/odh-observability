@@ -313,7 +313,10 @@ func TestIsLocalServiceEndpoint(t *testing.T) {
 		{"http://localhost:9090", true},
 		{"http://127.0.0.1:9090", true},
 		{"http://127.0.0.2:9090", true},
-		{"http://::1:9090", true},
+		{"http://[::1]:9090", true},
+		// Bracketless IPv6 authorities are malformed per RFC 3986. Go 1.26's
+		// net/url rejects them, so they are not recognised as local.
+		{"http://::1:9090", false},
 		{"http://prometheus.monitoring.svc.cluster.local:9090", true},
 		{"http://myservice.myns.svc:8080", true},
 		{"http://single-hostname:9090", true},
