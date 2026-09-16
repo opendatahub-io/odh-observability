@@ -180,7 +180,6 @@ spec:
           - context: datapoint
             statements:
               - set(datapoint.double_value, datapoint.double_value / 100) where metric.name == "nvidia_gpu_utilization_ratio"
-              - set(datapoint.double_value, datapoint.double_value / 100) where metric.name == "nvidia_gpu_engine_active_ratio"
               - set(datapoint.double_value, datapoint.double_value / 100) where metric.name == "nvidia_gpu_memory_utilization_ratio"
     exporters:
       prometheus/monitoring:

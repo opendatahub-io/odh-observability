@@ -93,7 +93,6 @@ func TestOpenTelemetryCollectorTemplateRendersValidGPUConfig(t *testing.T) {
 	metricStatements := stringValue(transform["metric_statements"])
 	for _, metric := range []string{
 		"nvidia_gpu_utilization_ratio",
-		"nvidia_gpu_engine_active_ratio",
 		"nvidia_gpu_memory_utilization_ratio",
 	} {
 		if !strings.Contains(metricStatements, metric) {
@@ -102,6 +101,9 @@ func TestOpenTelemetryCollectorTemplateRendersValidGPUConfig(t *testing.T) {
 	}
 	if !strings.Contains(metricStatements, "datapoint.double_value / 100") {
 		t.Error("GPU metric transform must scale percentage values to ratios")
+	}
+	if strings.Contains(metricStatements, "metric.name == \"nvidia_gpu_engine_active_ratio\"") {
+		t.Error("nvidia_gpu_engine_active_ratio is already a ratio and must not be rescaled")
 	}
 
 	pipelines, found, err := unstructured.NestedMap(config, "service", "pipelines", "metrics")
