@@ -128,7 +128,9 @@ func platformConfigMapGetForbidden() interceptor.Funcs {
 func operatorConditionListForbidden() interceptor.Funcs {
 	return interceptor.Funcs{
 		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			if list.GetObjectKind().GroupVersionKind().Kind == "OperatorConditionList" {
+			gvk := list.GetObjectKind().GroupVersionKind()
+			if gvk.Group == "operators.coreos.com" &&
+				(gvk.Kind == "OperatorCondition" || gvk.Kind == "OperatorConditionList") {
 				return k8serr.NewForbidden(schema.GroupResource{Resource: "operatorconditions"}, "", errors.New("not allowed"))
 			}
 			return c.List(ctx, list, opts...)

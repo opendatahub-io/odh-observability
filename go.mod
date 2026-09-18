@@ -8,8 +8,8 @@ require (
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/itchyny/gojq v0.12.19
 	github.com/onsi/gomega v1.42.0
-	github.com/opendatahub-io/odh-platform-utilities v0.3.0
-	github.com/openshift/api v0.0.0-20260212193555-c06ab675261f
+	github.com/opendatahub-io/odh-platform-utilities v0.4.0
+	github.com/openshift/api v0.0.0-20260610192510-1b2a074e0bd6
 	github.com/openshift/library-go v0.0.0-20260213153706-03f1709971c5
 	github.com/stretchr/testify v1.11.1
 	gopkg.in/yaml.v3 v3.0.1
@@ -55,7 +55,6 @@ require (
 	github.com/go-openapi/swag/typeutils v0.25.5 // indirect
 	github.com/go-openapi/swag/yamlutils v0.25.5 // indirect
 	github.com/gobwas/glob v0.2.3 // indirect
-	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/gnostic-models v0.7.1 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
