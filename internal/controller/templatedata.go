@@ -30,6 +30,7 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-multierror"
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/olm"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/openshift"
 	"gopkg.in/yaml.v3"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -321,47 +322,49 @@ func kubernetesAPIServerCIDRs(endpointSlices []discoveryv1.EndpointSlice) ([]str
 // the operational error encountered while checking for them.
 func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) error {
 	var allErrors *multierror.Error
+	checkOperator := func(name, missingMessage string) error {
+		_, err := olm.OperatorExists(ctx, c, name)
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, olm.ErrOperatorNotInstalled):
+			allErrors = multierror.Append(allErrors, errors.New(missingMessage))
+			return nil
+		default:
+			return fmt.Errorf("checking OLM operator %q: %w", name, err)
+		}
+	}
 
 	usageLogsConfigured := monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil
 	needsLoki := monitoring.Spec.Logs != nil || usageLogsConfigured
 
 	if monitoring.Spec.Metrics != nil || monitoring.Spec.Traces != nil || usageLogsConfigured {
-		if info, err := operatorExists(ctx, c, opentelemetryOperator); err != nil {
+		if err := checkOperator(opentelemetryOperator, conditions.OpenTelemetryCollectorOperatorMissingMessage); err != nil {
 			return err
-		} else if info == nil {
-			allErrors = multierror.Append(allErrors, errors.New(conditions.OpenTelemetryCollectorOperatorMissingMessage))
 		}
 	}
 
 	if monitoring.Spec.Metrics != nil {
-		if info, err := operatorExists(ctx, c, clusterObservabilityOperator); err != nil {
+		if err := checkOperator(clusterObservabilityOperator, conditions.COOMissingMessage); err != nil {
 			return err
-		} else if info == nil {
-			allErrors = multierror.Append(allErrors, errors.New(conditions.COOMissingMessage))
 		}
 	}
 
 	if monitoring.Spec.Traces != nil {
-		if info, err := operatorExists(ctx, c, tempoOperator); err != nil {
+		if err := checkOperator(tempoOperator, conditions.TempoOperatorMissingMessage); err != nil {
 			return err
-		} else if info == nil {
-			allErrors = multierror.Append(allErrors, errors.New(conditions.TempoOperatorMissingMessage))
 		}
 	}
 
 	if needsLoki {
-		if info, err := operatorExists(ctx, c, lokiOperator); err != nil {
+		if err := checkOperator(lokiOperator, conditions.LokiOperatorMissingMessage); err != nil {
 			return err
-		} else if info == nil {
-			allErrors = multierror.Append(allErrors, errors.New(conditions.LokiOperatorMissingMessage))
 		}
 	}
 
 	if monitoring.Spec.Logs != nil {
-		if info, err := operatorExists(ctx, c, clusterLoggingOperator); err != nil {
+		if err := checkOperator(clusterLoggingOperator, conditions.ClusterLoggingOperatorMissingMessage); err != nil {
 			return err
-		} else if info == nil {
-			allErrors = multierror.Append(allErrors, errors.New(conditions.ClusterLoggingOperatorMissingMessage))
 		}
 	}
 
@@ -369,32 +372,6 @@ func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitori
 		return &missingOperatorsError{err: err}
 	}
 	return nil
-}
-
-// operatorExists checks for an OLM OperatorCondition with the given name prefix.
-// Returns a non-nil sentinel when found, nil when absent.
-func operatorExists(ctx context.Context, c client.Client, prefix string) (*struct{}, error) {
-	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "operators.coreos.com",
-		Version: "v2",
-		Kind:    "OperatorConditionList",
-	})
-	if err := c.List(ctx, list); err != nil {
-		if k8serr.IsNotFound(err) || meta.IsNoMatchError(err) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("listing OperatorConditions: %w", err)
-	}
-	for _, item := range list.Items {
-		// Match exactly or with a "." separator (OLM names OperatorConditions as
-		// "<name>.<version>") to avoid false positives from similarly-prefixed operators.
-		name := item.GetName()
-		if name == prefix || strings.HasPrefix(name, prefix+".") {
-			return &struct{}{}, nil
-		}
-	}
-	return nil, nil
 }
 
 func addMetricsData(metrics *v1alpha1.Metrics, isSNO bool, templateData map[string]any) error {

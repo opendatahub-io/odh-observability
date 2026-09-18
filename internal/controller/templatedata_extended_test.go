@@ -25,6 +25,7 @@ import (
 	"time"
 
 	discoveryv1 "k8s.io/api/discovery/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -48,12 +49,66 @@ func registerOperatorCondition(s *kruntime.Scheme) {
 	}, &unstructured.UnstructuredList{})
 }
 
+func registerClusterExtension(s *kruntime.Scheme) {
+	s.AddKnownTypeWithName(schema.GroupVersionKind{
+		Group: "olm.operatorframework.io", Version: "v1", Kind: "ClusterExtension",
+	}, &unstructured.Unstructured{})
+	s.AddKnownTypeWithName(schema.GroupVersionKind{
+		Group: "olm.operatorframework.io", Version: "v1", Kind: "ClusterExtensionList",
+	}, &unstructured.UnstructuredList{})
+}
+
 func newOperatorCondition(name string) *unstructured.Unstructured {
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: "operators.coreos.com", Version: "v2", Kind: "OperatorCondition",
 	})
 	obj.SetName(name)
+	return obj
+}
+
+func newInstalledClusterExtension(name, packageName string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "olm.operatorframework.io", Version: "v1", Kind: "ClusterExtension",
+	})
+	obj.SetName(name)
+	obj.Object["spec"] = map[string]any{
+		"source": map[string]any{
+			"sourceType": "Catalog",
+			"catalog": map[string]any{
+				"packageName": packageName,
+			},
+		},
+	}
+	obj.Object["status"] = map[string]any{
+		"conditions": []any{
+			map[string]any{
+				"type":   "Installed",
+				"status": "True",
+				"reason": "Succeeded",
+			},
+		},
+		"install": map[string]any{
+			"bundle": map[string]any{
+				"version": "1.0.0",
+			},
+		},
+	}
+	return obj
+}
+
+func newPendingClusterExtension(name, packageName string) *unstructured.Unstructured {
+	obj := newInstalledClusterExtension(name, packageName)
+	obj.Object["status"] = map[string]any{
+		"conditions": []any{
+			map[string]any{
+				"type":   "Installed",
+				"status": "False",
+				"reason": "Progressing",
+			},
+		},
+	}
 	return obj
 }
 
@@ -134,6 +189,87 @@ func TestCheckPreconditions_AllOperatorsPresent(t *testing.T) {
 	err := checkMonitoringPreconditions(context.Background(), cli, m)
 	if err != nil {
 		t.Fatalf("expected no error when all operators present, got: %v", err)
+	}
+}
+
+func TestCheckPreconditions_OLMv1OperatorsPresent(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorCondition(s)
+	registerClusterExtension(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Traces = &v1alpha1.Traces{
+		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+	}
+
+	objects := []kruntime.Object{
+		newInstalledClusterExtension("otel", opentelemetryOperator),
+		newInstalledClusterExtension("coo", clusterObservabilityOperator),
+		newInstalledClusterExtension("tempo", tempoOperator),
+	}
+	cli := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objects...).Build()
+
+	if err := checkMonitoringPreconditions(context.Background(), cli, m); err != nil {
+		t.Fatalf("expected no error for installed OLMv1 operators, got: %v", err)
+	}
+}
+
+func TestCheckPreconditions_OLMv1PendingOperatorIsMissing(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorCondition(s)
+	registerClusterExtension(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+
+	objects := []kruntime.Object{
+		newInstalledClusterExtension("otel", opentelemetryOperator),
+		newPendingClusterExtension("coo", clusterObservabilityOperator),
+	}
+	cli := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objects...).Build()
+
+	err := checkMonitoringPreconditions(context.Background(), cli, m)
+	if err == nil || !strings.Contains(err.Error(), "Cluster Observability Operator") {
+		t.Fatalf("expected missing ClusterObservability operator error, got: %v", err)
+	}
+}
+
+func TestCheckPreconditions_OLMAPIsUnavailableReturnsError(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorCondition(s)
+	registerClusterExtension(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithInterceptorFuncs(interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			gvk := list.GetObjectKind().GroupVersionKind()
+			switch gvk.Group {
+			case "operators.coreos.com":
+				return &meta.NoKindMatchError{
+					GroupKind:        schema.GroupKind{Group: gvk.Group, Kind: "OperatorCondition"},
+					SearchedVersions: []string{gvk.Version},
+				}
+			case "olm.operatorframework.io":
+				return &meta.NoKindMatchError{
+					GroupKind:        schema.GroupKind{Group: gvk.Group, Kind: "ClusterExtension"},
+					SearchedVersions: []string{gvk.Version},
+				}
+			default:
+				return c.List(ctx, list, opts...)
+			}
+		},
+	}).Build()
+
+	err := checkMonitoringPreconditions(context.Background(), cli, m)
+	if err == nil || !meta.IsNoMatchError(err) {
+		t.Fatalf("expected OLM API discovery error, got: %v", err)
+	}
+	var missingErr *missingOperatorsError
+	if errors.As(err, &missingErr) {
+		t.Fatalf("API discovery failure was reported as a missing operator: %v", err)
 	}
 }
 
@@ -362,72 +498,6 @@ func TestCheckPreconditions_PartialOperatorInstallations(t *testing.T) {
 				t.Errorf("installed operator %q was reported missing: %s", tt.unexpectedMissing, errStr)
 			}
 		})
-	}
-}
-
-// --- operatorExists ---
-
-func TestOperatorExists_ExactMatch(t *testing.T) {
-	s := newTestScheme(t)
-	registerOperatorCondition(s)
-
-	op := newOperatorCondition("opentelemetry-operator")
-	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(op).Build()
-
-	info, err := operatorExists(context.Background(), cli, "opentelemetry-operator")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if info == nil {
-		t.Error("expected non-nil for exact match")
-	}
-}
-
-func TestOperatorExists_DotSeparatedMatch(t *testing.T) {
-	s := newTestScheme(t)
-	registerOperatorCondition(s)
-
-	op := newOperatorCondition("opentelemetry-operator.v0.100.0")
-	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(op).Build()
-
-	info, err := operatorExists(context.Background(), cli, "opentelemetry-operator")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if info == nil {
-		t.Error("expected non-nil for dot-separated match")
-	}
-}
-
-func TestOperatorExists_NoMatch(t *testing.T) {
-	s := newTestScheme(t)
-	registerOperatorCondition(s)
-
-	op := newOperatorCondition("some-other-operator.v1.0.0")
-	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(op).Build()
-
-	info, err := operatorExists(context.Background(), cli, "opentelemetry-operator")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if info != nil {
-		t.Error("expected nil when operator is not found")
-	}
-}
-
-func TestOperatorExists_PrefixCollisionPrevented(t *testing.T) {
-	s := newTestScheme(t)
-	registerOperatorCondition(s)
-
-	op := newOperatorCondition("opentelemetry-operator-extra")
-	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(op).Build()
-
-	info, err := operatorExists(context.Background(), cli, "opentelemetry-operator")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if info != nil {
-		t.Error("should not match 'opentelemetry-operator-extra' for prefix 'opentelemetry-operator'")
 	}
 }
 
