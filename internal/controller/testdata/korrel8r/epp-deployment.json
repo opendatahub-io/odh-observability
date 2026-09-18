@@ -1,0 +1,13 @@
+{
+  "apiVersion": "apps/v1",
+  "kind": "Deployment",
+  "metadata": {
+    "name": "llama-router-scheduler",
+    "namespace": "inference",
+    "labels": {
+      "app.kubernetes.io/component": "llminferenceservice-router-scheduler",
+      "app.kubernetes.io/name": "llama",
+      "app.kubernetes.io/part-of": "llminferenceservice"
+    }
+  }
+}

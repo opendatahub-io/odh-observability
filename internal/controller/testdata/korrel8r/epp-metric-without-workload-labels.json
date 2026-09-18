@@ -1,0 +1,7 @@
+{
+  "metric": "controller_runtime_reconcile_total",
+  "labels": {
+    "controller": "inferencepool",
+    "result": "success"
+  }
+}

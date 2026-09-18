@@ -1,0 +1,19 @@
+{
+  "apiVersion": "gateway.networking.k8s.io/v1",
+  "kind": "HTTPRoute",
+  "metadata": {
+    "name": "llama",
+    "namespace": "inference"
+  },
+  "spec": {
+    "rules": [
+      {
+        "backendRefs": [
+          {"name": "llama-epp-service"},
+          {"name": "llama-vllm-service", "namespace": "shared"},
+          {"name": "llama-pool", "kind": "InferencePool", "group": "inference.networking.x-k8s.io"}
+        ]
+      }
+    ]
+  }
+}

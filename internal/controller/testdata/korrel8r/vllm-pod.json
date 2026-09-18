@@ -1,0 +1,27 @@
+{
+  "apiVersion": "v1",
+  "kind": "Pod",
+  "metadata": {
+    "name": "llama-vllm",
+    "namespace": "inference",
+    "labels": {
+      "app.kubernetes.io/component": "llminferenceservice-workload",
+      "app.kubernetes.io/name": "llama",
+      "app.kubernetes.io/part-of": "llminferenceservice",
+      "kserve.io/component": "workload"
+    }
+  },
+  "spec": {
+    "nodeName": "gpu-worker",
+    "containers": [
+      {
+        "name": "main",
+        "resources": {
+          "limits": {
+            "nvidia.com/gpu": "1"
+          }
+        }
+      }
+    ]
+  }
+}

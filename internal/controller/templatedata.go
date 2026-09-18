@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -255,8 +257,37 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		}
 	}
 	templateData["CollectorReplicas"] = collectorReplicas
+	if err := addKorrel8rConfigChecksum(templateData); err != nil {
+		return nil, err
+	}
 
 	return templateData, nil
+}
+
+// addKorrel8rConfigChecksum derives the Pod-template value that restarts
+// Korrel8r when the generated configuration it reads at startup changes.
+func addKorrel8rConfigChecksum(templateData map[string]any) error {
+	configTemplate, err := resourcesFS.ReadFile(Korrel8rConfigTemplate)
+	if err != nil {
+		return fmt.Errorf("reading Korrel8r config template for checksum: %w", err)
+	}
+
+	hash := sha256.New()
+	_, _ = hash.Write(configTemplate)
+	for _, key := range []string{
+		"Metrics",
+		"Traces",
+		"Logs",
+		"ThanosQuerierEndpoint",
+		"TempoQueryEndpoint",
+		"LokiQueryEndpoint",
+		"Korrel8rRequestTimeout",
+		"Korrel8rSessionTimeout",
+	} {
+		_, _ = fmt.Fprintf(hash, "\n%s=%v", key, templateData[key])
+	}
+	templateData["Korrel8rConfigChecksum"] = hex.EncodeToString(hash.Sum(nil))
+	return nil
 }
 
 func addKorrel8rAPIServerData(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring, templateData map[string]any) error {

@@ -1,0 +1,8 @@
+{
+  "metric": "DCGM_FI_DEV_GPU_UTIL",
+  "labels": {
+    "node": "gpu-worker",
+    "exported_namespace": "inference",
+    "exported_pod": "llama-vllm"
+  }
+}

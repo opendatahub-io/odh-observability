@@ -57,10 +57,10 @@ var (
 		Kind:    "InferenceService",
 	}
 
-	// LLMInferenceService (serving.kserve.io/v1alpha1).
+	// LLMInferenceService (serving.kserve.io/v1alpha2).
 	LLMInferenceService = schema.GroupVersionKind{
 		Group:   "serving.kserve.io",
-		Version: "v1alpha1",
+		Version: "v1alpha2",
 		Kind:    "LLMInferenceService",
 	}
 

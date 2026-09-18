@@ -135,8 +135,8 @@ spec:
         metric_statements:
           - context: datapoint
             statements:
-              - set(datapoint.double_value, datapoint.double_value / 100) where metric.name == "DCGM_FI_DEV_GPU_UTIL"
-              - set(datapoint.double_value, datapoint.double_value / 100) where metric.name == "DCGM_FI_DEV_MEM_COPY_UTIL"
+              - set(datapoint.value_double, datapoint.value_double / 100) where metric.name == "DCGM_FI_DEV_GPU_UTIL"
+              - set(datapoint.value_double, datapoint.value_double / 100) where metric.name == "DCGM_FI_DEV_MEM_COPY_UTIL"
     exporters:
       prometheus/monitoring:
         endpoint: 0.0.0.0:8890

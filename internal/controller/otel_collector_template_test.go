@@ -99,8 +99,8 @@ func TestOpenTelemetryCollectorTemplateRendersValidGPUConfig(t *testing.T) {
 		t.Fatalf("GPU metric transform statements have unexpected type: %T", statementBlock["statements"])
 	}
 	expectedStatements := []string{
-		`set(datapoint.double_value, datapoint.double_value / 100) where metric.name == "DCGM_FI_DEV_GPU_UTIL"`,
-		`set(datapoint.double_value, datapoint.double_value / 100) where metric.name == "DCGM_FI_DEV_MEM_COPY_UTIL"`,
+		`set(datapoint.value_double, datapoint.value_double / 100) where metric.name == "DCGM_FI_DEV_GPU_UTIL"`,
+		`set(datapoint.value_double, datapoint.value_double / 100) where metric.name == "DCGM_FI_DEV_MEM_COPY_UTIL"`,
 	}
 	if len(statements) != len(expectedStatements) {
 		t.Fatalf("expected %d GPU scaling statements, got %d", len(expectedStatements), len(statements))

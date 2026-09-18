@@ -1,0 +1,7 @@
+{
+  "labels": {
+    "k8s_namespace_name": "inference",
+    "k8s_pod_name": "llama-vllm"
+  },
+  "line": "inference request completed"
+}

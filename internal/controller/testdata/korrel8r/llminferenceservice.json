@@ -1,0 +1,8 @@
+{
+  "apiVersion": "serving.kserve.io/v1alpha2",
+  "kind": "LLMInferenceService",
+  "metadata": {
+    "name": "llama",
+    "namespace": "inference"
+  }
+}
