@@ -235,6 +235,10 @@ func formatOatsCommand(env []string, args []string) string {
 		if !found || !wanted[name] {
 			continue
 		}
+		if name == "GRAFANA_TOKEN" {
+			assignments = append(assignments, name+"="+shellQuote("<redacted>"))
+			continue
+		}
 
 		assignments = append(assignments, name+"="+shellQuote(value))
 	}
@@ -247,7 +251,7 @@ func formatOatsCommand(env []string, args []string) string {
 }
 
 func shellQuote(value string) string {
-	if value != "" && !strings.ContainsAny(value, " \t\n'\"\\$`") {
+	if value != "" && !strings.ContainsAny(value, " \t\n'\"\\$`<>|&;*?~#()") {
 		return value
 	}
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
@@ -257,9 +261,16 @@ func restartVLLMPod(t *testing.T, tc *TestContext, namespace, llmSvcName string)
 	t.Helper()
 	g := gomega.NewWithT(t)
 
-	podSelector := vllmPodSelector()
-	targetPod, err := readyPodForSelector(tc, namespace, podSelector, "")
+	podSelector := vllmPodSelector(llmSvcName)
+	readyPods, err := readyPodsForSelector(tc, namespace, podSelector)
 	g.Expect(err).NotTo(gomega.HaveOccurred(), "failed to find a ready LLMInferenceService workload pod")
+	targetPod := readyPods[0]
+	initialReadyCount := len(readyPods)
+	initialPodUIDs := make(map[types.UID]struct{}, initialReadyCount)
+	for _, pod := range readyPods {
+		initialPodUIDs[pod.GetUID()] = struct{}{}
+	}
+	targetPodUID := targetPod.GetUID()
 
 	podName := targetPod.GetName()
 	t.Logf("Deleting pod %s in namespace %s for scrape recovery test...", podName, namespace)
@@ -268,29 +279,49 @@ func restartVLLMPod(t *testing.T, tc *TestContext, namespace, llmSvcName string)
 	g.Expect(err).NotTo(gomega.HaveOccurred(), "failed to delete pod %s", podName)
 
 	g.Eventually(func() bool {
-		replacement, findErr := readyPodForSelector(tc, namespace, podSelector, podName)
-		return findErr == nil && replacement != nil
+		readyPods, findErr := readyPodsForSelector(tc, namespace, podSelector)
+		if findErr != nil || len(readyPods) < initialReadyCount {
+			return false
+		}
+
+		hasNewPod := false
+		for _, pod := range readyPods {
+			if pod.GetUID() == targetPodUID {
+				return false
+			}
+			if _, existed := initialPodUIDs[pod.GetUID()]; !existed {
+				hasNewPod = true
+			}
+		}
+		return hasNewPod
 	}, 3*time.Minute, 5*time.Second).Should(gomega.BeTrue(), "New LLMInferenceService workload pod should be recreated and reach Ready state")
 }
 
-func vllmPodSelector() map[string]string {
-	return map[string]string{"app.kubernetes.io/part-of": "llminferenceservice"}
+func vllmPodSelector(llmSvcName string) map[string]string {
+	return map[string]string{
+		"app.kubernetes.io/part-of": "llminferenceservice",
+		"app.kubernetes.io/name":    llmSvcName,
+	}
 }
 
-func readyPodForSelector(tc *TestContext, namespace string, selector map[string]string, excludedName string) (*unstructured.Unstructured, error) {
+func readyPodsForSelector(tc *TestContext, namespace string, selector map[string]string) ([]*unstructured.Unstructured, error) {
 	podList := &unstructured.UnstructuredList{}
 	podList.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "PodList"})
 	if err := tc.Client().List(tc.Context(), podList, client.InNamespace(namespace), client.MatchingLabels(selector)); err != nil {
 		return nil, err
 	}
 
+	readyPods := make([]*unstructured.Unstructured, 0, len(podList.Items))
 	for i := range podList.Items {
 		pod := &podList.Items[i]
-		if pod.GetName() != excludedName && pod.GetDeletionTimestamp() == nil && isReadyPod(pod) {
-			return pod, nil
+		if pod.GetDeletionTimestamp() == nil && isReadyPod(pod) {
+			readyPods = append(readyPods, pod)
 		}
 	}
-	return nil, errors.New("no ready pod matched the LLMInferenceService workload selector")
+	if len(readyPods) == 0 {
+		return nil, errors.New("no ready pod matched the LLMInferenceService workload selector")
+	}
+	return readyPods, nil
 }
 
 func isReadyPod(pod *unstructured.Unstructured) bool {
