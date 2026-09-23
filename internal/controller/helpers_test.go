@@ -346,17 +346,17 @@ func TestDetermineTLSEnabled(t *testing.T) {
 	}{
 		{
 			name:   "nil TLS",
-			traces: &v1alpha1.Traces{Storage: v1alpha1.TracesStorage{Backend: "pv"}},
+			traces: &v1alpha1.Traces{Storage: &v1alpha1.TracesStorage{Backend: "pv"}},
 			want:   false,
 		},
 		{
 			name:   "TLS disabled",
-			traces: &v1alpha1.Traces{Storage: v1alpha1.TracesStorage{Backend: "pv"}, TLS: &v1alpha1.TracesTLS{Enabled: false}},
+			traces: &v1alpha1.Traces{Storage: &v1alpha1.TracesStorage{Backend: "pv"}, TLS: &v1alpha1.TracesTLS{Enabled: false}},
 			want:   false,
 		},
 		{
 			name:   "TLS enabled",
-			traces: &v1alpha1.Traces{Storage: v1alpha1.TracesStorage{Backend: "pv"}, TLS: &v1alpha1.TracesTLS{Enabled: true}},
+			traces: &v1alpha1.Traces{Storage: &v1alpha1.TracesStorage{Backend: "pv"}, TLS: &v1alpha1.TracesTLS{Enabled: true}},
 			want:   true,
 		},
 	}

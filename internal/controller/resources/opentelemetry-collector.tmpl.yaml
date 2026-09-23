@@ -159,6 +159,7 @@ spec:
       {{- end }}
       {{- end }}
       {{- if .Traces }}
+      {{- if .TempoStorage }}
       otlp/tempo:
         # In multitenancy/openshift mode, traces are always sent through the gateway
         # which uses TLS (service-CA signed cert) and requires bearer token auth.
@@ -170,6 +171,7 @@ spec:
         headers:
           # must be set to the tenant name from tempo CR
           X-Scope-OrgID: {{ .Namespace }}
+      {{- end }}
       {{- if .TracesExporterNames }}
       {{- range .TracesExporterNames }}
       {{ . }}:
@@ -195,7 +197,7 @@ spec:
         traces:
           receivers: [otlp]
           processors: [memory_limiter, k8sattributes, resourcedetection, batch]
-          exporters: [otlp/tempo{{- if .TracesExporterNames }}{{- range .TracesExporterNames }}, {{ . }}{{- end }}{{- end }}]
+          exporters: [{{- if .TempoStorage }}otlp/tempo{{- if .TracesExporterNames }}, {{ end }}{{- end }}{{- range $i, $name := .TracesExporterNames }}{{- if $i }}, {{ end }}{{ $name }}{{- end }}]
       {{- end }}
       {{- if .Metrics }}
         metrics:

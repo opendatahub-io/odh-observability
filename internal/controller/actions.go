@@ -175,7 +175,8 @@ func deployTracingStack(
 	cm *conditions.ConditionsManager,
 	sources *[]rendertemplate.TemplateSource,
 ) error {
-	if monitoring.Spec.Traces == nil {
+	if monitoring.Spec.Traces == nil || monitoring.Spec.Traces.Storage == nil {
+		// Exporters-only traces (no storage) send to external backends; skip built-in Tempo.
 		cm.MarkNotConfigured(conditions.ConditionTempoAvailable, conditions.TracesNotConfiguredReason, conditions.TracesNotConfiguredMessage)
 		cm.MarkNotConfigured(conditions.ConditionInstrumentationAvailable, conditions.TracesNotConfiguredReason, conditions.TracesNotConfiguredMessage)
 		return nil
@@ -261,10 +262,10 @@ func deployOpenTelemetryCollector(
 	}
 
 	if monitoring.Spec.Traces != nil {
-		*sources = append(*sources,
-			src(CollectorMLflowRBACTemplate),
-			src(CollectorTempoRBACTemplate),
-		)
+		*sources = append(*sources, src(CollectorMLflowRBACTemplate))
+		if monitoring.Spec.Traces.Storage != nil {
+			*sources = append(*sources, src(CollectorTempoRBACTemplate))
+		}
 	}
 
 	return nil

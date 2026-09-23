@@ -188,13 +188,41 @@ func TestDeployTracingStack_NoTraces(t *testing.T) {
 	}
 }
 
+func TestDeployTracingStack_ExportersOnly_SkipsTempo(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.TempoMonolithic, gvk.Instrumentation)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Traces = &v1alpha1.Traces{
+		Exporters: map[string]runtime.RawExtension{
+			"debug": {Raw: []byte(`{"verbosity":"detailed"}`)},
+		},
+	}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployTracingStack(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(sources) != 0 {
+		t.Errorf("exporters-only traces must not deploy Tempo templates, got %d sources", len(sources))
+	}
+	tempoC := findCondition(m, conditions.ConditionTempoAvailable)
+	if tempoC == nil || tempoC.Status != metav1.ConditionFalse {
+		t.Errorf("TempoAvailable: expected False for exporters-only, got %v", tempoC)
+	}
+}
+
 func TestDeployTracingStack_PVBackend_CRDsPresent(t *testing.T) {
 	s := newActionsTestScheme(t)
 	registerCRDs(s, gvk.TempoMonolithic, gvk.Instrumentation)
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
@@ -222,7 +250,7 @@ func TestDeployTracingStack_S3Backend_CRDsPresent(t *testing.T) {
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendS3, Secret: "my-secret"},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendS3, Secret: "my-secret"},
 	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
@@ -293,7 +321,7 @@ func TestDeployOpenTelemetryCollector_TracesOnly_CRDPresent(t *testing.T) {
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
@@ -318,7 +346,7 @@ func TestDeployOpenTelemetryCollector_MetricsAndTraces_CRDPresent(t *testing.T) 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Metrics = &v1alpha1.Metrics{}
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
@@ -1108,7 +1136,7 @@ func TestDeployKorrel8r_GatedBySignalConfiguration(t *testing.T) {
 			name: "traces",
 			configure: func(m *v1alpha1.Monitoring) {
 				m.Spec.Traces = &v1alpha1.Traces{
-					Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+					Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 				}
 			},
 			wantSources: 4,
@@ -1209,7 +1237,7 @@ func TestDeployKorrel8r_RendersOwnedResourcesAndConfiguredStores(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Metrics = &v1alpha1.Metrics{}
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 	m.Spec.Logs = &v1alpha1.Logs{}
 

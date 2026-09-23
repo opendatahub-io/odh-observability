@@ -153,7 +153,7 @@ func TestCheckPreconditions_TracesRequiresOTelAndTempo(t *testing.T) {
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).Build()
@@ -178,7 +178,7 @@ func TestCheckPreconditions_AllOperatorsPresent(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Metrics = &v1alpha1.Metrics{}
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 
 	otel := newOperatorCondition("opentelemetry-operator.v0.100.0")
@@ -200,7 +200,7 @@ func TestCheckPreconditions_OLMv1OperatorsPresent(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Metrics = &v1alpha1.Metrics{}
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 
 	objects := []kruntime.Object{
@@ -346,7 +346,7 @@ func TestCheckPreconditions_AllFeaturesAndOperatorsPresent(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Metrics = &v1alpha1.Metrics{}
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 	m.Spec.UsageLogs = &v1alpha1.UsageLogs{Storage: &v1alpha1.LokiStorageConfig{}}
 	m.Spec.Logs = &v1alpha1.Logs{Storage: &v1alpha1.LokiStorageConfig{}}
@@ -371,7 +371,7 @@ func TestCheckPreconditions_AllFeaturesReportEachMissingOperatorOnce(t *testing.
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Metrics = &v1alpha1.Metrics{}
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 	m.Spec.UsageLogs = &v1alpha1.UsageLogs{Storage: &v1alpha1.LokiStorageConfig{}}
 	m.Spec.Logs = &v1alpha1.Logs{Storage: &v1alpha1.LokiStorageConfig{}}
@@ -421,7 +421,7 @@ func TestCheckPreconditions_PartialOperatorInstallations(t *testing.T) {
 		{
 			name: "traces with OpenTelemetry installed",
 			configure: func(m *v1alpha1.Monitoring) {
-				m.Spec.Traces = &v1alpha1.Traces{Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV}}
+				m.Spec.Traces = &v1alpha1.Traces{Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV}}
 			},
 			installedOperator: "opentelemetry-operator.v0.158.0-1",
 			expectedMissing:   "Tempo Operator",
@@ -430,7 +430,7 @@ func TestCheckPreconditions_PartialOperatorInstallations(t *testing.T) {
 		{
 			name: "traces with Tempo installed",
 			configure: func(m *v1alpha1.Monitoring) {
-				m.Spec.Traces = &v1alpha1.Traces{Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV}}
+				m.Spec.Traces = &v1alpha1.Traces{Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV}}
 			},
 			installedOperator: "tempo-operator.v0.22.0-2",
 			expectedMissing:   "Red Hat build of OpenTelemetry",
@@ -601,7 +601,7 @@ func TestAddReplicasData_NoStorage(t *testing.T) {
 
 func TestAddTracesTemplateData_PVBackend(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{
+		Storage: &v1alpha1.TracesStorage{
 			Backend: v1alpha1.StorageBackendPV,
 			Size:    "10Gi",
 		},
@@ -613,6 +613,9 @@ func TestAddTracesTemplateData_PVBackend(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
+	if data["TempoStorage"] != true {
+		t.Errorf("TempoStorage: want true, got %v", data["TempoStorage"])
+	}
 	if data["Backend"] != v1alpha1.StorageBackendPV {
 		t.Errorf("Backend: want %q, got %v", v1alpha1.StorageBackendPV, data["Backend"])
 	}
@@ -629,9 +632,32 @@ func TestAddTracesTemplateData_PVBackend(t *testing.T) {
 	}
 }
 
+func TestAddTracesTemplateData_ExportersOnlyWithoutStorage(t *testing.T) {
+	traces := &v1alpha1.Traces{
+		Exporters: map[string]kruntime.RawExtension{
+			"debug": {Raw: []byte(`{"verbosity":"detailed"}`)},
+		},
+	}
+	data := make(map[string]any)
+	err := addTracesTemplateData(data, traces, "test-ns")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if data["TempoStorage"] != false {
+		t.Errorf("TempoStorage: want false, got %v", data["TempoStorage"])
+	}
+	if data["TempoEndpoint"] != "" {
+		t.Errorf("TempoEndpoint: want empty for exporters-only, got %v", data["TempoEndpoint"])
+	}
+	names, ok := data["TracesExporterNames"].([]string)
+	if !ok || len(names) != 1 || names[0] != "debug" {
+		t.Errorf("TracesExporterNames: want [debug], got %v", data["TracesExporterNames"])
+	}
+}
+
 func TestAddTracesTemplateData_S3Backend(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{
+		Storage: &v1alpha1.TracesStorage{
 			Backend: v1alpha1.StorageBackendS3,
 			Secret:  "my-s3-secret",
 		},
@@ -653,7 +679,7 @@ func TestAddTracesTemplateData_S3Backend(t *testing.T) {
 
 func TestAddTracesTemplateData_GCSBackend(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{
+		Storage: &v1alpha1.TracesStorage{
 			Backend: v1alpha1.StorageBackendGCS,
 			Secret:  "my-gcs-secret",
 		},
@@ -675,7 +701,7 @@ func TestAddTracesTemplateData_GCSBackend(t *testing.T) {
 
 func TestAddTracesTemplateData_DefaultSampleRatio(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 	data := make(map[string]any)
 	err := addTracesTemplateData(data, traces, "ns")
@@ -690,7 +716,7 @@ func TestAddTracesTemplateData_DefaultSampleRatio(t *testing.T) {
 
 func TestAddTracesTemplateData_DefaultRetention(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 	data := make(map[string]any)
 	err := addTracesTemplateData(data, traces, "ns")
@@ -705,7 +731,7 @@ func TestAddTracesTemplateData_DefaultRetention(t *testing.T) {
 
 func TestAddTracesTemplateData_CustomRetention(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{
+		Storage: &v1alpha1.TracesStorage{
 			Backend:   v1alpha1.StorageBackendPV,
 			Retention: metav1.Duration{Duration: 48 * time.Hour},
 		},
@@ -723,7 +749,7 @@ func TestAddTracesTemplateData_CustomRetention(t *testing.T) {
 
 func TestAddTracesTemplateData_TLSEnabled(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 		TLS: &v1alpha1.TracesTLS{
 			Enabled:           true,
 			CertificateSecret: "tempo-cert",
@@ -749,7 +775,7 @@ func TestAddTracesTemplateData_TLSEnabled(t *testing.T) {
 
 func TestAddTracesTemplateData_TLSDisabled(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 	data := make(map[string]any)
 	err := addTracesTemplateData(data, traces, "ns")
@@ -767,7 +793,7 @@ func TestAddTracesTemplateData_TLSDisabled(t *testing.T) {
 
 func TestAddTracesTemplateData_WithExporters(t *testing.T) {
 	traces := &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 		Exporters: map[string]kruntime.RawExtension{
 			"otlp/custom": {Raw: []byte(`endpoint: https://collector.example.com:4317`)},
 		},
@@ -945,7 +971,7 @@ func TestBuildTemplateData_Korrel8rConfiguration(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Metrics = &v1alpha1.Metrics{}
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 	m.Spec.Logs = &v1alpha1.Logs{}
 
