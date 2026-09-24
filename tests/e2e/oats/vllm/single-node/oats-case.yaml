@@ -26,7 +26,7 @@ expected:
 
   traces:
     # parentID is "0000000000000000" if absent
-    - traceql: '{ name = "llm_request" && span:parentID = "0000000000000000" }'
+    - traceql: '{ name = "llm_request" && resource.k8s.pod.name =~ "facebook-opt-125m-single-node.*" && span:parentID = "0000000000000000" }'
       count: ">= 1"
-    - traceql: '{ name = "llm_request" && span:parentID != "0000000000000000" }'
+    - traceql: '{ name = "llm_request" && resource.k8s.pod.name =~ "facebook-opt-125m-single-node.*" && span:parentID != "0000000000000000" }'
       count: ">= 1"
