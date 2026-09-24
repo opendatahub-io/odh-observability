@@ -23,6 +23,7 @@ import (
 
 	odhLabels "github.com/opendatahub-io/odh-platform-utilities/pkg/metadata/labels"
 	routev1 "github.com/openshift/api/route/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -122,6 +123,132 @@ func TestDiscoverInferenceNamespaces_NoCRs(t *testing.T) {
 	}
 	if len(namespaces) != 0 {
 		t.Errorf("expected empty namespaces, got %v", namespaces)
+	}
+}
+
+func TestListAllNamespacesIncludesFallbackAndSorts(t *testing.T) {
+	s := newTestScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-b"}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a"}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+			Name:   "redhat-ods-monitoring",
+			Labels: map[string]string{"openshift.io/cluster-monitoring": "true"},
+		}},
+	).Build()
+
+	namespaces, err := listAllNamespaces(context.Background(), cli, "redhat-ods-monitoring")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"redhat-ods-monitoring", "team-a", "team-b"}
+	if len(namespaces) != len(want) {
+		t.Fatalf("expected namespaces %v, got %v", want, namespaces)
+	}
+	for i := range want {
+		if namespaces[i] != want[i] {
+			t.Errorf("namespace %d: want %q, got %q", i, want[i], namespaces[i])
+		}
+	}
+}
+
+func TestIsSystemNamespace(t *testing.T) {
+	tests := []struct {
+		name      string
+		namespace *corev1.Namespace
+		want      bool
+	}{
+		{
+			name:      "kube system namespace",
+			namespace: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: metav1.NamespaceSystem}},
+			want:      true,
+		},
+		{
+			name:      "openshift system namespace",
+			namespace: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "openshift-console"}},
+			want:      true,
+		},
+		{
+			name: "openshift run-level marker",
+			namespace: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+				Name:   "platform-system",
+				Labels: map[string]string{"openshift.io/run-level": "0"},
+			}},
+			want: true,
+		},
+		{
+			name: "cluster monitoring marker",
+			namespace: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+				Name:   "platform-monitoring",
+				Labels: map[string]string{"openshift.io/cluster-monitoring": "true"},
+			}},
+			want: true,
+		},
+		{
+			name: "cluster logging marker",
+			namespace: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+				Name:   "platform-logging",
+				Labels: map[string]string{"openshift.io/cluster-logging": "true"},
+			}},
+			want: true,
+		},
+		{
+			name: "operator namespace",
+			namespace: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+				Name:   "operator-system",
+				Labels: map[string]string{"olm.operatorgroup.uid/example": ""},
+			}},
+			want: true,
+		},
+		{
+			name: "user namespace",
+			namespace: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+				Name:   "team-a",
+				Labels: map[string]string{"opendatahub.io/generated-namespace": "true"},
+			}},
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isSystemNamespace(tc.namespace); got != tc.want {
+				t.Errorf("isSystemNamespace(%q): want %t, got %t", tc.namespace.Name, tc.want, got)
+			}
+		})
+	}
+}
+
+func TestListAllNamespacesFiltersSystemAndTerminatingNamespaces(t *testing.T) {
+	s := newTestScheme(t)
+	deletionTimestamp := metav1.Now()
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-b"}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a"}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: metav1.NamespaceSystem}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+			Name:   "openshift-monitoring",
+			Labels: map[string]string{"openshift.io/cluster-monitoring": "true"},
+		}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+			Name:              "redhat-ods-monitoring",
+			DeletionTimestamp: &deletionTimestamp,
+			Finalizers:        []string{"kubernetes"},
+		}},
+	).Build()
+
+	namespaces, err := listAllNamespaces(context.Background(), cli, "redhat-ods-monitoring")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"team-a", "team-b"}
+	if len(namespaces) != len(want) {
+		t.Fatalf("expected namespaces %v, got %v", want, namespaces)
+	}
+	for i := range want {
+		if namespaces[i] != want[i] {
+			t.Errorf("namespace %d: want %q, got %q", i, want[i], namespaces[i])
+		}
 	}
 }
 

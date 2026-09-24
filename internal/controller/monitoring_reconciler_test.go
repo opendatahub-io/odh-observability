@@ -38,6 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	fakedynamic "k8s.io/client-go/dynamic/fake"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
@@ -49,6 +50,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
+	controllergvk "github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 )
 
 func newTestScheme(t *testing.T) *runtime.Scheme {
@@ -682,6 +684,152 @@ func TestPlatformConfigWatch_EnqueuesMonitoring(t *testing.T) {
 	if reqs[0].Name != v1alpha1.MonitoringInstanceName {
 		t.Errorf("mapped name: want %q, got %q", v1alpha1.MonitoringInstanceName, reqs[0].Name)
 	}
+}
+
+func TestNamespaceWatchPredicate(t *testing.T) {
+	pred := namespaceWatchPredicate()
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a"}}
+
+	if !pred.Create(event.CreateEvent{Object: ns}) {
+		t.Fatal("namespace creates should enqueue Monitoring")
+	}
+	if !pred.Delete(event.DeleteEvent{Object: ns}) {
+		t.Fatal("namespace deletes should enqueue Monitoring")
+	}
+	if pred.Update(event.UpdateEvent{ObjectOld: ns, ObjectNew: ns}) {
+		t.Fatal("namespace updates should not enqueue Monitoring")
+	}
+	if pred.Generic(event.GenericEvent{Object: ns}) {
+		t.Fatal("generic namespace events should not enqueue Monitoring")
+	}
+
+	t.Run("unchanged namespace update is ignored", func(t *testing.T) {
+		if pred.Update(event.UpdateEvent{ObjectOld: ns, ObjectNew: ns.DeepCopy()}) {
+			t.Fatal("unchanged namespace updates should not enqueue Monitoring")
+		}
+	})
+
+	t.Run("system classification change enqueues", func(t *testing.T) {
+		newNamespace := ns.DeepCopy()
+		newNamespace.Labels = map[string]string{"openshift.io/cluster-monitoring": "true"}
+		if !pred.Update(event.UpdateEvent{ObjectOld: ns, ObjectNew: newNamespace}) {
+			t.Fatal("system classification changes should enqueue Monitoring")
+		}
+	})
+
+	t.Run("deletion status change enqueues", func(t *testing.T) {
+		newNamespace := ns.DeepCopy()
+		deletionTimestamp := metav1.Now()
+		newNamespace.DeletionTimestamp = &deletionTimestamp
+		newNamespace.Finalizers = []string{"kubernetes"}
+		if !pred.Update(event.UpdateEvent{ObjectOld: ns, ObjectNew: newNamespace}) {
+			t.Fatal("deletion status changes should enqueue Monitoring")
+		}
+	})
+
+	t.Run("non-namespace update is ignored", func(t *testing.T) {
+		configMap := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "not-a-namespace"}}
+		if pred.Update(event.UpdateEvent{ObjectOld: configMap, ObjectNew: configMap.DeepCopy()}) {
+			t.Fatal("non-namespace updates should not enqueue Monitoring")
+		}
+	})
+}
+
+func TestGarbageCollectionOwnershipAndNamespaceScope(t *testing.T) {
+	monitoring := newMonitoring(v1alpha1.MonitoringInstanceName)
+	monitoring.UID = types.UID("monitoring-owner")
+
+	staleTargetRole := ownedGarbageCollectionTestObject(controllergvk.Role, "team-a", targetAllocatorSecretRBACName, monitoring.UID)
+	staleTargetBinding := ownedGarbageCollectionTestObject(controllergvk.RoleBinding, "team-a", targetAllocatorSecretRBACName, monitoring.UID)
+	otherMonitoringRole := ownedGarbageCollectionTestObject(controllergvk.Role, "team-a", targetAllocatorSecretRBACName, types.UID("other-monitoring"))
+	staleMonitoringConfigMap := ownedGarbageCollectionTestObject(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}, monitoring.Spec.Namespace, "stale-config", monitoring.UID)
+	clusterRole := ownedGarbageCollectionTestObject(controllergvk.ClusterRole, "", "stale-cluster-role", monitoring.UID)
+
+	desiredTargetRole := resourceKey{
+		gvk:       staleTargetRole.GroupVersionKind(),
+		namespace: staleTargetRole.GetNamespace(),
+		name:      staleTargetRole.GetName(),
+	}
+	desired := map[resourceKey]struct{}{desiredTargetRole: {}}
+
+	tests := []struct {
+		name         string
+		obj          unstructured.Unstructured
+		wantMainGC   bool
+		wantTargetGC bool
+		desired      map[resourceKey]struct{}
+	}{
+		{
+			name:         "cross-namespace target Role uses dedicated collector",
+			obj:          staleTargetRole,
+			wantMainGC:   false,
+			wantTargetGC: true,
+		},
+		{
+			name:         "cross-namespace target RoleBinding uses dedicated collector",
+			obj:          staleTargetBinding,
+			wantMainGC:   false,
+			wantTargetGC: true,
+		},
+		{
+			name:         "another Monitoring owner is preserved",
+			obj:          otherMonitoringRole,
+			wantMainGC:   false,
+			wantTargetGC: false,
+		},
+		{
+			name:         "desired target Role is preserved",
+			obj:          staleTargetRole,
+			wantMainGC:   false,
+			wantTargetGC: false,
+			desired:      desired,
+		},
+		{
+			name:         "monitoring namespace resource uses main collector",
+			obj:          staleMonitoringConfigMap,
+			wantMainGC:   true,
+			wantTargetGC: false,
+		},
+		{
+			name:         "cluster-scoped resource uses main collector",
+			obj:          clusterRole,
+			wantMainGC:   true,
+			wantTargetGC: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldCollectOwnedResource(monitoring, test.obj, test.desired, monitoring.Spec.Namespace); got != test.wantMainGC {
+				t.Errorf("main GC eligibility: want %t, got %t", test.wantMainGC, got)
+			}
+			if got := shouldCollectTargetAllocatorRBAC(monitoring, test.obj, test.desired); got != test.wantTargetGC {
+				t.Errorf("TargetAllocator GC eligibility: want %t, got %t", test.wantTargetGC, got)
+			}
+		})
+	}
+
+	withoutUID := monitoring.DeepCopy()
+	withoutUID.UID = ""
+	if shouldCollectTargetAllocatorRBAC(withoutUID, staleTargetRole, nil) {
+		t.Error("GC must fail closed when the Monitoring UID is unavailable")
+	}
+}
+
+func ownedGarbageCollectionTestObject(gvk schema.GroupVersionKind, namespace, name string, ownerUID types.UID) unstructured.Unstructured {
+	controller := true
+	obj := unstructured.Unstructured{Object: map[string]any{}}
+	obj.SetGroupVersionKind(gvk)
+	obj.SetNamespace(namespace)
+	obj.SetName(name)
+	obj.SetOwnerReferences([]metav1.OwnerReference{{
+		APIVersion: v1alpha1.GroupVersion.String(),
+		Kind:       "Monitoring",
+		Name:       v1alpha1.MonitoringInstanceName,
+		UID:        ownerUID,
+		Controller: &controller,
+	}})
+	return obj
 }
 
 func TestKorrel8rEndpointSliceWatch_EnqueuesForKorrel8rAndKubernetesAPI(t *testing.T) {

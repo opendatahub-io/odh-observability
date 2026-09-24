@@ -297,6 +297,7 @@ func (tc *MonitoringTestCtx) ValidateReconciliationStability(t *testing.T) {
 		{gvk.MonitoringStack, MonitoringStackName, tc.MonitoringNamespace, "MonitoringStack", true, false},
 		{gvk.ClusterRoleBinding, "data-science-monitoringstack-alertmanager-prometheus-metrics-reader", "", "alertmanager ClusterRoleBinding", true, true},
 		{gvk.ClusterRoleBinding, "generate-processors-collector-rolebinding", "", "collector ClusterRoleBinding", false, true},
+		{gvk.ClusterRoleBinding, "generate-processors-targetallocator-rolebinding", "", "TargetAllocator ClusterRoleBinding", false, true},
 		{gvk.Service, "data-science-collector-prometheus", tc.MonitoringNamespace, "collector prometheus Service", true, true},
 		{gvk.ConfigMap, "prometheus-web-tls-ca", tc.MonitoringNamespace, "prometheus TLS CA ConfigMap", true, true},
 	}
@@ -760,7 +761,10 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorDeploymentWithMetrics(t *tes
 		WithCondition(And(
 			jq.Match(`.spec.targetAllocator.enabled == true`),
 			jq.Match(`.spec.targetAllocator.serviceAccount == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.spec.targetAllocator.mtls == null`),
 			jq.Match(`.spec.targetAllocator.prometheusCR.enabled == true`),
+			jq.Match(`.spec.targetAllocator.prometheusCR.denyFSAccessThroughSMs == true`),
+			jq.Match(`.spec.targetAllocator.prometheusCR.secretNamespaces | contains(["%s"])`, tc.MonitoringNamespace),
 			jq.Match(`.spec.targetAllocator.prometheusCR.podMonitorSelector.matchLabels."monitoring.opendatahub.io/scrape" == "true"`),
 			jq.Match(`.spec.targetAllocator.prometheusCR.serviceMonitorSelector.matchLabels."monitoring.opendatahub.io/scrape" == "true"`),
 		)),
@@ -891,24 +895,47 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorRBACConfiguration(t *testing
 		WithCondition(And(
 			jq.Match(`.rules[] | select(.apiGroups[] == "monitoring.coreos.com") | .resources | contains(["podmonitors", "servicemonitors"])`),
 			jq.Match(`.rules[] | select(.apiGroups[] == "monitoring.coreos.com") | .verbs | contains(["get", "list", "watch"])`),
+			jq.Match(`[.rules[] | select(.apiGroups[] == "") | select(.resources | contains(["secrets"]))] | length == 0`),
 			jq.Match(`.rules[] | select(.apiGroups[] == "") | .resources | contains(["endpoints"])`),
 			jq.Match(`.rules[] | select(.apiGroups[] == "") | .verbs | contains(["get", "list", "watch"])`),
 			jq.Match(`.rules[] | select(.apiGroups[] == "discovery.k8s.io") | .resources | contains(["endpointslices"])`),
 			jq.Match(`.rules[] | select(.apiGroups[] == "discovery.k8s.io") | .verbs | contains(["get", "list", "watch"])`),
 		)),
-		WithCustomErrorMsg("ClusterRole should grant Target Allocator permissions to watch ServiceMonitors, PodMonitors, Endpoints, and EndpointSlices"),
+		WithCustomErrorMsg("collector discovery ClusterRole should not grant Secret access"),
 	)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
-			Name: "generate-processors-collector-rolebinding",
+			Name: "generate-processors-targetallocator-rolebinding",
 		}),
 		WithCondition(And(
 			jq.Match(`.roleRef.name == "generate-processors-role"`),
 			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
 			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
 		)),
-		WithCustomErrorMsg("ClusterRoleBinding should bind Target Allocator ClusterRole to ServiceAccount"),
+		WithCustomErrorMsg("ClusterRoleBinding should bind discovery permissions to the TargetAllocator ServiceAccount"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Role, types.NamespacedName{
+			Name:      "data-science-collector-targetallocator-secrets",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.rules[] | select(.resources | contains(["secrets"])) | .verbs | contains(["get", "list", "watch"])`)),
+		WithCustomErrorMsg("TargetAllocator namespace Role should grant namespaced Secret reads"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.RoleBinding, types.NamespacedName{
+			Name:      "data-science-collector-targetallocator-secrets",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.name == "data-science-collector-targetallocator-secrets"`),
+			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("TargetAllocator Secret RoleBinding should use the dedicated ServiceAccount"),
 	)
 }
 
@@ -1033,6 +1060,24 @@ func (tc *MonitoringTestCtx) ValidatePrometheusNetworkPolicyAllowsThanosQuerier(
 		tc.withMetricsConfig(),
 	)
 
+	namespaceProxyIngress := `[.spec.ingress[] |
+  select([.from[]?.podSelector.matchLabels.app]
+    | index("data-science-prometheus-namespace-proxy") != null) |
+  .ports[] |
+  select(.protocol == "TCP" and .port == 9090)] | length == 1`
+	clusterProxyIngress := `[.spec.ingress[] |
+  select([.from[]?.podSelector.matchLabels.app]
+    | index("data-science-prometheus-cluster-proxy") != null) |
+  .ports[] |
+  select(.protocol == "TCP" and .port == 9090)] | length == 1`
+	thanosQuerierIngress := `[.spec.ingress[] |
+  select(( [.from[]?.podSelector.matchLabels]
+    | map(select(.["app.kubernetes.io/part-of"] == "ThanosQuerier"
+      and .["app.kubernetes.io/managed-by"] == "observability-operator"))
+    | length) > 0) |
+  .ports[] |
+  select(.protocol == "TCP" and .port == 10901)] | length == 1`
+
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
 		WithCondition(And(
@@ -1052,15 +1097,10 @@ func (tc *MonitoringTestCtx) ValidatePrometheusNetworkPolicyAllowsThanosQuerier(
 			jq.Match(`.metadata.labels["platform.opendatahub.io/part-of"] == "monitoring"`),
 			jq.Match(`.spec.podSelector.matchLabels["app.kubernetes.io/name"] == "prometheus"`),
 			jq.Match(`.spec.podSelector.matchLabels["app.kubernetes.io/instance"] == "data-science-monitoringstack"`),
-			jq.Match(`.spec.policyTypes[0] == "Ingress"`),
-			jq.Match(`.spec.ingress[0].from[0].podSelector.matchLabels.app == "data-science-prometheus-namespace-proxy"`),
-			jq.Match(`.spec.ingress[0].from[1].podSelector.matchLabels.app == "data-science-prometheus-cluster-proxy"`),
-			jq.Match(`.spec.ingress[0].ports[0].protocol == "TCP"`),
-			jq.Match(`.spec.ingress[0].ports[0].port == 9090`),
-			jq.Match(`.spec.ingress[1].from[0].podSelector.matchLabels["app.kubernetes.io/part-of"] == "ThanosQuerier"`),
-			jq.Match(`.spec.ingress[1].from[0].podSelector.matchLabels["app.kubernetes.io/managed-by"] == "observability-operator"`),
-			jq.Match(`.spec.ingress[1].ports[0].protocol == "TCP"`),
-			jq.Match(`.spec.ingress[1].ports[0].port == 10901`),
+			jq.Match(`.spec.policyTypes | contains(["Ingress"])`),
+			jq.Match("%s", namespaceProxyIngress),
+			jq.Match("%s", clusterProxyIngress),
+			jq.Match("%s", thanosQuerierIngress),
 		)),
 		WithCustomErrorMsg("Prometheus NetworkPolicy should allow Thanos Querier ingress on gRPC port 10901"),
 	)
@@ -1154,7 +1194,7 @@ func (tc *MonitoringTestCtx) ValidateCollectorMLflowIntegrationRBAC(t *testing.T
 			jq.Match(`.roleRef.name == "data-science-collector-mlflow-trace-export"`),
 			jq.Match(`(.subjects | length) == 1`),
 			jq.Match(`.subjects[0].kind == "ServiceAccount"`),
-			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.subjects[0].name == "%s"`, CollectorServiceAccount),
 			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
 		)),
 		WithCustomErrorMsg("ClusterRoleBinding should bind collector SA to MLflow trace export ClusterRole"),
@@ -1217,7 +1257,7 @@ func (tc *MonitoringTestCtx) ValidateCollectorTempoTraceExportRBAC(t *testing.T)
 			jq.Match(`.roleRef.name == "data-science-collector-tempo-trace-export"`),
 			jq.Match(`(.subjects | length) == 1`),
 			jq.Match(`.subjects[0].kind == "ServiceAccount"`),
-			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.subjects[0].name == "%s"`, CollectorServiceAccount),
 			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
 		)),
 		WithCustomErrorMsg("ClusterRoleBinding should bind collector SA to Tempo trace export ClusterRole"),

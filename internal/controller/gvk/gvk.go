@@ -292,6 +292,20 @@ var (
 		Kind:    "ClusterRole",
 	}
 
+	// Role (rbac.authorization.k8s.io/v1).
+	Role = schema.GroupVersionKind{
+		Group:   "rbac.authorization.k8s.io",
+		Version: "v1",
+		Kind:    "Role",
+	}
+
+	// RoleBinding (rbac.authorization.k8s.io/v1).
+	RoleBinding = schema.GroupVersionKind{
+		Group:   "rbac.authorization.k8s.io",
+		Version: "v1",
+		Kind:    "RoleBinding",
+	}
+
 	// ClusterRoleBinding (rbac.authorization.k8s.io/v1).
 	ClusterRoleBinding = schema.GroupVersionKind{
 		Group:   "rbac.authorization.k8s.io",

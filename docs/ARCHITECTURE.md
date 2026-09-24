@@ -38,7 +38,7 @@ flowchart TD
 
 ### Precondition Checks
 
-Before any feature deployment, the reconciler verifies that prerequisite operators are installed by checking OLM OperatorConditions:
+Before any feature deployment, the reconciler verifies prerequisite operators through OLM OperatorConditions:
 
 | Operator | Required When |
 |----------|--------------|
@@ -49,6 +49,10 @@ Before any feature deployment, the reconciler verifies that prerequisite operato
 | `cluster-logging` | Cluster log forwarding configured |
 
 If any required operator is missing, `MonitoringDependenciesReady` is set to False with the missing operator names and OperatorHub installation guidance. Reconciliation then stops without error (no retry -- the CRD watch will trigger re-reconciliation when operators are installed). The legacy `MonitoringAvailable` condition is updated in parallel for compatibility.
+
+The metrics TargetAllocator selects labeled ServiceMonitors and PodMonitors cluster-wide because KServe creates its scheduler monitors and per-workload TLS monitors in inference workload namespaces. The collector ServiceAccount has no Secret permissions. A separate TargetAllocator ServiceAccount receives namespace-scoped Roles for the current namespace set and is configured with the same `secretNamespaces` allowlist; namespace events trigger reconciliation so new namespaces receive the binding. `denyFSAccessThroughSMs` prevents selected monitors from making the collector expose file-backed credentials.
+
+The TargetAllocator currently uses its non-mTLS connection mode. TargetAllocator mTLS is deferred until the supported OpenTelemetry Operator webhook bundle can handle cert-manager-backed admission for this configuration.
 
 ## Action Functions
 
@@ -104,7 +108,7 @@ All templates are embedded via `//go:embed` and rendered with Go's `text/templat
 | Template | Resources Created |
 |----------|-------------------|
 | `opentelemetry-collector.tmpl.yaml` | OpenTelemetryCollector CR |
-| `collector-rbac.tmpl.yaml` | RBAC for the collector |
+| `collector-rbac.tmpl.yaml` | Collector discovery RBAC, dedicated TargetAllocator ServiceAccount, and namespace-scoped Secret RBAC |
 | `collector-servicemonitors.tmpl.yaml` | ServiceMonitors for collector metrics |
 | `collector-prometheus-service.tmpl.yaml` | Prometheus receiver service |
 

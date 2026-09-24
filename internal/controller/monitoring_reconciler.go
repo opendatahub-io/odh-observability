@@ -49,6 +49,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -56,14 +57,16 @@ import (
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
+	controllergvk "github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 )
 
 const (
-	monitoringFinalizer = "monitoring.opendatahub.io/cleanup"
-	monitoringPartOf    = "monitoring"
-	platformType        = "OpenDataHub"
-	platformConfigName  = "odh-" + v1alpha1.MonitoringServiceName + "-config"
-	platformVersionKey  = "platformVersion"
+	monitoringFinalizer           = "monitoring.opendatahub.io/cleanup"
+	monitoringPartOf              = "monitoring"
+	platformType                  = "OpenDataHub"
+	platformConfigName            = "odh-" + v1alpha1.MonitoringServiceName + "-config"
+	platformVersionKey            = "platformVersion"
+	targetAllocatorSecretRBACName = "data-science-collector-targetallocator-secrets"
 )
 
 func operatorVersion() string {
@@ -391,24 +394,23 @@ func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v
 		gc.InNamespace(monitoring.Spec.Namespace),
 		gc.WithDeletePropagationPolicy(metav1.DeletePropagationBackground),
 		gc.WithObjectPredicate(func(_ gc.RunParams, obj unstructured.Unstructured) (bool, error) {
-			k := resourceKey{
-				gvk:       obj.GroupVersionKind(),
-				namespace: obj.GetNamespace(),
-				name:      obj.GetName(),
-			}
-			_, inDesired := desiredSet[k]
-			return !inDesired, nil
+			return shouldCollectOwnedResource(monitoring, obj, desiredSet, monitoring.Spec.Namespace), nil
 		}),
 	)
 
-	return collector.Run(ctx, gc.RunParams{
+	params := gc.RunParams{
 		Client:          r.Client,
 		DynamicClient:   r.DynamicClient,
 		DiscoveryClient: r.DiscoveryClient,
 		Owner:           monitoring,
 		Version:         operatorVersion(),
 		PlatformType:    platformType,
-	})
+	}
+	if err := collector.Run(ctx, params); err != nil {
+		return err
+	}
+
+	return r.collectTargetAllocatorRBACGarbage(ctx, params, desiredSet)
 }
 
 // deleteAllOwned removes all resources owned by this controller (used on Removed state).
@@ -421,16 +423,98 @@ func (r *MonitoringReconciler) deleteAllOwned(ctx context.Context, monitoring *v
 		gc.WithLabel(odhLabels.PlatformPartOf, monitoringPartOf),
 		gc.InNamespace(monitoring.Spec.Namespace),
 		gc.WithDeletePropagationPolicy(metav1.DeletePropagationBackground),
+		gc.WithObjectPredicate(func(_ gc.RunParams, obj unstructured.Unstructured) (bool, error) {
+			return isOwnedByMonitoring(monitoring, &obj) && isInMonitoringScope(&obj, monitoring.Spec.Namespace), nil
+		}),
 	)
 
-	return collector.Run(ctx, gc.RunParams{
+	params := gc.RunParams{
 		Client:          r.Client,
 		DynamicClient:   r.DynamicClient,
 		DiscoveryClient: r.DiscoveryClient,
 		Owner:           monitoring,
 		Version:         operatorVersion(),
 		PlatformType:    platformType,
-	})
+	}
+	if err := collector.Run(ctx, params); err != nil {
+		return err
+	}
+
+	return r.collectTargetAllocatorRBACGarbage(ctx, params, nil)
+}
+
+func (r *MonitoringReconciler) collectTargetAllocatorRBACGarbage(
+	ctx context.Context,
+	params gc.RunParams,
+	desiredSet map[resourceKey]struct{},
+) error {
+	collector := gc.New(
+		gc.WithLabel(odhLabels.PlatformPartOf, monitoringPartOf),
+		gc.InNamespace(""),
+		gc.WithDeletePropagationPolicy(metav1.DeletePropagationBackground),
+		gc.WithTypePredicate(func(_ gc.RunParams, gvk schema.GroupVersionKind) (bool, error) {
+			return gvk == controllergvk.Role || gvk == controllergvk.RoleBinding, nil
+		}),
+		gc.WithObjectPredicate(func(_ gc.RunParams, obj unstructured.Unstructured) (bool, error) {
+			return shouldCollectTargetAllocatorRBAC(params.Owner, obj, desiredSet), nil
+		}),
+	)
+
+	return collector.Run(ctx, params)
+}
+
+func shouldCollectOwnedResource(
+	monitoring client.Object,
+	obj unstructured.Unstructured,
+	desiredSet map[resourceKey]struct{},
+	namespace string,
+) bool {
+	if !isOwnedByMonitoring(monitoring, &obj) || !isInMonitoringScope(&obj, namespace) {
+		return false
+	}
+
+	k := resourceKey{
+		gvk:       obj.GroupVersionKind(),
+		namespace: obj.GetNamespace(),
+		name:      obj.GetName(),
+	}
+	_, inDesired := desiredSet[k]
+	return !inDesired
+}
+
+func shouldCollectTargetAllocatorRBAC(
+	monitoring client.Object,
+	obj unstructured.Unstructured,
+	desiredSet map[resourceKey]struct{},
+) bool {
+	if !isTargetAllocatorSecretRBAC(obj) || !isOwnedByMonitoring(monitoring, &obj) {
+		return false
+	}
+
+	k := resourceKey{
+		gvk:       obj.GroupVersionKind(),
+		namespace: obj.GetNamespace(),
+		name:      obj.GetName(),
+	}
+	_, inDesired := desiredSet[k]
+	return !inDesired
+}
+
+func isOwnedByMonitoring(monitoring client.Object, obj metav1.Object) bool {
+	if monitoring.GetUID() == "" {
+		return false
+	}
+	controller := metav1.GetControllerOf(obj)
+	return controller != nil && controller.UID == monitoring.GetUID()
+}
+
+func isInMonitoringScope(obj metav1.Object, namespace string) bool {
+	return obj.GetNamespace() == "" || obj.GetNamespace() == namespace
+}
+
+func isTargetAllocatorSecretRBAC(obj unstructured.Unstructured) bool {
+	return obj.GetName() == targetAllocatorSecretRBACName &&
+		(obj.GroupVersionKind() == controllergvk.Role || obj.GroupVersionKind() == controllergvk.RoleBinding)
 }
 
 // patchStatus uses MergePatch to update the status subresource.
@@ -501,6 +585,23 @@ func isKorrel8rEndpointSlice(obj client.Object) bool {
 		serviceName == Korrel8rServiceName
 }
 
+func namespaceWatchPredicate() predicate.Funcs {
+	return predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool { return true },
+		DeleteFunc: func(event.DeleteEvent) bool { return true },
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldNamespace, oldOK := e.ObjectOld.(*corev1.Namespace)
+			newNamespace, newOK := e.ObjectNew.(*corev1.Namespace)
+			if !oldOK || !newOK {
+				return false
+			}
+			return (oldNamespace.DeletionTimestamp != nil) != (newNamespace.DeletionTimestamp != nil) ||
+				isSystemNamespace(oldNamespace) != isSystemNamespace(newNamespace)
+		},
+		GenericFunc: func(event.GenericEvent) bool { return false },
+	}
+}
+
 // SetupWithManager registers the controller with the manager.
 func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	toSingleton := handler.EnqueueRequestsFromMapFunc(singletonRequests)
@@ -531,6 +632,8 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Service{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&discoveryv1.EndpointSlice{}, toSingleton, builder.WithPredicates(predicate.NewPredicateFuncs(isKorrel8rEndpointSlice))).
 		Watches(&corev1.ServiceAccount{}, toSingleton, builder.WithPredicates(managedPredicate)).
+		// Namespace creation or deletion changes the TargetAllocator Secret Role allowlist.
+		Watches(&corev1.Namespace{}, toSingleton, builder.WithPredicates(namespaceWatchPredicate())).
 		Watches(&routev1.Route{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		// Watch CRDs to react when optional operators are installed / removed.
 		Watches(&extv1.CustomResourceDefinition{}, toSingleton).

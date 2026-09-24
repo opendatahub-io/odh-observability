@@ -9,9 +9,14 @@ spec:
   {{- if .Metrics }}
   targetAllocator:
     enabled: true
-    serviceAccount: data-science-collector-collector
+    serviceAccount: {{.TargetAllocatorServiceAccount}}
     prometheusCR:
       enabled: true
+      denyFSAccessThroughSMs: true
+      secretNamespaces:
+      {{ range .TargetAllocatorSecretNamespaces }}
+        - {{ . }}
+      {{ end }}
       podMonitorSelector:
         matchLabels:
           monitoring.opendatahub.io/scrape: "true"
@@ -69,6 +74,11 @@ spec:
                 - action: keep
                   regex: true
                   source_labels: [__meta_kubernetes_pod_label_monitoring_opendatahub_io_scrape]
+                # EPP metrics are collected by KServe's authorized ServiceMonitor.
+                # Exclude scheduler pods here to avoid a second, unauthorized scrape.
+                - action: drop
+                  regex: 'llminferenceservice-router-scheduler'
+                  source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
                 - action: replace
                   regex: '([^:]+)(?::\d+)?'
                   replacement: '$1:8080'

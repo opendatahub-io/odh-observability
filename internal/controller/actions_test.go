@@ -353,6 +353,31 @@ func TestDeployOpenTelemetryCollector_MetricsOnly_CRDPresent(t *testing.T) {
 	}
 }
 
+func TestDeployOpenTelemetryCollector_MetricsOnly_WithoutCertManagerCRD(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	err := deployOpenTelemetryCollector(context.Background(), cli, m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(sources) != 4 {
+		t.Fatalf("expected collector sources without cert-manager, got %d", len(sources))
+	}
+
+	condition := findCondition(m, conditions.ConditionOpenTelemetryCollectorAvailable)
+	if condition == nil || condition.Status != metav1.ConditionTrue {
+		t.Fatalf("expected collector condition to be true without cert-manager, got %v", condition)
+	}
+}
+
 func TestDeployOpenTelemetryCollector_TracesOnly_CRDPresent(t *testing.T) {
 	s := newActionsTestScheme(t)
 	registerCRDs(s, gvk.OpenTelemetryCollector)

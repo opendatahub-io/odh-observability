@@ -4,7 +4,6 @@ metadata:
   name: default-dsci
 spec:
   applicationsNamespace: redhat-ods-applications
-  alerting: {}
   monitoring:
     managementState: Managed
     metrics:

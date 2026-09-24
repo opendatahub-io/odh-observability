@@ -799,6 +799,15 @@ func ensureCRDExists(ctx context.Context, tc *TestContext, name string) error {
 }
 
 func applyManifest(tc *TestContext, path string) error {
+	return applyManifestWithOptions(tc, path, true)
+}
+
+// applyManifestIfAbsent creates missing resources without taking ownership of existing ones.
+func applyManifestIfAbsent(tc *TestContext, path string) error {
+	return applyManifestWithOptions(tc, path, false)
+}
+
+func applyManifestWithOptions(tc *TestContext, path string, updateExisting bool) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return err
@@ -830,6 +839,9 @@ func applyManifest(tc *TestContext, path string) error {
 		}
 		if getErr != nil {
 			return getErr
+		}
+		if !updateExisting {
+			continue
 		}
 		resource.SetResourceVersion(current.GetResourceVersion())
 		if err := tc.Client().Update(tc.Context(), resource); err != nil {
@@ -876,9 +888,24 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("inference prerequisite manifest %s is unavailable: %v", path, err)
 		}
-		if err := applyManifest(tc, path); err != nil {
+		apply := applyManifest
+		if name == "kuadrant.yaml" {
+			// Kuadrant may be preconfigured; this test only needs it to exist.
+			apply = applyManifestIfAbsent
+		}
+		if err := apply(tc, path); err != nil {
 			t.Fatalf("failed to apply inference prerequisite %s: %v", name, err)
 		}
+	}
+
+	if testOpts.installOperators {
+		t.Log("Installing Cluster Observability, cert-manager, Tempo, OpenTelemetry, LeaderWorkerSet, and Red Hat Connectivity Link operators")
+		tc.EnsureOperatorInstalled(observabilityOpNamespace, observabilityOpName, observabilityOpChannel)
+		tc.EnsureOperatorInstalled(certManagerOpNamespace, certManagerOpName, certManagerOpChannel)
+		tc.EnsureOperatorInstalled(tempoOpNamespace, tempoOpName, tempoOpChannel)
+		tc.EnsureOperatorInstalled(opentelemetryOpNamespace, opentelemetryOpName, opentelemetryOpChannel)
+		tc.EnsureOperatorInstalledInOwnNamespace(leaderWorkerSetOpNamespace, leaderWorkerSetOpName, leaderWorkerSetOpChannel)
+		tc.EnsureOperatorInstalledFromCatalog(connectivityLinkOpNamespace, connectivityLinkOpName, connectivityLinkOpChannel, connectivityLinkOpSource)
 	}
 
 	t.Log("Setting up DSCI, DSC, and UIPlugin prerequisites")
@@ -916,7 +943,37 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 		"Ready",
 	)
 
+	for _, crd := range []string{
+		"kuadrants.kuadrant.io",
+		"authpolicies.kuadrant.io",
+	} {
+		waitFor(
+			"CRD "+crd+" should be established",
+			schema.GroupVersionKind{
+				Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition",
+			},
+			types.NamespacedName{Name: crd},
+			"Established",
+		)
+	}
+	tc.ensureNamespaceExists(kuadrantResourceNamespace)
+	applyPrerequisite("kuadrant.yaml")
+	waitFor(
+		"Kuadrant kuadrant should be Ready",
+		schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1beta1", Kind: "Kuadrant"},
+		types.NamespacedName{Name: "kuadrant", Namespace: kuadrantResourceNamespace},
+		"Ready",
+	)
+
 	t.Log("Setting up LGTM and remaining inference prerequisites")
+	waitFor(
+		"CRD leaderworkersetoperators.operator.openshift.io should be established",
+		schema.GroupVersionKind{
+			Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition",
+		},
+		types.NamespacedName{Name: "leaderworkersetoperators.operator.openshift.io"},
+		"Established",
+	)
 	applyPrerequisite("lwsoperator.yaml")
 	waitFor(
 		"CRD leaderworkersets.leaderworkerset.x-k8s.io should be established",

@@ -17,6 +17,10 @@ spec:
     - from:
         - podSelector:
             matchLabels:
+              app.kubernetes.io/name: prometheus
+              app.kubernetes.io/instance: data-science-monitoringstack
+        - podSelector:
+            matchLabels:
               app: data-science-prometheus-namespace-proxy
         - podSelector:
             matchLabels:

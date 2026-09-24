@@ -21,8 +21,10 @@ import (
 	"encoding/base64"
 	"fmt"
 	"sort"
+	"strings"
 
 	routev1 "github.com/openshift/api/route/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -35,6 +37,14 @@ import (
 )
 
 const fieldManager = "odh-observability-controller"
+
+const (
+	openshiftRunLevelLabel        = "openshift.io/run-level"
+	openshiftClusterMonitoringKey = "openshift.io/cluster-monitoring"
+	openshiftClusterLoggingKey    = "openshift.io/cluster-logging"
+	hypershiftManagedLabel        = "hypershift.openshift.io/managed"
+	olmOperatorGroupLabelPrefix   = "olm.operatorgroup.uid/"
+)
 
 // hasCRD checks whether a CRD for the given GVK is installed.
 // Uses a cheap List to avoid the retry backoff of CustomResourceDefinitionExists.
@@ -93,6 +103,87 @@ func discoverInferenceNamespaces(ctx context.Context, c client.Client) ([]string
 	sort.Strings(namespaces)
 
 	return namespaces, nil
+}
+
+// listAllNamespaces returns the sorted namespace set used to scope
+// TargetAllocator Secret access. The fallback keeps the monitoring namespace
+// covered even when a fake or eventually consistent API omits it from a list.
+func listAllNamespaces(ctx context.Context, c client.Client, fallback string) ([]string, error) {
+	namespaces := map[string]struct{}{}
+	fallbackFound := false
+
+	list := &corev1.NamespaceList{}
+	if err := c.List(ctx, list); err != nil {
+		return nil, fmt.Errorf("listing namespaces: %w", err)
+	}
+	for _, namespace := range list.Items {
+		if namespace.Name == "" || namespace.DeletionTimestamp != nil {
+			if namespace.Name == fallback {
+				fallbackFound = true
+			}
+			continue
+		}
+		if namespace.Name == fallback {
+			fallbackFound = true
+			namespaces[namespace.Name] = struct{}{}
+			continue
+		}
+		if !isSystemNamespace(&namespace) {
+			namespaces[namespace.Name] = struct{}{}
+		}
+	}
+	if fallback != "" && !fallbackFound {
+		namespaces[fallback] = struct{}{}
+	}
+
+	result := make([]string, 0, len(namespaces))
+	for namespace := range namespaces {
+		result = append(result, namespace)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+// isSystemNamespace identifies namespaces that must not receive the
+// TargetAllocator's per-namespace Secret read Role. Kubernetes does not have a
+// portable system-namespace marker, so account for the built-in namespaces and
+// the system markers used by OpenShift, HyperShift, and OLM.
+func isSystemNamespace(namespace *corev1.Namespace) bool {
+	if namespace == nil {
+		return true
+	}
+
+	switch namespace.Name {
+	case "", "default", "kube-system", "kube-public", "kube-node-lease", "openshift", "openshift-infra", "openshift-node":
+		return true
+	}
+
+	// OpenShift reserves system-created namespaces with this prefix. The label
+	// checks below also cover system namespaces that do not use the prefix.
+	if strings.HasPrefix(namespace.Name, "openshift-") {
+		return true
+	}
+
+	labels := namespace.GetLabels()
+	annotations := namespace.GetAnnotations()
+	if _, found := labels[openshiftRunLevelLabel]; found {
+		return true
+	}
+	for _, key := range []string{openshiftClusterMonitoringKey, openshiftClusterLoggingKey} {
+		if labels[key] == "true" || annotations[key] == "true" {
+			return true
+		}
+	}
+	if labels[hypershiftManagedLabel] == "true" {
+		return true
+	}
+	for key := range labels {
+		if strings.HasPrefix(key, olmOperatorGroupLabelPrefix) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // syncPrometheusWebTLSCA copies the service-ca.crt from the prometheus-web-tls-ca ConfigMap
