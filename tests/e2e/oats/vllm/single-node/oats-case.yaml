@@ -23,3 +23,10 @@ expected:
     # Histogram buckets have a larger budget to accommodate their bucket boundaries and labels.
     - promql: 'max by (__name__) (count by (__name__) ({__name__=~"vllm:.*|vllm_.*",__name__=~".*_bucket",llm_isvc_name=~".*single-node.*"}))'
       value: "<= 50"
+
+  traces:
+    # parentID is "0000000000000000" if absent
+    - traceql: '{ name = "llm_request" && resource.k8s.pod.name =~ "facebook-opt-125m-single-node.*" && span:parentID = "0000000000000000" }'
+      count: ">= 1"
+    - traceql: '{ name = "llm_request" && resource.k8s.pod.name =~ "facebook-opt-125m-single-node.*" && span:parentID != "0000000000000000" }'
+      count: ">= 1"
