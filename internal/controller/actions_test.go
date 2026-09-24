@@ -132,12 +132,42 @@ func TestDeployMonitoringStack_NoMetrics(t *testing.T) {
 	}
 }
 
+func TestDeployMonitoringStack_ExportersOnly_SkipsStack(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.MonitoringStack, gvk.ThanosQuerier)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Exporters: map[string]runtime.RawExtension{
+			"otlphttp/external": {Raw: []byte(`{"endpoint":"http://example:4318"}`)},
+		},
+	}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployMonitoringStackWithQuerierAndRestrictions(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(sources) != 0 {
+		t.Errorf("exporters-only metrics must not deploy MonitoringStack, got %d sources", len(sources))
+	}
+	msC := findCondition(m, conditions.ConditionMonitoringStackAvailable)
+	if msC == nil || msC.Status != metav1.ConditionFalse {
+		t.Errorf("MonitoringStackAvailable: expected False for exporters-only, got %v", msC)
+	}
+}
+
 func TestDeployMonitoringStack_CRDsPresent(t *testing.T) {
 	s := newActionsTestScheme(t)
 	registerCRDs(s, gvk.MonitoringStack, gvk.ThanosQuerier)
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
@@ -188,13 +218,47 @@ func TestDeployTracingStack_NoTraces(t *testing.T) {
 	}
 }
 
+func TestDeployTracingStack_ExportersOnly_SkipsTempo(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.TempoMonolithic, gvk.Instrumentation)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Traces = &v1alpha1.Traces{
+		Exporters: map[string]runtime.RawExtension{
+			"debug": {Raw: []byte(`{"verbosity":"detailed"}`)},
+		},
+	}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployTracingStack(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(sources) != 1 {
+		t.Errorf("exporters-only traces must deploy Instrumentation only, got %d sources", len(sources))
+	} else if sources[0].Path != InstrumentationTemplate {
+		t.Errorf("expected Instrumentation template, got %q", sources[0].Path)
+	}
+	tempoC := findCondition(m, conditions.ConditionTempoAvailable)
+	if tempoC == nil || tempoC.Status != metav1.ConditionFalse {
+		t.Errorf("TempoAvailable: expected False for exporters-only, got %v", tempoC)
+	}
+	instrC := findCondition(m, conditions.ConditionInstrumentationAvailable)
+	if instrC == nil || instrC.Status != metav1.ConditionTrue {
+		t.Errorf("InstrumentationAvailable: expected True for exporters-only, got %v", instrC)
+	}
+}
+
 func TestDeployTracingStack_PVBackend_CRDsPresent(t *testing.T) {
 	s := newActionsTestScheme(t)
 	registerCRDs(s, gvk.TempoMonolithic, gvk.Instrumentation)
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
@@ -222,7 +286,7 @@ func TestDeployTracingStack_S3Backend_CRDsPresent(t *testing.T) {
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendS3, Secret: "my-secret"},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendS3, Secret: "my-secret"},
 	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
@@ -265,7 +329,9 @@ func TestDeployOpenTelemetryCollector_MetricsOnly_CRDPresent(t *testing.T) {
 	registerCRDs(s, gvk.OpenTelemetryCollector)
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
@@ -293,7 +359,7 @@ func TestDeployOpenTelemetryCollector_TracesOnly_CRDPresent(t *testing.T) {
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
@@ -305,9 +371,45 @@ func TestDeployOpenTelemetryCollector_TracesOnly_CRDPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// 5 base sources (incl. monitor service + monitoring NetworkPolicy) + 2 traces RBAC (MLflow + Tempo)
-	if len(sources) != 7 {
-		t.Errorf("expected 7 sources for traces-only+OTel, got %d", len(sources))
+	// 4 base sources (no ServiceMonitors without metrics.storage) + 2 traces RBAC (MLflow + Tempo)
+	if len(sources) != 6 {
+		t.Errorf("expected 6 sources for traces-only+OTel, got %d", len(sources))
+	}
+}
+
+func TestDeployOpenTelemetryCollector_ExportersOnlyMetrics_NoServiceMonitors(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Exporters: map[string]runtime.RawExtension{
+			"otlphttp/metrics-external": {Raw: []byte(`{"endpoint":"http://otel-external.example.svc:4318"}`)},
+		},
+	}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployOpenTelemetryCollector(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// 4 base sources only — no ServiceMonitors / prometheus Service without metrics.storage
+	if len(sources) != 4 {
+		t.Errorf("expected 4 sources for exporters-only metrics, got %d", len(sources))
+	}
+	for _, source := range sources {
+		if source.Path == CollectorServiceMonitorsTemplate || source.Path == CollectorPrometheusServiceTemplate {
+			t.Errorf("exporters-only metrics must not include %s", source.Path)
+		}
+	}
+
+	otcC := findCondition(m, conditions.ConditionOpenTelemetryCollectorAvailable)
+	if otcC == nil || otcC.Status != metav1.ConditionTrue {
+		t.Error("OTelCollectorAvailable should be True")
 	}
 }
 
@@ -316,9 +418,11 @@ func TestDeployOpenTelemetryCollector_MetricsAndTraces_CRDPresent(t *testing.T) 
 	registerCRDs(s, gvk.OpenTelemetryCollector)
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
@@ -330,7 +434,7 @@ func TestDeployOpenTelemetryCollector_MetricsAndTraces_CRDPresent(t *testing.T) 
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// 5 base sources + 1 prometheus service + 2 traces RBAC (MLflow + Tempo)
+	// 4 base + ServiceMonitors + prometheus service + 2 traces RBAC (MLflow + Tempo)
 	if len(sources) != 8 {
 		t.Errorf("expected 8 sources for metrics+traces+OTel, got %d", len(sources))
 	}
@@ -408,7 +512,9 @@ func TestDeployNodeMetricsEndpoint_NoMetrics(t *testing.T) {
 
 func TestDeployNodeMetricsEndpoint_MetricsConfigured(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
 
@@ -451,7 +557,9 @@ func TestDeployPerses_NoMetricsOrTraces(t *testing.T) {
 func TestDeployPerses_CRDNotFound(t *testing.T) {
 	s := newActionsTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
@@ -473,7 +581,9 @@ func TestDeployPerses_CRDPresent(t *testing.T) {
 	registerCRDs(s, gvk.PersesV1Alpha2)
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
@@ -491,6 +601,39 @@ func TestDeployPerses_CRDPresent(t *testing.T) {
 	persesC := findCondition(m, conditions.ConditionPersesAvailable)
 	if persesC == nil || persesC.Status != metav1.ConditionTrue {
 		t.Error("PersesAvailable should be True")
+	}
+}
+
+func TestDeployPerses_ExportersOnly_SkipsPerses(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.PersesV1Alpha2)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Exporters: map[string]runtime.RawExtension{
+			"otlphttp/external": {Raw: []byte(`{"endpoint":"http://example:4318"}`)},
+		},
+	}
+	m.Spec.Traces = &v1alpha1.Traces{
+		Exporters: map[string]runtime.RawExtension{
+			"otlphttp/traces": {Raw: []byte(`{"endpoint":"http://example:4318"}`)},
+		},
+	}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployPerses(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources, "v1alpha2", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(sources) != 0 {
+		t.Errorf("exporters-only metrics/traces must not deploy Perses, got %d sources", len(sources))
+	}
+	persesC := findCondition(m, conditions.ConditionPersesAvailable)
+	if persesC == nil || persesC.Status != metav1.ConditionFalse || persesC.Severity != platformcommon.ConditionSeverityInfo {
+		t.Errorf("PersesAvailable: expected False+Info for exporters-only, got %v", persesC)
 	}
 }
 
@@ -606,7 +749,9 @@ func TestDeployPersesPrometheusIntegration_CRDPresent(t *testing.T) {
 	registerCRDs(s, gvk.PersesDatasourceV1Alpha2)
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
@@ -1098,7 +1243,9 @@ func TestDeployKorrel8r_GatedBySignalConfiguration(t *testing.T) {
 		{
 			name: "metrics",
 			configure: func(m *v1alpha1.Monitoring) {
-				m.Spec.Metrics = &v1alpha1.Metrics{}
+				m.Spec.Metrics = &v1alpha1.Metrics{
+					Storage: &v1alpha1.MetricsStorage{},
+				}
 			},
 			wantSources: 4,
 			wantStatus:  metav1.ConditionFalse,
@@ -1108,7 +1255,7 @@ func TestDeployKorrel8r_GatedBySignalConfiguration(t *testing.T) {
 			name: "traces",
 			configure: func(m *v1alpha1.Monitoring) {
 				m.Spec.Traces = &v1alpha1.Traces{
-					Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+					Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 				}
 			},
 			wantSources: 4,
@@ -1162,7 +1309,9 @@ func TestDeployKorrel8r_GatedBySignalConfiguration(t *testing.T) {
 
 func TestDeployKorrel8r_MarksAvailableWhenServiceReady(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 
 	replicas := int32(1)
 	cli := fake.NewClientBuilder().WithScheme(newActionsTestScheme(t)).WithObjects(
@@ -1207,9 +1356,11 @@ func TestDeployKorrel8r_MarksAvailableWhenServiceReady(t *testing.T) {
 func TestDeployKorrel8r_RendersOwnedResourcesAndConfiguredStores(t *testing.T) {
 	s := newActionsTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
 	m.Spec.Traces = &v1alpha1.Traces{
-		Storage: v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
+		Storage: &v1alpha1.TracesStorage{Backend: v1alpha1.StorageBackendPV},
 	}
 	m.Spec.Logs = &v1alpha1.Logs{}
 

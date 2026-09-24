@@ -132,10 +132,13 @@ func TestKorrel8rRHOAIMetricsRuleUsesCollectorExportedPodLabels(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := template.Must(template.New("korrel8r-config").Parse(string(configTemplate))).Execute(&out, map[string]any{
+	if err := template.Must(template.New("korrel8r-config").Option("missingkey=error").Parse(string(configTemplate))).Execute(&out, map[string]any{
 		"Namespace":              "monitoring",
 		"Korrel8rServiceName":    Korrel8rServiceName,
 		"Metrics":                true,
+		"MetricsStorage":         true,
+		"TempoStorage":           false,
+		"Logs":                   false,
 		"ThanosQuerierEndpoint":  "https://thanos.example.test",
 		"Korrel8rRequestTimeout": "30s",
 		"Korrel8rSessionTimeout": "5m",
@@ -169,7 +172,9 @@ func TestKorrel8rConfigChecksumChangesWithEffectiveConfiguration(t *testing.T) {
 
 	data := map[string]any{
 		"Metrics":                true,
+		"MetricsStorage":         true,
 		"Traces":                 true,
+		"TempoStorage":           true,
 		"Logs":                   false,
 		"ThanosQuerierEndpoint":  "http://thanos.example.test:10902",
 		"TempoQueryEndpoint":     "https://tempo.example.test:8080",
@@ -274,6 +279,9 @@ func loadRHOAIKorrel8rRules(t *testing.T) []korrel8rRule {
 		"Korrel8rMetricsStore":   true,
 		"Korrel8rTracesStore":    true,
 		"Korrel8rLokiStore":      true,
+		"Metrics":                true,
+		"MetricsStorage":         true,
+		"TempoStorage":           true,
 		"Logs":                   true,
 		"ThanosQuerierEndpoint":  "https://thanos.example.test",
 		"TempoQueryEndpoint":     "https://tempo.example.test",

@@ -30,7 +30,7 @@ spec:
   - name: monitoring-tls-certs
     mountPath: /etc/otel-collector/monitoring-tls
     readOnly: true
-  {{- if .Metrics }}
+  {{- if .MetricsStorage }}
   - name: tls-certs
     mountPath: /etc/otel-collector/tls
     readOnly: true
@@ -39,7 +39,7 @@ spec:
   - name: monitoring-tls-certs
     secret:
       secretName: data-science-collector-monitoring-tls
-  {{- if .Metrics }}
+  {{- if .MetricsStorage }}
   - name: tls-certs
     secret:
       secretName: data-science-collector-tls
@@ -144,6 +144,7 @@ spec:
           cert_file: "/etc/otel-collector/monitoring-tls/tls.crt"
           key_file: "/etc/otel-collector/monitoring-tls/tls.key"
       {{- if .Metrics }}
+      {{- if .MetricsStorage }}
       prometheus:
         endpoint: 0.0.0.0:8889
         tls:
@@ -151,6 +152,7 @@ spec:
           key_file: "/etc/otel-collector/tls/tls.key"
         resource_to_telemetry_conversion:
           enabled: true # by default resource attributes are dropped
+      {{- end }}
       {{- if .MetricsExporterNames }}
       {{- range .MetricsExporterNames }}
       {{ . }}:
@@ -159,6 +161,7 @@ spec:
       {{- end }}
       {{- end }}
       {{- if .Traces }}
+      {{- if .TempoStorage }}
       otlp/tempo:
         # In multitenancy/openshift mode, traces are always sent through the gateway
         # which uses TLS (service-CA signed cert) and requires bearer token auth.
@@ -170,6 +173,7 @@ spec:
         headers:
           # must be set to the tenant name from tempo CR
           X-Scope-OrgID: {{ .Namespace }}
+      {{- end }}
       {{- if .TracesExporterNames }}
       {{- range .TracesExporterNames }}
       {{ . }}:
@@ -195,11 +199,11 @@ spec:
         traces:
           receivers: [otlp]
           processors: [memory_limiter, k8sattributes, resourcedetection, batch]
-          exporters: [otlp/tempo{{- if .TracesExporterNames }}{{- range .TracesExporterNames }}, {{ . }}{{- end }}{{- end }}]
+          exporters: [{{- if .TempoStorage }}otlp/tempo{{- if .TracesExporterNames }}, {{ end }}{{- end }}{{- range $i, $name := .TracesExporterNames }}{{- if $i }}, {{ end }}{{ $name }}{{- end }}]
       {{- end }}
       {{- if .Metrics }}
         metrics:
           receivers: [prometheus, otlp]
           processors: [memory_limiter, k8sattributes, resourcedetection, transform/gpu_metrics, batch]
-          exporters: [prometheus{{- if .MetricsExporterNames }}{{- range .MetricsExporterNames }}, {{ . }}{{- end }}{{- end }}]
+          exporters: [{{- if .MetricsStorage }}prometheus{{- if .MetricsExporterNames }}, {{ end }}{{- end }}{{- range $i, $name := .MetricsExporterNames }}{{- if $i }}, {{ end }}{{ $name }}{{- end }}]
       {{- end }}

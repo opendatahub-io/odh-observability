@@ -1,4 +1,4 @@
-# ServiceMonitor for collector's own telemetry metrics (always deployed for health monitoring)
+# ServiceMonitor for collector's own telemetry metrics (rendered only with metrics.storage)
 apiVersion: monitoring.rhobs/v1
 kind: ServiceMonitor
 metadata:

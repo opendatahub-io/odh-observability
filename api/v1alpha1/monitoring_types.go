@@ -35,7 +35,7 @@ var _ platformcommon.PlatformObject = (*Monitoring)(nil)
 
 // MonitoringSpec defines the desired state of Monitoring.
 // +kubebuilder:validation:XValidation:rule="has(self.alerting) ? (has(self.metrics) && has(self.metrics.storage)) : true",message="Alerting configuration requires metrics.storage to be configured"
-// +kubebuilder:validation:XValidation:rule="!has(self.collectorReplicas) || (self.collectorReplicas > 0 && ((has(self.metrics) && self.metrics.storage != null) || self.traces != null))",message="CollectorReplicas can only be set when metrics.storage or traces are configured, and must be > 0"
+// +kubebuilder:validation:XValidation:rule="!has(self.collectorReplicas) || (self.collectorReplicas > 0 && ((has(self.metrics) && (has(self.metrics.storage) || (has(self.metrics.exporters) && size(self.metrics.exporters) > 0))) || has(self.traces)))",message="CollectorReplicas can only be set when metrics (storage or exporters) or traces are configured, and must be > 0"
 // +kubebuilder:validation:XValidation:rule="has(self.logs) ? has(self.logs.storage) : true",message="Log forwarding requires logs.storage to be configured for the LokiStack instance"
 type MonitoringSpec struct {
 	// ManagementState controls whether the operator actively manages the module (Managed) or removes it (Removed).
@@ -70,8 +70,12 @@ type MonitoringSpec struct {
 }
 
 // Metrics defines the desired state of metrics collection.
+// Built-in MonitoringStack requires storage; exporters-only configs (external backends) omit storage.
+// +kubebuilder:validation:XValidation:rule="has(self.storage) || (has(self.exporters) && size(self.exporters) > 0)",message="metrics requires storage and/or at least one exporter"
 // +kubebuilder:validation:XValidation:rule="has(self.storage) || !has(self.replicas) || self.replicas == 0",message="Non-zero replicas require metrics.storage to be configured"
 type Metrics struct {
+	// Storage configures the built-in MonitoringStack backend. Omit when using exporters only (external observability).
+	// +optional
 	Storage *MetricsStorage `json:"storage,omitempty"`
 	// Replicas specifies the number of replicas in the MonitoringStack.
 	// +kubebuilder:validation:Minimum=0
@@ -96,8 +100,12 @@ type MetricsStorage struct {
 }
 
 // Traces defines the configuration for distributed traces collection.
+// Built-in Tempo requires storage; exporters-only configs (external backends) omit storage.
+// +kubebuilder:validation:XValidation:rule="has(self.storage) || (has(self.exporters) && size(self.exporters) > 0)",message="traces requires storage and/or at least one exporter"
 type Traces struct {
-	Storage TracesStorage `json:"storage"`
+	// Storage configures the built-in Tempo backend. Omit when using exporters only (external observability).
+	// +optional
+	Storage *TracesStorage `json:"storage,omitempty"`
 	// SampleRatio determines the sampling rate for traces (0.0–1.0).
 	// +kubebuilder:validation:Pattern="^(0(\\.[0-9]+)?|1(\\.0+)?)$"
 	SampleRatio string `json:"sampleRatio,omitempty"`

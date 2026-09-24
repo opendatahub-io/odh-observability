@@ -115,11 +115,11 @@ data:
   korrel8r.yaml: |
     stores:
       - domain: k8s
-{{- if .Metrics}}
+{{- if .MetricsStorage}}
       - domain: metric
         metric: {{.ThanosQuerierEndpoint}}
 {{- end}}
-{{- if .Traces}}
+{{- if .TempoStorage}}
       - domain: trace
         tempoStack: {{.TempoQueryEndpoint}}/api/search
         certificateAuthority: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
@@ -132,14 +132,14 @@ data:
 {{- end}}
     include:
       - /etc/korrel8r/rules/all.yaml
-{{- if .Metrics}}
+{{- if .MetricsStorage}}
       - /etc/korrel8r/custom/rhoai-metrics.yaml
 {{- end}}
       - /etc/korrel8r/custom/rhai-inference-rules.yaml
     tuning:
       requestTimeout: {{.Korrel8rRequestTimeout}}
       sessionTimeout: {{.Korrel8rSessionTimeout}}
-{{- if .Metrics}}
+{{- if .MetricsStorage}}
   rhoai-metrics.yaml: |
     rules:
       - name: PodToRHOAIMetric

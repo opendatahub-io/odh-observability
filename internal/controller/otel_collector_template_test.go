@@ -180,6 +180,7 @@ func renderCollectorTemplate(t *testing.T) unstructured.Unstructured {
 	}}, map[string]any{
 		"Namespace":              "redhat-ods-monitoring",
 		"Metrics":                true,
+		"MetricsStorage":         true,
 		"AcceleratorMetrics":     true,
 		"Traces":                 false,
 		"CollectorReplicas":      1,

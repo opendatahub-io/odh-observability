@@ -112,7 +112,8 @@ func deployMonitoringAdmissionPolicies(
 	return nil
 }
 
-// deployMonitoringStackWithQuerierAndRestrictions deploys MonitoringStack + ThanosQuerier.
+// deployMonitoringStackWithQuerierAndRestrictions deploys MonitoringStack + ThanosQuerier
+// when built-in metrics storage is configured. Exporters-only metrics skip the local stack.
 func deployMonitoringStackWithQuerierAndRestrictions(
 	ctx context.Context,
 	c client.Client,
@@ -120,7 +121,7 @@ func deployMonitoringStackWithQuerierAndRestrictions(
 	cm *conditions.ConditionsManager,
 	sources *[]rendertemplate.TemplateSource,
 ) error {
-	if monitoring.Spec.Metrics == nil {
+	if monitoring.Spec.Metrics == nil || monitoring.Spec.Metrics.Storage == nil {
 		cm.MarkNotConfigured(conditions.ConditionMonitoringStackAvailable, conditions.MetricsNotConfiguredReason, conditions.MetricsNotConfiguredMessage)
 		cm.MarkNotConfigured(conditions.ConditionThanosQuerierAvailable, conditions.MetricsNotConfiguredReason, conditions.MetricsNotConfiguredMessage)
 		return nil
@@ -167,7 +168,9 @@ func deployMonitoringStackWithQuerierAndRestrictions(
 	return nil
 }
 
-// deployTracingStack deploys Tempo + Instrumentation based on storage backend.
+// deployTracingStack deploys Instrumentation whenever traces are configured, and
+// Tempo only when built-in storage is configured. Exporters-only traces still get
+// Instrumentation so workloads send OTLP to the collector.
 func deployTracingStack(
 	ctx context.Context,
 	c client.Client,
@@ -183,6 +186,24 @@ func deployTracingStack(
 
 	traces := monitoring.Spec.Traces
 
+	instrExists, err := hasCRD(ctx, c, gvk.Instrumentation)
+	if err != nil {
+		return fmt.Errorf("checking Instrumentation CRD: %w", err)
+	}
+	if !instrExists {
+		cm.MarkFalse(conditions.ConditionInstrumentationAvailable,
+			"InstrumentationCRDNotFoundReason", "Instrumentation CRD not found")
+	} else {
+		cm.MarkTrue(conditions.ConditionInstrumentationAvailable)
+		*sources = append(*sources, src(InstrumentationTemplate))
+	}
+
+	// Exporters-only (no storage): skip built-in Tempo; collector forwards externally.
+	if traces.Storage == nil {
+		cm.MarkNotConfigured(conditions.ConditionTempoAvailable, conditions.TracesNotConfiguredReason, conditions.TracesNotConfiguredMessage)
+		return nil
+	}
+
 	tempoGVK := gvk.TempoStack
 	tempoTemplate := TempoStackTemplate
 	if traces.Storage.Backend == v1alpha1.StorageBackendPV {
@@ -194,28 +215,15 @@ func deployTracingStack(
 	if err != nil {
 		return fmt.Errorf("checking %s CRD: %w", tempoGVK.Kind, err)
 	}
-	instrExists, err := hasCRD(ctx, c, gvk.Instrumentation)
-	if err != nil {
-		return fmt.Errorf("checking Instrumentation CRD: %w", err)
-	}
-
-	if !tempoExists || !instrExists {
-		if !tempoExists {
-			cm.MarkFalse(conditions.ConditionTempoAvailable,
-				tempoGVK.Kind+"CRDNotFoundReason",
-				fmt.Sprintf("%s CRD not found (atomic deployment requires all CRDs)", tempoGVK.Kind))
-		}
-		if !instrExists {
-			cm.MarkFalse(conditions.ConditionInstrumentationAvailable,
-				"InstrumentationCRDNotFoundReason", "Instrumentation CRD not found (atomic deployment requires all CRDs)")
-		}
+	if !tempoExists {
+		cm.MarkFalse(conditions.ConditionTempoAvailable,
+			tempoGVK.Kind+"CRDNotFoundReason",
+			fmt.Sprintf("%s CRD not found", tempoGVK.Kind))
 		return nil
 	}
 
 	cm.MarkTrue(conditions.ConditionTempoAvailable)
-	cm.MarkTrue(conditions.ConditionInstrumentationAvailable)
-
-	*sources = append(*sources, src(tempoTemplate), src(InstrumentationTemplate))
+	*sources = append(*sources, src(tempoTemplate))
 	return nil
 }
 
@@ -250,21 +258,26 @@ func deployOpenTelemetryCollector(
 	*sources = append(*sources,
 		src(OpenTelemetryCollectorTemplate),
 		src(CollectorRBACTemplate),
-		src(CollectorServiceMonitorsTemplate),
 		// Service for internal telemetry re-exported on :8890 with TLS (always-on)
 		src(CollectorMonitorServiceTemplate),
 		src(CollectorMonitoringNetworkPolicyTemplate),
 	)
 
-	if monitoring.Spec.Metrics != nil {
-		*sources = append(*sources, src(CollectorPrometheusServiceTemplate))
+	// ServiceMonitors (monitoring.rhobs) and the local prometheus Service (:8889)
+	// are only for MonitoringStack scrape. Exporters-only omits storage and must
+	// not require the COO ServiceMonitor CRD.
+	if monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil {
+		*sources = append(*sources,
+			src(CollectorServiceMonitorsTemplate),
+			src(CollectorPrometheusServiceTemplate),
+		)
 	}
 
 	if monitoring.Spec.Traces != nil {
-		*sources = append(*sources,
-			src(CollectorMLflowRBACTemplate),
-			src(CollectorTempoRBACTemplate),
-		)
+		*sources = append(*sources, src(CollectorMLflowRBACTemplate))
+		if monitoring.Spec.Traces.Storage != nil {
+			*sources = append(*sources, src(CollectorTempoRBACTemplate))
+		}
 	}
 
 	return nil
@@ -300,7 +313,8 @@ func deployAlerting(
 	return nil
 }
 
-// deployPerses deploys the Perses CR when metrics or traces are configured.
+// deployPerses deploys the Perses CR when built-in metrics or traces storage is configured.
+// Exporters-only configs have no local Thanos/Tempo query backends for Perses datasources.
 // persesVersion and persesFound are pre-resolved by the reconciler to avoid
 // redundant API calls across the three Perses action functions.
 func deployPerses(
@@ -312,10 +326,12 @@ func deployPerses(
 	persesVersion string,
 	persesFound bool,
 ) error {
-	if monitoring.Spec.Metrics == nil && monitoring.Spec.Traces == nil {
+	hasMetricsStorage := monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil
+	hasTracesStorage := monitoring.Spec.Traces != nil && monitoring.Spec.Traces.Storage != nil
+	if !hasMetricsStorage && !hasTracesStorage {
 		cm.MarkNotConfigured(conditions.ConditionPersesAvailable,
 			conditions.MetricsAndTracesNotConfiguredReason,
-			"Perses requires at least Metrics or Traces to be configured")
+			"Perses requires metrics.storage or traces.storage to be configured")
 		return nil
 	}
 
@@ -370,8 +386,9 @@ func deployPersesTempoIntegration(
 		}
 	}
 
-	if monitoring.Spec.Traces == nil {
-		// Clean up existing Tempo datasource + dashboard if traces are deconfigured.
+	// Perses Tempo datasource targets built-in Tempo; exporters-only has no Tempo query API.
+	if monitoring.Spec.Traces == nil || monitoring.Spec.Traces.Storage == nil {
+		// Clean up existing Tempo datasource + dashboard if storage is removed or traces deconfigured.
 		if datasourceExists {
 			ds := &unstructured.Unstructured{}
 			ds.SetGroupVersionKind(datasourceGVK)
@@ -417,7 +434,8 @@ func deployPersesTempoIntegration(
 	return nil
 }
 
-// deployPersesPrometheusIntegration deploys the Perses Prometheus datasource when metrics are configured.
+// deployPersesPrometheusIntegration deploys the Perses Prometheus datasource when
+// built-in metrics storage is configured (Thanos Querier URL).
 // persesVersion and persesFound are pre-resolved by the reconciler to avoid
 // redundant API calls across the three Perses action functions.
 func deployPersesPrometheusIntegration(
@@ -429,10 +447,10 @@ func deployPersesPrometheusIntegration(
 	persesVersion string,
 	persesFound bool,
 ) error {
-	if monitoring.Spec.Metrics == nil {
+	if monitoring.Spec.Metrics == nil || monitoring.Spec.Metrics.Storage == nil {
 		cm.MarkNotConfigured(conditions.ConditionPersesPrometheusDataSourceAvailable,
 			conditions.MetricsNotConfiguredReason,
-			"Prometheus datasource requires metrics configuration")
+			"Prometheus datasource requires metrics.storage to be configured")
 		return nil
 	}
 
@@ -464,7 +482,8 @@ func deployPersesPrometheusIntegration(
 	return nil
 }
 
-// deployNodeMetricsEndpoint deploys the node metrics cluster proxy when metrics are configured.
+// deployNodeMetricsEndpoint deploys the node metrics cluster proxy when built-in
+// metrics storage is configured (part of the MonitoringStack query path).
 func deployNodeMetricsEndpoint(
 	_ context.Context,
 	_ client.Client,
@@ -472,7 +491,7 @@ func deployNodeMetricsEndpoint(
 	cm *conditions.ConditionsManager,
 	sources *[]rendertemplate.TemplateSource,
 ) error {
-	if monitoring.Spec.Metrics == nil {
+	if monitoring.Spec.Metrics == nil || monitoring.Spec.Metrics.Storage == nil {
 		cm.MarkNotConfigured(conditions.ConditionNodeMetricsEndpointAvailable,
 			conditions.MetricsNotConfiguredReason, conditions.MetricsNotConfiguredMessage)
 		return nil
