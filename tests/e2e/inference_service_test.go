@@ -191,7 +191,12 @@ func inferenceServiceURL(t *testing.T, tc *TestContext, nn types.NamespacedName)
 	return endpoint
 }
 
-func createInferenceServiceOAuthProxy(t *testing.T, tc *TestContext, serviceNN, proxyNN types.NamespacedName, proxyName, serviceAccountName, bindingName, tlsSecretName, cookieSecretName, inferenceURL string) string {
+func createInferenceServiceOAuthProxy(
+	t *testing.T,
+	tc *TestContext,
+	serviceNN, proxyNN types.NamespacedName,
+	proxyName, serviceAccountName, bindingName, tlsSecretName, cookieSecretName, inferenceURL string,
+) string {
 	t.Helper()
 
 	clusterDomain, err := getClusterDomain(tc)
@@ -359,7 +364,7 @@ func sendInferenceServiceCompletion(ctx context.Context, endpoint, ocToken, trac
 	req.Header.Set("Authorization", "Bearer "+ocToken)
 	req.Header.Set("Content-Type", "application/json")
 	if traceparent != "" {
-		req.Header.Set("traceparent", traceparent)
+		req.Header.Set("Traceparent", traceparent)
 	}
 
 	httpClient := &http.Client{

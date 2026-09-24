@@ -208,7 +208,7 @@ func sendCompletion(ctx context.Context, routeHost, ocToken string, traceparent 
 	req.Header.Set("Authorization", "Bearer "+ocToken)
 	req.Header.Set("Content-Type", "application/json")
 	if len(traceparent) > 0 && traceparent[0] != "" {
-		req.Header.Set("traceparent", traceparent[0])
+		req.Header.Set("Traceparent", traceparent[0])
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
