@@ -127,7 +127,9 @@ func TestInferenceServiceTracing(t *testing.T) {
 	persistedService := tc.FetchResource(WithMinimalObject(gvk.InferenceService, serviceNN))
 	tracingEndpoint, tracingEndpointFound, err := unstructured.NestedString(persistedService.Object, "spec", "tracing", "exporterEndpoint")
 	require.NoError(t, err, "failed to read persisted InferenceService tracing exporter endpoint")
-	require.True(t, tracingEndpointFound, "KServe admission dropped spec.tracing.exporterEndpoint even though the CRD schema exposes it; the installed KServe webhook/controller must include InferenceService tracing support")
+	require.True(t, tracingEndpointFound,
+		"KServe admission dropped spec.tracing.exporterEndpoint even though the CRD schema exposes it; "+
+			"the installed KServe webhook/controller must include InferenceService tracing support")
 	require.Equal(t, inferenceServiceTracingEndpoint, tracingEndpoint, "KServe must preserve the configured tracing exporter endpoint")
 	tracingSampler, tracingSamplerFound, err := unstructured.NestedString(persistedService.Object, "spec", "tracing", "sampler")
 	require.NoError(t, err, "failed to read persisted InferenceService tracing sampler")
