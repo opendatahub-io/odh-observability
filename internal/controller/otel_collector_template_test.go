@@ -56,6 +56,9 @@ func TestDCGMMetricsAreRetainedWithOriginalNames(t *testing.T) {
 	if strings.Contains(relabelSection, "__name__") {
 		t.Error("relabel_configs must not reference __name__ (unavailable at target-discovery stage)")
 	}
+	if strings.Contains(metricRelabelSection, "__tmp_scale_needed") {
+		t.Error("metric_relabel_configs must not add __tmp_scale_needed (rejected by OTel prometheus exporter)")
+	}
 	if strings.Contains(metricRelabelSection, "target_label: __name__") {
 		t.Error("DCGM metric names must not be renamed in metric_relabel_configs")
 	}

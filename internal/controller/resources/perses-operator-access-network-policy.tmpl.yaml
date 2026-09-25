@@ -19,6 +19,12 @@ spec:
         podSelector:
           matchLabels:
             app.kubernetes.io/name: perses-operator
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: openshift-operators
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: perses-operator
       ports:
         - protocol: TCP
           port: 8080

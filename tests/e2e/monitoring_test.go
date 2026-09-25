@@ -1704,6 +1704,8 @@ func (tc *MonitoringTestCtx) ValidatePersesNetworkPolicy(t *testing.T) {
 			jq.Match(`.spec.policyTypes[0] == "Ingress"`),
 			jq.Match(`.spec.ingress[0].from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"] == "openshift-cluster-observability-operator"`),
 			jq.Match(`.spec.ingress[0].from[0].podSelector.matchLabels["app.kubernetes.io/name"] == "perses-operator"`),
+			jq.Match(`.spec.ingress[0].from[1].namespaceSelector.matchLabels["kubernetes.io/metadata.name"] == "openshift-operators"`),
+			jq.Match(`.spec.ingress[0].from[1].podSelector.matchLabels["app.kubernetes.io/name"] == "perses-operator"`),
 			jq.Match(`.spec.ingress[0].ports[0].protocol == "TCP"`),
 			jq.Match(`.spec.ingress[0].ports[0].port == 8080`),
 		)),

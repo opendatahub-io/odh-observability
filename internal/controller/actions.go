@@ -73,6 +73,7 @@ const (
 	TempoServiceCAConfigMapTemplate                  = "resources/tempo-service-ca-configmap.tmpl.yaml"
 	PersesOperatorAccessNetworkPolicyTemplate        = "resources/perses-operator-access-network-policy.tmpl.yaml"
 	OperatorPrometheusRulesTemplate                  = "monitoring/operator-prometheusrules.tmpl.yaml"
+	AcceleratorRecordingRulesTemplate                = "resources/accelerator-recording-rules.tmpl.yaml"
 	UsageLogsOpenTelemetryCollectorTemplate          = "resources/usage-logs-opentelemetry-collector.tmpl.yaml"
 	UsageLogsOpenTelemetryCollectorRBACTemplate      = "resources/usage-logs-opentelemetry-collector-rbac.tmpl.yaml"
 	LokiStackTemplate                                = "resources/loki-stack.tmpl.yaml"
@@ -157,6 +158,7 @@ func deployMonitoringStackWithQuerierAndRestrictions(
 		src(MonitoringStackTemplate),
 		src(PrometheusSelfServiceMonitorTemplate),
 		src(MonitoringStackAlertmanagerRBACTemplate),
+		src(AcceleratorRecordingRulesTemplate),
 		src(PrometheusRouteTemplate),
 		src(PrometheusServiceOverrideTemplate),
 		src(PrometheusNetworkPolicyTemplate),
