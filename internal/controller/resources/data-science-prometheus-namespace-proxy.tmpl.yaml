@@ -156,6 +156,8 @@ spec:
             - --insecure-listen-address=127.0.0.1:9091
             - --upstream=https://prometheus-operated.{{.Namespace}}.svc:9090
             - --label=namespace
+            - --query-param=namespace
+            - --error-on-replace
             - --enable-label-apis
           env:
             - name: SSL_CERT_DIR
