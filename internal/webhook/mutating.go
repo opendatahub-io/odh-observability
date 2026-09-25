@@ -51,8 +51,8 @@ const (
 	webhookPath = "/mutate-prometheus-monitors"
 )
 
-//+kubebuilder:webhook:path=/mutate-prometheus-monitors,mutating=true,failurePolicy=fail,groups=monitoring.coreos.com,resources=podmonitors,verbs=create;update,versions=v1,name=podmonitor-injector.opendatahub.io,sideEffects=None,admissionReviewVersions=v1
-//+kubebuilder:webhook:path=/mutate-prometheus-monitors,mutating=true,failurePolicy=fail,groups=monitoring.coreos.com,resources=servicemonitors,verbs=create;update,versions=v1,name=servicemonitor-injector.opendatahub.io,sideEffects=None,admissionReviewVersions=v1
+//+kubebuilder:webhook:path=/mutate-prometheus-monitors,mutating=true,failurePolicy=ignore,groups=monitoring.coreos.com,resources=podmonitors,verbs=create;update,versions=v1,name=podmonitor-injector.opendatahub.io,sideEffects=None,admissionReviewVersions=v1
+//+kubebuilder:webhook:path=/mutate-prometheus-monitors,mutating=true,failurePolicy=ignore,groups=monitoring.coreos.com,resources=servicemonitors,verbs=create;update,versions=v1,name=servicemonitor-injector.opendatahub.io,sideEffects=None,admissionReviewVersions=v1
 
 // Injector is a mutating admission webhook that injects the monitoring label
 // into ServiceMonitor and PodMonitor resources in opted-in namespaces.
