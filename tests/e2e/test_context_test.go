@@ -818,22 +818,47 @@ func (tc *TestContext) ensureSubscriptionExistsFromCatalog(namespace, name, chan
 			}
 			return unstructured.SetNestedField(u.Object, "Automatic", "spec", "installPlanApproval")
 		}),
-		WithCondition(jq.Match(`.status | has("installPlanRef")`)),
+		WithCondition(jq.Match(`(.spec.source == %q) and (.status | has("installPlanRef"))`, source)),
 		WithEventuallyTimeout(tc.Timeouts.olmOperationTimeout),
-		WithCustomErrorMsg("Subscription %s/%s should have an installPlanRef", namespace, name),
+		WithCustomErrorMsg("Subscription %s/%s should use catalog %s and have an installPlanRef", namespace, name, source),
 	)
 }
 
-func (tc *TestContext) ensureCSVSucceeded(namespace string, subscriptionNN types.NamespacedName) {
+func (tc *TestContext) ensureCSVSucceeded(namespace string, subscriptionNN types.NamespacedName, source string) {
 	tc.g.Eventually(func(g Gomega) {
 		sub, err := tc.fetchResource(tc.t, gvk.Subscription, subscriptionNN)
 		g.Expect(err).NotTo(HaveOccurred(), "failed to fetch Subscription %s", subscriptionNN)
+
+		actualSource, found, err := unstructured.NestedString(sub.Object, "spec", "source")
+		g.Expect(err).NotTo(HaveOccurred(), "failed to read Subscription %s source", subscriptionNN)
+		g.Expect(found).To(BeTrue(), "Subscription %s has no source", subscriptionNN)
+		g.Expect(actualSource).To(Equal(source), "Subscription %s uses an unexpected catalog", subscriptionNN)
+
+		installPlanName, found, err := unstructured.NestedString(sub.Object, "status", "installPlanRef", "name")
+		g.Expect(err).NotTo(HaveOccurred(), "failed to read Subscription %s installPlanRef", subscriptionNN)
+		g.Expect(found).To(BeTrue(), "Subscription %s has no installPlanRef name", subscriptionNN)
+		g.Expect(installPlanName).NotTo(BeEmpty(), "Subscription %s has an empty installPlanRef name", subscriptionNN)
+
+		installPlanNamespace, _, err := unstructured.NestedString(sub.Object, "status", "installPlanRef", "namespace")
+		g.Expect(err).NotTo(HaveOccurred(), "failed to read Subscription %s installPlanRef namespace", subscriptionNN)
+		if installPlanNamespace == "" {
+			installPlanNamespace = namespace
+		}
 
 		csvName, _, _ := unstructured.NestedString(sub.Object, "status", "currentCSV")
 		if csvName == "" {
 			csvName, _, _ = unstructured.NestedString(sub.Object, "status", "installedCSV")
 		}
 		g.Expect(csvName).NotTo(BeEmpty(), "Subscription %s has no currentCSV or installedCSV", subscriptionNN)
+
+		installPlan, err := tc.fetchResource(tc.t, gvk.InstallPlan, types.NamespacedName{
+			Name:      installPlanName,
+			Namespace: installPlanNamespace,
+		})
+		g.Expect(err).NotTo(HaveOccurred(), "failed to fetch InstallPlan %s/%s", installPlanNamespace, installPlanName)
+		g.Expect(installPlanMatchesSource(installPlan, source, csvName)).To(BeTrue(),
+			"InstallPlan %s/%s must be complete, use catalog %s, and contain CSV %s",
+			installPlanNamespace, installPlanName, source, csvName)
 
 		csv, err := tc.fetchResource(tc.t, gvk.ClusterServiceVersion, types.NamespacedName{
 			Name:      csvName,
@@ -848,13 +873,28 @@ func (tc *TestContext) ensureCSVSucceeded(namespace string, subscriptionNN types
 		Should(Succeed())
 }
 
+func installPlanMatchesSource(installPlan *unstructured.Unstructured, source, csvName string) bool {
+	planSource, found, err := unstructured.NestedString(installPlan.Object, "spec", "source")
+	if err != nil || !found || planSource != source {
+		return false
+	}
+
+	phase, found, err := unstructured.NestedString(installPlan.Object, "status", "phase")
+	if err != nil || !found || phase != "Complete" {
+		return false
+	}
+
+	csvNames, found, err := unstructured.NestedStringSlice(installPlan.Object, "spec", "clusterServiceVersionNames")
+	return err == nil && found && slices.Contains(csvNames, csvName)
+}
+
 func (tc *TestContext) EnsureOperatorInstalled(namespace, name, channel string) {
 	tc.ensureNamespaceExists(namespace)
 	tc.ensureOperatorGroupExists(namespace, name)
 
 	nn := types.NamespacedName{Name: name, Namespace: namespace}
 	tc.ensureSubscriptionExists(namespace, name, channel)
-	tc.ensureCSVSucceeded(namespace, nn)
+	tc.ensureCSVSucceeded(namespace, nn, "redhat-operators")
 }
 
 func (tc *TestContext) EnsureOperatorInstalledInOwnNamespace(namespace, name, channel string) {
@@ -863,7 +903,7 @@ func (tc *TestContext) EnsureOperatorInstalledInOwnNamespace(namespace, name, ch
 
 	nn := types.NamespacedName{Name: name, Namespace: namespace}
 	tc.ensureSubscriptionExists(namespace, name, channel)
-	tc.ensureCSVSucceeded(namespace, nn)
+	tc.ensureCSVSucceeded(namespace, nn, "redhat-operators")
 }
 
 func (tc *TestContext) EnsureOperatorInstalledFromCatalog(namespace, name, channel, source string) {
@@ -872,5 +912,5 @@ func (tc *TestContext) EnsureOperatorInstalledFromCatalog(namespace, name, chann
 
 	nn := types.NamespacedName{Name: name, Namespace: namespace}
 	tc.ensureSubscriptionExistsFromCatalog(namespace, name, channel, source)
-	tc.ensureCSVSucceeded(namespace, nn)
+	tc.ensureCSVSucceeded(namespace, nn, source)
 }

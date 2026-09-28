@@ -88,3 +88,74 @@ func TestOperatorGroupTargetsNamespace(t *testing.T) {
 		})
 	}
 }
+
+func TestInstallPlanMatchesSource(t *testing.T) {
+	tests := []struct {
+		name        string
+		installPlan *unstructured.Unstructured
+		source      string
+		csvName     string
+		want        bool
+	}{
+		{
+			name: "complete plan from requested source contains current CSV",
+			installPlan: &unstructured.Unstructured{Object: map[string]any{
+				"spec": map[string]any{
+					"source":                     "redhat-operators",
+					"clusterServiceVersionNames": []any{"rhcl-operator.v1.0.0"},
+				},
+				"status": map[string]any{"phase": "Complete"},
+			}},
+			source:  "redhat-operators",
+			csvName: "rhcl-operator.v1.0.0",
+			want:    true,
+		},
+		{
+			name: "stale plan from previous source",
+			installPlan: &unstructured.Unstructured{Object: map[string]any{
+				"spec": map[string]any{
+					"source":                     "certified-operators",
+					"clusterServiceVersionNames": []any{"rhcl-operator.v1.0.0"},
+				},
+				"status": map[string]any{"phase": "Complete"},
+			}},
+			source:  "redhat-operators",
+			csvName: "rhcl-operator.v1.0.0",
+			want:    false,
+		},
+		{
+			name: "requested plan is not complete",
+			installPlan: &unstructured.Unstructured{Object: map[string]any{
+				"spec": map[string]any{
+					"source":                     "redhat-operators",
+					"clusterServiceVersionNames": []any{"rhcl-operator.v1.0.0"},
+				},
+				"status": map[string]any{"phase": "Installing"},
+			}},
+			source:  "redhat-operators",
+			csvName: "rhcl-operator.v1.0.0",
+			want:    false,
+		},
+		{
+			name: "requested plan does not contain current CSV",
+			installPlan: &unstructured.Unstructured{Object: map[string]any{
+				"spec": map[string]any{
+					"source":                     "redhat-operators",
+					"clusterServiceVersionNames": []any{"rhcl-operator.v1.0.1"},
+				},
+				"status": map[string]any{"phase": "Complete"},
+			}},
+			source:  "redhat-operators",
+			csvName: "rhcl-operator.v1.0.0",
+			want:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := installPlanMatchesSource(tc.installPlan, tc.source, tc.csvName); got != tc.want {
+				t.Errorf("installPlanMatchesSource() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
