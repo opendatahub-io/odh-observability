@@ -1,0 +1,34 @@
+{{- if .AcceleratorMetrics }}
+apiVersion: monitoring.rhobs/v1
+kind: PrometheusRule
+metadata:
+  name: data-science-accelerator-recording-rules
+  namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+spec:
+  groups:
+    - name: rhoai.accelerator.metrics
+      interval: 30s
+      rules:
+        # Align with OpenShift accelerator dashboard metric names on the data-science
+        # MonitoringStack. Source series come from OTC DCGM scrape (canonical DCGM_FI_*
+        # names; GPU util is 0-1 after transform/gpu_metrics).
+        - record: accelerator_gpu_utilization
+          expr: DCGM_FI_DEV_GPU_UTIL * 100
+          labels:
+            vendor: nvidia
+        # DCGM_FI_DEV_FB_USED is framebuffer used in MiB; metric name is bytes.
+        - record: accelerator_memory_used_bytes
+          expr: DCGM_FI_DEV_FB_USED * 1024 * 1024
+          labels:
+            vendor: nvidia
+        - record: accelerator_temperature_celsius
+          expr: DCGM_FI_DEV_GPU_TEMP
+          labels:
+            vendor: nvidia
+        - record: accelerator_power_usage_watts
+          expr: DCGM_FI_DEV_POWER_USAGE
+          labels:
+            vendor: nvidia
+{{- end }}

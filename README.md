@@ -106,13 +106,13 @@ go test ./internal/controller/ -run TestBuildTemplateData -v
 Requires a live cluster with `KUBECONFIG` set:
 
 ```bash
-make e2e-test
+make e2e-test-monitoring
 ```
 
 Or with flags:
 
 ```bash
-go test ./tests/e2e/ -v -timeout 120m -count=1 \
+go test ./tests/e2e/ -v -timeout 120m -count=1 -run '^TestMonitoring$' \
   -monitoring-namespace=opendatahub \
   -install-operators=true \
   -eventually-timeout=5m

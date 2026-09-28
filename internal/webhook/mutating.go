@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"slices"
 
+	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
@@ -122,7 +123,7 @@ func (i *Injector) inject(ctx context.Context, req *admission.Request, obj *unst
 		return admission.Allowed("namespace not configured for monitoring")
 	}
 
-	// Verify Monitoring CR exists (confirms monitoring is actually enabled).
+	// Verify Monitoring exists and is not being removed.
 	monitoringCR := &unstructured.Unstructured{}
 	monitoringCR.SetGroupVersionKind(gvk.Monitoring)
 	if err := i.Client.Get(ctx, types.NamespacedName{Name: v1alpha1.MonitoringInstanceName}, monitoringCR); err != nil {
@@ -131,6 +132,13 @@ func (i *Injector) inject(ctx context.Context, req *admission.Request, obj *unst
 			return admission.Allowed("monitoring is disabled — CR does not exist")
 		}
 		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("failed to verify monitoring state: %w", err))
+	}
+	managementState, _, err := unstructured.NestedString(monitoringCR.Object, "spec", "managementState")
+	if err != nil {
+		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("failed to read monitoring management state: %w", err))
+	}
+	if managementState == string(platformcommon.Removed) {
+		return admission.Allowed("monitoring is disabled — management state is Removed")
 	}
 
 	lbls := obj.GetLabels()

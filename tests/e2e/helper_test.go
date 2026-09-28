@@ -5,12 +5,18 @@ import (
 	"testing"
 	"time"
 
+	gTypes "github.com/onsi/gomega/types"
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/olm"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 	jq "github.com/opendatahub-io/odh-observability/tests/e2e/matchers/jq"
@@ -20,7 +26,6 @@ import (
 
 // Constants for monitoring resource names.
 const (
-	MonitoringCRName                  = "default-monitoring"
 	MonitoringStackName               = "data-science-monitoringstack"
 	OpenTelemetryCollectorName        = "data-science-collector"
 	TargetAllocatorDeploymentName     = "data-science-collector-targetallocator"
@@ -67,6 +72,9 @@ const (
 	connectivityLinkOpChannel   = "stable"
 	connectivityLinkOpSource    = "redhat-operators"
 	kuadrantResourceNamespace   = "kuadrant-system"
+
+	lokiOpName      = "loki-operator"
+	lokiOpNamespace = "openshift-operators-redhat"
 )
 
 // Constants for common test values.
@@ -87,12 +95,16 @@ const (
 	TracesStorageSize1Gi    = "1Gi"
 )
 
-// monitoringOwnerReferencesCondition validates owner references point to the Monitoring CR.
-var monitoringOwnerReferencesCondition = And(
-	jq.Match(`.metadata.ownerReferences | length == 1`),
-	jq.Match(`.metadata.ownerReferences[0].kind == "%s"`, gvk.Monitoring.Kind),
-	jq.Match(`.metadata.ownerReferences[0].name == "%s"`, MonitoringCRName),
-)
+// monitoringOwnerReferencesCondition validates ownership by the configured Monitoring CR.
+//
+//nolint:ireturn // Gomega's And matcher returns the GomegaMatcher interface.
+func (tc *MonitoringTestCtx) monitoringOwnerReferencesCondition() gTypes.GomegaMatcher {
+	return And(
+		jq.Match(`.metadata.ownerReferences | length == 1`),
+		jq.Match(`.metadata.ownerReferences[0].kind == "%s"`, gvk.Monitoring.Kind),
+		jq.Match(`.metadata.ownerReferences[0].name == "%s"`, tc.MonitoringCRName),
+	)
+}
 
 // rebaseForDSCI wraps transforms so they operate on DSCI's .spec.monitoring
 // as if it were .spec on a Monitoring CR. This lets every existing transform
@@ -136,23 +148,33 @@ func (tc *MonitoringTestCtx) patchViaDSCI(expectedPhase common.Phase, transforms
 }
 
 // ensureMonitoringCRExists creates the Monitoring CR if it does not already exist.
-// In DSC mode, it patches the DSCI to enable monitoring and waits for the
-// module handler to create the Monitoring CR.
+// Readiness is checked after the suite clears any pre-existing optional config.
 func (tc *MonitoringTestCtx) ensureMonitoringCRExists(t *testing.T) {
 	t.Helper()
 
 	if tc.ApiMode == APIModeDSC {
-		tc.patchViaDSCI(common.PhaseReady, withManagementState(common.Managed))
+		tc.EventuallyResourcePatched(
+			WithMinimalObject(gvk.DSCInitialization, types.NamespacedName{Name: tc.DSCICRName}),
+			WithMutateFunc(rebaseForDSCI(withManagementState(common.Managed))),
+		)
+		tc.EnsureResourceExists(
+			WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		)
 		return
 	}
 
 	tc.EventuallyResourceCreatedOrPatched(
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
 		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			if u.GetResourceVersion() == "" && tc.MonitoringNamespace != "" {
+				if err := unstructured.SetNestedField(u.Object, tc.MonitoringNamespace, "spec", "namespace"); err != nil {
+					return err
+				}
+			}
 			return jq.TransformPipeline(withManagementState(common.Managed))(u)
 		}),
-		WithCondition(jq.Match(`.status.phase == "%s"`, common.PhaseReady)),
-		WithCustomErrorMsg("Monitoring CR should exist and reach Ready phase"),
+		WithCondition(jq.Match(`.spec.managementState == "%s"`, common.Managed)),
+		WithCustomErrorMsg("Monitoring CR should exist and be managed"),
 	)
 }
 
@@ -169,6 +191,23 @@ func (tc *MonitoringTestCtx) updateMonitoringConfig(transforms ...jq.TransformFn
 	tc.updateMonitoringConfigWithOptions(WithMutateFunc(func(u *unstructured.Unstructured) error {
 		return jq.TransformPipeline(transforms...)(u)
 	}))
+}
+
+// updateMonitoringConfigWithoutReady applies configuration whose dependent
+// operands need additional test setup before Monitoring can become Ready.
+func (tc *MonitoringTestCtx) updateMonitoringConfigWithoutReady(transforms ...jq.TransformFn) {
+	if tc.ApiMode == APIModeDSC {
+		tc.EventuallyResourcePatched(
+			WithMinimalObject(gvk.DSCInitialization, types.NamespacedName{Name: tc.DSCICRName}),
+			WithMutateFunc(rebaseForDSCI(transforms...)),
+		)
+		return
+	}
+
+	tc.EventuallyResourcePatched(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithMutateFunc(jq.TransformPipeline(transforms...)),
+	)
 }
 
 // updateMonitoringConfigWithOptions patches the Monitoring CR with advanced options.
@@ -202,6 +241,24 @@ func (tc *MonitoringTestCtx) cleanupGroup(t *testing.T, secretName string) {
 
 	tc.resetMonitoringConfigToManaged()
 
+	tc.DeleteResource(
+		WithMinimalObject(gvk.TempoMonolithic, types.NamespacedName{
+			Name:      TempoMonolithicName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithWaitForDeletion(true),
+		WithIgnoreNotFound(true),
+	)
+
+	tc.DeleteResource(
+		WithMinimalObject(gvk.TempoStack, types.NamespacedName{
+			Name:      TempoStackName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithWaitForDeletion(true),
+		WithIgnoreNotFound(true),
+	)
+
 	if secretName != "" {
 		tc.DeleteResource(
 			WithMinimalObject(gvk.Secret, types.NamespacedName{
@@ -212,33 +269,13 @@ func (tc *MonitoringTestCtx) cleanupGroup(t *testing.T, secretName string) {
 			WithWaitForDeletion(true),
 		)
 	}
-
-	tc.DeleteResource(
-		WithMinimalObject(gvk.TempoMonolithic, types.NamespacedName{
-			Name:      TempoMonolithicName,
-			Namespace: tc.MonitoringNamespace,
-		}),
-		WithWaitForDeletion(true),
-		WithRemoveFinalizersOnDelete(true),
-		WithIgnoreNotFound(true),
-	)
-
-	tc.DeleteResource(
-		WithMinimalObject(gvk.TempoStack, types.NamespacedName{
-			Name:      TempoStackName,
-			Namespace: tc.MonitoringNamespace,
-		}),
-		WithWaitForDeletion(true),
-		WithRemoveFinalizersOnDelete(true),
-		WithIgnoreNotFound(true),
-	)
 }
 
 // resetMonitoringConfigToManaged deletes optional config fields and sets managementState=Managed.
 func (tc *MonitoringTestCtx) resetMonitoringConfigToManaged() {
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		jq.Transform(`del(.spec.metrics, .spec.traces, .spec.alerting, .spec.collectorReplicas, .spec.usageLogs)`),
+		jq.Transform(`del(.spec.metrics, .spec.traces, .spec.alerting, .spec.collectorReplicas, .spec.usageLogs, .spec.logs)`),
 	)
 
 	tc.EnsureResourcesGone(
@@ -261,6 +298,17 @@ func (tc *MonitoringTestCtx) resetMonitoringConfigToManaged() {
 			Namespace: tc.MonitoringNamespace,
 		}),
 	)
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+			Name: UsageLogsCollectorName, Namespace: tc.MonitoringNamespace,
+		}),
+	)
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
+			Name: LokiStackName, Namespace: tc.MonitoringNamespace,
+		}),
+		WithEventuallyTimeout(15*time.Minute),
+	)
 }
 
 // resetMonitoringConfigToRemoved deletes optional config fields and sets managementState=Removed.
@@ -269,7 +317,7 @@ func (tc *MonitoringTestCtx) resetMonitoringConfigToRemoved() {
 	if tc.ApiMode == APIModeDSC {
 		tc.patchViaDSCI(common.PhaseNotReady,
 			withManagementState(common.Removed),
-			jq.Transform(`del(.spec.metrics, .spec.traces, .spec.alerting, .spec.collectorReplicas, .spec.usageLogs)`),
+			jq.Transform(`del(.spec.metrics, .spec.traces, .spec.alerting, .spec.collectorReplicas, .spec.usageLogs, .spec.logs)`),
 		)
 
 		tc.EnsureResourcesGone(
@@ -286,7 +334,7 @@ func (tc *MonitoringTestCtx) resetMonitoringConfigToRemoved() {
 		WithMutateFunc(func(u *unstructured.Unstructured) error {
 			return jq.TransformPipeline(
 				withManagementState(common.Removed),
-				jq.Transform(`del(.spec.metrics, .spec.traces, .spec.alerting, .spec.collectorReplicas, .spec.usageLogs)`),
+				jq.Transform(`del(.spec.metrics, .spec.traces, .spec.alerting, .spec.collectorReplicas, .spec.usageLogs, .spec.logs)`),
 			)(u)
 		}),
 		WithCondition(jq.Match(`.status.phase == "%s"`, common.PhaseNotReady)),
@@ -312,7 +360,6 @@ func (tc *MonitoringTestCtx) ensureMonitoringCleanSlate(t *testing.T, secretName
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithWaitForDeletion(true),
-		WithRemoveFinalizersOnDelete(true),
 		WithIgnoreNotFound(true),
 	)
 
@@ -322,7 +369,6 @@ func (tc *MonitoringTestCtx) ensureMonitoringCleanSlate(t *testing.T, secretName
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithWaitForDeletion(true),
-		WithRemoveFinalizersOnDelete(true),
 		WithIgnoreNotFound(true),
 	)
 
@@ -351,32 +397,6 @@ func (tc *MonitoringTestCtx) cleanupTempoStackAndSecret(secretName string) {
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithWaitForDeletion(true),
-		WithRemoveFinalizersOnDelete(true),
-		WithIgnoreNotFound(true),
-		WithEventuallyTimeout(15*time.Minute),
-	)
-
-	if secretName != "" {
-		tc.DeleteResource(
-			WithMinimalObject(gvk.Secret, types.NamespacedName{
-				Name:      secretName,
-				Namespace: tc.MonitoringNamespace,
-			}),
-			WithIgnoreNotFound(true),
-			WithWaitForDeletion(true),
-		)
-	}
-}
-
-// cleanupLokiStackAndSecret removes LokiStack and optionally an associated secret.
-func (tc *MonitoringTestCtx) cleanupLokiStackAndSecret(secretName string) {
-	tc.DeleteResource(
-		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name:      LokiStackName,
-			Namespace: tc.MonitoringNamespace,
-		}),
-		WithWaitForDeletion(true),
-		WithRemoveFinalizersOnDelete(true),
 		WithIgnoreNotFound(true),
 		WithEventuallyTimeout(15*time.Minute),
 	)
@@ -399,13 +419,13 @@ func (tc *MonitoringTestCtx) setupUsageLogsWithStorage(t *testing.T, storageType
 	tc.createLokiS3Secret(t, secretName, tc.MonitoringNamespace)
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		withUsageLogsStorage(storageType, secretName, ""),
+		withUsageLogsStorage(storageType, secretName, tc.DefaultStorageClass),
 	)
 }
 
 // cleanupTracesConfiguration resets traces configuration.
 func (tc *MonitoringTestCtx) cleanupTracesConfiguration() {
-	tc.updateMonitoringConfig(withNoTraces())
+	tc.updateMonitoringConfig(withManagementState(common.Managed), withNoTraces())
 }
 
 // detectExpectedReplicas queries the cluster node count to determine expected Prometheus replicas.
@@ -440,11 +460,8 @@ func detectExpectedReplicas(t *testing.T, tc *TestContext) int {
 	return 2
 }
 
-// createDummySecret creates a test secret for the specified backend type.
-// For Tempo backends, this routes to tempo-specific helpers.
-//
-// Deprecated: Use createTempoS3Secret, createTempoGCSSecret, or createLokiS3Secret directly.
-func (tc *MonitoringTestCtx) createDummySecret(t *testing.T, backendType, secretName, namespace string) {
+// createTempoStorageSecret creates a test secret for a locally hosted Tempo backend.
+func (tc *MonitoringTestCtx) createTempoStorageSecret(t *testing.T, backendType, secretName, namespace string) {
 	t.Helper()
 
 	switch backendType {
@@ -468,10 +485,10 @@ func (tc *MonitoringTestCtx) createTempoS3Secret(t *testing.T, secretName, names
 		},
 		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
-			"access_key_id":     []byte("fake-access-key"),
-			"access_key_secret": []byte("fake-secret-key"),
-			"bucket":            []byte("fake-bucket"),
-			"endpoint":          []byte("https://s3.amazonaws.com"),
+			"access_key_id":     []byte(seaweedFSAccessKey),
+			"access_key_secret": []byte(seaweedFSSecretKey),
+			"bucket":            []byte(tempoS3Bucket),
+			"endpoint":          fmt.Appendf(nil, "http://%s.%s.svc.cluster.local:%d", seaweedFSServiceName, namespace, seaweedFSS3Port),
 		},
 	}
 
@@ -501,6 +518,7 @@ func (tc *MonitoringTestCtx) createTempoGCSSecret(t *testing.T, secretName, name
 		},
 		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
+			"bucketname": []byte(fakeGCSBucket),
 			"key.json": []byte(`{
 				"type": "service_account",
 				"project_id": "fake-test-project-not-real",
@@ -537,13 +555,13 @@ func (tc *MonitoringTestCtx) createLokiS3Secret(t *testing.T, secretName, namesp
 		},
 		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
-			"access_key_id":     []byte("fake-access-key"),
-			"access_key_secret": []byte("fake-secret-key"),
-			"bucketnames":       []byte("fake-bucket"),
-			"endpoint":          []byte("https://s3.us-east-1.amazonaws.com"),
+			"access_key_id":     []byte(seaweedFSAccessKey),
+			"access_key_secret": []byte(seaweedFSSecretKey),
+			"bucketnames":       []byte(lokiS3Bucket),
+			"endpoint":          fmt.Appendf(nil, "http://%s.%s.svc.cluster.local:%d", seaweedFSServiceName, namespace, seaweedFSS3Port),
 			"region":            []byte("us-east-1"),
-			"insecure":          []byte("false"),
-			"s3ForcePathStyle":  []byte("false"),
+			"insecure":          []byte("true"),
+			"s3ForcePathStyle":  []byte("true"),
 		},
 	}
 
@@ -681,6 +699,58 @@ func withMonitoringTraces(backend, secret, size, retention string) jq.TransformF
 	return jq.TransformPipeline(transforms...)
 }
 
+// registerMonitoringRestore records only the field the suite mutates. In DSC
+// mode the real DSCI must already exist; module mode may start without a CR.
+func (tc *MonitoringTestCtx) registerMonitoringRestore(t *testing.T) {
+	t.Helper()
+
+	kind := gvk.Monitoring
+	nn := types.NamespacedName{Name: tc.MonitoringCRName}
+	fieldPath := []string{"spec"}
+	if tc.ApiMode == APIModeDSC {
+		kind = gvk.DSCInitialization
+		nn.Name = tc.DSCICRName
+		fieldPath = []string{"spec", "monitoring"}
+	}
+
+	original, err := tc.fetchResource(t, kind, nn)
+	existed := err == nil
+	if err != nil && (tc.ApiMode != APIModeModule || !k8serr.IsNotFound(err)) {
+		t.Fatalf("failed to record original %s %s: %v", kind.Kind, nn.Name, err)
+	}
+
+	var originalValue map[string]any
+	var hadValue bool
+	if existed {
+		originalValue, hadValue, err = unstructured.NestedMap(original.Object, fieldPath...)
+		require.NoError(t, err)
+	}
+
+	t.Cleanup(func() {
+		if !existed {
+			tc.DeleteResource(
+				WithMinimalObject(kind, nn),
+				WithIgnoreNotFound(true),
+				WithWaitForDeletion(true),
+				WithEventuallyTimeout(15*time.Minute),
+			)
+			return
+		}
+
+		tc.EventuallyResourcePatched(
+			WithMinimalObject(kind, nn),
+			WithMutateFunc(func(current *unstructured.Unstructured) error {
+				if hadValue {
+					return unstructured.SetNestedMap(current.Object, originalValue, fieldPath...)
+				}
+				unstructured.RemoveNestedField(current.Object, fieldPath...)
+				return nil
+			}),
+			WithCustomErrorMsg("failed to restore original %s %s configuration", kind.Kind, nn.Name),
+		)
+	})
+}
+
 // ensurePrerequisites verifies that the operator is running, the CRD is
 // registered, installs dependent operators (when enabled), and ensures the
 // Monitoring CR exists before any test groups run. The monitoring namespace
@@ -688,17 +758,61 @@ func withMonitoringTraces(backend, secret, size, retention string) jq.TransformF
 func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 	t.Helper()
 
-	tc.ensureOperatorPodRunning(t)
+	operatorMonitoringNamespace := tc.ensureOperatorDeploymentReady(t)
+	if tc.ApiMode == APIModeModule && tc.MonitoringNamespace == "" {
+		_, err := tc.fetchResource(t, gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName})
+		switch {
+		case err == nil:
+			tc.MonitoringNamespace = tc.detectMonitoringNamespace(t)
+		case k8serr.IsNotFound(err):
+			tc.MonitoringNamespace = operatorMonitoringNamespace
+		default:
+			t.Fatalf("failed to check existing Monitoring CR %s: %v", tc.MonitoringCRName, err)
+		}
+	}
 	tc.ensureCRDExists(t, gvk.Monitoring)
+	tc.DefaultStorageClass = tc.ensureDefaultStorageClass(t)
 
 	if tc.ApiMode == APIModeDSC {
 		tc.ensureCRDExists(t, gvk.DSCInitialization)
 	}
+	tc.registerMonitoringRestore(t)
 
 	if testOpts.installOperators {
 		tc.installDependentOperators(t)
 	}
 	tc.ensureCRDExists(t, gvk.CertManagerCertificate)
+	for _, name := range []string{
+		"cluster-observability-operator",
+		"tempo-operator",
+		"opentelemetry-operator",
+		"loki-operator",
+	} {
+		if testOpts.installOperators {
+			tc.g.Eventually(func() error {
+				_, err := olm.OperatorExists(tc.Context(), tc.Client(), name)
+				return err
+			}).WithTimeout(tc.Timeouts.olmOperationTimeout).Should(Succeed(),
+				"required OLM operator %s should be installed", name)
+		} else {
+			_, err := olm.OperatorExists(tc.Context(), tc.Client(), name)
+			require.NoError(t, err, "required OLM operator %s is missing", name)
+		}
+	}
+	for _, required := range []schema.GroupVersionKind{
+		gvk.MonitoringStack,
+		gvk.TempoMonolithic,
+		gvk.TempoStack,
+		gvk.OpenTelemetryCollector,
+		gvk.Instrumentation,
+		gvk.LokiStack,
+		gvk.Perses,
+		gvk.ThanosQuerier,
+		gvk.CoreosPodMonitor,
+		gvk.CoreosServiceMonitor,
+	} {
+		tc.ensureCRDExists(t, required)
+	}
 
 	tc.ensureMonitoringCRExists(t)
 
@@ -708,10 +822,12 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 	}
 
 	tc.ensureNamespaceExists(tc.MonitoringNamespace)
+	tc.resetMonitoringConfigToManaged()
 }
 
-// installDependentOperators installs the required OLM operators
-// in parallel sub-tests. Each operator gets its own namespace + OperatorGroup + Subscription.
+// installDependentOperators installs required OLM operators in parallel sub-tests.
+// Each operator gets its own namespace, OperatorGroup, and Subscription when it is
+// not already present.
 func (tc *MonitoringTestCtx) installDependentOperators(t *testing.T) {
 	t.Helper()
 
@@ -736,6 +852,41 @@ func (tc *MonitoringTestCtx) installDependentOperators(t *testing.T) {
 			})
 		}
 	})
+
+	// Loki channels are versioned, so use the cluster catalog's default channel.
+	// A preinstalled Loki Operator may not have a PackageManifest in the catalog.
+	lokiStacks := &unstructured.UnstructuredList{}
+	lokiStacks.SetGroupVersionKind(gvk.LokiStack)
+	if err := tc.Client().List(tc.Context(), lokiStacks); err == nil {
+		t.Log("LokiStack CRD is already available")
+		return
+	} else if !meta.IsNoMatchError(err) && !k8serr.IsNotFound(err) {
+		t.Fatalf("failed to check LokiStack CRD: %v", err)
+	}
+
+	manifests := &unstructured.UnstructuredList{}
+	manifests.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "packages.operators.coreos.com", Version: "v1", Kind: "PackageManifestList",
+	})
+	if err := tc.Client().List(tc.Context(), manifests,
+		client.InNamespace("openshift-marketplace"),
+		client.MatchingLabels{"catalog": "redhat-operators"},
+	); err != nil {
+		t.Fatalf("Loki Operator is required; failed to list redhat-operators PackageManifests: %v", err)
+	}
+	for _, manifest := range manifests.Items {
+		if manifest.GetName() != lokiOpName {
+			continue
+		}
+		channel, _, err := unstructured.NestedString(manifest.Object, "status", "defaultChannel")
+		if err != nil || channel == "" {
+			t.Fatalf("redhat-operators Loki PackageManifest has no default channel: %v", err)
+		}
+		t.Logf("installing Loki Operator from redhat-operators channel %s", channel)
+		tc.EnsureOperatorInstalled(lokiOpNamespace, lokiOpName, channel)
+		return
+	}
+	t.Fatalf("Loki Operator is required; %s PackageManifest is missing from redhat-operators", lokiOpName)
 }
 
 // Suppress unused warnings for transform functions used in later commits.

@@ -61,6 +61,10 @@ lint: golangci-lint ## Run golangci-lint against code.
 e2e-test: ## Run e2e tests against a cluster (requires KUBECONFIG).
 	go test ./tests/e2e/ -v -timeout 120m -count=1 $(E2E_TEST_FLAGS)
 
+.PHONY: e2e-test-monitoring
+e2e-test-monitoring: ## Run only the monitoring e2e suite against a cluster.
+	go test ./tests/e2e/ -v -timeout 120m -count=1 $(E2E_TEST_FLAGS) -run '^TestMonitoring$$'
+
 BIN_DIR  ?= $(LOCALBIN)
 OATS_BIN ?= $(BIN_DIR)/oats
 
@@ -111,7 +115,7 @@ e2e-test-container: ## Run containerized e2e tests in module mode (standalone op
 		-e E2E_TEST_API_MODE=module \
 		-e E2E_TEST_INSTALL_OPERATORS=true \
 		-e E2E_TEST_MONITORING_CR_NAME=default-monitoring \
-		"$(E2E_IMG)"
+		"$(E2E_IMG)" '-test.run=^TestMonitoring$$'
 
 .PHONY: e2e-test-container-dsc
 e2e-test-container-dsc: ## Run containerized e2e tests in DSC mode (via ODH platform operator).
@@ -125,7 +129,7 @@ e2e-test-container-dsc: ## Run containerized e2e tests in DSC mode (via ODH plat
 		-e E2E_TEST_API_MODE=dsc \
 		-e E2E_TEST_INSTALL_OPERATORS=false \
 		-e E2E_TEST_MONITORING_CR_NAME=default-monitoring \
-		"$(E2E_IMG)"
+		"$(E2E_IMG)" '-test.run=^TestMonitoring$$'
 
 ##@ Prometheus Rules
 

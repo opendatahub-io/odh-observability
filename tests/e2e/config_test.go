@@ -32,7 +32,7 @@ type TestContextConfig struct {
 // registerFlags registers test binary flags.
 // These flags are mapped from env vars by runner.envToFlags (tests/e2e/runner/runner.go).
 func (c *TestContextConfig) registerFlags() {
-	flag.StringVar(&c.monitoringNamespace, "monitoring-namespace", "", "namespace where monitoring operands are deployed (auto-detected from CR if omitted)")
+	flag.StringVar(&c.monitoringNamespace, "monitoring-namespace", "", "namespace where monitoring operands are deployed (auto-detected from operator or CR if omitted)")
 	flag.StringVar(&c.monitoringCRName, "monitoring-cr-name", "", "name of the Monitoring CR")
 	flag.BoolVar(&c.installOperators, "install-operators", true, "install dependent OLM operators before running tests")
 	flag.StringVar(&c.apiMode, "api-mode", "module", "API mode: 'module' for standalone module CR, 'dsc' for DSC/DSCI integration")

@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"testing"
 
+	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -195,6 +196,7 @@ func TestHandle_InjectsLabelOnServiceMonitor(t *testing.T) {
 		},
 	}
 	monCR := monitoringCR()
+	monCR.Spec.ManagementState = platformcommon.Managed
 
 	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ns).WithObjects(monCR).Build()
 	injector := &Injector{
@@ -236,6 +238,7 @@ func TestHandle_InjectsLabelOnPodMonitor(t *testing.T) {
 		},
 	}
 	monCR := monitoringCR()
+	monCR.Spec.ManagementState = platformcommon.Managed
 
 	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ns).WithObjects(monCR).Build()
 	injector := &Injector{
@@ -310,6 +313,36 @@ func TestHandle_MonitoringCRMissing(t *testing.T) {
 	resp := injector.Handle(context.Background(), req)
 	if !resp.Allowed {
 		t.Errorf("expected allowed (monitoring disabled), got denied: %v", resp.Result)
+	}
+}
+
+func TestHandle_MonitoringRemoved(t *testing.T) {
+	scheme := newTestScheme()
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name: "monitored-ns", Labels: map[string]string{labelMonitoring: "true"},
+	}}
+	monCR := monitoringCR()
+	monCR.Spec.ManagementState = platformcommon.Removed
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ns, monCR).Build()
+	injector := &Injector{Client: cli, Decoder: admission.NewDecoder(scheme)}
+
+	for _, tc := range []struct {
+		name string
+		kind string
+		obj  *unstructured.Unstructured
+	}{
+		{name: "ServiceMonitor", kind: "ServiceMonitor", obj: newServiceMonitor("monitored-ns", "sm", nil)},
+		{name: "PodMonitor", kind: "PodMonitor", obj: newPodMonitor("monitored-ns", "pm", nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := makeAdmissionRequest(t, admissionv1.Create, metav1.GroupVersionKind{
+				Group: "monitoring.coreos.com", Version: "v1", Kind: tc.kind,
+			}, tc.obj)
+			resp := injector.Handle(context.Background(), req)
+			if !resp.Allowed || len(resp.Patches) != 0 {
+				t.Fatalf("expected allowed without label injection for Removed monitoring, got allowed=%t patches=%v", resp.Allowed, resp.Patches)
+			}
+		})
 	}
 }
 
