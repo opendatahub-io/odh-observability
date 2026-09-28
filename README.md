@@ -26,6 +26,7 @@ The operator watches a singleton `Monitoring` CR (`services.platform.opendatahub
 - Cluster Observability Operator and OpenTelemetry Operator for metrics
 - OpenTelemetry Operator and Tempo Operator for traces
 - OpenTelemetry Operator and Loki Operator for usage logs
+- cert-manager for the mutating webhook
 
 ### Build
 
