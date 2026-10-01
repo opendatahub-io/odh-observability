@@ -35,6 +35,8 @@ spec:
               name: data
             - mountPath: /var/tempo
               name: tempo
+            - mountPath: /otel-lgtm/grafana/data
+              name: grafana-data
           env:
             - name: ENABLE_LOGS_ALL
               value: "true"
@@ -43,6 +45,8 @@ spec:
         - name: data
           emptyDir: {}
         - name: tempo
+          emptyDir: {}
+        - name: grafana-data
           emptyDir: {}
 ---
 apiVersion: v1

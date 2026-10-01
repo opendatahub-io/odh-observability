@@ -1,0 +1,14 @@
+name: InferenceService vLLM tracing
+
+tags: ["e2e", "vllm", "isvc"]
+
+fixture:
+  remote:
+    endpoint: default
+
+expected:
+  traces:
+    - traceql: '{ name = "llm_request" && resource.k8s.pod.name =~ "facebook-opt-125m-isvc.*" && span:parentID = "0000000000000000" }'
+      count: ">= 1"
+    - traceql: '{ name = "llm_request" && resource.k8s.pod.name =~ "facebook-opt-125m-isvc.*" && span:parentID != "0000000000000000" }'
+      count: ">= 1"
