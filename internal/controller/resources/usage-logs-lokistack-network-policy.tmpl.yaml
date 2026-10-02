@@ -1,0 +1,21 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{.LokiStackName}}-allow
+  namespace: {{.Namespace}}
+spec:
+  # Protects the loki gateway pods (the ones RECEIVING the connection).
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: lokistack-gateway
+      app.kubernetes.io/instance: {{.LokiStackName}}
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: {{.UsageLogsCollectorName}}-collector
+    ports:
+    - protocol: TCP
+      port: 8080

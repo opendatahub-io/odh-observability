@@ -1,0 +1,31 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{.UsageLogsCollectorName}}-collector-allow
+  namespace: {{.Namespace}}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{.UsageLogsCollectorName}}-collector
+  policyTypes:
+  - Ingress
+  
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          network.openshift.io/policy-group: ingress
+      # podSelector:
+      #   matchLabels:
+      #     maas-gateway: "true" 
+    ports:
+    - protocol: TCP
+      port: 4317
+    - protocol: TCP
+      port: 4318
+
+  # 3. Allow Prometheus Metrics Get - internal telemetry metrics
+  - ports:
+    - protocol: TCP
+      port: 8888 # The prometheus metrics port defined in your config
+

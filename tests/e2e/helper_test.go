@@ -43,6 +43,9 @@ const (
 	UsageLogsCollectorName            = "data-science-usage-logs"
 	UsageLogsCollectorServiceAccount  = "data-science-usage-logs-collector"
 	LokiStackName                     = "data-science-lokistack"
+
+	UsageLogsCollectorNetworkPolicyName = UsageLogsCollectorName + "-collector-allow"
+	UsageLogsLokiStackNetworkPolicyName = LokiStackName + "-allow"
 )
 
 // OLM operator constants for dependent operators.

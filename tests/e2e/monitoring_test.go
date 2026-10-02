@@ -2318,6 +2318,8 @@ func (tc *MonitoringTestCtx) ValidateMonitoringServiceDisabled(t *testing.T) {
 		{gvk: gvk.Perses, name: PersesName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.PersesDatasource, name: PersesDatasourceName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.PersesDatasource, name: ClusterPrometheusDatasourceName, namespace: tc.MonitoringNamespace},
+		{gvk: gvk.NetworkPolicy, name: UsageLogsCollectorNetworkPolicyName, namespace: tc.MonitoringNamespace},
+		{gvk: gvk.NetworkPolicy, name: UsageLogsLokiStackNetworkPolicyName, namespace: tc.MonitoringNamespace},
 	} {
 		tc.EnsureResourceGone(
 			WithMinimalObject(resource.gvk, types.NamespacedName{
