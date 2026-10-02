@@ -1965,6 +1965,7 @@ func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 		t.Run("Prometheus secure proxy authentication", tc.ValidatePrometheusSecureProxyAuthentication)
 		t.Run("Node metrics endpoint deployment", tc.ValidateNodeMetricsEndpointDeployment)
 		t.Run("Node metrics endpoint RBAC configuration", tc.ValidateNodeMetricsEndpointRBACConfiguration)
+		t.Run("Namespace isolation POST form bypass", tc.ValidateNamespaceIsolationPostFormBypass)
 	})
 }
 
@@ -2275,6 +2276,30 @@ func (tc *MonitoringTestCtx) ValidateNodeMetricsEndpointRBACConfiguration(t *tes
 		)),
 		WithCustomErrorMsg("deployment should have volumes and mounts for mTLS to Prometheus"),
 	)
+}
+
+func (tc *MonitoringTestCtx) ValidateNamespaceIsolationPostFormBypass(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.EnsureResourceDoesNotExist(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{Name: "data-science-metrics-view"}),
+		WithCustomErrorMsg("ClusterRole 'data-science-metrics-view' must not exist: granting 'create' on metrics.k8s.io/pods authorizes POST and enables a POST-body namespace bypass"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      "data-science-prometheus-namespace-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--query-param=namespace"])`),
+			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--error-on-replace"])`),
+		)),
+		WithCustomErrorMsg("prom-label-proxy must have --query-param=namespace and --error-on-replace flags"),
+	)
+
+	t.Log("POST-body namespace bypass is closed: no ClusterRole grants 'create' on metrics.k8s.io/pods, so POST is rejected (403) at kube-rbac-proxy before reaching prom-label-proxy")
 }
 
 // ========================================================================

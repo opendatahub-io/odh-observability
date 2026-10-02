@@ -1,27 +1,20 @@
-# Aggregated ClusterRole granting "create" on metrics.k8s.io/pods.
+# Namespace-scoped Prometheus proxy.
 #
-# Perses uses POST for Prometheus queries. The namespace proxy's kube-rbac-proxy
-# derives the SAR verb from the HTTP method (POST -> "create"). OpenShift's
-# built-in view/edit/admin roles already grant "get" (covering GET requests),
-# but not "create". The metrics.k8s.io API is read-only so granting "create"
-# has no side-effects -- it only satisfies the SAR authorization check.
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: data-science-metrics-view
-  labels:
-    rbac.authorization.k8s.io/aggregate-to-admin: "true"
-    rbac.authorization.k8s.io/aggregate-to-edit: "true"
-    rbac.authorization.k8s.io/aggregate-to-view: "true"
-    platform.opendatahub.io/part-of: monitoring
-rules:
-  - apiGroups:
-      - metrics.k8s.io
-    resources:
-      - pods
-    verbs:
-      - create
+# POST requests are intentionally NOT authorized. kube-rbac-proxy derives the
+# SAR verb from the HTTP method (POST -> "create"), and no role grants users
+# "create" on metrics.k8s.io/pods -- so every POST is rejected with 403 at the
+# auth layer, before it reaches prom-label-proxy.
+#
+# This closes a tenant-isolation bypass: prom-label-proxy's --query-param uses
+# ParseForm, which merges the URL query AND the POST body. A POST body
+# "namespace" value would be OR'd into the enforced label matcher
+# (namespace=~"authorized|attacker"), even though kube-rbac-proxy only
+# authorized the URL-query namespace. Rejecting POST removes the vector.
+#
+# Clients must use GET with the namespace in the URL query:
+#   /api/v1/query?query=<promql>&namespace=<namespace-name>
+# GET maps to the "get" verb, which OpenShift's built-in view/edit/admin roles
+# already grant on metrics.k8s.io/pods.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -156,6 +149,8 @@ spec:
             - --insecure-listen-address=127.0.0.1:9091
             - --upstream=https://prometheus-operated.{{.Namespace}}.svc:9090
             - --label=namespace
+            - --query-param=namespace
+            - --error-on-replace
             - --enable-label-apis
           env:
             - name: SSL_CERT_DIR

@@ -27,6 +27,14 @@ resources:
 # Leader election - enable when running multiple replicas.
 leaderElect: false
 
+# Webhook admission policy configuration.
+# failurePolicy controls what happens when the webhook is unavailable.
+# Use Ignore (default) for single-replica deployments to avoid blocking
+# PodMonitor/ServiceMonitor admission during operator restarts or node drains.
+# Switch to Fail only after enabling HA (replicaCount >= 2, leaderElect: true).
+webhook:
+  failurePolicy: Ignore
+
 # Image pull secrets for private registries.
 imagePullSecrets: []
 

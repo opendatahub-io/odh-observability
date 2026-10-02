@@ -172,24 +172,16 @@ func TestDeployMonitoringStackWithQuerierIncludesTelemetryResources(t *testing.T
 func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 	resources := renderObservabilityTemplate(t, PrometheusNamespaceProxyTemplate, proxyTemplateData())
 
-	clusterRole := findRenderedResource(t, resources, "ClusterRole", "data-science-metrics-view")
-	if labels := clusterRole.GetLabels(); len(labels) != 4 || labels["rbac.authorization.k8s.io/aggregate-to-view"] != "true" ||
-		labels["rbac.authorization.k8s.io/aggregate-to-edit"] != "true" ||
-		labels["rbac.authorization.k8s.io/aggregate-to-admin"] != "true" ||
-		labels["platform.opendatahub.io/part-of"] != "monitoring" {
-		t.Fatalf("metrics ClusterRole must aggregate to view/edit/admin: %#v", labels)
+	// The template must NOT grant users "create" on metrics.k8s.io/pods. kube-rbac-proxy
+	// maps POST -> "create", so any such grant would authorize POST requests, and
+	// prom-label-proxy's --query-param (ParseForm) would then merge a POST-body
+	// "namespace" into the enforced matcher, bypassing tenant isolation. The proxy is
+	// GET-only; POST is rejected at the authorization layer.
+	for _, resource := range resources {
+		if resource.GetKind() == "ClusterRole" && resource.GetName() == "data-science-metrics-view" {
+			t.Fatalf("template must not render the data-science-metrics-view ClusterRole: granting create on metrics.k8s.io/pods authorizes POST and enables a POST-body namespace bypass")
+		}
 	}
-	rules := nestedSlice(t, clusterRole, "rules")
-	if len(rules) != 1 {
-		t.Fatalf("expected one metrics ClusterRole rule, got %d", len(rules))
-	}
-	rule := asMap(t, rules[0])
-	if len(rule) != 3 {
-		t.Fatalf("metrics ClusterRole rule must not contain extra permissions: %#v", rule)
-	}
-	assertStringSet(t, rule, "apiGroups", []string{"metrics.k8s.io"})
-	assertStringSet(t, rule, "resources", []string{"pods"})
-	assertStringSet(t, rule, "verbs", []string{"create"})
 
 	assertClusterRoleBinding(
 		t,
@@ -602,30 +594,6 @@ func asMap(t *testing.T, value any) map[string]any {
 		t.Fatalf("expected map[string]any, got %T", value)
 	}
 	return result
-}
-
-func assertStringSet(t *testing.T, object map[string]any, field string, want []string) {
-	t.Helper()
-	got, found, err := unstructured.NestedStringSlice(object, field)
-	if err != nil || !found {
-		t.Fatalf("field %q is missing: found=%t error=%v", field, found, err)
-	}
-	wantSet := make(map[string]struct{}, len(want))
-	for _, value := range want {
-		wantSet[value] = struct{}{}
-	}
-	gotSet := make(map[string]struct{}, len(got))
-	for _, value := range got {
-		gotSet[value] = struct{}{}
-	}
-	if len(got) != len(gotSet) || len(gotSet) != len(wantSet) {
-		t.Fatalf("field %q: got %v, want exactly %v", field, got, want)
-	}
-	for value := range wantSet {
-		if _, found := gotSet[value]; !found {
-			t.Fatalf("field %q: got %v, want exactly %v", field, got, want)
-		}
-	}
 }
 
 func assertClusterRoleBinding(t *testing.T, binding unstructured.Unstructured, roleName, subjectName, subjectNamespace string) {
