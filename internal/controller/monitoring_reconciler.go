@@ -410,7 +410,7 @@ func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v
 		return err
 	}
 
-	return r.collectTargetAllocatorRBACGarbage(ctx, params, desiredSet)
+	return r.collectTargetAllocatorRBACGarbage(ctx, params, desiredSet, monitoring.Spec.Namespace)
 }
 
 // deleteAllOwned removes all resources owned by this controller (used on Removed state).
@@ -440,17 +440,20 @@ func (r *MonitoringReconciler) deleteAllOwned(ctx context.Context, monitoring *v
 		return err
 	}
 
-	return r.collectTargetAllocatorRBACGarbage(ctx, params, nil)
+	return r.collectTargetAllocatorRBACGarbage(ctx, params, nil, monitoring.Spec.Namespace)
 }
 
 func (r *MonitoringReconciler) collectTargetAllocatorRBACGarbage(
 	ctx context.Context,
 	params gc.RunParams,
 	desiredSet map[resourceKey]struct{},
+	namespace string,
 ) error {
 	collector := gc.New(
 		gc.WithLabel(odhLabels.PlatformPartOf, monitoringPartOf),
-		gc.InNamespace(""),
+		// Role and RoleBinding listing remains cluster-wide, but the
+		// SelfSubjectRulesReview used by the collector requires a namespace.
+		gc.InNamespace(namespace),
 		gc.WithDeletePropagationPolicy(metav1.DeletePropagationBackground),
 		gc.WithTypePredicate(func(_ gc.RunParams, gvk schema.GroupVersionKind) (bool, error) {
 			return gvk == controllergvk.Role || gvk == controllergvk.RoleBinding, nil
