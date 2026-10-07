@@ -952,6 +952,8 @@ func (tc *MonitoringTestCtx) runThanosQuerierTests(t *testing.T) {
 
 		t.Run("Test ThanosQuerier not deployed without metrics", tc.ValidateThanosQuerierNotDeployedWithoutMetrics)
 		t.Run("Test ThanosQuerier deployment with metrics", tc.ValidateThanosQuerierDeployment)
+		t.Run("Test ThanosQuerier route authorization boundary", tc.ValidateThanosQuerierRouteAuthorizationBoundary)
+		t.Run("Test ThanosQuerier route namespace isolation", tc.ValidateThanosQuerierRouteNamespaceIsolation)
 		t.Run("Test Prometheus NetworkPolicy allows Thanos Querier on gRPC port", tc.ValidatePrometheusNetworkPolicyAllowsThanosQuerier)
 	})
 }
@@ -1030,8 +1032,10 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierDeployment(t *testing.T) {
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Route, types.NamespacedName{Name: ThanosQuerierRouteName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
-			jq.Match(`.spec.to.name == "thanos-querier-data-science-thanos-querier"`),
-			jq.Match(`.spec.tls.termination == "edge"`),
+			jq.Match(`.spec.to.name == "%s"`, ThanosQuerierProxyName),
+			jq.Match(`.spec.port.targetPort == "https"`),
+			jq.Match(`.spec.tls.termination == "reencrypt"`),
+			jq.Match(`.spec.tls.destinationCACertificate != null and (.spec.tls.destinationCACertificate | length) > 0`),
 			jq.Match(`.spec.tls.insecureEdgeTerminationPolicy == "Redirect"`),
 			jq.Match(`.metadata.labels.app == "thanos-querier"`),
 			jq.Match(`.metadata.labels."app.kubernetes.io/name" == "thanos-querier"`),
@@ -1040,6 +1044,96 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierDeployment(t *testing.T) {
 			tc.monitoringOwnerReferencesCondition(),
 		)),
 		WithCustomErrorMsg("ThanosQuerier Route should be created when metrics are configured"),
+	)
+}
+
+// ValidateThanosQuerierRouteAuthorizationBoundary verifies that the external
+// Thanos route terminates at the authenticated, namespace-restricted proxy
+// rather than directly at the ThanosQuerier Service.
+func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteAuthorizationBoundary(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+	t.Cleanup(tc.resetMonitoringConfigToManaged)
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      ThanosQuerierProxyName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.status.readyReplicas == 1`),
+			jq.Match(`.spec.template.spec.serviceAccountName == "%s"`, ThanosQuerierProxyName),
+			jq.Match(`.spec.template.spec.containers | map(.name) | contains(["kube-rbac-proxy", "prom-label-proxy"])`),
+		)),
+		WithCustomErrorMsg("Thanos Querier proxy deployment should be ready with both authorization containers"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ServiceAccount, types.NamespacedName{
+			Name:      ThanosQuerierProxyName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: ThanosQuerierProxyName,
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.name == "cluster-monitoring-view"`),
+			jq.Match(`.subjects[0].name == "%s"`, ThanosQuerierProxyName),
+			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
+		)),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: ThanosQuerierProxyName + "-auth-delegator",
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.name == "system:auth-delegator"`),
+			jq.Match(`.subjects[0].name == "%s"`, ThanosQuerierProxyName),
+		)),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ConfigMap, types.NamespacedName{
+			Name:      ThanosQuerierProxyName + "-config",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.data."kube-rbac-proxy.yaml" | contains("byQueryParameter")`),
+			jq.Match(`.data."kube-rbac-proxy.yaml" | contains("metrics.k8s.io")`),
+			jq.Match(`.data."kube-rbac-proxy.yaml" | contains("resource: pods")`),
+		)),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      ThanosQuerierProxyName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.ports[0].name == "https"`),
+			jq.Match(`.spec.ports[0].port == 8443`),
+			jq.Match(`.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == "%s-tls"`, ThanosQuerierProxyName),
+		)),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+			Name:      "data-science-thanos-querier-proxy-ingress",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.podSelector.matchLabels.app == "%s"`, ThanosQuerierProxyName),
+			jq.Match(`.spec.ingress[0].from[0].namespaceSelector.matchLabels."kubernetes.io/metadata.name" == "openshift-ingress"`),
+			jq.Match(`.spec.ingress[0].ports[0].port == 8443`),
+		)),
 	)
 }
 
@@ -2042,6 +2136,15 @@ func (tc *MonitoringTestCtx) validatePrometheusNamespaceProxyResourcesCommon(t *
 			jq.Match(`.spec.tls.termination == "reencrypt"`),
 			jq.Match(`.spec.tls.insecureEdgeTerminationPolicy == "Redirect"`),
 		)),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+			Name:      "data-science-prometheus-proxy-ingress",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.spec.ingress[0].from[0].namespaceSelector.matchLabels."policy-group.network.openshift.io/ingress" == ""`)),
+		WithCustomErrorMsg("Prometheus namespace proxy NetworkPolicy should allow the OpenShift ingress policy group"),
 	)
 }
 

@@ -58,6 +58,8 @@ const (
 	PrometheusNamespaceProxyNetworkPolicyTemplate    = "resources/data-science-prometheus-namespace-proxy-network-policy.tmpl.yaml"
 	PrometheusServiceOverrideTemplate                = "resources/data-science-prometheus-service-override.tmpl.yaml"
 	PrometheusNetworkPolicyTemplate                  = "resources/data-science-prometheus-network-policy.tmpl.yaml"
+	ThanosQuerierProxyTemplate                       = "resources/data-science-thanos-querier-proxy.tmpl.yaml"
+	ThanosQuerierProxyNetworkPolicyTemplate          = "resources/data-science-thanos-querier-proxy-network-policy.tmpl.yaml"
 	PrometheusWebTLSServiceTemplate                  = "resources/prometheus-web-tls-service.tmpl.yaml"
 	PrometheusSelfServiceMonitorTemplate             = "resources/prometheus-self-servicemonitor.tmpl.yaml"
 	ThanosQuerierTemplate                            = "resources/thanos-querier-cr.tmpl.yaml"
@@ -165,6 +167,8 @@ func deployMonitoringStackWithQuerierAndRestrictions(
 		src(PrometheusNamespaceProxyTemplate),
 		src(PrometheusNamespaceProxyNetworkPolicyTemplate),
 		src(ThanosQuerierTemplate),
+		src(ThanosQuerierProxyTemplate),
+		src(ThanosQuerierProxyNetworkPolicyTemplate),
 		src(ThanosQuerierRouteTemplate),
 	)
 	return nil

@@ -12,11 +12,11 @@ spec:
   path: /
   to:
     kind: Service
-    name: thanos-querier-data-science-thanos-querier
+    name: data-science-thanos-querier-proxy
     weight: 100
   port:
-    targetPort: http
+    targetPort: https
   wildcardPolicy: None
   tls:
-    termination: edge
+    termination: reencrypt
     insecureEdgeTerminationPolicy: Redirect

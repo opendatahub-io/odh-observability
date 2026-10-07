@@ -100,6 +100,10 @@ linters:
       - linters:
           - lll
         source: "^// \\+kubebuilder:rbac:"
+      # Kubebuilder webhook markers must remain single-line annotations.
+      - linters:
+          - lll
+        path: internal/webhook/mutating.go
       - linters:
           - staticcheck
         text: "ST1005:"

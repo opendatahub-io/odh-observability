@@ -293,7 +293,7 @@ func TestSyncPrometheusWebTLSCA_ConfigMapPresent(t *testing.T) {
 	cm.SetNamespace(m.Spec.Namespace)
 	cm.SetName("prometheus-web-tls-ca")
 	_ = unstructured.SetNestedStringMap(cm.Object, map[string]string{
-		"service-ca.crt": "-----BEGIN CERTIFICATE-----\ntest-cert\n-----END CERTIFICATE-----",
+		serviceCACertificateKey: "-----BEGIN CERTIFICATE-----\ntest-cert\n-----END CERTIFICATE-----",
 	}, "data")
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(cm).Build()
@@ -316,7 +316,7 @@ func TestSyncPrometheusWebTLSCA_ConfigMapPresent(t *testing.T) {
 	}
 
 	data, _, _ := unstructured.NestedStringMap(secret.Object, "data")
-	encoded, ok := data["service-ca.crt"]
+	encoded, ok := data[serviceCACertificateKey]
 	if !ok {
 		t.Fatal("Secret missing service-ca.crt key")
 	}
@@ -347,6 +347,71 @@ func TestSyncPrometheusWebTLSCA_EmptyData(t *testing.T) {
 	err := syncPrometheusWebTLSCA(context.Background(), cli, m)
 	if err != nil {
 		t.Fatalf("expected no error when ConfigMap has no data: %v", err)
+	}
+}
+
+func TestSyncThanosQuerierRouteDestinationCA(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
+
+	ca := "-----BEGIN CERTIFICATE-----\ntest-ca\n-----END CERTIFICATE-----"
+	cm := &unstructured.Unstructured{}
+	cm.SetAPIVersion("v1")
+	cm.SetKind("ConfigMap")
+	cm.SetNamespace(m.Spec.Namespace)
+	cm.SetName(prometheusWebTLSCAConfigMapName)
+	_ = unstructured.SetNestedStringMap(cm.Object, map[string]string{serviceCACertificateKey: ca}, "data")
+
+	route := &routev1.Route{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      thanosQuerierRouteName,
+			Namespace: m.Spec.Namespace,
+		},
+		Spec: routev1.RouteSpec{
+			TLS: &routev1.TLSConfig{Termination: routev1.TLSTerminationReencrypt},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(cm, route).Build()
+	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	updated := &routev1.Route{}
+	if err := cli.Get(context.Background(), objKey(m.Spec.Namespace, thanosQuerierRouteName), updated); err != nil {
+		t.Fatalf("failed to read updated Route: %v", err)
+	}
+	if got := updated.Spec.TLS.DestinationCACertificate; got != ca {
+		t.Fatalf("destination CA mismatch: want %q, got %q", ca, got)
+	}
+}
+
+func TestSyncThanosQuerierRouteDestinationCA_NoRouteOrCA(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
+		t.Fatalf("missing ConfigMap should not fail reconciliation: %v", err)
+	}
+
+	cm := &unstructured.Unstructured{}
+	cm.SetAPIVersion("v1")
+	cm.SetKind("ConfigMap")
+	cm.SetNamespace(m.Spec.Namespace)
+	cm.SetName(prometheusWebTLSCAConfigMapName)
+	_ = unstructured.SetNestedStringMap(cm.Object, map[string]string{}, "data")
+	if err := cli.Create(context.Background(), cm); err != nil {
+		t.Fatalf("failed to create empty ConfigMap: %v", err)
+	}
+	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
+		t.Fatalf("empty ConfigMap should not fail reconciliation: %v", err)
 	}
 }
 

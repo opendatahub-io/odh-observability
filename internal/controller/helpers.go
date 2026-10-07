@@ -36,7 +36,10 @@ import (
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 )
 
-const fieldManager = "odh-observability-controller"
+const (
+	fieldManager            = "odh-observability-controller"
+	serviceCACertificateKey = "service-ca.crt"
+)
 
 const (
 	openshiftRunLevelLabel        = "openshift.io/run-level"
@@ -202,7 +205,7 @@ func syncPrometheusWebTLSCA(ctx context.Context, c client.Client, monitoring *v1
 	configMap.SetAPIVersion("v1")
 	configMap.SetKind("ConfigMap")
 
-	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: "prometheus-web-tls-ca"}, &configMap); err != nil {
+	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: prometheusWebTLSCAConfigMapName}, &configMap); err != nil {
 		if errors.IsNotFound(err) {
 			log.V(1).Info("CA ConfigMap not found yet, will sync when created")
 			return nil
@@ -219,9 +222,9 @@ func syncPrometheusWebTLSCA(ctx context.Context, c client.Client, monitoring *v1
 		return nil
 	}
 
-	caCert, found := data["service-ca.crt"]
+	caCert, found := data[serviceCACertificateKey]
 	if !found || caCert == "" {
-		log.V(1).Info("service-ca.crt not found in ConfigMap, service-ca operator may not have injected CA yet")
+		log.V(1).Info(serviceCACertificateKey + " not found in ConfigMap, service-ca operator may not have injected CA yet")
 		return nil
 	}
 
@@ -241,7 +244,7 @@ func syncPrometheusWebTLSCA(ctx context.Context, c client.Client, monitoring *v1
 	// consistent with what the API server actually stores (it converts stringData
 	// to data on admission, creating a field-manager mismatch on subsequent applies).
 	encoded := base64.StdEncoding.EncodeToString([]byte(caCert))
-	if err := unstructured.SetNestedField(secret.Object, map[string]any{"service-ca.crt": encoded}, "data"); err != nil {
+	if err := unstructured.SetNestedField(secret.Object, map[string]any{serviceCACertificateKey: encoded}, "data"); err != nil {
 		return fmt.Errorf("failed to set secret data: %w", err)
 	}
 
@@ -254,6 +257,58 @@ func syncPrometheusWebTLSCA(ctx context.Context, c client.Client, monitoring *v1
 }
 
 const thanosQuerierRouteName = "data-science-thanos-querier-route"
+
+const prometheusWebTLSCAConfigMapName = "prometheus-web-tls-ca"
+
+// syncThanosQuerierRouteDestinationCA configures the Thanos route to validate
+// the service-serving certificate presented by the authorized proxy. The
+// service-ca operator injects the namespace's service CA into the same
+// ConfigMap used by the Prometheus TLS setup.
+func syncThanosQuerierRouteDestinationCA(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) error {
+	if monitoring.Spec.Metrics == nil || monitoring.Spec.Metrics.Storage == nil {
+		return nil
+	}
+
+	namespace := monitoring.Spec.Namespace
+	configMap := &unstructured.Unstructured{}
+	configMap.SetAPIVersion("v1")
+	configMap.SetKind("ConfigMap")
+	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: prometheusWebTLSCAConfigMapName}, configMap); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get Thanos route destination CA ConfigMap: %w", err)
+	}
+
+	data, found, err := unstructured.NestedStringMap(configMap.Object, "data")
+	if err != nil {
+		return fmt.Errorf("failed to extract Thanos route destination CA: %w", err)
+	}
+	if !found || data[serviceCACertificateKey] == "" {
+		return nil
+	}
+
+	route := &routev1.Route{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: thanosQuerierRouteName}, route); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get Thanos Querier Route: %w", err)
+	}
+	if route.Spec.TLS == nil || route.Spec.TLS.Termination != routev1.TLSTerminationReencrypt {
+		return nil
+	}
+	if route.Spec.TLS.DestinationCACertificate == data[serviceCACertificateKey] {
+		return nil
+	}
+
+	patch := client.MergeFrom(route.DeepCopy())
+	route.Spec.TLS.DestinationCACertificate = data[serviceCACertificateKey]
+	if err := c.Patch(ctx, route, patch); err != nil {
+		return fmt.Errorf("failed to set Thanos Querier Route destination CA: %w", err)
+	}
+	return nil
+}
 
 // syncStatusURL fetches the Thanos Querier route and updates monitoring.Status.URL.
 // When metrics are not configured the URL is cleared.

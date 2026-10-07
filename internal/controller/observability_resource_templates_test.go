@@ -33,8 +33,7 @@ import (
 )
 
 const (
-	testMonitoringNamespace     = "redhat-ods-monitoring"
-	testPrometheusServiceCACert = "service-ca.crt"
+	testMonitoringNamespace = "redhat-ods-monitoring"
 )
 
 func TestAcceleratorRecordingRulesTemplateContract(t *testing.T) {
@@ -164,9 +163,147 @@ func TestDeployMonitoringStackWithQuerierIncludesTelemetryResources(t *testing.T
 		PrometheusNamespaceProxyTemplate,
 		PrometheusNamespaceProxyNetworkPolicyTemplate,
 		ThanosQuerierTemplate,
+		ThanosQuerierProxyTemplate,
+		ThanosQuerierProxyNetworkPolicyTemplate,
 		ThanosQuerierRouteTemplate,
 	}
 	assertTemplatePaths(t, sources, wantSources)
+}
+
+func TestThanosQuerierProxyTemplateContract(t *testing.T) {
+	resources := renderObservabilityTemplate(t, ThanosQuerierProxyTemplate, proxyTemplateData())
+
+	assertClusterRoleBinding(
+		t,
+		findRenderedResource(t, resources, "ClusterRoleBinding", "data-science-thanos-querier-proxy"),
+		"cluster-monitoring-view",
+		"data-science-thanos-querier-proxy",
+		testMonitoringNamespace,
+	)
+	assertClusterRoleBinding(
+		t,
+		findRenderedResource(t, resources, "ClusterRoleBinding", "data-science-thanos-querier-proxy-auth-delegator"),
+		"system:auth-delegator",
+		"data-science-thanos-querier-proxy",
+		testMonitoringNamespace,
+	)
+
+	configMap := findRenderedResource(t, resources, "ConfigMap", "data-science-thanos-querier-proxy-config")
+	config, found, err := unstructured.NestedString(configMap.Object, "data", "kube-rbac-proxy.yaml")
+	if err != nil || !found {
+		t.Fatalf("Thanos proxy authorization config is missing: found=%t error=%v", found, err)
+	}
+	for _, expected := range []string{
+		"byQueryParameter:",
+		"name: \"namespace\"",
+		"apiGroup: metrics.k8s.io",
+		"resource: pods",
+		"namespace: \"{{ .Value }}\"",
+	} {
+		if !strings.Contains(config, expected) {
+			t.Errorf("Thanos proxy config must contain %q, got %q", expected, config)
+		}
+	}
+
+	deployment := findRenderedResource(t, resources, "Deployment", "data-science-thanos-querier-proxy")
+	serviceAccount, found, err := unstructured.NestedString(
+		deployment.Object, "spec", "template", "spec", "serviceAccountName",
+	)
+	if err != nil || !found || serviceAccount != "data-science-thanos-querier-proxy" {
+		t.Fatalf("Thanos proxy must use its service account: found=%t value=%q error=%v", found, serviceAccount, err)
+	}
+	containers := nestedSliceAt(t, deployment, "spec", "template", "spec", "containers")
+	if len(containers) != 2 {
+		t.Fatalf("Thanos proxy must have kube-rbac-proxy and prom-label-proxy containers, got %d", len(containers))
+	}
+	assertContainerArgs(t, findContainer(t, containers, "kube-rbac-proxy"),
+		"--secure-listen-address=0.0.0.0:8443",
+		"--upstream=http://127.0.0.1:9091/",
+		"--config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml",
+		"--tls-cert-file=/etc/tls/private/tls.crt",
+		"--tls-private-key-file=/etc/tls/private/tls.key",
+		"--tls-min-version=VersionTLS12",
+	)
+	assertContainerArgs(t, findContainer(t, containers, "prom-label-proxy"),
+		"--insecure-listen-address=127.0.0.1:9091",
+		"--upstream=http://thanos-querier-data-science-thanos-querier."+testMonitoringNamespace+".svc.cluster.local:10902",
+		"--label=namespace",
+		"--enable-label-apis",
+	)
+
+	service := findRenderedResource(t, resources, "Service", "data-science-thanos-querier-proxy")
+	ports := nestedSlice(t, service, "spec", "ports")
+	if len(ports) != 1 || asMap(t, ports[0])["port"] != int64(8443) || asMap(t, ports[0])["targetPort"] != "https" {
+		t.Fatalf("Thanos proxy Service must expose HTTPS port 8443: %#v", ports)
+	}
+}
+
+func TestThanosQuerierProxyNetworkPolicyTemplateContract(t *testing.T) {
+	resources := renderObservabilityTemplate(t, ThanosQuerierProxyNetworkPolicyTemplate, proxyTemplateData())
+	policy := findRenderedResource(t, resources, "NetworkPolicy", "data-science-thanos-querier-proxy-ingress")
+
+	selector, found, err := unstructured.NestedString(policy.Object, "spec", "podSelector", "matchLabels", "app")
+	if err != nil || !found || selector != "data-science-thanos-querier-proxy" {
+		t.Fatalf("Thanos proxy NetworkPolicy must select the proxy pods: found=%t value=%q error=%v", found, selector, err)
+	}
+	ingress := nestedSlice(t, policy, "spec", "ingress")
+	if len(ingress) != 1 {
+		t.Fatalf("Thanos proxy NetworkPolicy must have one ingress rule, got %d", len(ingress))
+	}
+	ingressRule := asMap(t, ingress[0])
+	fromValues, ok := ingressRule["from"].([]any)
+	if !ok || len(fromValues) != 1 {
+		t.Fatalf("Thanos proxy NetworkPolicy must have one ingress source, got %#v", ingressRule["from"])
+	}
+	from := asMap(t, fromValues[0])
+	namespaceSelector := asMap(t, from["namespaceSelector"])
+	matchLabels := asMap(t, namespaceSelector["matchLabels"])
+	if len(matchLabels) != 1 || matchLabels["policy-group.network.openshift.io/ingress"] != "" {
+		t.Fatalf("Thanos proxy NetworkPolicy must select the OpenShift ingress policy group: %#v", matchLabels)
+	}
+	portValues, ok := ingressRule["ports"].([]any)
+	if !ok || len(portValues) != 1 {
+		t.Fatalf("Thanos proxy NetworkPolicy must have one port, got %#v", ingressRule["ports"])
+	}
+	ports := asMap(t, portValues[0])
+	if ports["protocol"] != "TCP" || ports["port"] != int64(8443) {
+		t.Fatalf("Thanos proxy NetworkPolicy must allow router HTTPS ingress: %#v", ports)
+	}
+}
+
+func TestPrometheusNamespaceProxyNetworkPolicyTemplateContract(t *testing.T) {
+	resources := renderObservabilityTemplate(t, PrometheusNamespaceProxyNetworkPolicyTemplate, proxyTemplateData())
+	policy := findRenderedResource(t, resources, "NetworkPolicy", "data-science-prometheus-proxy-ingress")
+	ingress := nestedSlice(t, policy, "spec", "ingress")
+	if len(ingress) < 1 {
+		t.Fatalf("Prometheus namespace proxy NetworkPolicy must have router ingress, got %d rules", len(ingress))
+	}
+
+	firstRule := asMap(t, ingress[0])
+	fromValues, ok := firstRule["from"].([]any)
+	if !ok || len(fromValues) != 1 {
+		t.Fatalf("Prometheus namespace proxy NetworkPolicy router ingress must have one source, got %#v", firstRule["from"])
+	}
+	from := asMap(t, fromValues[0])
+	namespaceSelector := asMap(t, from["namespaceSelector"])
+	matchLabels := asMap(t, namespaceSelector["matchLabels"])
+	if len(matchLabels) != 1 || matchLabels["policy-group.network.openshift.io/ingress"] != "" {
+		t.Fatalf("Prometheus namespace proxy NetworkPolicy must select the OpenShift ingress policy group: %#v", matchLabels)
+	}
+}
+
+func TestThanosQuerierRouteUsesAuthorizedProxy(t *testing.T) {
+	route := findRenderedResource(t, renderObservabilityTemplate(t, ThanosQuerierRouteTemplate, proxyTemplateData()), "Route", "data-science-thanos-querier-route")
+
+	if target, found, err := unstructured.NestedString(route.Object, "spec", "to", "name"); err != nil || !found || target != "data-science-thanos-querier-proxy" {
+		t.Fatalf("Thanos Route must target the authorized proxy: found=%t value=%q error=%v", found, target, err)
+	}
+	if targetPort, found, err := unstructured.NestedString(route.Object, "spec", "port", "targetPort"); err != nil || !found || targetPort != "https" {
+		t.Fatalf("Thanos Route must target the proxy HTTPS port: found=%t value=%q error=%v", found, targetPort, err)
+	}
+	if termination, found, err := unstructured.NestedString(route.Object, "spec", "tls", "termination"); err != nil || !found || termination != "reencrypt" {
+		t.Fatalf("Thanos Route must re-encrypt to the proxy: found=%t value=%q error=%v", found, termination, err)
+	}
 }
 
 func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
@@ -479,7 +616,7 @@ func assertPersesDatasourceTLS(t *testing.T, datasource unstructured.Unstructure
 		t.Fatalf("cluster datasource must use the datasource namespace for its CA: found=%t value=%q error=%v", found, caNamespace, err)
 	}
 	certPath, found, err := unstructured.NestedString(datasource.Object, "spec", "client", "tls", "caCert", "certPath")
-	if err != nil || !found || certPath != testPrometheusServiceCACert {
+	if err != nil || !found || certPath != serviceCACertificateKey {
 		t.Fatalf("cluster datasource must use service-ca.crt: found=%t value=%q error=%v", found, certPath, err)
 	}
 }

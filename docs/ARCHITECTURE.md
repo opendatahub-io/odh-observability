@@ -62,7 +62,7 @@ Action functions run sequentially in a fixed order. Each function checks whether
 |-------|----------|-------------|--------------|-----------|-----------|
 | 1 | `deployWebhookInfrastructure` | Always | `Issuer` (cert-manager) | `WebhookAvailable` | webhook-service, webhook-cert-manager, webhook-configuration |
 | 2 | `deployMonitoringAdmissionPolicies` | Always | None | None | monitoring-admission-policies |
-| 3 | `deployMonitoringStackWithQuerierAndRestrictions` | `spec.metrics` | `MonitoringStack`, `ThanosQuerier` | `MonitoringStackAvailable`, `ThanosQuerierAvailable` | 11 templates (see inventory) |
+| 3 | `deployMonitoringStackWithQuerierAndRestrictions` | `spec.metrics` | `MonitoringStack`, `ThanosQuerier` | `MonitoringStackAvailable`, `ThanosQuerierAvailable` | 14 templates (see inventory) |
 | 4 | `deployTracingStack` | `spec.traces` | `TempoMonolithic`/`TempoStack`, `Instrumentation` | `TempoAvailable`, `InstrumentationAvailable` | Tempo template + instrumentation |
 | 5 | `deployOpenTelemetryCollector` | `spec.metrics` or `spec.traces` | `OpenTelemetryCollector` | `OpenTelemetryCollectorAvailable` | collector, RBAC, ServiceMonitors, Prometheus service |
 | 6 | `deployAlerting` | `spec.alerting` | `PrometheusRule` | `AlertingAvailable` | operator-prometheusrules |
@@ -92,7 +92,9 @@ All templates are embedded via `//go:embed` and rendered with Go's `text/templat
 | `data-science-prometheus-namespace-proxy.tmpl.yaml` | Namespace-scoped Prometheus proxy |
 | `data-science-prometheus-namespace-proxy-network-policy.tmpl.yaml` | NetworkPolicy for namespace proxy |
 | `thanos-querier-cr.tmpl.yaml` | ThanosQuerier CR |
-| `thanos-querier-route.tmpl.yaml` | Route for Thanos Querier |
+| `data-science-thanos-querier-proxy.tmpl.yaml` | Authenticated, namespace-scoped Thanos proxy |
+| `data-science-thanos-querier-proxy-network-policy.tmpl.yaml` | Router-only ingress policy for the Thanos proxy |
+| `thanos-querier-route.tmpl.yaml` | Re-encrypt Route for the authorized Thanos proxy |
 
 ### Tracing (Tempo + Instrumentation)
 
@@ -282,7 +284,7 @@ This handles scenarios like:
 
 ## Namespace-Scoped Metrics
 
-The operator deploys a two-proxy architecture (`data-science-prometheus-namespace-proxy`) that provides secure, namespace-scoped access to Prometheus metrics.
+The operator deploys namespace-scoped proxy paths for both the Prometheus route and the data-science Thanos route. Each path uses the same two-stage architecture: `kube-rbac-proxy` authenticates and authorizes the namespace, while `prom-label-proxy` enforces the namespace label in PromQL.
 
 ```
 User Request
@@ -305,7 +307,9 @@ Prometheus (port 9090)
 
 **Query isolation**: prom-label-proxy rewrites PromQL queries to inject `{namespace="<value>"}`, ensuring users only see metrics from namespaces they are authorized for, regardless of how they craft their queries.
 
-**Network isolation**: A NetworkPolicy restricts ingress to the OpenShift router and Alertmanager only.
+**Network isolation**: The Prometheus proxy NetworkPolicy restricts ingress to the OpenShift router and Alertmanager. The Thanos proxy NetworkPolicy restricts ingress to the OpenShift router.
+
+The external `data-science-thanos-querier-route` terminates at `data-science-thanos-querier-proxy` using re-encrypt TLS; it never targets the ThanosQuerier Service directly. The controller populates the Route's destination CA from the OpenShift service CA so the router validates the proxy's serving certificate. The Thanos proxy forwards the authorized and label-constrained request to the existing Thanos Querier on port `10902`, preserving the backend used by internal consumers.
 
 ## Controller Setup and Watches
 

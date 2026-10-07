@@ -36,6 +36,7 @@ const (
 	InstrumentationName               = "data-science-instrumentation"
 	ThanosQuerierName                 = "data-science-thanos-querier"
 	ThanosQuerierRouteName            = "data-science-thanos-querier-route"
+	ThanosQuerierProxyName            = "data-science-thanos-querier-proxy"
 	PersesName                        = "data-science-perses"
 	PersesDatasourceName              = "data-science-prometheus-datasource"
 	ClusterPrometheusDatasourceName   = "cluster-prometheus-datasource"

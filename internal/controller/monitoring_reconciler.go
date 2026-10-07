@@ -310,18 +310,7 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		log.Error(err, "Garbage collection encountered errors")
 	}
 
-	// Sync Prometheus CA ConfigMap → Secret (workaround for COO-1270).
-	if err := syncPrometheusWebTLSCA(ctx, r.Client, monitoring); err != nil {
-		log.Error(err, "Failed to sync Prometheus web TLS CA")
-		cm.MarkFalse(conditions.ConditionMonitoringStackAvailable,
-			"PrometheusCAConfigSyncFailed",
-			fmt.Sprintf("Failed to sync Prometheus web TLS CA: %v", err))
-	}
-
-	// Populate status.url from the Thanos Querier route.
-	if err := syncStatusURL(ctx, r.Client, monitoring); err != nil {
-		log.Error(err, "Failed to sync status URL")
-	}
+	r.syncPostDeployResources(ctx, monitoring, cm)
 
 	// Update usageLogsEndpoint in status only when LokiStack is ready
 	requeueNeeded := false
@@ -364,6 +353,30 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func (r *MonitoringReconciler) syncPostDeployResources(
+	ctx context.Context,
+	monitoring *v1alpha1.Monitoring,
+	cm *conditions.ConditionsManager,
+) {
+	log := logf.FromContext(ctx)
+
+	// Sync Prometheus CA ConfigMap → Secret (workaround for COO-1270).
+	if err := syncPrometheusWebTLSCA(ctx, r.Client, monitoring); err != nil {
+		log.Error(err, "Failed to sync Prometheus web TLS CA")
+		cm.MarkFalse(conditions.ConditionMonitoringStackAvailable,
+			"PrometheusCAConfigSyncFailed",
+			fmt.Sprintf("Failed to sync Prometheus web TLS CA: %v", err))
+	}
+	if err := syncThanosQuerierRouteDestinationCA(ctx, r.Client, monitoring); err != nil {
+		log.Error(err, "Failed to sync Thanos Querier Route destination CA")
+	}
+
+	// Populate status.url from the Thanos Querier route.
+	if err := syncStatusURL(ctx, r.Client, monitoring); err != nil {
+		log.Error(err, "Failed to sync status URL")
+	}
 }
 
 // resourceKey identifies a Kubernetes resource for desired-set comparison.
