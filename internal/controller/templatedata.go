@@ -32,6 +32,7 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-multierror"
+	pkgtls "github.com/opendatahub-io/odh-platform-utilities/framework/tls"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/olm"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/openshift"
 	"gopkg.in/yaml.v3"
@@ -47,7 +48,6 @@ import (
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
-	pkgtls "github.com/opendatahub-io/odh-observability/pkg/tls"
 )
 
 const (
@@ -605,7 +605,7 @@ func getKorrel8rImage() string {
 }
 
 func addTLSData(ctx context.Context, c client.Client, templateData map[string]any) error {
-	minVersion, cipherSuites, err := pkgtls.FromAPIServer(ctx, c, pkgtls.FormatGo)
+	minVersion, cipherSuites, err := pkgtls.FromAPIServerWithAdherence(ctx, c, pkgtls.FormatGo)
 	if err != nil {
 		return err
 	}
