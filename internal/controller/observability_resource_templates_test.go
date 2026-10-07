@@ -164,7 +164,6 @@ func TestDeployMonitoringStackWithQuerierIncludesTelemetryResources(t *testing.T
 		PrometheusNamespaceProxyTemplate,
 		PrometheusNamespaceProxyNetworkPolicyTemplate,
 		ThanosQuerierTemplate,
-		ThanosQuerierRouteTemplate,
 	}
 	assertTemplatePaths(t, sources, wantSources)
 }

@@ -43,6 +43,7 @@ import (
 	fakedynamic "k8s.io/client-go/dynamic/fake"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -312,6 +313,44 @@ func TestReconcile_PreconditionsFailed(t *testing.T) {
 	}
 }
 
+func TestReconcile_RemovesLegacyThanosRouteBeforePreconditions(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		specNamespace string
+		routeNamespace string
+	}{
+		{name: "explicit namespace", specNamespace: "test-ns", routeNamespace: "test-ns"},
+		{name: "empty namespace uses default", routeNamespace: defaultMonitoringNamespace},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("MONITORING_NAMESPACE", tc.routeNamespace)
+			s := newTestScheme(t)
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			m.Spec.Namespace = tc.specNamespace
+			m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+			m.Status.URL = "https://legacy-thanos.example.com"
+			route := legacyThanosQuerierRoute()
+			route.Namespace = tc.routeNamespace
+
+			cli := fake.NewClientBuilder().WithScheme(s).WithObjects(m, route).WithStatusSubresource(m).Build()
+			r := newTestReconciler(t, s, cli)
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: m.Name}}); err != nil {
+				t.Fatalf("reconcile returned error: %v", err)
+			}
+			if err := cli.Get(context.Background(), client.ObjectKey{Namespace: tc.routeNamespace, Name: thanosQuerierRouteName}, &routev1.Route{}); !k8serr.IsNotFound(err) {
+				t.Errorf("legacy route should be deleted even when dependencies are unavailable: %v", err)
+			}
+			updated := &v1alpha1.Monitoring{}
+			if err := cli.Get(context.Background(), client.ObjectKey{Name: m.Name}, updated); err != nil {
+				t.Fatalf("getting Monitoring after reconcile: %v", err)
+			}
+			if updated.Status.URL != "" {
+				t.Errorf("status URL should be cleared, got %q", updated.Status.URL)
+			}
+		})
+	}
+}
+
 func TestReconcile_PreconditionLookupFailureReturnsError(t *testing.T) {
 	s := newTestScheme(t)
 	registerOperatorConditionTypes(s)
@@ -389,6 +428,7 @@ func TestReconcile_NothingConfigured(t *testing.T) {
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	// No Metrics/Traces configured: no operator precondition checks triggered.
+	m.Status.URL = "https://stale-thanos.example.com"
 
 	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build())
 
@@ -422,72 +462,8 @@ func TestReconcile_NothingConfigured(t *testing.T) {
 	if legacyAvailable != dependenciesReady {
 		t.Errorf("legacy MonitoringAvailable status %q does not match MonitoringDependenciesReady %q", legacyAvailable, dependenciesReady)
 	}
-}
-
-// TestSyncStatusURL_RoutePresent: when metrics are configured and the route exists
-// with a host, status.url is populated.
-func TestSyncStatusURL_RoutePresent(t *testing.T) {
-	s := newTestScheme(t)
-	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{
-		Storage: &v1alpha1.MetricsStorage{},
-	}
-
-	route := &routev1.Route{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      thanosQuerierRouteName,
-			Namespace: m.Spec.Namespace,
-		},
-		Status: routev1.RouteStatus{
-			Ingress: []routev1.RouteIngress{
-				{Host: "thanos.example.com"},
-			},
-		},
-	}
-
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(m, route).WithStatusSubresource(route).Build()
-	if err := syncStatusURL(context.Background(), c, m); err != nil {
-		t.Fatalf("syncStatusURL returned error: %v", err)
-	}
-
-	want := "https://thanos.example.com"
-	if m.Status.URL != want {
-		t.Errorf("Status.URL: want %q, got %q", want, m.Status.URL)
-	}
-}
-
-// TestSyncStatusURL_RouteMissing: when the route doesn't exist yet, URL is empty.
-func TestSyncStatusURL_RouteMissing(t *testing.T) {
-	s := newTestScheme(t)
-	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{
-		Storage: &v1alpha1.MetricsStorage{},
-	}
-	m.Status.URL = "https://stale.example.com"
-
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(m).Build()
-	if err := syncStatusURL(context.Background(), c, m); err != nil {
-		t.Fatalf("syncStatusURL returned error: %v", err)
-	}
-
 	if m.Status.URL != "" {
-		t.Errorf("Status.URL: want empty, got %q", m.Status.URL)
-	}
-}
-
-// TestSyncStatusURL_NoMetrics: when metrics are not configured, URL is cleared.
-func TestSyncStatusURL_NoMetrics(t *testing.T) {
-	s := newTestScheme(t)
-	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Status.URL = "https://stale.example.com"
-
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(m).Build()
-	if err := syncStatusURL(context.Background(), c, m); err != nil {
-		t.Fatalf("syncStatusURL: %v", err)
-	}
-
-	if m.Status.URL != "" {
-		t.Errorf("Status.URL: want empty, got %q", m.Status.URL)
+		t.Errorf("status URL should be cleared when the Thanos route is removed, got %q", m.Status.URL)
 	}
 }
 

@@ -126,6 +126,13 @@ func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
+	// Remove the direct HTTP route before other reconciliation checks. Legacy
+	// routes lack the monitoring GC label and must also be removed when the CR
+	// is disabled, being deleted, or its dependencies are unavailable.
+	if err := removeLegacyThanosQuerierRoute(ctx, r.Client, monitoringNamespace(monitoring)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("removing unauthenticated Thanos Querier route: %w", err)
+	}
+
 	// Handle finalizer for cleanup on deletion. The ODH module handler's
 	// two-phase cleanup relies on the finalizer keeping the CR alive while
 	// deleteAllOwned runs.
@@ -173,6 +180,7 @@ func (r *MonitoringReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alpha1.Monitoring) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	cm := conditions.NewConditionsManager(monitoring, monitoring.Generation)
+	monitoring.Status.URL = ""
 
 	platformVersion, err := r.readPlatformVersion(ctx)
 	if err != nil {
@@ -316,11 +324,6 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		cm.MarkFalse(conditions.ConditionMonitoringStackAvailable,
 			"PrometheusCAConfigSyncFailed",
 			fmt.Sprintf("Failed to sync Prometheus web TLS CA: %v", err))
-	}
-
-	// Populate status.url from the Thanos Querier route.
-	if err := syncStatusURL(ctx, r.Client, monitoring); err != nil {
-		log.Error(err, "Failed to sync status URL")
 	}
 
 	// Update usageLogsEndpoint in status only when LokiStack is ready
@@ -614,6 +617,10 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	managedPredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		return obj.GetLabels()[odhLabels.PlatformPartOf] == monitoringPartOf
 	})
+	thanosRoutePredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
+		return obj.GetName() == thanosQuerierRouteName ||
+			obj.GetLabels()[odhLabels.PlatformPartOf] == monitoringPartOf
+	})
 	platformConfigPredicate := predicate.NewPredicateFuncs(isPlatformConfigMap)
 
 	return ctrl.NewControllerManagedBy(mgr).
@@ -634,7 +641,7 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.ServiceAccount{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		// Namespace creation or deletion changes the TargetAllocator Secret Role allowlist.
 		Watches(&corev1.Namespace{}, toSingleton, builder.WithPredicates(namespaceWatchPredicate())).
-		Watches(&routev1.Route{}, toSingleton, builder.WithPredicates(managedPredicate)).
+		Watches(&routev1.Route{}, toSingleton, builder.WithPredicates(thanosRoutePredicate)).
 		// Watch CRDs to react when optional operators are installed / removed.
 		Watches(&extv1.CustomResourceDefinition{}, toSingleton).
 		// Reconcile when cluster APIServer TLS profile changes.

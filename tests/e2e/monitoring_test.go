@@ -995,7 +995,8 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierNotDeployedWithoutMetrics(t *t
 	)
 }
 
-// ValidateThanosQuerierDeployment tests that ThanosQuerier CR and Route are created when metrics are configured.
+// ValidateThanosQuerierDeployment tests that the ThanosQuerier CR is created
+// without exposing its unauthenticated HTTP service through a Route.
 func (tc *MonitoringTestCtx) ValidateThanosQuerierDeployment(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
@@ -1010,6 +1011,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierDeployment(t *testing.T) {
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
 		WithCondition(And(
 			jq.Match(`.spec.metrics != null`),
+			jq.Match(`.status.url == null or .status.url == ""`),
 			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, common.ConditionTypeReady, metav1.ConditionTrue),
 			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, conditions.ConditionThanosQuerierAvailable, metav1.ConditionTrue),
 		)),
@@ -1027,19 +1029,9 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierDeployment(t *testing.T) {
 		WithCustomErrorMsg("ThanosQuerier CR should be created when metrics are configured"),
 	)
 
-	tc.EnsureResourceExists(
+	tc.EnsureResourceGone(
 		WithMinimalObject(gvk.Route, types.NamespacedName{Name: ThanosQuerierRouteName, Namespace: tc.MonitoringNamespace}),
-		WithCondition(And(
-			jq.Match(`.spec.to.name == "thanos-querier-data-science-thanos-querier"`),
-			jq.Match(`.spec.tls.termination == "edge"`),
-			jq.Match(`.spec.tls.insecureEdgeTerminationPolicy == "Redirect"`),
-			jq.Match(`.metadata.labels.app == "thanos-querier"`),
-			jq.Match(`.metadata.labels."app.kubernetes.io/name" == "thanos-querier"`),
-			jq.Match(`.metadata.labels."app.kubernetes.io/component" == "querier"`),
-			jq.Match(`.metadata.labels."app.kubernetes.io/part-of" == "data-science-monitoring"`),
-			tc.monitoringOwnerReferencesCondition(),
-		)),
-		WithCustomErrorMsg("ThanosQuerier Route should be created when metrics are configured"),
+		WithCustomErrorMsg("Unauthenticated ThanosQuerier Route should be absent when metrics are configured"),
 	)
 }
 

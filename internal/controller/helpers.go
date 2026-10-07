@@ -255,29 +255,28 @@ func syncPrometheusWebTLSCA(ctx context.Context, c client.Client, monitoring *v1
 
 const thanosQuerierRouteName = "data-science-thanos-querier-route"
 
-// syncStatusURL fetches the Thanos Querier route and updates monitoring.Status.URL.
-// When metrics are not configured the URL is cleared.
-func syncStatusURL(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) error {
-	if monitoring.Spec.Metrics == nil || monitoring.Spec.Metrics.Storage == nil {
-		monitoring.Status.URL = ""
-		return nil
-	}
-
+// removeLegacyThanosQuerierRoute removes the direct HTTP route shipped by
+// previous releases. It checks the backend so a different route reusing this
+// name is left alone. The legacy template had no monitoring GC label.
+func removeLegacyThanosQuerierRoute(ctx context.Context, c client.Client, namespace string) error {
 	route := &routev1.Route{}
 	if err := c.Get(ctx, client.ObjectKey{
-		Namespace: monitoring.Spec.Namespace,
+		Namespace: namespace,
 		Name:      thanosQuerierRouteName,
 	}, route); err != nil {
-		monitoring.Status.URL = ""
 		if errors.IsNotFound(err) {
 			return nil
 		}
-		return fmt.Errorf("failed to fetch Thanos Querier route for status URL: %w", err)
+		return fmt.Errorf("getting legacy Thanos Querier route: %w", err)
 	}
 
-	if len(route.Status.Ingress) > 0 && route.Status.Ingress[0].Host != "" {
-		monitoring.Status.URL = "https://" + route.Status.Ingress[0].Host
+	if route.Spec.To.Kind != "Service" ||
+		route.Spec.To.Name != "thanos-querier-data-science-thanos-querier" {
+		return nil
 	}
 
+	if err := c.Delete(ctx, route); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("deleting legacy Thanos Querier route: %w", err)
+	}
 	return nil
 }

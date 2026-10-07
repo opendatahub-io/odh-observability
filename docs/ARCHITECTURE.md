@@ -92,7 +92,6 @@ All templates are embedded via `//go:embed` and rendered with Go's `text/templat
 | `data-science-prometheus-namespace-proxy.tmpl.yaml` | Namespace-scoped Prometheus proxy |
 | `data-science-prometheus-namespace-proxy-network-policy.tmpl.yaml` | NetworkPolicy for namespace proxy |
 | `thanos-querier-cr.tmpl.yaml` | ThanosQuerier CR |
-| `thanos-querier-route.tmpl.yaml` | Route for Thanos Querier |
 
 ### Tracing (Tempo + Instrumentation)
 

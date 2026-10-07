@@ -24,10 +24,13 @@ import (
 	odhLabels "github.com/opendatahub-io/odh-platform-utilities/pkg/metadata/labels"
 	routev1 "github.com/openshift/api/route/v1"
 	corev1 "k8s.io/api/core/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
@@ -350,95 +353,57 @@ func TestSyncPrometheusWebTLSCA_EmptyData(t *testing.T) {
 	}
 }
 
-// --- syncStatusURL ---
+// --- removeLegacyThanosQuerierRoute ---
 
-func TestSyncStatusURL_RoutePresent_MultipleIngress(t *testing.T) {
-	s := newTestScheme(t)
-	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{
-		Storage: &v1alpha1.MetricsStorage{},
-	}
-
-	route := &routev1.Route{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      thanosQuerierRouteName,
-			Namespace: m.Spec.Namespace,
-		},
-		Status: routev1.RouteStatus{
-			Ingress: []routev1.RouteIngress{
-				{Host: "primary.example.com"},
-				{Host: "secondary.example.com"},
-			},
-		},
-	}
-
-	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(m, route).WithStatusSubresource(route).Build()
-	if err := syncStatusURL(context.Background(), cli, m); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Should use the first ingress host.
-	if m.Status.URL != "https://primary.example.com" {
-		t.Errorf("Status.URL: want %q, got %q", "https://primary.example.com", m.Status.URL)
-	}
-}
-
-func TestSyncStatusURL_EmptyHost(t *testing.T) {
-	s := newTestScheme(t)
-	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{
-		Storage: &v1alpha1.MetricsStorage{},
-	}
-	m.Status.URL = "https://stale.example.com"
-
-	route := &routev1.Route{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      thanosQuerierRouteName,
-			Namespace: m.Spec.Namespace,
-		},
-		Status: routev1.RouteStatus{
-			Ingress: []routev1.RouteIngress{{Host: ""}},
-		},
-	}
-
-	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(m, route).WithStatusSubresource(route).Build()
-	if err := syncStatusURL(context.Background(), cli, m); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// When the route exists but the host is empty (ingress not ready), the
-	// function preserves the existing URL. It will be updated on the next
-	// reconcile when the host becomes available.
-	if m.Status.URL != "https://stale.example.com" {
-		t.Errorf("Status.URL: want preserved stale value, got %q", m.Status.URL)
+func TestRemoveLegacyThanosQuerierRoute(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		route      *routev1.Route
+		wantAbsent bool
+	}{
+		{name: "route already absent", wantAbsent: true},
+		{name: "unlabeled legacy route", route: legacyThanosQuerierRoute(), wantAbsent: true},
+		{name: "different backend", route: func() *routev1.Route {
+			route := legacyThanosQuerierRoute()
+			route.Spec.To.Name = "authenticated-proxy"
+			return route
+		}()},
+		{name: "same raw backend on different port", route: func() *routev1.Route {
+			route := legacyThanosQuerierRoute()
+			route.Spec.Port.TargetPort = intstr.FromString("https")
+			return route
+		}(), wantAbsent: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestScheme(t)
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			builder := fake.NewClientBuilder().WithScheme(s)
+			if tc.route != nil {
+				tc.route.Namespace = m.Spec.Namespace
+				builder.WithObjects(tc.route)
+			}
+			cli := builder.Build()
+			if err := removeLegacyThanosQuerierRoute(context.Background(), cli, m.Spec.Namespace); err != nil {
+				t.Fatalf("removing legacy route: %v", err)
+			}
+			err := cli.Get(context.Background(), client.ObjectKey{Namespace: m.Spec.Namespace, Name: thanosQuerierRouteName}, &routev1.Route{})
+			if tc.wantAbsent && !k8serr.IsNotFound(err) {
+				t.Errorf("route should be absent, got error %v", err)
+			}
+			if !tc.wantAbsent && err != nil {
+				t.Errorf("different route should remain: %v", err)
+			}
+		})
 	}
 }
 
-func TestSyncStatusURL_NoIngress(t *testing.T) {
-	s := newTestScheme(t)
-	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Metrics = &v1alpha1.Metrics{
-		Storage: &v1alpha1.MetricsStorage{},
-	}
-	m.Status.URL = "https://stale.example.com"
-
-	route := &routev1.Route{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      thanosQuerierRouteName,
-			Namespace: m.Spec.Namespace,
+func legacyThanosQuerierRoute() *routev1.Route {
+	return &routev1.Route{
+		ObjectMeta: metav1.ObjectMeta{Name: thanosQuerierRouteName},
+		Spec: routev1.RouteSpec{
+			To:   routev1.RouteTargetReference{Kind: "Service", Name: "thanos-querier-data-science-thanos-querier"},
+			Port: &routev1.RoutePort{TargetPort: intstr.FromString("http")},
 		},
-		Status: routev1.RouteStatus{Ingress: nil},
-	}
-
-	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(m, route).WithStatusSubresource(route).Build()
-	if err := syncStatusURL(context.Background(), cli, m); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// When the route exists but has no ingress entries yet, the function
-	// preserves the existing URL.
-	if m.Status.URL != "https://stale.example.com" {
-		t.Errorf("Status.URL: want preserved stale value, got %q", m.Status.URL)
 	}
 }
 
