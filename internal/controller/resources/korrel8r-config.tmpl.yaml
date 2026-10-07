@@ -137,6 +137,8 @@ data:
 {{- end}}
       - /etc/korrel8r/custom/rhai-inference-rules.yaml
     tuning:
+      totalLimit: 3000
+      totalQueryLimit: 300
       requestTimeout: {{.Korrel8rRequestTimeout}}
       sessionTimeout: {{.Korrel8rSessionTimeout}}
 {{- if .MetricsStorage}}

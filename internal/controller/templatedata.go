@@ -598,9 +598,8 @@ func addImageURLs(templateData map[string]any) {
 // manifests to override it with the related-image environment contract.
 func getKorrel8rImage() string {
 	// Keep the default aligned with the supported Cluster Observability Operator
-	// image. The COO build includes the top-level tuning configuration used by
-	// the Monitoring CR; the older upstream 0.7.x image rejects that section.
-	const defaultImage = "registry.redhat.io/cluster-observability-operator/korrel8r-rhel9@sha256:90cc70741585b3a555888cc119c1ad630e988513dd2065158b26f6fa33dc8a22"
+	// image. This build enforces the traversal limits in the Monitoring config.
+	const defaultImage = "registry.redhat.io/cluster-observability-operator/korrel8r-rhel9@sha256:e3ebab37597e15fc58b989e7f3cf70f5561e96723f4f409333e8b99540386c8a"
 	return getEnvOrDefault("RELATED_IMAGE_KORREL8R_IMAGE", defaultImage)
 }
 

@@ -10,10 +10,10 @@ The Deployment uses one replica with requests of `50m` CPU and `64Mi` memory,
 and limits of `200m` CPU and `512Mi` memory. The operator includes the stock
 Korrel8r rules and pins the stores to RHOAI backends:
 
-The default container is the pinned Korrel8r image shipped with the supported
-Cluster Observability Operator release. The older upstream `0.7.x` image does
-not accept the top-level timeout configuration required here; releases can
-override the image through `RELATED_IMAGE_KORREL8R_IMAGE`.
+The default container is the Korrel8r image from Cluster Observability Operator
+1.5.3. This build supports traversal-wide object and query limits and cancels
+searches under memory pressure. Releases can override the image through
+`RELATED_IMAGE_KORREL8R_IMAGE`; an override must support these tuning settings.
 
 - metrics: the RHOAI `ThanosQuerier` on port `10902`;
 - traces: the RHOAI Tempo gateway and the monitoring-namespace tenant;
@@ -132,7 +132,7 @@ test -n "$WINDOW_START" || {
 }
 WINDOW_END=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 NEIGHBORS_BODY=$(jq -n --arg start "$START" --arg windowStart "$WINDOW_START" --arg windowEnd "$WINDOW_END" '{depth:2,start:{queries:[$start],constraint:{limit:50,queryLimit:10,start:$windowStart,end:$windowEnd}}}')
-GOALS_BODY=$(jq -n --arg start "$START" --arg windowStart "$WINDOW_START" --arg windowEnd "$WINDOW_END" '{goals:["metric:metric"],start:{queries:[$start],constraint:{limit:50,queryLimit:10,start:$windowStart,end:$windowEnd}}}')
+GOALS_BODY=$(jq -n --arg start "$START" --arg windowStart "$WINDOW_START" --arg windowEnd "$WINDOW_END" '{goals:["metric:metric","trace:span","log:application"],start:{queries:[$start],constraint:{limit:50,queryLimit:10,start:$windowStart,end:$windowEnd}}}')
 ```
 
 Check authentication, configured domains, and the disabled runtime config
@@ -150,8 +150,10 @@ curl --noproxy '*' --cacert "$CA_FILE" --resolve "$KORREL8R_HOST:8443:127.0.0.1"
 ```
 
 Use bounded requests. `depth: 2` is the normal sign-off path; never omit the
-start constraint from graph requests. Set both a result limit and a one-hour
-time window (replace the timestamps with the desired UTC window):
+start constraint from graph requests. `limit` applies per query and `queryLimit`
+per class; the server also caps each traversal at 3,000 objects and 300 queries.
+Set a one-hour time window (replace the timestamps with the desired UTC window).
+For a partial signal configuration, remove unavailable domains from `GOALS_BODY`.
 
 ```bash
 curl --noproxy '*' --cacert "$CA_FILE" --resolve "$KORREL8R_HOST:8443:127.0.0.1" \
@@ -193,11 +195,13 @@ request. The response must contain the three edges from `k8s:Pod.v1` to
 `metric:metric`, `trace:span`, and `log:application`. Check that the
 ClusterLogForwarder is `Ready=True` and its Vector DaemonSet has ready pods
 before treating the Loki result as a Korrel8r failure. For a partial signal
-configuration, validate only the edges for enabled stores.
+configuration, validate only the edges for enabled stores. If the response has
+`truncation` metadata, narrow the request and rerun it before treating a missing
+edge as a missing signal.
 
-The `512Mi` memory limit accommodates the bounded trace and log queries that
-exceeded the spike baseline. Record the Korrel8r pod's last termination state
-while exercising trace and log goals:
+The `512Mi` memory limit is paired with traversal-wide caps and a memory-pressure
+guard. Record the Korrel8r pod's last termination state while exercising trace
+and log goals:
 
 ```bash
 oc -n "$STORE_NS" get pod -l app.kubernetes.io/name=korrel8r -o json \

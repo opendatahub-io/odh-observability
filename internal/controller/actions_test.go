@@ -1464,7 +1464,7 @@ func assertKorrel8rConfiguration(t *testing.T, config, metricsRule string) {
 	if !ok {
 		t.Fatalf("Korrel8r config has no tuning section: %#v", parsed["tuning"])
 	}
-	if tuning["requestTimeout"] != "30s" || tuning["sessionTimeout"] != "5m" {
+	if tuning["totalLimit"] != 3000 || tuning["totalQueryLimit"] != 300 || tuning["requestTimeout"] != "30s" || tuning["sessionTimeout"] != "5m" {
 		t.Errorf("unexpected tuning section: %#v", tuning)
 	}
 	for _, expected := range []string{
@@ -1476,6 +1476,8 @@ func assertKorrel8rConfiguration(t *testing.T, config, metricsRule string) {
 		"/etc/korrel8r/rules/all.yaml",
 		"/etc/korrel8r/custom/rhoai-metrics.yaml",
 		"/etc/korrel8r/custom/rhai-inference-rules.yaml",
+		"totalLimit: 3000",
+		"totalQueryLimit: 300",
 		"requestTimeout: 30s",
 		"sessionTimeout: 5m",
 	} {
