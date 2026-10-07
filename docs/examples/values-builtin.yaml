@@ -1,0 +1,34 @@
+# All built-in observability (metrics, traces, dashboards, logs).
+# CLO (Red Hat OpenShift Logging) is still installed from OperatorHub.
+# Create the S3 secret in redhat-ods-monitoring before enabling logs.
+components:
+  dashboard:
+    dsc:
+      managementState: Managed
+services:
+  monitoring:
+    dependencies:
+      clusterObservability: true
+      opentelemetry: true
+      tempo: true
+      loki: true
+    dsci:
+      managementState: Managed
+      metrics:
+        storage:
+          size: 5Gi
+          retention: 90d
+      traces:
+        sampleRatio: "0.1"
+        storage:
+          backend: pv
+          size: 5Gi
+          retention: 2160h
+      logs:
+        storage:
+          type: s3
+          secretName: rhoai-logs-s3
+          credentialMode: static
+          # API default; change if your cluster uses a different StorageClass.
+          storageClassName: gp3-csi
+        inferenceNamespaces: []

@@ -1,0 +1,18 @@
+# Custom: metrics only.
+components:
+  dashboard:
+    dsc:
+      managementState: Managed
+services:
+  monitoring:
+    dependencies:
+      clusterObservability: true
+      opentelemetry: true
+      tempo: false
+      loki: false
+    dsci:
+      managementState: Managed
+      metrics:
+        storage:
+          size: 10Gi
+          retention: 30d

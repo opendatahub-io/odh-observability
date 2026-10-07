@@ -1,0 +1,13 @@
+# No observability module.
+components:
+  dashboard:
+    dsc:
+      managementState: Managed
+services:
+  monitoring:
+    dependencies:
+      clusterObservability: false
+      opentelemetry: false
+      tempo: false
+    dsci:
+      managementState: Removed
