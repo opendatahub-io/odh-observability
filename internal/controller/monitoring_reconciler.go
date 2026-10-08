@@ -371,6 +371,9 @@ func (r *MonitoringReconciler) syncPostDeployResources(
 	}
 	if err := syncThanosQuerierRouteDestinationCA(ctx, r.Client, monitoring); err != nil {
 		log.Error(err, "Failed to sync Thanos Querier Route destination CA")
+		cm.MarkFalse(conditions.ConditionMonitoringStackAvailable,
+			"ThanosCAConfigSyncFailed",
+			fmt.Sprintf("Failed to sync Thanos Querier Route destination CA: %v", err))
 	}
 
 	// Populate status.url from the Thanos Querier route.

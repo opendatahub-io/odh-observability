@@ -1131,7 +1131,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteAuthorizationBoundary(t *
 		}),
 		WithCondition(And(
 			jq.Match(`.spec.podSelector.matchLabels.app == "%s"`, ThanosQuerierProxyName),
-			jq.Match(`.spec.ingress[0].from[0].namespaceSelector.matchLabels."kubernetes.io/metadata.name" == "openshift-ingress"`),
+			jq.Match(`.spec.ingress[0].from[0].namespaceSelector.matchLabels["policy-group.network.openshift.io/ingress"] == ""`),
 			jq.Match(`.spec.ingress[0].ports[0].port == 8443`),
 		)),
 	)
