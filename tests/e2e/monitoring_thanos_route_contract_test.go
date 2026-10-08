@@ -111,6 +111,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 		t.Fatalf("failed to create restricted probe ServiceAccount: %v", err)
 	}
 	registerProbeCleanup(restrictedSA)
+	setupRestrictedProbeAccess(t, tc, restrictedName, identitySuffix, registerProbeCleanup)
 
 	roleBinding := &rbacv1.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
@@ -237,6 +238,71 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 	if duplicateNamespace.HTTPStatus != http.StatusBadRequest {
 		t.Fatalf("POST with conflicting URL and form namespace values must be rejected, got %d", duplicateNamespace.HTTPStatus)
 	}
+}
+
+func setupRestrictedProbeAccess(t *testing.T, tc *MonitoringTestCtx, restrictedName, identitySuffix string, registerCleanup func(client.Object)) {
+	t.Helper()
+	restrictedNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name: "thanos-route-other-" + identitySuffix,
+	}}
+	createAndRegisterProbeObject(t, tc, restrictedNamespace, "restricted probe namespace", registerCleanup)
+
+	restrictedViewBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      restrictedName + "-view",
+			Namespace: restrictedNamespace.Name,
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "view",
+		},
+		Subjects: []rbacv1.Subject{{
+			Kind:      "ServiceAccount",
+			Name:      restrictedName,
+			Namespace: tc.MonitoringNamespace,
+		}},
+	}
+	createAndRegisterProbeObject(t, tc, restrictedViewBinding, "restricted probe view RoleBinding", registerCleanup)
+
+	restrictedMetricsRole := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      restrictedName + "-metrics",
+			Namespace: restrictedNamespace.Name,
+		},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{"metrics.k8s.io"},
+			Resources: []string{"pods"},
+			Verbs:     []string{"get", "create"},
+		}},
+	}
+	createAndRegisterProbeObject(t, tc, restrictedMetricsRole, "restricted probe metrics Role", registerCleanup)
+
+	restrictedMetricsBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      restrictedName + "-metrics",
+			Namespace: restrictedNamespace.Name,
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     restrictedMetricsRole.Name,
+		},
+		Subjects: []rbacv1.Subject{{
+			Kind:      "ServiceAccount",
+			Name:      restrictedName,
+			Namespace: tc.MonitoringNamespace,
+		}},
+	}
+	createAndRegisterProbeObject(t, tc, restrictedMetricsBinding, "restricted probe metrics RoleBinding", registerCleanup)
+}
+
+func createAndRegisterProbeObject(t *testing.T, tc *MonitoringTestCtx, object client.Object, description string, registerCleanup func(client.Object)) {
+	t.Helper()
+	if err := tc.Client().Create(tc.Context(), object); err != nil {
+		t.Fatalf("failed to create %s: %v", description, err)
+	}
+	registerCleanup(object)
 }
 
 func logThanosRouteEvidence(t *testing.T, persona string, probe thanosRouteProbe) {
