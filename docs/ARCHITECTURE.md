@@ -296,6 +296,7 @@ kube-rbac-proxy (port 8443)
     |
 prom-label-proxy (port 9091)
     |-- Validates namespace parameter is present
+    |-- Rejects multiple namespace values, including URL/form duplicates
     |-- Rewrites PromQL queries to inject namespace label filter
     |
 Prometheus (port 9090)
@@ -305,7 +306,7 @@ Prometheus (port 9090)
 
 **Authorization**: SubjectAccessReview checks that the user has permissions for `metrics.k8s.io/pods` in the requested namespace. The verb is derived from the HTTP method (GET -> `get`, POST -> `create`).
 
-**Query isolation**: prom-label-proxy rewrites PromQL queries to inject `{namespace="<value>"}`, ensuring users only see metrics from namespaces they are authorized for, regardless of how they craft their queries.
+**Query isolation**: prom-label-proxy rewrites PromQL queries to inject `{namespace="<value>"}`, ensuring users only see metrics from namespaces they are authorized for, regardless of how they craft their queries. Its single-value regex mode rejects duplicate namespace values supplied across URL and POST form parameters instead of widening the enforced matcher.
 
 **Network isolation**: The Prometheus proxy NetworkPolicy restricts ingress to the OpenShift router and Alertmanager. The Thanos proxy NetworkPolicy restricts ingress to the OpenShift router.
 

@@ -131,6 +131,8 @@ spec:
             - --upstream=http://thanos-querier-data-science-thanos-querier.{{.Namespace}}.svc.cluster.local:10902
             - --label=namespace
             - --enable-label-apis
+            # Reject duplicate namespace values from URL and POST form data.
+            - --regex-match
           resources:
             limits:
               cpu: 100m

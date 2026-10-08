@@ -229,6 +229,7 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		"--upstream=http://thanos-querier-data-science-thanos-querier."+testMonitoringNamespace+".svc.cluster.local:10902",
 		"--label=namespace",
 		"--enable-label-apis",
+		"--regex-match",
 	)
 
 	service := findRenderedResource(t, resources, "Service", "data-science-thanos-querier-proxy")
@@ -384,6 +385,7 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		"--upstream=https://prometheus-operated."+testMonitoringNamespace+".svc:9090",
 		"--label=namespace",
 		"--enable-label-apis",
+		"--regex-match",
 	)
 
 	service := findRenderedResource(t, resources, "Service", "data-science-prometheus-namespace-proxy")

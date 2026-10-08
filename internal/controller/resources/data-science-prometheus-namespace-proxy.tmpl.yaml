@@ -157,6 +157,8 @@ spec:
             - --upstream=https://prometheus-operated.{{.Namespace}}.svc:9090
             - --label=namespace
             - --enable-label-apis
+            # Reject duplicate namespace values from URL and POST form data.
+            - --regex-match
           env:
             - name: SSL_CERT_DIR
               value: /etc/prometheus-tls-ca:/etc/ssl/certs:/etc/pki/tls/certs
