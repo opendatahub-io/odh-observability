@@ -1,0 +1,18 @@
+# Custom: traces only (Tempo Perses views; no metrics/COO dashboards).
+components:
+  dashboard:
+    dsc:
+      managementState: Managed
+services:
+  monitoring:
+    dependencies:
+      clusterObservability: false
+      opentelemetry: true
+      tempo: true
+      loki: false
+    dsci:
+      managementState: Managed
+      traces:
+        storage:
+          backend: pv
+          size: 5Gi

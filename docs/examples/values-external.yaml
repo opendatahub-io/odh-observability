@@ -1,0 +1,25 @@
+# External only: forward metrics and traces; no built-in storage or dashboards.
+# If you forward cluster logs, install CLO from OperatorHub separately.
+components:
+  dashboard:
+    dsc:
+      managementState: Managed
+services:
+  monitoring:
+    dependencies:
+      clusterObservability: false
+      opentelemetry: true
+      tempo: false
+      loki: false
+    dsci:
+      managementState: Managed
+      metrics:
+        exporters:
+          otlp/external:
+            endpoint: https://metrics.example.com:4317
+            tls:
+              insecure: false
+      traces:
+        exporters:
+          otlp/external:
+            endpoint: https://traces.example.com:4317

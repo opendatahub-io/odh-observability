@@ -963,7 +963,7 @@ func TestGetPersesImage_Override(t *testing.T) {
 
 func TestGetKorrel8rImage_Default(t *testing.T) {
 	t.Setenv("RELATED_IMAGE_KORREL8R_IMAGE", "")
-	if got := getKorrel8rImage(); got != "registry.redhat.io/cluster-observability-operator/korrel8r-rhel9@sha256:90cc70741585b3a555888cc119c1ad630e988513dd2065158b26f6fa33dc8a22" {
+	if got := getKorrel8rImage(); got != "registry.redhat.io/cluster-observability-operator/korrel8r-rhel9@sha256:e3ebab37597e15fc58b989e7f3cf70f5561e96723f4f409333e8b99540386c8a" {
 		t.Errorf("unexpected default Korrel8r image: %q", got)
 	}
 }
@@ -1043,7 +1043,7 @@ func TestBuildTemplateData_Korrel8rConfiguration(t *testing.T) {
 	if data["Logs"] != true {
 		t.Error("Logs: want true")
 	}
-	if data["Korrel8rImage"] != "registry.redhat.io/cluster-observability-operator/korrel8r-rhel9@sha256:90cc70741585b3a555888cc119c1ad630e988513dd2065158b26f6fa33dc8a22" {
+	if data["Korrel8rImage"] != "registry.redhat.io/cluster-observability-operator/korrel8r-rhel9@sha256:e3ebab37597e15fc58b989e7f3cf70f5561e96723f4f409333e8b99540386c8a" {
 		t.Errorf("unexpected Korrel8r image: %v", data["Korrel8rImage"])
 	}
 	if data["Korrel8rRequestTimeout"] != "30s" || data["Korrel8rSessionTimeout"] != "5m" {
