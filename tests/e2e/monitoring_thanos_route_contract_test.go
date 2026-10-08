@@ -206,10 +206,15 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 		}
 	}
 
-	crafted := probeThanosRoute(t, rootCAs, routeHost, authorizedToken, tc.MonitoringNamespace, `up{namespace="kube-system"}`)
+	// Keep the selector broad enough to match the known series returned above;
+	// otherwise an empty response would make the namespace-boundary assertion vacuous.
+	crafted := probeThanosRoute(t, rootCAs, routeHost, authorizedToken, tc.MonitoringNamespace, `up{namespace=~".*"}`)
 	logThanosRouteEvidence(t, "authorized-crafted-selector", crafted)
 	if crafted.HTTPStatus != http.StatusOK || crafted.PrometheusStatus != "success" {
 		t.Fatalf("authorized crafted-selector query should remain a successful Prometheus request, got http_status=%d prometheus_status=%q", crafted.HTTPStatus, crafted.PrometheusStatus)
+	}
+	if len(crafted.Labels) == 0 {
+		t.Fatalf("authorized crafted-selector query returned no metric series")
 	}
 	for _, labels := range crafted.Labels {
 		if labels["namespace"] != tc.MonitoringNamespace {
