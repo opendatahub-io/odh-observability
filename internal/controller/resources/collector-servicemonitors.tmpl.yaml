@@ -35,6 +35,7 @@ metadata:
 spec:
   endpoints:
     - port: prometheus
+      honorLabels: true
       scheme: https
       tlsConfig:
         caFile: /etc/prometheus/secrets/prometheus-web-tls-ca/service-ca.crt
@@ -51,4 +52,3 @@ spec:
       app.kubernetes.io/name: data-science-collector-prometheus
       app.kubernetes.io/part-of: opentelemetry
 {{- end }}
-
