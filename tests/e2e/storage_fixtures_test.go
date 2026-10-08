@@ -23,7 +23,7 @@ const (
 	seaweedFSPodName     = "seaweedfs"
 	seaweedFSServiceName = "seaweedfs"
 	seaweedFSBucketPod   = "seaweedfs-bucket-creator"
-	seaweedFSImage       = "chrislusf/seaweedfs@sha256:08d516132314207d10c8e37cbffc1f32b147d870169688734cc61c6231625b62"
+	seaweedFSImage       = "quay.io/flysangel/chrislusf/seaweedfs@sha256:aba492e2a4e4c90bff795745e8e660affa1f09e7650f5981bd7bccd1a06cd931"
 	seaweedFSAccessKey   = "seaweedfs-test-key"
 	seaweedFSSecretKey   = "seaweedfs-test-secret"
 	tempoS3Bucket        = "tempo-traces"
@@ -59,7 +59,7 @@ func fixtureContainerSecurityContext() *corev1.SecurityContext {
 	}
 }
 
-func (tc *MonitoringTestCtx) createFixtureResource(t *testing.T, kind schema.GroupVersionKind, obj client.Object) {
+func (tc *TestContext) createFixtureResource(t *testing.T, kind schema.GroupVersionKind, obj client.Object) {
 	t.Helper()
 	content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
 	require.NoError(t, err)
@@ -69,7 +69,7 @@ func (tc *MonitoringTestCtx) createFixtureResource(t *testing.T, kind schema.Gro
 	)
 }
 
-func (tc *MonitoringTestCtx) waitForFixturePod(name string, condition gTypes.GomegaMatcher) {
+func (tc *TestContext) waitForFixturePod(name string, condition gTypes.GomegaMatcher) {
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Pod, types.NamespacedName{Name: name, Namespace: tc.MonitoringNamespace}),
 		WithCondition(condition),
@@ -78,7 +78,7 @@ func (tc *MonitoringTestCtx) waitForFixturePod(name string, condition gTypes.Gom
 	)
 }
 
-func (tc *MonitoringTestCtx) deleteFixtureResources(names ...string) {
+func (tc *TestContext) deleteFixtureResources(names ...string) {
 	for _, name := range names {
 		tc.DeleteResource(
 			WithMinimalObject(gvk.Pod, types.NamespacedName{Name: name, Namespace: tc.MonitoringNamespace}),
@@ -88,7 +88,7 @@ func (tc *MonitoringTestCtx) deleteFixtureResources(names ...string) {
 	}
 }
 
-func (tc *MonitoringTestCtx) cleanupSeaweedFS() {
+func (tc *TestContext) cleanupSeaweedFS() {
 	tc.deleteFixtureResources(seaweedFSBucketPod, seaweedFSPodName)
 	tc.DeleteResource(
 		WithMinimalObject(gvk.Service, types.NamespacedName{Name: seaweedFSServiceName, Namespace: tc.MonitoringNamespace}),
@@ -97,7 +97,7 @@ func (tc *MonitoringTestCtx) cleanupSeaweedFS() {
 	)
 }
 
-func (tc *MonitoringTestCtx) startSeaweedFS(t *testing.T, bucket string) {
+func (tc *TestContext) startSeaweedFS(t *testing.T, bucket string) {
 	t.Helper()
 	require.Regexp(t, `^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`, bucket)
 	tc.cleanupSeaweedFS()
@@ -153,7 +153,7 @@ func (tc *MonitoringTestCtx) startSeaweedFS(t *testing.T, bucket string) {
 	tc.createBucketPod(t, seaweedFSBucketPod, seaweedFSImage, script)
 }
 
-func (tc *MonitoringTestCtx) cleanupFakeGCS() {
+func (tc *TestContext) cleanupFakeGCS() {
 	tc.deleteFixtureResources(fakeGCSBucketPod, fakeGCSPodName)
 	tc.DeleteResource(
 		WithMinimalObject(gvk.Service, types.NamespacedName{Name: fakeGCSServiceName, Namespace: tc.MonitoringNamespace}),
@@ -162,7 +162,7 @@ func (tc *MonitoringTestCtx) cleanupFakeGCS() {
 	)
 }
 
-func (tc *MonitoringTestCtx) startFakeGCS(t *testing.T) {
+func (tc *TestContext) startFakeGCS(t *testing.T) {
 	t.Helper()
 	tc.cleanupFakeGCS()
 
@@ -215,7 +215,7 @@ func (tc *MonitoringTestCtx) startFakeGCS(t *testing.T) {
 	tc.createBucketPod(t, fakeGCSBucketPod, fakeGCSClientImage, script)
 }
 
-func (tc *MonitoringTestCtx) createBucketPod(t *testing.T, name, image, script string) {
+func (tc *TestContext) createBucketPod(t *testing.T, name, image, script string) {
 	t.Helper()
 	tc.createFixtureResource(t, gvk.Pod, &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: tc.MonitoringNamespace},

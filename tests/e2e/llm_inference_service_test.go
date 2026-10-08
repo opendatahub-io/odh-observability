@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/onsi/gomega"
+	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/stretchr/testify/require"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,6 +39,33 @@ var (
 		Group:   "serving.kserve.io",
 		Version: "v1alpha2",
 		Kind:    "LLMInferenceService",
+	}
+
+	// gvk.DSCInitialization is v1; the inference prerequisites use v2.
+	gvkDSCInitializationV2 = schema.GroupVersionKind{
+		Group:   "dscinitialization.opendatahub.io",
+		Version: "v2",
+		Kind:    "DSCInitialization",
+	}
+
+	gvkCustomResourceDefinition = schema.GroupVersionKind{
+		Group:   "apiextensions.k8s.io",
+		Version: "v1",
+		Kind:    "CustomResourceDefinition",
+	}
+
+	// The MaaS Config CR is cluster-scoped, despite what `oc get config.maas.opendatahub.io -A`
+	// suggests.
+	gvkMaaSConfig = schema.GroupVersionKind{
+		Group:   "maas.opendatahub.io",
+		Version: "v1alpha1",
+		Kind:    "Config",
+	}
+
+	gvkEnvoyFilter = schema.GroupVersionKind{
+		Group:   "networking.istio.io",
+		Version: "v1alpha3",
+		Kind:    "EnvoyFilter",
 	}
 )
 
@@ -79,7 +107,11 @@ func ensureOatsBinary(t *testing.T, projectRoot string) string {
 
 	cmd := exec.CommandContext(t.Context(), "go", "install", "github.com/grafana/oats@v0.10.0")
 	cmd.Dir = projectRoot
-	cmd.Env = append(os.Environ(), "GOBIN="+localBin)
+	// OATS is a tool binary, not a dependency of this module -- it is in neither go.mod nor
+	// vendor/. "go install pkg@version" has to query the proxy and refuses to run under
+	// -mod=vendor, which this repo's vendor/ directory and a GOFLAGS=-mod=vendor in the user's
+	// go env both select.
+	cmd.Env = append(os.Environ(), "GOBIN="+localBin, "GOFLAGS=-mod=mod")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("Failed to install OATS: %v\nOutput: %s", err, string(out))
 	}
@@ -109,7 +141,7 @@ func buildOatsEnv(t *testing.T, tc *TestContext) []string {
 	if envMap["GRAFANA_SERVER"] == "" {
 		route := &unstructured.Unstructured{}
 		route.SetGroupVersionKind(gvk.Route)
-		err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: "lgtm", Namespace: "redhat-ods-monitoring"}, route)
+		err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: "lgtm", Namespace: inferenceMonitoringNamespace()}, route)
 		host, _, hostErr := unstructured.NestedString(route.Object, "spec", "host")
 		if err == nil && hostErr == nil && host != "" {
 			envMap["GRAFANA_SERVER"] = "https://" + host
@@ -479,7 +511,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 			"name": "facebook/opt-125m",
 		},
 		"tracing": map[string]any{
-			"exporterEndpoint": "http://data-science-collector.redhat-ods-monitoring.svc.cluster.local:4317",
+			"exporterEndpoint": fmt.Sprintf("http://data-science-collector.%s.svc.cluster.local:4317", inferenceMonitoringNamespace()),
 			"sampler":          "always_on",
 		},
 		"replicas": int64(1),
@@ -757,10 +789,8 @@ func logManualCleanupCommands(t *testing.T, topology, llmSvcName, proxyName, tls
 }
 
 func ensureOAuthProxySecret(tc *TestContext) error {
-	const (
-		secretName = "oauth-proxy-secrets"
-		namespace  = "redhat-ods-monitoring"
-	)
+	const secretName = "oauth-proxy-secrets"
+	namespace := inferenceMonitoringNamespace()
 	secret := &unstructured.Unstructured{}
 	secret.SetGroupVersionKind(gvk.Secret)
 	err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: secretName, Namespace: namespace}, secret)
@@ -789,6 +819,122 @@ func inferencePrerequisiteDir(projectRoot string) string {
 	return filepath.Join(projectRoot, "tests", "e2e", "prerequisites", "inference")
 }
 
+// warnIfStorageClassMissing reports a missing StorageClass up front. dsci.yaml pins
+// usageLogs to a named class, and PVCs that reference a missing one stay Pending
+// indefinitely, surfacing only as an unexplained LokiStack readiness timeout.
+func warnIfStorageClassMissing(t *testing.T, tc *TestContext, name string) {
+	t.Helper()
+
+	storageClasses := &unstructured.UnstructuredList{}
+	storageClasses.SetGroupVersionKind(schema.GroupVersionKind{Group: "storage.k8s.io", Version: "v1", Kind: "StorageClassList"})
+	if err := tc.Client().List(tc.Context(), storageClasses); err != nil {
+		t.Logf("WARNING: failed to list StorageClasses to verify %q: %v", name, err)
+		return
+	}
+	available := make([]string, 0, len(storageClasses.Items))
+	for _, storageClass := range storageClasses.Items {
+		if storageClass.GetName() == name {
+			return
+		}
+		available = append(available, storageClass.GetName())
+	}
+	t.Logf("WARNING: dsci.yaml pins usageLogs storageClassName=%q but the cluster has only [%s]; "+
+		"LokiStack PVCs will stay Pending", name, strings.Join(available, ", "))
+}
+
+// logUsageLogsPropagation reports whether the DSCI kept spec.monitoring.usageLogs. It never
+// fails the run: DSCI -> Monitoring propagation is the opendatahub-operator's job, and
+// applyMonitoringManifest configures the Monitoring CR regardless.
+func logUsageLogsPropagation(t *testing.T, tc *TestContext) {
+	t.Helper()
+
+	dsci, err := tc.fetchResource(t, gvkDSCInitializationV2, types.NamespacedName{Name: tc.DSCICRName})
+	if err != nil {
+		t.Logf("could not read DSCI %s to check usageLogs propagation: %v", tc.DSCICRName, err)
+		return
+	}
+	_, found, err := unstructured.NestedMap(dsci.Object, "spec", "monitoring", "usageLogs", "storage")
+	switch {
+	case err != nil:
+		t.Logf("could not read spec.monitoring.usageLogs.storage from DSCI %s: %v", tc.DSCICRName, err)
+	case found:
+		t.Log("DSCI kept spec.monitoring.usageLogs; the opendatahub-operator should propagate it " +
+			"to the Monitoring CR")
+	default:
+		t.Log("WARNING: the installed DSCInitialization CRD has no spec.monitoring.usageLogs, so " +
+			"the stanza in dsci.yaml was pruned; usage logs depend on monitoring.yaml being applied")
+	}
+}
+
+// requireNamespacesMatchExistingDSCI fails before dsci.yaml is applied when the cluster already
+// carries a DSCI pinned to different namespaces.
+//
+// spec.applicationsNamespace and spec.monitoring.namespace are both immutable
+// (rule: self == oldSelf), so the apply would be rejected with a CEL message naming a field but
+// not the flag that set it, and nothing short of deleting the CRs recovers. The namespaces are
+// chosen per cluster, not per run.
+func requireNamespacesMatchExistingDSCI(t *testing.T, tc *TestContext) {
+	t.Helper()
+
+	dsci, err := tc.fetchResource(t, gvkDSCInitializationV2, types.NamespacedName{Name: tc.DSCICRName})
+	if err != nil {
+		// No DSCI yet is the normal path: there is nothing to conflict with.
+		return
+	}
+
+	for _, pinned := range []struct {
+		flag  string
+		want  string
+		field []string
+	}{
+		{"-applications-namespace", inferenceApplicationsNamespace(), []string{"spec", "applicationsNamespace"}},
+		{"-monitoring-namespace", inferenceMonitoringNamespace(), []string{"spec", "monitoring", "namespace"}},
+	} {
+		got, found, err := unstructured.NestedString(dsci.Object, pinned.field...)
+		if err != nil || !found || got == pinned.want {
+			continue
+		}
+		t.Fatalf("DSCI %s has %s=%q but this run is configured for %q via %s, and the field is "+
+			"immutable; delete the DSCI, DSC, and Monitoring CRs to switch namespaces",
+			tc.DSCICRName, strings.Join(pinned.field, "."), got, pinned.want, pinned.flag)
+	}
+}
+
+// warnIfOperatorPredatesNamespace reports a namespace the opendatahub-operator cannot see. The
+// operator builds a namespace-scoped cache when its pod starts, so a namespace created later
+// fails every module deploy with "unknown namespace for the cache" -- which surfaces only as
+// odh-observability never appearing, several minutes into the run.
+func warnIfOperatorPredatesNamespace(t *testing.T, tc *TestContext, namespace string) {
+	t.Helper()
+
+	ns, err := tc.fetchResource(t, gvk.Namespace, types.NamespacedName{Name: namespace})
+	if err != nil {
+		return
+	}
+	pods := &unstructured.UnstructuredList{}
+	pods.SetGroupVersionKind(gvk.Pod.GroupVersion().WithKind(gvk.Pod.Kind + "List"))
+	if err := tc.Client().List(tc.Context(), pods, client.InNamespace(odhOperatorNamespace)); err != nil {
+		return
+	}
+
+	for _, pod := range pods.Items {
+		started, found, err := unstructured.NestedString(pod.Object, "status", "startTime")
+		if err != nil || !found {
+			continue
+		}
+		startTime, err := time.Parse(time.RFC3339, started)
+		if err != nil || !ns.GetCreationTimestamp().After(startTime) {
+			continue
+		}
+		t.Logf("WARNING: namespace %s was created at %s but %s/%s started at %s; the operator's "+
+			"namespace cache predates it and module deploys will fail with \"unknown namespace "+
+			"for the cache\". Run: oc rollout restart deploy/%s -n %s",
+			namespace, ns.GetCreationTimestamp().Format(time.RFC3339), odhOperatorNamespace,
+			pod.GetName(), started, odhOperatorDeployment, odhOperatorNamespace)
+		return
+	}
+}
+
 func ensureCRDExists(ctx context.Context, tc *TestContext, name string) error {
 	crd := &unstructured.Unstructured{}
 	crd.SetGroupVersionKind(schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"})
@@ -796,6 +942,43 @@ func ensureCRDExists(ctx context.Context, tc *TestContext, name string) error {
 		return err
 	}
 	return nil
+}
+
+// inferenceMonitoringNamespace and inferenceApplicationsNamespace resolve the namespaces the
+// inference prerequisites install into. -monitoring-namespace is shared with the TestMonitoring
+// suite, where an empty value means "auto-detect from the running operator"; nothing is deployed
+// yet here, so the inference suite falls back to the manifest literal instead.
+func inferenceMonitoringNamespace() string {
+	if testOpts.monitoringNamespace != "" {
+		return testOpts.monitoringNamespace
+	}
+	return defaultInferenceMonitoringNamespace
+}
+
+func inferenceApplicationsNamespace() string {
+	if testOpts.applicationsNamespace != "" {
+		return testOpts.applicationsNamespace
+	}
+	return defaultInferenceApplicationsNamespace
+}
+
+// renderManifest reads a manifest and rewrites the default namespaces to the configured ones.
+//
+// Substitution is textual because the namespace is not only a field: it is embedded in the
+// exporter endpoints (http://lgtm.<ns>.svc.cluster.local:4317) that dsci.yaml and monitoring.yaml
+// both carry. It runs in one direction only -- redhat-ods-* to the configured value, never the
+// reverse -- which is why the manifests keep the RHOAI namespaces as their literals. Rewriting
+// toward them would have to match "opendatahub", a substring of every apiVersion in the
+// directory.
+func renderManifest(path string) ([]byte, error) {
+	manifest, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(strings.NewReplacer(
+		defaultInferenceMonitoringNamespace, inferenceMonitoringNamespace(),
+		defaultInferenceApplicationsNamespace, inferenceApplicationsNamespace(),
+	).Replace(string(manifest))), nil
 }
 
 func applyManifest(tc *TestContext, path string) error {
@@ -808,13 +991,12 @@ func applyManifestIfAbsent(tc *TestContext, path string) error {
 }
 
 func applyManifestWithOptions(tc *TestContext, path string, updateExisting bool) error {
-	file, err := os.Open(path)
+	manifest, err := renderManifest(path)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
 
-	decoder := utilyaml.NewYAMLOrJSONDecoder(file, 4096)
+	decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(manifest), 4096)
 	for {
 		object := map[string]any{}
 		if err := decoder.Decode(&object); err != nil {
@@ -850,6 +1032,240 @@ func applyManifestWithOptions(tc *TestContext, path string, updateExisting bool)
 	}
 }
 
+// readSingleManifest decodes a manifest holding exactly one object. applyManifestWithOptions
+// streams multi-document files straight to the API server; callers that need to inspect or
+// reshape the object before writing it use this instead.
+func readSingleManifest(path string) (*unstructured.Unstructured, error) {
+	manifest, err := renderManifest(path)
+	if err != nil {
+		return nil, err
+	}
+
+	decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(manifest), 4096)
+	object := map[string]any{}
+	if err := decoder.Decode(&object); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", path, err)
+	}
+	if len(object) == 0 {
+		return nil, fmt.Errorf("%s contains no object", path)
+	}
+
+	extra := map[string]any{}
+	switch err := decoder.Decode(&extra); {
+	case errors.Is(err, io.EOF):
+	case err != nil:
+		return nil, fmt.Errorf("decode %s: %w", path, err)
+	case len(extra) > 0:
+		return nil, fmt.Errorf("%s must contain a single object", path)
+	}
+
+	return &unstructured.Unstructured{Object: object}, nil
+}
+
+// monitoringUpdateAttempts bounds the conflict retries in updateMonitoringSpec. The
+// opendatahub-operator writes the Monitoring CR on every reconcile, so a 409 here is routine.
+const monitoringUpdateAttempts = 5
+
+// updateMonitoringSpec replaces the Monitoring CR's spec with the manifest's. The CR already
+// exists -- the opendatahub-operator creates and owns it -- so the live metadata is carried over:
+// a whole-object Update would otherwise drop monitoring.opendatahub.io/cleanup, leaving the CR
+// deletable without deleteAllOwned running, along with the operator's ownerReferences.
+func updateMonitoringSpec(tc *TestContext, manifest *unstructured.Unstructured) error {
+	nn := types.NamespacedName{Name: manifest.GetName()}
+
+	var conflictErr error
+	for range monitoringUpdateAttempts {
+		current := &unstructured.Unstructured{}
+		current.SetGroupVersionKind(manifest.GroupVersionKind())
+		if err := tc.Client().Get(tc.Context(), nn, current); err != nil {
+			return fmt.Errorf("get %s: %w", nn, err)
+		}
+
+		desired := manifest.DeepCopy()
+		desired.SetResourceVersion(current.GetResourceVersion())
+		desired.SetFinalizers(current.GetFinalizers())
+		desired.SetOwnerReferences(current.GetOwnerReferences())
+		desired.SetLabels(current.GetLabels())
+		desired.SetAnnotations(current.GetAnnotations())
+
+		err := tc.Client().Update(tc.Context(), desired)
+		switch {
+		case err == nil:
+			return nil
+		case k8serr.IsConflict(err):
+			conflictErr = err
+		default:
+			return fmt.Errorf("update %s: %w", nn, err)
+		}
+	}
+	return fmt.Errorf("update %s: %w", nn, conflictErr)
+}
+
+// applyMonitoringManifest overwrites the Monitoring CR the opendatahub-operator created with the
+// spec from monitoring.yaml. DSCI -> Monitoring propagation belongs to the opendatahub-operator,
+// and a DSCInitialization CRD that predates usageLogs prunes the stanza silently; writing the
+// config straight onto the Monitoring CR keeps odh-observability -- the thing actually under
+// test -- exercised end to end.
+func applyMonitoringManifest(t *testing.T, tc *TestContext, dir string) {
+	t.Helper()
+
+	path := filepath.Join(dir, "monitoring.yaml")
+	manifest, err := readSingleManifest(path)
+	if err != nil {
+		t.Fatalf("failed to read the Monitoring manifest: %v", err)
+	}
+	if name := manifest.GetName(); name != tc.MonitoringCRName {
+		t.Fatalf("%s targets Monitoring %q but the suite is configured for %q", path, name, tc.MonitoringCRName)
+	}
+	// spec.namespace is immutable (api/v1alpha1/monitoring_types.go), so a desync with what the
+	// opendatahub-operator wrote rejects the update with a CEL message that reads nothing like
+	// the real cause.
+	namespace, _, err := unstructured.NestedString(manifest.Object, "spec", "namespace")
+	if err != nil {
+		t.Fatalf("failed to read spec.namespace from %s: %v", path, err)
+	}
+	if namespace != inferenceMonitoringNamespace() {
+		t.Fatalf("%s pins spec.namespace=%q but the prerequisites use %q, and the field is immutable",
+			path, namespace, inferenceMonitoringNamespace())
+	}
+
+	nn := types.NamespacedName{Name: tc.MonitoringCRName}
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, nn),
+		WithEventuallyTimeout(5*time.Minute),
+		WithCustomErrorMsg("Monitoring CR %s should be created from the DSCI", tc.MonitoringCRName),
+	)
+
+	t.Logf("Overwriting the Monitoring CR spec from %s", path)
+	if err := updateMonitoringSpec(tc, manifest); err != nil {
+		t.Fatalf("failed to configure the Monitoring CR from %s: %v", path, err)
+	}
+
+	// Read back. A Monitoring CRD that predates usageLogs prunes the stanza exactly as the DSCI
+	// CRD did and the update still returns 200; without this the first symptom is the LokiStack
+	// wait below spending its full budget blaming a LokiStack nobody asked for.
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, nn),
+		WithCondition(jq.Match(`.spec.usageLogs.storage.secretName == "%s"`, lokiS3SecretName)),
+		WithCustomErrorMsg("Monitoring CR %s should carry usageLogs storage after applying %s", tc.MonitoringCRName, path),
+	)
+}
+
+// enableMaaSUsageLogging flips spec.usageLogging on the cluster-scoped MaaS Config CR.
+//
+// It writes the single field rather than replacing the spec: the maas-controller owns
+// spec.limitadorScrapeInterval and the maas.opendatahub.io/default-aitenant-bootstrapped
+// annotation on the same object, and there is no manifest here to declare them from.
+func enableMaaSUsageLogging(tc *TestContext) error {
+	nn := types.NamespacedName{Name: maasConfigCRName}
+
+	var conflictErr error
+	for range monitoringUpdateAttempts {
+		config := &unstructured.Unstructured{}
+		config.SetGroupVersionKind(gvkMaaSConfig)
+		if err := tc.Client().Get(tc.Context(), nn, config); err != nil {
+			return fmt.Errorf("get MaaS Config %s: %w", nn, err)
+		}
+
+		// Re-runs against a configured cluster are the common case.
+		if enabled, _, err := unstructured.NestedBool(config.Object, "spec", "usageLogging"); err == nil && enabled {
+			return nil
+		}
+		if err := unstructured.SetNestedField(config.Object, true, "spec", "usageLogging"); err != nil {
+			return fmt.Errorf("set spec.usageLogging on MaaS Config %s: %w", nn, err)
+		}
+
+		err := tc.Client().Update(tc.Context(), config)
+		switch {
+		case err == nil:
+			return nil
+		case k8serr.IsConflict(err):
+			conflictErr = err
+		default:
+			return fmt.Errorf("update MaaS Config %s: %w", nn, err)
+		}
+	}
+	return fmt.Errorf("update MaaS Config %s: %w", nn, conflictErr)
+}
+
+// enableMaaSUsageLoggingPrerequisite turns on per-request usage logging in MaaS.
+//
+// The maas-controller only deploys the gateway EnvoyFilter that emits usage logs -- the input
+// this repo's collector ingests -- when spec.usageLogging is true, and the field defaults to
+// false. Without this there is nothing for the collector to receive.
+//
+// It must run after the DSC is Ready: the maas-controller is deployed by the DSC's aigateway
+// component, and it is the controller, not any manifest here, that bootstraps Config/default.
+func enableMaaSUsageLoggingPrerequisite(t *testing.T, tc *TestContext) {
+	t.Helper()
+
+	nn := types.NamespacedName{Name: maasConfigCRName}
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvkMaaSConfig, nn),
+		WithEventuallyTimeout(5*time.Minute),
+		WithCustomErrorMsg("MaaS Config %s should be bootstrapped by the maas-controller", maasConfigCRName),
+	)
+
+	t.Logf("Enabling spec.usageLogging on MaaS Config %s", maasConfigCRName)
+	if err := enableMaaSUsageLogging(tc); err != nil {
+		t.Fatalf("failed to enable MaaS usage logging: %v", err)
+	}
+
+	// Read back. A maas CRD predating the field prunes the write and still returns 200; without
+	// this the only symptom is a gateway EnvoyFilter that never appears.
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvkMaaSConfig, nn),
+		WithCondition(jq.Match(`.spec.usageLogging == true`)),
+		WithCustomErrorMsg("MaaS Config %s should have spec.usageLogging=true", maasConfigCRName),
+	)
+}
+
+// maasResourceAttributeKeysExpr collects every OTel access-log resource-attribute key declared in
+// a MaaS EnvoyFilter. It walks all configPatches rather than indexing: only the NETWORK_FILTER
+// patch carries access_log, and its position in the list is not part of any contract. The "?" on
+// access_log is what lets the HTTP_FILTER patches fall through -- their patch.value.typed_config
+// has no access_log, so the iterator yields nothing instead of erroring.
+const maasResourceAttributeKeysExpr = `[.spec.configPatches[]?.patch.value.typed_config` +
+	`.access_log[]?.typed_config.resource_attributes.values[]?.key]`
+
+// testMaaSUsageLogEnvoyFilter pins the one thing this repo needs from the EnvoyFilter MaaS
+// deploys when usage logging is on: a service.namespace resource attribute.
+//
+// The collector inserts kubernetes_namespace_name from it
+// (internal/controller/resources/usage-logs-opentelemetry-collector.tmpl.yaml:45-54), and that is
+// the subject LokiStack per-tenant RBAC filters on. If MaaS stops emitting the attribute the
+// tenancy quietly loses its subject rather than failing.
+//
+// Only the key's presence is asserted -- the value is MaaS's to choose.
+func testMaaSUsageLogEnvoyFilter(t *testing.T, tc *TestContext) {
+	t.Helper()
+
+	nn := types.NamespacedName{
+		Name:      maasUsageLogEnvoyFilter,
+		Namespace: maasUsageLogEnvoyFilterNamespace,
+	}
+
+	// Split from the attribute check below so "never created" and "created but missing the
+	// attribute" are distinguishable failures. The maas-controller creates the filter in reaction
+	// to the Config flip, which nothing waited for.
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvkEnvoyFilter, nn),
+		WithEventuallyTimeout(5*time.Minute),
+		WithCustomErrorMsg(
+			"the maas-controller should create EnvoyFilter %s after spec.usageLogging is enabled on MaaS Config %s",
+			maasUsageLogEnvoyFilter, maasConfigCRName),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvkEnvoyFilter, nn),
+		WithCondition(jq.Match(maasResourceAttributeKeysExpr+` | any(. == "%s")`, maasTenantResourceAttribute)),
+		WithCustomErrorMsg(
+			"EnvoyFilter %s must declare %s as an OTel access-log resource attribute; the collector maps it to "+
+				"kubernetes_namespace_name, which LokiStack per-tenant RBAC depends on",
+			maasUsageLogEnvoyFilter, maasTenantResourceAttribute),
+	)
+}
+
 func waitForCondition(tc *TestContext, g schema.GroupVersionKind, nn types.NamespacedName, conditionType string) error {
 	resource := &unstructured.Unstructured{}
 	resource.SetGroupVersionKind(g)
@@ -869,17 +1285,64 @@ func waitForCondition(tc *TestContext, g schema.GroupVersionKind, nn types.Names
 	return fmt.Errorf("%s/%s condition %s is not True", g.Kind, nn, conditionType)
 }
 
+func installInferenceOperators(t *testing.T, tc *TestContext) {
+	t.Helper()
+
+	t.Log("Installing Cluster Observability, cert-manager, Tempo, OpenTelemetry, LeaderWorkerSet, " +
+		"Loki, and Red Hat Connectivity Link operators")
+	tc.EnsureOperatorInstalled(observabilityOpNamespace, observabilityOpName, observabilityOpChannel)
+	tc.EnsureOperatorInstalled(certManagerOpNamespace, certManagerOpName, certManagerOpChannel)
+	tc.EnsureOperatorInstalled(tempoOpNamespace, tempoOpName, tempoOpChannel)
+	tc.EnsureOperatorInstalled(opentelemetryOpNamespace, opentelemetryOpName, opentelemetryOpChannel)
+	tc.EnsureOperatorInstalledInOwnNamespace(leaderWorkerSetOpNamespace, leaderWorkerSetOpName, leaderWorkerSetOpChannel)
+	tc.EnsureOperatorInstalledFromCatalog(connectivityLinkOpNamespace, connectivityLinkOpName, connectivityLinkOpChannel, connectivityLinkOpSource)
+	// dsci.yaml enables usageLogs, so the operator renders a LokiStack.
+	tc.ensureLokiOperatorInstalled(t)
+}
+
+// requireObservabilityAgreesOnNamespaces gates the run on odh-observability being deployed and
+// pointed at the same namespaces the prerequisites used. It can only run after dsci.yaml: the
+// ODH operator deploys odh-observability in response to the DSCI monitoring stanza, and the
+// applications namespace is the operator's to create.
+func requireObservabilityAgreesOnNamespaces(t *testing.T, tc *TestContext) {
+	t.Helper()
+
+	for _, namespace := range []string{inferenceApplicationsNamespace(), inferenceMonitoringNamespace()} {
+		warnIfOperatorPredatesNamespace(t, tc, namespace)
+	}
+
+	// Nothing else reconciles the Monitoring CR, so without this the waits that follow spend
+	// their full budget on a CR that was never going to be touched.
+	operatorMonitoringNamespace := tc.ensureOperatorDeploymentReady(t)
+	// validateMonitoringNamespace (internal/controller/monitoring_reconciler.go) refuses to
+	// reconcile on a mismatch, so a desync here stalls silently rather than erroring visibly.
+	if operatorMonitoringNamespace != inferenceMonitoringNamespace() {
+		t.Fatalf("odh-observability is configured with MONITORING_NAMESPACE=%q but dsci.yaml pins "+
+			"spec.monitoring.namespace=%q; the operator will refuse to reconcile the Monitoring CR",
+			operatorMonitoringNamespace, inferenceMonitoringNamespace())
+	}
+}
+
 func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot string) {
 	t.Helper()
 	g := gomega.NewWithT(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
 
-	waitFor := func(description string, gvk schema.GroupVersionKind, nn types.NamespacedName, condition string) {
-		t.Logf("Waiting for %s", description)
+	// The storage fixtures and the Loki S3 Secret must land where the operator creates the
+	// LokiStack, which dsci.yaml pins to spec.monitoring.namespace.
+	tc.MonitoringNamespace = inferenceMonitoringNamespace()
+	t.Logf("Inference prerequisites use applicationsNamespace=%s, monitoring.namespace=%s",
+		inferenceApplicationsNamespace(), inferenceMonitoringNamespace())
+	requireNamespacesMatchExistingDSCI(t, tc)
+
+	waitFor := func(description string, gvk schema.GroupVersionKind, nn types.NamespacedName, condition string, timeout ...time.Duration) {
+		wait := 5 * time.Minute
+		if len(timeout) > 0 {
+			wait = timeout[0]
+		}
+		t.Logf("Waiting for %s (timeout %s)", description, wait)
 		g.Eventually(func() error {
 			return waitForCondition(tc, gvk, nn, condition)
-		}, 5*time.Minute, 2*time.Second).Should(gomega.Succeed(), description)
+		}, wait, 2*time.Second).Should(gomega.Succeed(), description)
 		t.Logf("Completed wait: %s", description)
 	}
 	dir := inferencePrerequisiteDir(projectRoot)
@@ -899,40 +1362,87 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	}
 
 	if testOpts.installOperators {
-		t.Log("Installing Cluster Observability, cert-manager, Tempo, OpenTelemetry, LeaderWorkerSet, and Red Hat Connectivity Link operators")
-		tc.EnsureOperatorInstalled(observabilityOpNamespace, observabilityOpName, observabilityOpChannel)
-		tc.EnsureOperatorInstalled(certManagerOpNamespace, certManagerOpName, certManagerOpChannel)
-		tc.EnsureOperatorInstalled(tempoOpNamespace, tempoOpName, tempoOpChannel)
-		tc.EnsureOperatorInstalled(opentelemetryOpNamespace, opentelemetryOpName, opentelemetryOpChannel)
-		tc.EnsureOperatorInstalledInOwnNamespace(leaderWorkerSetOpNamespace, leaderWorkerSetOpName, leaderWorkerSetOpChannel)
-		tc.EnsureOperatorInstalledFromCatalog(connectivityLinkOpNamespace, connectivityLinkOpName, connectivityLinkOpChannel, connectivityLinkOpSource)
+		installInferenceOperators(t, tc)
 	}
 
 	t.Log("Setting up DSCI, DSC, and UIPlugin prerequisites")
 	for _, crd := range []string{
+		// Gate on the CRD's Established condition rather than listing LokiStack objects:
+		// the client's RESTMapper can keep reporting NoMatch briefly after install.
+		"lokistacks.loki.grafana.com",
 		"dscinitializations.dscinitialization.opendatahub.io",
 		"datascienceclusters.datasciencecluster.opendatahub.io",
 		"uiplugins.observability.openshift.io",
 	} {
 		waitFor(
 			"CRD "+crd+" should be established",
-			schema.GroupVersionKind{
-				Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition",
-			},
+			gvkCustomResourceDefinition,
 			types.NamespacedName{Name: crd},
 			"Established",
 		)
 	}
+
+	// The operator renders the LokiStack as soon as it sees usageLogs storage and never
+	// checks the Secret, so the S3 backend and its credentials must exist before dsci.yaml
+	// is applied. The namespace does not exist yet; the ODH operator adopts it later.
+	t.Logf("Setting up the S3 backend for usage logs in %s", inferenceMonitoringNamespace())
+	tc.ensureNamespaceExists(inferenceMonitoringNamespace())
+	tc.startSeaweedFS(t, lokiS3Bucket)
+	tc.createLokiS3Secret(t, lokiS3SecretName, inferenceMonitoringNamespace())
+
 	for _, name := range []string{"dsci.yaml", "dsc.yaml", "coo-uiplugins.yaml"} {
 		applyPrerequisite(name)
 	}
+	// Diagnostic only: a DSCInitialization CRD that predates usageLogs prunes the stanza
+	// silently, and applyMonitoringManifest below covers for it. Logging which path configured
+	// usage logs is the difference between reading a run's log and guessing.
+	logUsageLogsPropagation(t, tc)
+
+	warnIfStorageClassMissing(t, tc, lokiStorageClassName)
+	requireObservabilityAgreesOnNamespaces(t, tc)
+
+	if testOpts.applyMonitoringManifest {
+		applyMonitoringManifest(t, tc, dir)
+	}
+
 	waitFor(
-		"DSCI default-dsci should be Ready",
-		schema.GroupVersionKind{
-			Group: "dscinitialization.opendatahub.io", Version: "v2", Kind: "DSCInitialization",
-		},
-		types.NamespacedName{Name: "default-dsci"},
+		"LokiStack "+LokiStackName+" should be Ready",
+		gvk.LokiStack,
+		types.NamespacedName{Name: LokiStackName, Namespace: inferenceMonitoringNamespace()},
 		"Ready",
+		20*time.Minute,
+	)
+	// Assert on the Monitoring CR rather than on the DSCI: the DSCI copies monitoring
+	// conditions across and then sets phase Ready unconditionally, so it reports Ready over a
+	// broken monitoring stack.
+	//
+	// Ready on the Monitoring CR is no better: AggregateReady leaves it True and flips Degraded
+	// instead when a configured feature fails, because the platform treats Ready as a runlevel
+	// gate rather than a health summary. Degraded is the health signal.
+	//
+	// Degraded is only an alarm for things the spec actually asked for -- an unrequested
+	// feature is marked Severity: Info and skipped by the aggregation. That is exact when you
+	// write the Monitoring spec yourself, but this test does not: the spec propagates
+	// DSCI -> opendatahub-operator -> Monitoring. The guard above only proves the stanza
+	// survived the DSCI CRD, so confirm the ask landed here before trusting Degraded.
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(gomega.And(
+			jq.Match(`.spec.namespace == %q`, inferenceMonitoringNamespace()),
+			jq.Match(`.spec.usageLogs.storage.secretName == %q`, lokiS3SecretName),
+			// Every action function runs before AggregateReady in the same pass, so
+			// ProvisioningSucceeded=True means the feature conditions Degraded reads are from
+			// this reconcile. The early-return paths skip the aggregation and leave them stale.
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
+				platformcommon.ConditionTypeProvisioningSucceeded, metav1.ConditionTrue),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
+				platformcommon.ConditionTypeDegraded, metav1.ConditionFalse),
+			// Implied by the above, but asserted directly because it is the artifact the envoy
+			// filter consumes. An absent field compares as null, so default it first.
+			jq.Match(`(.status.usageLogsEndpoint // "") != ""`),
+		)),
+		WithEventuallyTimeout(10*time.Minute),
+		WithCustomErrorMsg("Monitoring %s should expose a usage logs endpoint and not be Degraded", tc.MonitoringCRName),
 	)
 	waitFor(
 		"DSC default-dsc should be Ready",
@@ -943,15 +1453,15 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 		"Ready",
 	)
 
+	enableMaaSUsageLoggingPrerequisite(t, tc)
+
 	for _, crd := range []string{
 		"kuadrants.kuadrant.io",
 		"authpolicies.kuadrant.io",
 	} {
 		waitFor(
 			"CRD "+crd+" should be established",
-			schema.GroupVersionKind{
-				Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition",
-			},
+			gvkCustomResourceDefinition,
 			types.NamespacedName{Name: crd},
 			"Established",
 		)
@@ -968,26 +1478,20 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	t.Log("Setting up LGTM and remaining inference prerequisites")
 	waitFor(
 		"CRD leaderworkersetoperators.operator.openshift.io should be established",
-		schema.GroupVersionKind{
-			Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition",
-		},
+		gvkCustomResourceDefinition,
 		types.NamespacedName{Name: "leaderworkersetoperators.operator.openshift.io"},
 		"Established",
 	)
 	applyPrerequisite("lwsoperator.yaml")
 	waitFor(
 		"CRD leaderworkersets.leaderworkerset.x-k8s.io should be established",
-		schema.GroupVersionKind{
-			Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition",
-		},
+		gvkCustomResourceDefinition,
 		types.NamespacedName{Name: "leaderworkersets.leaderworkerset.x-k8s.io"},
 		"Established",
 	)
 	waitFor(
 		"CRD llminferenceservices.serving.kserve.io should be established",
-		schema.GroupVersionKind{
-			Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition",
-		},
+		gvkCustomResourceDefinition,
 		types.NamespacedName{Name: "llminferenceservices.serving.kserve.io"},
 		"Established",
 	)
@@ -996,27 +1500,27 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	}
 	applyPrerequisite("lgtm.yaml")
 	waitFor(
-		"RHOAI operator should be Available",
+		"opendatahub-operator should be Available",
 		schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"},
-		types.NamespacedName{Name: "rhods-operator", Namespace: "redhat-ods-operator"},
+		types.NamespacedName{Name: odhOperatorDeployment, Namespace: odhOperatorNamespace},
 		"Available",
 	)
 	waitFor(
 		"LGTM should be Available",
 		schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"},
-		types.NamespacedName{Name: "lgtm", Namespace: "redhat-ods-monitoring"},
+		types.NamespacedName{Name: "lgtm", Namespace: inferenceMonitoringNamespace()},
 		"Available",
 	)
 	for _, endpoint := range []struct{ service, namespace string }{
-		{"rhods-operator-service", "redhat-ods-operator"},
-		{"kserve-webhook-server-service", "redhat-ods-applications"},
-		{"llmisvc-webhook-server-service", "redhat-ods-applications"},
-		{"lgtm", "redhat-ods-monitoring"},
+		{odhOperatorWebhookService, odhOperatorNamespace},
+		{"kserve-webhook-server-service", inferenceApplicationsNamespace()},
+		{"llmisvc-webhook-server-service", inferenceApplicationsNamespace()},
+		{"lgtm", inferenceMonitoringNamespace()},
 	} {
 		g.Eventually(func() bool {
 			endpoints := &unstructured.Unstructured{}
 			endpoints.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Endpoints"})
-			if err := tc.Client().Get(ctx, types.NamespacedName{Name: endpoint.service, Namespace: endpoint.namespace}, endpoints); err != nil {
+			if err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: endpoint.service, Namespace: endpoint.namespace}, endpoints); err != nil {
 				return false
 			}
 			subsets, found, _ := unstructured.NestedSlice(endpoints.Object, "subsets")
@@ -1051,6 +1555,12 @@ func TestLLMInferenceService(t *testing.T) {
 	require.NoError(t, err)
 
 	setupInferencePrerequisites(t, tc, projectRoot)
+
+	// Runs before the OATS setup below: it needs neither the binary nor an LLMInferenceService.
+	t.Run("maas-usage-log-envoyfilter", func(t *testing.T) {
+		testMaaSUsageLogEnvoyFilter(t, tc)
+	})
+
 	oatsBin := ensureOatsBinary(t, projectRoot)
 	oatsEnv := buildOatsEnv(t, tc)
 

@@ -119,7 +119,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringStackCRMetricsWhenSet(t *testing.
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -183,7 +183,7 @@ func (tc *MonitoringTestCtx) ValidatePrometheusRulesLifecycle(t *testing.T) {
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 		withEmptyAlerting(),
 	)
 
@@ -208,7 +208,7 @@ func (tc *MonitoringTestCtx) ValidatePrometheusSelfServiceMonitorTLSFix(t *testi
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -261,7 +261,7 @@ func (tc *MonitoringTestCtx) ValidateReconciliationStability(t *testing.T) {
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -431,7 +431,7 @@ func (tc *MonitoringTestCtx) ValidateOpenTelemetryCollectorConfigurations(t *tes
 			name: "Custom Metrics Exporters",
 			transforms: []jq.TransformFn{
 				withManagementState(common.Managed),
-				tc.withMetricsConfig(),
+				withMetricsConfig(),
 				withCustomMetricsExporters(),
 			},
 			monitoringCondition: jq.Match(`.spec.metrics != null`),
@@ -497,7 +497,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringCRCollectorReplicas(t *testing.T)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 		withNoCollectorReplicas(),
 	)
 
@@ -528,7 +528,7 @@ func (tc *MonitoringTestCtx) ValidateMetricsTLSAlwaysEnabled(t *testing.T) {
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.ensureOpenTelemetryCollectorReady(t)
@@ -592,7 +592,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringTLSAlwaysEnabled(t *testing.T) {
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.ensureOpenTelemetryCollectorReady(t)
@@ -736,7 +736,7 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorDeploymentWithMetrics(t *tes
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -787,7 +787,7 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorServiceAndConfigMap(t *testi
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -818,7 +818,7 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorLifecycle(t *testing.T) {
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -851,7 +851,7 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorLifecycle(t *testing.T) {
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -872,7 +872,7 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorRBACConfiguration(t *testing
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -1003,7 +1003,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierDeployment(t *testing.T) {
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -1052,7 +1052,7 @@ func (tc *MonitoringTestCtx) ValidatePrometheusNetworkPolicyAllowsThanosQuerier(
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	namespaceProxyIngress := `[.spec.ingress[] |
@@ -1568,7 +1568,7 @@ func (tc *MonitoringTestCtx) ValidatePersesCRCreation(t *testing.T) {
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -1600,7 +1600,7 @@ func (tc *MonitoringTestCtx) ValidatePersesCRConfiguration(t *testing.T) {
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -1651,7 +1651,7 @@ func (tc *MonitoringTestCtx) ValidatePersesLifecycle(t *testing.T) {
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -1680,7 +1680,7 @@ func (tc *MonitoringTestCtx) ValidatePersesLifecycle(t *testing.T) {
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -1733,7 +1733,7 @@ func (tc *MonitoringTestCtx) ValidatePersesNetworkPolicy(t *testing.T) {
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -1843,7 +1843,7 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceWithPrometheus(t *testing.T
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -1891,7 +1891,7 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceLifecycle(t *testing.T) {
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -1929,7 +1929,7 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceLifecycle(t *testing.T) {
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -2051,7 +2051,7 @@ func (tc *MonitoringTestCtx) ValidatePrometheusRestrictedResourceConfiguration(t
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -2130,7 +2130,7 @@ func (tc *MonitoringTestCtx) ValidateNodeMetricsEndpointDeployment(t *testing.T)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -2194,7 +2194,7 @@ func (tc *MonitoringTestCtx) ValidateNodeMetricsEndpointRBACConfiguration(t *tes
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -2318,6 +2318,8 @@ func (tc *MonitoringTestCtx) ValidateMonitoringServiceDisabled(t *testing.T) {
 		{gvk: gvk.Perses, name: PersesName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.PersesDatasource, name: PersesDatasourceName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.PersesDatasource, name: ClusterPrometheusDatasourceName, namespace: tc.MonitoringNamespace},
+		{gvk: gvk.NetworkPolicy, name: UsageLogsCollectorNetworkPolicyName, namespace: tc.MonitoringNamespace},
+		{gvk: gvk.NetworkPolicy, name: UsageLogsLokiStackNetworkPolicyName, namespace: tc.MonitoringNamespace},
 	} {
 		tc.EnsureResourceGone(
 			WithMinimalObject(resource.gvk, types.NamespacedName{

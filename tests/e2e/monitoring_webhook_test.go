@@ -156,7 +156,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringWebhookTestsSetup(t *testing.T) {
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 
 	tc.EnsureResourceExists(
@@ -606,7 +606,7 @@ func (tc *MonitoringTestCtx) ValidateWebhookSkipsWhenMonitoringDisabled(t *testi
 	t.Cleanup(func() {
 		tc.updateMonitoringConfig(
 			withManagementState(common.Managed),
-			tc.withMetricsConfig(),
+			withMetricsConfig(),
 		)
 
 		tc.EnsureResourceExists(

@@ -23,6 +23,12 @@ spec:
           endpoint: "http://lgtm.redhat-ods-monitoring.svc.cluster.local:4317"
           tls:
             insecure: true
+    usageLogs:
+      storage:
+        type: s3
+        secretName: loki-s3-secret
+        credentialMode: static
+        storageClassName: gp3-csi
     namespace: redhat-ods-monitoring
   trustedCABundle:
     customCABundle: ""

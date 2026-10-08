@@ -6,3 +6,10 @@ spec:
   components:
     kserve:
       managementState: Managed
+    aigateway:
+      managementState: "Managed"
+      modelsAsAService:
+        managementState: "Managed"
+      batchGateway:
+        managementState: "Removed"
+

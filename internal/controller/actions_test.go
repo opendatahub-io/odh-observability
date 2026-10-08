@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -1248,6 +1249,362 @@ func TestDeployLokiStack_LogsOnlyNoUsageLogs(t *testing.T) {
 	if data["UsageLogs"] != false {
 		t.Errorf("expected UsageLogs=false when usageLogs is nil, got %v", data["UsageLogs"])
 	}
+}
+
+// --- deployUsageLogsCollector ---
+
+// usageLogsEndpoint is the LokiStack OTLP endpoint the reconciler publishes to
+// status once LokiStack is ready; the collector deploys only after it is set.
+const usageLogsEndpoint = "https://data-science-lokistack-gateway-http.test-ns.svc.cluster.local:8080/api/logs/v1/application/otlp"
+
+func TestDeployUsageLogsCollector_NoUsageLogs(t *testing.T) {
+	s := newActionsTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = nil
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployUsageLogsCollector(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 0 {
+		t.Errorf("expected no sources when usageLogs is nil, got %d", len(sources))
+	}
+
+	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
+	if c == nil || c.Status != metav1.ConditionFalse || c.Severity != platformcommon.ConditionSeverityInfo {
+		t.Errorf("UsageLogsCollectorAvailable: expected False+Info, got %v", c)
+	}
+}
+
+func TestDeployUsageLogsCollector_NoStorage(t *testing.T) {
+	s := newActionsTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployUsageLogsCollector(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 0 {
+		t.Errorf("expected no sources when usageLogs has no storage, got %d", len(sources))
+	}
+
+	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
+	if c == nil || c.Status != metav1.ConditionFalse || c.Severity != platformcommon.ConditionSeverityInfo {
+		t.Errorf("UsageLogsCollectorAvailable: expected False+Info, got %v", c)
+	}
+}
+
+func TestDeployUsageLogsCollector_LokiStackNotReady(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{
+			Type:           "s3",
+			SecretName:     "usage-logs-secret",
+			CredentialMode: "static",
+		},
+	}
+	// The endpoint is published to status only once LokiStack reports ready.
+	m.Status.UsageLogsEndpoint = ""
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployUsageLogsCollector(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 0 {
+		t.Errorf("expected no sources while the LokiStack endpoint is unset, got %d", len(sources))
+	}
+
+	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
+	if c == nil {
+		t.Fatal("expected UsageLogsCollectorAvailable condition to be set")
+	}
+	if c.Status != metav1.ConditionFalse {
+		t.Errorf("expected status False, got %s", c.Status)
+	}
+	if c.Reason != "LokiStackNotReady" {
+		t.Errorf("expected reason LokiStackNotReady, got %s", c.Reason)
+	}
+}
+
+func TestDeployUsageLogsCollector_CRDMissing(t *testing.T) {
+	s := newActionsTestScheme(t)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{
+			Type:           "s3",
+			SecretName:     "usage-logs-secret",
+			CredentialMode: "static",
+		},
+	}
+	m.Status.UsageLogsEndpoint = usageLogsEndpoint
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithInterceptorFuncs(missingCRDs(gvk.OpenTelemetryCollector)).Build()
+	err := deployUsageLogsCollector(context.Background(), cli, m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 0 {
+		t.Errorf("expected no sources when the OpenTelemetryCollector CRD is missing, got %d", len(sources))
+	}
+
+	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
+	if c == nil {
+		t.Fatal("expected UsageLogsCollectorAvailable condition to be set")
+	}
+	if c.Status != metav1.ConditionFalse {
+		t.Errorf("expected status False, got %s", c.Status)
+	}
+	if c.Reason != "OpenTelemetryCollectorCRDNotFound" {
+		t.Errorf("expected reason OpenTelemetryCollectorCRDNotFound, got %s", c.Reason)
+	}
+}
+
+func TestDeployUsageLogsCollector_RendersCollectorRBACAndNetworkPolicies(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{
+			Type:           "s3",
+			SecretName:     "usage-logs-secret",
+			CredentialMode: "static",
+		},
+	}
+	m.Status.UsageLogsEndpoint = usageLogsEndpoint
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
+	if err := deployUsageLogsCollector(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("deployUsageLogsCollector error: %v", err)
+	}
+
+	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
+	if c == nil || c.Status != metav1.ConditionTrue {
+		t.Errorf("UsageLogsCollectorAvailable: expected True, got %v", c)
+	}
+	if len(sources) != 4 {
+		t.Fatalf("expected 4 sources (collector, RBAC, collector NetworkPolicy, LokiStack NetworkPolicy), got %d", len(sources))
+	}
+
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("buildTemplateData error: %v", err)
+	}
+	objects, err := rendertemplate.Render(context.Background(), s, sources, data)
+	if err != nil {
+		t.Fatalf("rendering usage logs templates: %v", err)
+	}
+
+	rendered := map[string]*unstructured.Unstructured{}
+	for i := range objects {
+		rendered[objects[i].GetKind()+"/"+objects[i].GetName()] = objects[i].DeepCopy()
+	}
+	for _, key := range []string{
+		"OpenTelemetryCollector/data-science-usage-logs",
+		"ClusterRole/data-science-usage-logs-processor",
+		"ClusterRoleBinding/data-science-usage-logs-processor",
+		"NetworkPolicy/data-science-usage-logs-collector-allow",
+		"NetworkPolicy/data-science-lokistack-allow",
+	} {
+		if rendered[key] == nil {
+			t.Errorf("missing rendered resource %s (got %v)", key, slices.Sorted(maps.Keys(rendered)))
+		}
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	// Both policies select their peers by name, so they must agree with the names
+	// the collector and LokiStack templates actually render.
+	collectorName, ok := data["UsageLogsCollectorName"].(string)
+	if !ok {
+		t.Fatal("UsageLogsCollectorName should be a string")
+	}
+	lokiStackName, ok := data["LokiStackName"].(string)
+	if !ok {
+		t.Fatal("LokiStackName should be a string")
+	}
+
+	assertUsageLogsCollectorConfig(t, rendered["OpenTelemetryCollector/data-science-usage-logs"])
+	assertUsageLogsNetworkPolicies(t, usageLogsNetworkPolicyPeers{
+		collectorPolicy:  rendered["NetworkPolicy/data-science-usage-logs-collector-allow"],
+		lokiStackPolicy:  rendered["NetworkPolicy/data-science-lokistack-allow"],
+		collectorPodName: collectorName + "-collector",
+		lokiStackName:    lokiStackName,
+		namespace:        m.Spec.Namespace,
+	})
+}
+
+type usageLogsNetworkPolicyPeers struct {
+	collectorPolicy  *unstructured.Unstructured
+	lokiStackPolicy  *unstructured.Unstructured
+	collectorPodName string
+	lokiStackName    string
+	namespace        string
+}
+
+func assertUsageLogsCollectorConfig(t *testing.T, collector *unstructured.Unstructured) {
+	t.Helper()
+
+	// Ingress is governed by the NetworkPolicies this operator renders, so the
+	// operator-managed one must stay off.
+	enabled, found, err := unstructured.NestedBool(collector.Object, "spec", "networkPolicy", "enabled")
+	if err != nil || !found {
+		t.Fatalf("reading spec.networkPolicy.enabled: found=%t err=%v", found, err)
+	}
+	if enabled {
+		t.Error("the operator-managed collector NetworkPolicy must be disabled")
+	}
+
+	attributes, found, err := unstructured.NestedSlice(collector.Object, "spec", "config", "processors", "resource", "attributes")
+	if err != nil || !found {
+		t.Fatalf("reading resource processor attributes: found=%t err=%v", found, err)
+	}
+	byKey := map[string]map[string]any{}
+	for _, attribute := range attributes {
+		entry, ok := attribute.(map[string]any)
+		if !ok {
+			t.Fatalf("resource attribute has unexpected type %T", attribute)
+		}
+		key, _ := entry["key"].(string)
+		byKey[key] = entry
+	}
+
+	// log_type is pinned to the Loki application tenant. It must not be sourced
+	// from log_name, which MaaS consumes with its envoy access-logger value.
+	logType := byKey["log_type"]
+	if logType["action"] != "upsert" || logType["value"] != "application" {
+		t.Errorf("log_type must be upserted to the application tenant, got %#v", logType)
+	}
+	if _, ok := logType["from_attribute"]; ok {
+		t.Errorf("log_type must not be derived from another attribute, got %#v", logType)
+	}
+
+	// The AI tenant namespace arrives on service.namespace and drives LokiStack
+	// RBAC. insert (not upsert) so a value already set by the sender wins.
+	namespaceName := byKey["kubernetes_namespace_name"]
+	if namespaceName["action"] != "insert" || namespaceName["from_attribute"] != "service.namespace" {
+		t.Errorf("kubernetes_namespace_name must be inserted from service.namespace, got %#v", namespaceName)
+	}
+
+	cleanup, found, err := unstructured.NestedSlice(collector.Object, "spec", "config", "processors", "transform/cleanup", "log_statements")
+	if err != nil || !found {
+		t.Fatalf("reading transform/cleanup log_statements: found=%t err=%v", found, err)
+	}
+	for _, block := range cleanup {
+		entry, ok := block.(map[string]any)
+		if !ok {
+			t.Fatalf("cleanup log_statement has unexpected type %T", block)
+		}
+		statements, _, err := unstructured.NestedStringSlice(entry, "statements")
+		if err != nil {
+			t.Fatalf("reading cleanup statements: %v", err)
+		}
+		for _, statement := range statements {
+			if strings.Contains(statement, "log_name") {
+				t.Errorf("cleanup must preserve log_name for MaaS consumers, got %q", statement)
+			}
+		}
+	}
+}
+
+func assertUsageLogsNetworkPolicies(t *testing.T, peers usageLogsNetworkPolicyPeers) {
+	t.Helper()
+
+	collector := &networkingv1.NetworkPolicy{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(peers.collectorPolicy.Object, collector); err != nil {
+		t.Fatalf("converting collector NetworkPolicy: %v", err)
+	}
+	if got := collector.Spec.PodSelector.MatchLabels["app.kubernetes.io/name"]; got != peers.collectorPodName {
+		t.Errorf("collector NetworkPolicy must select the collector pods %q, got %q", peers.collectorPodName, got)
+	}
+	if !slices.Equal(collector.Spec.PolicyTypes, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}) {
+		t.Errorf("collector NetworkPolicy must be ingress-only, got %v", collector.Spec.PolicyTypes)
+	}
+
+	// OTLP ingest is restricted to the ingress policy group (the MaaS gateway):
+	// write access to Loki cannot be delegated, so reachability is the control.
+	var otlpRules, openRules int
+	for _, rule := range collector.Spec.Ingress {
+		if len(rule.From) == 0 {
+			openRules++
+			if !networkPolicyAllowsIngressPort(rule, 8888) {
+				t.Errorf("the unrestricted ingress rule must only expose the metrics port, got %#v", rule.Ports)
+			}
+			continue
+		}
+		otlpRules++
+		for _, port := range []int32{4317, 4318} {
+			if !networkPolicyAllowsIngressPort(rule, port) {
+				t.Errorf("collector NetworkPolicy must admit OTLP on %d, got %#v", port, rule.Ports)
+			}
+		}
+		for _, peer := range rule.From {
+			if peer.NamespaceSelector == nil ||
+				peer.NamespaceSelector.MatchLabels["network.openshift.io/policy-group"] != "ingress" {
+				t.Errorf("OTLP ingest must come from the ingress policy group, got %#v", peer)
+			}
+		}
+	}
+	if otlpRules != 1 || openRules != 1 {
+		t.Errorf("expected exactly one restricted OTLP rule and one metrics rule, got %d and %d", otlpRules, openRules)
+	}
+
+	lokiStack := &networkingv1.NetworkPolicy{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(peers.lokiStackPolicy.Object, lokiStack); err != nil {
+		t.Fatalf("converting LokiStack NetworkPolicy: %v", err)
+	}
+	if lokiStack.GetNamespace() != peers.namespace {
+		t.Errorf("LokiStack NetworkPolicy must live beside the gateway in %q, got namespace %q",
+			peers.namespace, lokiStack.GetNamespace())
+	}
+	if got := lokiStack.Spec.PodSelector.MatchLabels; got["app.kubernetes.io/component"] != "lokistack-gateway" ||
+		got["app.kubernetes.io/instance"] != peers.lokiStackName {
+		t.Errorf("LokiStack NetworkPolicy must select the %q gateway pods, got %v", peers.lokiStackName, got)
+	}
+	if len(lokiStack.Spec.Ingress) != 1 {
+		t.Fatalf("expected a single ingress rule on the LokiStack NetworkPolicy, got %d", len(lokiStack.Spec.Ingress))
+	}
+	rule := lokiStack.Spec.Ingress[0]
+	if !networkPolicyAllowsIngressPort(rule, 8080) {
+		t.Errorf("LokiStack NetworkPolicy must admit the gateway port 8080, got %#v", rule.Ports)
+	}
+	if len(rule.From) != 1 || rule.From[0].PodSelector == nil ||
+		rule.From[0].PodSelector.MatchLabels["app.kubernetes.io/name"] != peers.collectorPodName {
+		t.Errorf("only the usage logs collector may reach the gateway, got %#v", rule.From)
+	}
+}
+
+func networkPolicyAllowsIngressPort(rule networkingv1.NetworkPolicyIngressRule, port int32) bool {
+	return networkPolicyAllowsPort(networkingv1.NetworkPolicyEgressRule{Ports: rule.Ports}, port)
 }
 
 func TestDeployKorrel8r_GatedBySignalConfiguration(t *testing.T) {

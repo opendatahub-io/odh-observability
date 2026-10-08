@@ -587,6 +587,18 @@ func (tc *TestContext) WithT(t *testing.T) *TestContext {
 	}
 }
 
+// MonitoringTestCtx is the context for tests that own the Monitoring CR.
+//
+// Every e2e test in this repo is a monitoring test — this operator has nothing else to
+// reconcile — so the receiver split is not "monitoring vs. not". It is write access:
+//
+//   - A helper that mutates the Monitoring CR or the DSCI belongs here. Those tests share a
+//     single cluster-scoped default-monitoring CR, and mutating it is only safe for a test
+//     that registered registerMonitoringRestore to put it back.
+//   - A helper that installs dependencies, provisions fixtures or asserts on conditions
+//     belongs on TestContext, whatever it happens to be about. A test that declares its
+//     config in a manifest (TestLLMInferenceService) needs those and must never reach the
+//     mutators.
 type MonitoringTestCtx struct {
 	*TestContext
 

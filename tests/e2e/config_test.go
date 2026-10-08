@@ -21,20 +21,24 @@ type TestTimeouts struct {
 }
 
 type TestContextConfig struct {
-	monitoringNamespace string
-	monitoringCRName    string
-	installOperators    bool
-	apiMode             string
-	dsciCRName          string
-	Timeouts            TestTimeouts
+	monitoringNamespace     string
+	applicationsNamespace   string
+	monitoringCRName        string
+	installOperators        bool
+	applyMonitoringManifest bool
+	apiMode                 string
+	dsciCRName              string
+	Timeouts                TestTimeouts
 }
 
 // registerFlags registers test binary flags.
 // These flags are mapped from env vars by runner.envToFlags (tests/e2e/runner/runner.go).
 func (c *TestContextConfig) registerFlags() {
-	flag.StringVar(&c.monitoringNamespace, "monitoring-namespace", "", "namespace where monitoring operands are deployed (auto-detected from operator or CR if omitted)")
+	flag.StringVar(&c.monitoringNamespace, "monitoring-namespace", "", "namespace for monitoring operands (auto-detected if omitted; inference test uses redhat-ods-monitoring)")
+	flag.StringVar(&c.applicationsNamespace, "applications-namespace", "", "inference test only: DSCI spec.applicationsNamespace (defaults to redhat-ods-applications)")
 	flag.StringVar(&c.monitoringCRName, "monitoring-cr-name", "", "name of the Monitoring CR")
 	flag.BoolVar(&c.installOperators, "install-operators", true, "install dependent OLM operators before running tests")
+	flag.BoolVar(&c.applyMonitoringManifest, "apply-monitoring-manifest", true, "inference test only: overwrite the Monitoring CR spec from prerequisites/inference/monitoring.yaml")
 	flag.StringVar(&c.apiMode, "api-mode", "module", "API mode: 'module' for standalone module CR, 'dsc' for DSC/DSCI integration")
 	flag.StringVar(&c.dsciCRName, "dsci-cr-name", "default-dsci", "name of the DSCInitialization CR (DSC mode only)")
 

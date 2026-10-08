@@ -72,6 +72,7 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 		t.Run("Validate Usage Logs Collector deployment", tc.ValidateUsageLogsCollectorDeployment)
 		t.Run("Validate Usage Logs Collector configuration", tc.ValidateUsageLogsCollectorConfiguration)
 		t.Run("Validate Usage Logs Collector RBAC", tc.ValidateUsageLogsCollectorRBACConfiguration)
+		t.Run("Validate Usage Logs Collector network policies", tc.ValidateUsageLogsCollectorNetworkPolicies)
 
 		// Lifecycle test modifies state, run last
 		t.Run("Test Usage Logs lifecycle (LokiStack + Collector)", tc.ValidateUsageLogsLifecycle)
@@ -120,6 +121,15 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorNotDeployedWithoutConfig(
 			Namespace: tc.MonitoringNamespace,
 		}),
 	)
+
+	for _, name := range []string{UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName} {
+		tc.EnsureResourceGone(
+			WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+				Name:      name,
+				Namespace: tc.MonitoringNamespace,
+			}),
+		)
+	}
 }
 
 // ValidateUsageLogsCollectorDeployment tests that the logs collector is deployed and ready when logs are configured.
@@ -171,6 +181,10 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorConfiguration(t *testing.
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithCondition(And(
+			// The operator-managed NetworkPolicy is disabled; ingress is governed by
+			// the NetworkPolicies this operator renders (see ValidateUsageLogsCollectorNetworkPolicies).
+			jq.Match(`.spec.networkPolicy.enabled == false`),
+
 			// Verify receivers
 			jq.Match(`.spec.config.receivers.otlp.protocols.grpc.endpoint == "0.0.0.0:4317"`),
 			jq.Match(`.spec.config.receivers.otlp.protocols.http.endpoint == "0.0.0.0:4318"`),
@@ -180,6 +194,27 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorConfiguration(t *testing.
 			jq.Match(`.spec.config.processors.k8sattributes.auth_type == "serviceAccount"`),
 			jq.Match(`.spec.config.processors."groupbyattrs/maas" != null`),
 			jq.Match(`.spec.config.processors.batch != null`),
+
+			// log_type is pinned to the Loki application tenant. It must NOT be copied
+			// from log_name: MaaS relies on log_name keeping its envoy access-logger value.
+			jq.Match(`
+				[.spec.config.processors.resource.attributes[] | select(.key == "log_type")] ==
+				[{"action": "upsert", "key": "log_type", "value": "application"}]
+			`),
+			// The AI tenant namespace arrives on service.namespace and drives LokiStack
+			// RBAC via kubernetes_namespace_name. insert (not upsert) so a namespace
+			// already set by the sender wins.
+			jq.Match(`
+				[.spec.config.processors.resource.attributes[] | select(.key == "kubernetes_namespace_name")] ==
+				[{"action": "insert", "key": "kubernetes_namespace_name", "from_attribute": "service.namespace"}]
+			`),
+			// Cleanup must preserve log_name for MaaS consumers.
+			jq.Match(`
+				[.spec.config.processors."transform/cleanup".log_statements[].statements[] | select(test("log_name"))] | length == 0
+			`),
+			jq.Match(`
+				[.spec.config.processors."transform/cleanup".log_statements[].statements[] | select(test("service.namespace"))] | length == 1
+			`),
 
 			// Verify exporter endpoint (auto-generated from LokiStack)
 			jq.Match(`.spec.config.exporters."otlphttp/loki".endpoint | test("https://data-science-lokistack-gateway-http\\..+\\.svc\\.cluster\\.local:8080/api/logs/v1/application/otlp")`),
@@ -245,6 +280,61 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorRBACConfiguration(t *test
 	)
 }
 
+// ValidateUsageLogsCollectorNetworkPolicies tests the NetworkPolicies that gate traffic into the
+// collector and into the LokiStack gateway. These stand in for RBAC on the write path: write
+// authorization cannot be delegated to Loki, so reachability is restricted instead.
+func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorNetworkPolicies(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+			Name:      UsageLogsCollectorNetworkPolicyName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/name" == "%s"`, UsageLogsCollectorName+"-collector"),
+			jq.Match(`.spec.policyTypes == ["Ingress"]`),
+			// OTLP ingest is reachable only from the ingress policy group (the MaaS gateway).
+			jq.Match(`
+				[.spec.ingress[] | select(.from != null)] | length == 1
+			`),
+			jq.Match(`
+				[.spec.ingress[] | select(.from != null) |
+					.from[0].namespaceSelector.matchLabels."network.openshift.io/policy-group" == "ingress"] == [true]
+			`),
+			jq.Match(`
+				[.spec.ingress[] | select(.from != null) | .ports[] | select(.protocol == "TCP") | .port] == [4317, 4318]
+			`),
+			// Internal telemetry scraping stays open cluster-wide (no from selector).
+			jq.Match(`
+				[.spec.ingress[] | select(.from == null) | .ports[] | select(.protocol == "TCP") | .port] == [8888]
+			`),
+		)),
+		WithCustomErrorMsg("Usage logs collector NetworkPolicy should allow OTLP only from the ingress policy group and expose the metrics port"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+			Name:      UsageLogsLokiStackNetworkPolicyName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			// Guards the gateway pods that receive the connection.
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/component" == "lokistack-gateway"`),
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, LokiStackName),
+			jq.Match(`.spec.policyTypes == ["Ingress"]`),
+			jq.Match(`
+				[.spec.ingress[].from[] | .podSelector.matchLabels."app.kubernetes.io/name"] == ["%s"]
+			`, UsageLogsCollectorName+"-collector"),
+			jq.Match(`
+				[.spec.ingress[].ports[] | select(.protocol == "TCP") | .port] == [8080]
+			`),
+		)),
+		WithCustomErrorMsg("LokiStack gateway NetworkPolicy should only admit the usage logs collector on 8080"),
+	)
+}
+
 // ValidateUsageLogsLifecycle tests the complete lifecycle of usage logs (LokiStack + collector) deployment and cleanup.
 func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 	t.Helper()
@@ -272,6 +362,16 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 		WithCondition(jq.Match(`.spec.config.exporters."otlphttp/loki" != null`)),
 		WithCustomErrorMsg("Logs collector should be deployed when usage logs are enabled"),
 	)
+
+	for _, name := range []string{UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName} {
+		tc.EnsureResourceExists(
+			WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+				Name:      name,
+				Namespace: tc.MonitoringNamespace,
+			}),
+			WithCustomErrorMsg("NetworkPolicy %s should be deployed when usage logs are enabled", name),
+		)
+	}
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
@@ -302,6 +402,15 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 		}),
 	)
 
+	for _, name := range []string{UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName} {
+		tc.EnsureResourceGone(
+			WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+				Name:      name,
+				Namespace: tc.MonitoringNamespace,
+			}),
+		)
+	}
+
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
 		WithCondition(And(
@@ -330,6 +439,16 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 		WithCondition(jq.Match(`.spec.config.exporters."otlphttp/loki" != null`)),
 		WithCustomErrorMsg("Logs collector should be recreated when usage logs are re-enabled"),
 	)
+
+	for _, name := range []string{UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName} {
+		tc.EnsureResourceExists(
+			WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+				Name:      name,
+				Namespace: tc.MonitoringNamespace,
+			}),
+			WithCustomErrorMsg("NetworkPolicy %s should be recreated when usage logs are re-enabled", name),
+		)
+	}
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),

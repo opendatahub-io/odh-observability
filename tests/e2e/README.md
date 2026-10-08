@@ -45,14 +45,37 @@ Pass test flags through `E2E_TEST_FLAGS` for local Make targets. The container r
 |------|---------|-------------|
 | `-api-mode` | `module` | `module` updates the Monitoring CR; `dsc` updates the existing DSCI |
 | `-dsci-cr-name` | `default-dsci` | DSCI name in DSC mode |
-| `-monitoring-namespace` | auto-detected | Namespace from the operator when creating a Monitoring CR, or from an existing Monitoring CR |
+| `-monitoring-namespace` | auto-detected | Namespace from the operator when creating a Monitoring CR, or from an existing Monitoring CR. The inference test cannot auto-detect (nothing is installed yet) and uses `redhat-ods-monitoring` |
+| `-applications-namespace` | `redhat-ods-applications` | Inference test only: DSCI `spec.applicationsNamespace` |
 | `-monitoring-cr-name` | `default-monitoring` | Monitoring CR name |
 | `-install-operators` | `true` | Install dependent OLM operators when needed |
+| `-apply-monitoring-manifest` | `true` | Inference test only: overwrite the DSCI-created Monitoring CR spec from `prerequisites/inference/monitoring.yaml`. Set `false` to test DSCI → Monitoring propagation instead |
 | `-olm-timeout` | `5m` | Timeout for OLM installation |
 | `-eventually-timeout` | `5m` | Default wait timeout; specific slow resources use longer waits |
 | `-eventually-poll-interval` | `2s` | Default wait polling interval |
 | `-consistently-timeout` | `30s` | Default consistency check duration |
 | `-consistently-poll-interval` | `2s` | Default consistency polling interval |
+
+### Inference test namespaces
+
+`prerequisites/inference/*.yaml` are written for the RHOAI layout, and the two namespace flags
+rewrite those literals wherever they appear — including inside the exporter endpoints
+(`http://lgtm.<monitoring-namespace>.svc.cluster.local:4317`). For the ODH layout, which is what
+all three CRDs default to:
+
+```sh
+go test ./tests/e2e/ -run '^TestLLMInferenceService$' \
+    -monitoring-namespace=opendatahub -applications-namespace=opendatahub
+```
+
+Pick once per cluster. DSCI `applicationsNamespace`, DSCI `monitoring.namespace`, and Monitoring
+`spec.namespace` are all immutable (`self == oldSelf`), so running with different values against a
+cluster that already has these CRs is rejected. Delete the DSCI, DSC, and Monitoring CRs first —
+the suite checks for the mismatch and says so rather than letting the CEL error surface.
+
+The namespace must also be one the opendatahub-operator knew about when its pod started: it builds
+a namespace-scoped cache at startup, and a namespace created afterwards fails every module deploy
+with `unknown namespace for the cache`. Restart the operator after creating a new one.
 
 ## Test groups
 

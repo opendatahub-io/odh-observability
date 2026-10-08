@@ -1,0 +1,36 @@
+# setupInferencePrerequisites writes this spec onto the Monitoring CR the opendatahub-operator
+# creates from dsci.yaml, because a DSCInitialization CRD that predates spec.monitoring.usageLogs
+# prunes the stanza and usage logs are never configured.
+#
+# The write is a whole-object Update, so every key under dsci.yaml's spec.monitoring must appear
+# here or it is deleted from the live CR. TestMonitoringManifestMatchesDSCI enforces that.
+apiVersion: services.platform.opendatahub.io/v1alpha1
+kind: Monitoring
+metadata:
+  name: default-monitoring
+spec:
+  namespace: redhat-ods-monitoring
+  managementState: Managed
+  metrics:
+    storage:
+      size: 5Gi
+    exporters:
+      otlp/metrics:
+        endpoint: "http://lgtm.redhat-ods-monitoring.svc.cluster.local:4317"
+        tls:
+          insecure: true
+  traces:
+    storage:
+      backend: pv
+      size: 5Gi
+    exporters:
+      otlp/traces:
+        endpoint: "http://lgtm.redhat-ods-monitoring.svc.cluster.local:4317"
+        tls:
+          insecure: true
+  usageLogs:
+    storage:
+      type: s3
+      secretName: loki-s3-secret
+      credentialMode: static
+      storageClassName: gp3-csi

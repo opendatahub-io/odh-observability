@@ -43,6 +43,9 @@ const (
 	UsageLogsCollectorName            = "data-science-usage-logs"
 	UsageLogsCollectorServiceAccount  = "data-science-usage-logs-collector"
 	LokiStackName                     = "data-science-lokistack"
+
+	UsageLogsCollectorNetworkPolicyName = UsageLogsCollectorName + "-collector-allow"
+	UsageLogsLokiStackNetworkPolicyName = LokiStackName + "-allow"
 )
 
 // OLM operator constants for dependent operators.
@@ -75,6 +78,49 @@ const (
 
 	lokiOpName      = "loki-operator"
 	lokiOpNamespace = "openshift-operators-redhat"
+
+	// defaultInferenceMonitoringNamespace is the literal spec.monitoring.namespace written in
+	// tests/e2e/prerequisites/inference/dsci.yaml, and defaultInferenceApplicationsNamespace the
+	// literal spec.applicationsNamespace. renderManifest rewrites both to -monitoring-namespace
+	// and -applications-namespace, so these are the substitution source, not just a default:
+	// changing one without changing the manifest breaks the rewrite silently.
+	//
+	// The ODH layout puts both in opendatahub, which is what all three CRDs default to; run with
+	// -monitoring-namespace=opendatahub -applications-namespace=opendatahub to get it.
+	defaultInferenceMonitoringNamespace   = "redhat-ods-monitoring"
+	defaultInferenceApplicationsNamespace = "redhat-ods-applications"
+
+	// The opendatahub-operator owns the DSCI and DSC and provisions the monitoring module, so
+	// the inference prerequisites cannot make progress until it is Available and serving its
+	// webhook. These are not part of the namespace switch above: which operator is installed is
+	// independent of the namespaces its DSCI points at. An RHOAI install names them
+	// rhods-operator / redhat-ods-operator instead.
+	odhOperatorNamespace      = "opendatahub-operator-system"
+	odhOperatorDeployment     = "opendatahub-operator-controller-manager"
+	odhOperatorWebhookService = "opendatahub-operator-webhook-service"
+	// lokiStorageType mirrors spec.monitoring.usageLogs.storage.type there.
+	lokiStorageType = "s3"
+	// lokiS3SecretName mirrors spec.monitoring.usageLogs.storage.secretName there.
+	lokiS3SecretName = "loki-s3-secret"
+	// lokiCredentialMode mirrors spec.monitoring.usageLogs.storage.credentialMode there.
+	lokiCredentialMode = "static"
+	// lokiStorageClassName mirrors spec.monitoring.usageLogs.storage.storageClassName there.
+	lokiStorageClassName = "gp3-csi"
+
+	// maasConfigCRName is the singleton cluster-scoped MaaS Config the maas-controller bootstraps
+	// once the DSC enables aigateway.modelsAsAService.
+	maasConfigCRName = "default"
+
+	// maasUsageLogEnvoyFilter is the EnvoyFilter the maas-controller creates on the shared
+	// gateway once Config/default has spec.usageLogging=true. It is what emits usage logs to the
+	// collector, and the only object of the several that flip creates that this repo depends on.
+	maasUsageLogEnvoyFilter          = "maas-model-access-logs"
+	maasUsageLogEnvoyFilterNamespace = "openshift-ingress"
+
+	// maasTenantResourceAttribute is the resource attribute the collector maps to
+	// kubernetes_namespace_name, which drives LokiStack per-tenant RBAC
+	// (internal/controller/resources/usage-logs-opentelemetry-collector.tmpl.yaml:45-54).
+	maasTenantResourceAttribute = "service.namespace"
 )
 
 // Constants for common test values.
@@ -98,7 +144,7 @@ const (
 // monitoringOwnerReferencesCondition validates ownership by the configured Monitoring CR.
 //
 //nolint:ireturn // Gomega's And matcher returns the GomegaMatcher interface.
-func (tc *MonitoringTestCtx) monitoringOwnerReferencesCondition() gTypes.GomegaMatcher {
+func (tc *TestContext) monitoringOwnerReferencesCondition() gTypes.GomegaMatcher {
 	return And(
 		jq.Match(`.metadata.ownerReferences | length == 1`),
 		jq.Match(`.metadata.ownerReferences[0].kind == "%s"`, gvk.Monitoring.Kind),
@@ -231,7 +277,7 @@ func (tc *MonitoringTestCtx) setupMetrics(t *testing.T) {
 	t.Helper()
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
-		tc.withMetricsConfig(),
+		withMetricsConfig(),
 	)
 }
 
@@ -376,7 +422,7 @@ func (tc *MonitoringTestCtx) ensureMonitoringCleanSlate(t *testing.T, secretName
 }
 
 // ensureOpenTelemetryCollectorReady waits for the OTel Collector deployment to have at least one ready replica.
-func (tc *MonitoringTestCtx) ensureOpenTelemetryCollectorReady(t *testing.T) {
+func (tc *TestContext) ensureOpenTelemetryCollectorReady(t *testing.T) {
 	t.Helper()
 
 	tc.EnsureResourceExists(
@@ -390,7 +436,9 @@ func (tc *MonitoringTestCtx) ensureOpenTelemetryCollectorReady(t *testing.T) {
 }
 
 // cleanupTempoStackAndSecret removes TempoStack and optionally an associated secret.
-func (tc *MonitoringTestCtx) cleanupTempoStackAndSecret(secretName string) {
+// Operand-only: it never touches the Monitoring CR, so a test that configured traces
+// declaratively can still tear the operand down.
+func (tc *TestContext) cleanupTempoStackAndSecret(secretName string) {
 	tc.DeleteResource(
 		WithMinimalObject(gvk.TempoStack, types.NamespacedName{
 			Name:      TempoStackName,
@@ -461,7 +509,7 @@ func detectExpectedReplicas(t *testing.T, tc *TestContext) int {
 }
 
 // createTempoStorageSecret creates a test secret for a locally hosted Tempo backend.
-func (tc *MonitoringTestCtx) createTempoStorageSecret(t *testing.T, backendType, secretName, namespace string) {
+func (tc *TestContext) createTempoStorageSecret(t *testing.T, backendType, secretName, namespace string) {
 	t.Helper()
 
 	switch backendType {
@@ -475,7 +523,7 @@ func (tc *MonitoringTestCtx) createTempoStorageSecret(t *testing.T, backendType,
 }
 
 // createTempoS3Secret creates an S3 secret compatible with TempoStack operator.
-func (tc *MonitoringTestCtx) createTempoS3Secret(t *testing.T, secretName, namespace string) {
+func (tc *TestContext) createTempoS3Secret(t *testing.T, secretName, namespace string) {
 	t.Helper()
 
 	secret := &corev1.Secret{
@@ -508,7 +556,7 @@ func (tc *MonitoringTestCtx) createTempoS3Secret(t *testing.T, secretName, names
 }
 
 // createTempoGCSSecret creates a GCS secret compatible with TempoStack operator.
-func (tc *MonitoringTestCtx) createTempoGCSSecret(t *testing.T, secretName, namespace string) {
+func (tc *TestContext) createTempoGCSSecret(t *testing.T, secretName, namespace string) {
 	t.Helper()
 
 	secret := &corev1.Secret{
@@ -545,7 +593,7 @@ func (tc *MonitoringTestCtx) createTempoGCSSecret(t *testing.T, secretName, name
 }
 
 // createLokiS3Secret creates an S3 secret compatible with LokiStack operator.
-func (tc *MonitoringTestCtx) createLokiS3Secret(t *testing.T, secretName, namespace string) {
+func (tc *TestContext) createLokiS3Secret(t *testing.T, secretName, namespace string) {
 	t.Helper()
 
 	secret := &corev1.Secret{
@@ -586,7 +634,7 @@ func withManagementState(state common.ManagementState) jq.TransformFn {
 	return jq.Transform(`.spec.managementState = "%s"`, state)
 }
 
-func (tc *MonitoringTestCtx) withMetricsConfig() jq.TransformFn {
+func withMetricsConfig() jq.TransformFn {
 	return jq.Transform(`.spec.metrics = {
         "storage": {
             "size": "%s",
@@ -828,7 +876,7 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 // installDependentOperators installs required OLM operators in parallel sub-tests.
 // Each operator gets its own namespace, OperatorGroup, and Subscription when it is
 // not already present.
-func (tc *MonitoringTestCtx) installDependentOperators(t *testing.T) {
+func (tc *TestContext) installDependentOperators(t *testing.T) {
 	t.Helper()
 
 	type operator struct {
@@ -852,6 +900,14 @@ func (tc *MonitoringTestCtx) installDependentOperators(t *testing.T) {
 			})
 		}
 	})
+
+	tc.ensureLokiOperatorInstalled(t)
+}
+
+// ensureLokiOperatorInstalled installs the Loki Operator unless the LokiStack CRD is
+// already served. Required by both the usage logs and log forwarding features.
+func (tc *TestContext) ensureLokiOperatorInstalled(t *testing.T) {
+	t.Helper()
 
 	// Loki channels are versioned, so use the cluster catalog's default channel.
 	// A preinstalled Loki Operator may not have a PackageManifest in the catalog.
