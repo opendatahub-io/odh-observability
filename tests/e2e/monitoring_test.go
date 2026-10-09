@@ -1,7 +1,13 @@
 package e2e_test
 
 import (
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,6 +15,7 @@ import (
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -955,6 +962,14 @@ func (tc *MonitoringTestCtx) runThanosQuerierTests(t *testing.T) {
 		t.Run("Test ThanosQuerier route authorization boundary", tc.ValidateThanosQuerierRouteAuthorizationBoundary)
 		t.Run("Test ThanosQuerier route namespace isolation", tc.ValidateThanosQuerierRouteNamespaceIsolation)
 		t.Run("Test Prometheus NetworkPolicy allows Thanos Querier on gRPC port", tc.ValidatePrometheusNetworkPolicyAllowsThanosQuerier)
+
+		t.Run("Component Isolation — Thanos", func(t *testing.T) {
+			t.Run("Test Thanos baseline fixture — record rollout identity and health", tc.ValidateThanosComponentBaselineFixture)
+			t.Run("Test Thanos version boundary — UNSUPPORTED (no operand pinning), reported as SKIP", tc.ValidateThanosComponentVersionBoundaryUnsupported)
+			t.Run("Test Thanos component health check with failure-attribution diagnostics", tc.ValidateThanosComponentHealthWithDiagnostics)
+		})
+
+		t.Run("Integration — Thanos ⇄ Perses datasource wiring", tc.ValidateThanosPersesDatasourceIntegration)
 	})
 }
 
@@ -1193,6 +1208,213 @@ func (tc *MonitoringTestCtx) ValidatePrometheusNetworkPolicyAllowsThanosQuerier(
 		)),
 		WithCustomErrorMsg("Prometheus NetworkPolicy should allow Thanos Querier ingress on gRPC port 10901"),
 	)
+}
+
+func (tc *MonitoringTestCtx) assertThanosPromQLResponds(t *testing.T, query string) string {
+	t.Helper()
+	g := NewWithT(t)
+
+	var host string
+	g.Eventually(func() (string, error) {
+		route := tc.FetchResource(
+			WithMinimalObject(gvk.Route, types.NamespacedName{Name: ThanosQuerierRouteName, Namespace: tc.MonitoringNamespace}),
+		)
+		if route == nil {
+			return "", fmt.Errorf("Route %s not found", ThanosQuerierRouteName)
+		}
+		var ingressHost string
+		if ingress, found, _ := unstructured.NestedSlice(route.Object, "status", "ingress"); found && len(ingress) > 0 {
+			if entry, ok := ingress[0].(map[string]any); ok {
+				ingressHost, _, _ = unstructured.NestedString(entry, "host")
+			}
+		}
+		if ingressHost == "" {
+			// Fall back to spec.host for clusters where the admission plugin writes it back.
+			ingressHost, _, _ = unstructured.NestedString(route.Object, "spec", "host")
+		}
+		host = ingressHost
+		return host, nil
+	}).ShouldNot(BeEmpty(),
+		"Component=Thanos Assertion=promql-response: Route %s has no ingress host", ThanosQuerierRouteName)
+
+	token := getAuthToken(tc.TestContext)
+	g.Expect(token).NotTo(BeEmpty(),
+		"Component=Thanos Assertion=promql-response: no bearer token available for query %q (set OC_TOKEN or use a token-auth kubeconfig)", query)
+
+	endpoint := fmt.Sprintf("https://%s/api/v1/query?query=%s", host, url.QueryEscape(query))
+	httpClient := &http.Client{
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}},
+		Timeout:   30 * time.Second,
+	}
+
+	var seriesCount int
+	g.Eventually(func() error {
+		req, err := http.NewRequestWithContext(tc.Context(), http.MethodGet, endpoint, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode != http.StatusOK {
+			httpErr := fmt.Errorf("PromQL query %q returned HTTP %d (want 200)", query, resp.StatusCode)
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+				return httpErr
+			}
+			return StopTrying(httpErr.Error())
+		}
+
+		var parsed struct {
+			Status string `json:"status"`
+			Data   struct {
+				ResultType string            `json:"resultType"`
+				Result     []json.RawMessage `json:"result"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return fmt.Errorf("PromQL response for %q is not valid JSON: %w", query, err)
+		}
+		if parsed.Status != "success" {
+			return fmt.Errorf("PromQL query %q returned status=%q (want success)", query, parsed.Status)
+		}
+		if parsed.Data.ResultType != "vector" {
+			return fmt.Errorf("PromQL query %q returned resultType=%q (want vector)", query, parsed.Data.ResultType)
+		}
+		if len(parsed.Data.Result) == 0 {
+			return fmt.Errorf("PromQL query %q returned 0 series", query)
+		}
+		seriesCount = len(parsed.Data.Result)
+		return nil
+	}).WithTimeout(2*time.Minute).WithPolling(5*time.Second).Should(Succeed(),
+		"Component=Thanos Assertion=promql-response: authenticated PromQL query did not return a successful result")
+
+	return fmt.Sprintf("query=%q status=success series=%d", query, seriesCount)
+}
+
+func (tc *MonitoringTestCtx) ValidateThanosComponentBaselineFixture(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.ensureMetricsManaged()
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(jq.Match(
+			`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
+			conditions.ConditionThanosQuerierAvailable, metav1.ConditionTrue,
+		)),
+		WithCustomErrorMsg("Component=Thanos: ThanosQuerierAvailable condition did not become True — Thanos failed independently of Perses/Prometheus"),
+	)
+
+	thanosRollout := tc.recordRolloutIdentity(t, gvk.ThanosQuerier, ThanosQuerierName)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{Name: thanosQuerierDeploymentName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(And(
+			jq.Match(`.status.readyReplicas >= 1`),
+			jq.Match(`.status.readyReplicas == .status.replicas`),
+		)),
+		WithCustomErrorMsg("Component=Thanos Assertion=query-readiness: Thanos Deployment %s has no ready replica", thanosQuerierDeploymentName),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Route, types.NamespacedName{Name: ThanosQuerierRouteName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(And(
+			jq.Match(`.spec.to.name == "%s"`, thanosQuerierDeploymentName),
+			jq.Match(`.spec.tls.termination == "edge"`),
+		)),
+		WithCustomErrorMsg("Component=Thanos Assertion=promql-endpoint: Route %s does not publish the Thanos query endpoint", ThanosQuerierRouteName),
+	)
+
+	promqlResult := tc.assertThanosPromQLResponds(t, "up")
+
+	t.Logf(
+		"✓ THANOS BASELINE RECORDED (independent of Perses)\n"+
+			"  • Component:          Thanos Querier\n"+
+			"  • Rollout identity:   %s\n"+
+			"  • CR status:          ThanosQuerierAvailable=True\n"+
+			"  • Query readiness:    Deployment %s ready replicas up\n"+
+			"  • PromQL endpoint:    Route %s → %s (edge TLS)\n"+
+			"  • PromQL response:    %s\n",
+		thanosRollout, thanosQuerierDeploymentName, ThanosQuerierRouteName, thanosQuerierDeploymentName, promqlResult)
+}
+
+func (tc *MonitoringTestCtx) ValidateThanosPersesDatasourceIntegration(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.ensureMetricsManaged()
+
+	expectedThanosURL := fmt.Sprintf("http://%s.%s.svc.cluster.local:10902", thanosQuerierDeploymentName, tc.MonitoringNamespace)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: PersesDatasourceName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(And(
+			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url == "%s"`, expectedThanosURL),
+		)),
+		WithCustomErrorMsg("Integration=Thanos⇄Perses Assertion=dependent-dashboards: "+
+			"PersesDatasource %s does not route through HTTPProxy to Thanos Querier at %s", PersesDatasourceName, expectedThanosURL),
+	)
+
+	t.Logf(
+		"✓ THANOS ⇄ PERSES DATASOURCE WIRING OK\n"+
+			"  • Dependent dashboards: PersesDatasource %s → HTTPProxy → %s\n",
+		PersesDatasourceName, expectedThanosURL)
+}
+
+func (tc *MonitoringTestCtx) ValidateThanosComponentVersionBoundaryUnsupported(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	rollout := tc.recordRolloutIdentity(t, gvk.ThanosQuerier, ThanosQuerierName)
+
+	t.Skipf(
+		"LIMITATION (Component=Thanos): independent version-boundary testing is UNSUPPORTED and no "+
+			"version boundary is exercised here. COO packages Perses, Thanos and MonitoringStack under a "+
+			"single operator version, so the Thanos operand version cannot be pinned or swapped "+
+			"independently. Current rollout identity: %s. Reported as SKIP (not PASS) so this is not "+
+			"mistaken for boundary coverage; revisit once operand pinning is available.",
+		rollout,
+	)
+}
+
+func (tc *MonitoringTestCtx) ValidateThanosComponentHealthWithDiagnostics(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.ensureMetricsManaged()
+
+	attribution := formatFailureAttribution(failureAttribution{
+		component: "Thanos",
+		rollout:   tc.recordRolloutIdentity(t, gvk.ThanosQuerier, ThanosQuerierName),
+		assertion: fmt.Sprintf("Deployment %s ready replicas", thanosQuerierDeploymentName),
+		diagnostics: []string{
+			fmt.Sprintf("oc -n %s logs deployment/%s", tc.MonitoringNamespace, thanosQuerierDeploymentName),
+			fmt.Sprintf("oc -n %s describe deployment %s", tc.MonitoringNamespace, thanosQuerierDeploymentName),
+			fmt.Sprintf("oc -n %s get thanosquerier %s -o yaml", tc.MonitoringNamespace, ThanosQuerierName),
+		},
+	})
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{Name: thanosQuerierDeploymentName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(And(
+			jq.Match(`.status.readyReplicas >= 1`),
+			jq.Match(`.status.readyReplicas == .status.replicas`),
+		)),
+		WithCustomErrorMsg(attribution),
+	)
+
+	t.Logf("✓ Thanos health check passed; failure-attribution diagnostics wired:\n%s", attribution)
 }
 
 // ========================================================================
@@ -1652,7 +1874,147 @@ func (tc *MonitoringTestCtx) runPersesTests(t *testing.T) {
 			t.Run("Test PersesDatasource deployment with Prometheus", tc.ValidatePersesDatasourceWithPrometheus)
 			t.Run("Test PersesDatasource lifecycle", tc.ValidatePersesDatasourceLifecycle)
 		})
+
+		t.Run("Component Isolation — Perses", func(t *testing.T) {
+			t.Run("Test Perses baseline fixture — record rollout identity and health", tc.ValidatePersesComponentBaselineFixture)
+			t.Run("Test Perses version boundary — UNSUPPORTED (no operand pinning), reported as SKIP", tc.ValidatePersesComponentVersionBoundaryUnsupported)
+			t.Run("Test Perses component health check with failure-attribution diagnostics", tc.ValidatePersesComponentHealthWithDiagnostics)
+		})
 	})
+}
+
+const (
+	thanosQuerierDeploymentName = "thanos-querier-data-science-thanos-querier"
+	persesPodName               = PersesName + "-0"
+)
+
+type failureAttribution struct {
+	component   string
+	rollout     string
+	assertion   string
+	diagnostics []string
+}
+
+func formatFailureAttribution(a failureAttribution) string {
+	return fmt.Sprintf(
+		"FAILURE ATTRIBUTION | Component=%s | Rollout=%s | Assertion=%s | Diagnostics: %s",
+		a.component, a.rollout, a.assertion, strings.Join(a.diagnostics, " ; "),
+	)
+}
+
+func (tc *MonitoringTestCtx) recordRolloutIdentity(t *testing.T, componentGVK schema.GroupVersionKind, name string) string {
+	t.Helper()
+
+	u, err := tc.fetchResource(t, componentGVK, types.NamespacedName{Name: name, Namespace: tc.MonitoringNamespace})
+	if err != nil || u == nil {
+		return "<absent>"
+	}
+	return fmt.Sprintf("resourceVersion=%s generation=%d", u.GetResourceVersion(), u.GetGeneration())
+}
+
+func (tc *MonitoringTestCtx) ensureMetricsManaged() {
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+}
+
+func (tc *MonitoringTestCtx) ValidatePersesComponentBaselineFixture(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.ensureMetricsManaged()
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(jq.Match(
+			`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
+			conditions.ConditionPersesAvailable, metav1.ConditionTrue,
+		)),
+		WithCustomErrorMsg("Component=Perses: PersesAvailable condition did not become True — Perses failed independently of Thanos/Prometheus"),
+	)
+
+	persesRollout := tc.recordRolloutIdentity(t, gvk.Perses, PersesName)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Perses, types.NamespacedName{Name: PersesName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(And(
+			jq.Match(`.spec.config.database.file != null`),
+			jq.Match(`.spec.config.schemas.panels_path != null`),
+			jq.Match(`.spec.containerPort == 8080`),
+		)),
+		WithCustomErrorMsg("Component=Perses Assertion=dashboard-config: Perses CR .spec.config (database/schemas) is not configured"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.StatefulSet, types.NamespacedName{Name: PersesName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(jq.Match(`.status.readyReplicas == 1`)),
+		WithCustomErrorMsg("Component=Perses Assertion=service-readiness: Perses StatefulSet %s has no ready replica", PersesName),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Pod, types.NamespacedName{Name: persesPodName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(And(
+			jq.Match(`.status.phase == "Running"`),
+			jq.Match(`.status.conditions[] | select(.type == "Ready") | .status == "True"`),
+		)),
+		WithCustomErrorMsg("Component=Perses Assertion=api Pod=%s: API pod not Running/Ready — Perses operand unhealthy", persesPodName),
+	)
+
+	t.Logf(
+		"✓ PERSES BASELINE RECORDED (independent of Thanos)\n"+
+			"  • Component:        Perses\n"+
+			"  • Rollout identity: %s\n"+
+			"  • CR status:        PersesAvailable=True\n"+
+			"  • Dashboard config: .spec.config database+schemas present\n"+
+			"  • Service ready:    StatefulSet %s readyReplicas=1\n"+
+			"  • API:              Pod %s Running/Ready on :8080\n",
+		persesRollout, PersesName, persesPodName)
+}
+
+func (tc *MonitoringTestCtx) ValidatePersesComponentVersionBoundaryUnsupported(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	rollout := tc.recordRolloutIdentity(t, gvk.Perses, PersesName)
+
+	t.Skipf(
+		"LIMITATION (Component=Perses): independent version-boundary testing is UNSUPPORTED and no "+
+			"version boundary is exercised here. COO packages Perses, Thanos and MonitoringStack under a "+
+			"single operator version, so the Perses operand version cannot be pinned or swapped "+
+			"independently. Current rollout identity: %s. Reported as SKIP (not PASS) so this is not "+
+			"mistaken for boundary coverage; revisit once operand pinning is available.",
+		rollout,
+	)
+}
+
+func (tc *MonitoringTestCtx) ValidatePersesComponentHealthWithDiagnostics(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.ensureMetricsManaged()
+
+	attribution := formatFailureAttribution(failureAttribution{
+		component: "Perses",
+		rollout:   tc.recordRolloutIdentity(t, gvk.Perses, PersesName),
+		assertion: fmt.Sprintf("Pod %s Running/Ready", persesPodName),
+		diagnostics: []string{
+			fmt.Sprintf("oc -n %s logs %s", tc.MonitoringNamespace, persesPodName),
+			fmt.Sprintf("oc -n %s describe pod %s", tc.MonitoringNamespace, persesPodName),
+			fmt.Sprintf("oc -n %s get perses %s -o yaml", tc.MonitoringNamespace, PersesName),
+		},
+	})
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Pod, types.NamespacedName{Name: persesPodName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(And(
+			jq.Match(`.status.phase == "Running"`),
+			jq.Match(`.status.conditions[] | select(.type == "Ready") | .status == "True"`),
+		)),
+		WithCustomErrorMsg(attribution),
+	)
+
+	t.Logf("✓ Perses health check passed; failure-attribution diagnostics wired:\n%s", attribution)
 }
 
 // ValidatePersesCRCreation tests that Perses CR is created when monitoring is managed with metrics.

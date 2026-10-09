@@ -575,6 +575,7 @@ func (tc *TestContext) WithT(t *testing.T) *TestContext {
 	return &TestContext{
 		t:                   t,
 		client:              tc.client,
+		authToken:           tc.authToken,
 		ctx:                 tc.ctx,
 		g:                   g,
 		Timeouts:            tc.Timeouts,
