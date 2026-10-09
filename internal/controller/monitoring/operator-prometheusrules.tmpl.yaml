@@ -70,3 +70,40 @@ spec:
             summary: "Data Science Alertmanager self-monitoring scrape target is down"
             description: "The alertmanager-self target has been down for more than 10 minutes. Alertmanager health cannot be verified, which may mask alert delivery failures."
             triage: "https://github.com/opendatahub-io/opendatahub-operator/blob/main/docs/troubleshooting.md#alertmanager-self-scrape-target-down"
+      
+      - name: Webhook Health
+        interval: 1m
+        rules:
+        - alert: MonitoringOperatorPodUnavailable
+          expr: |
+            absent(kube_pod_status_ready{
+              namespace="{{ .OperatorNamespace }}",
+              pod=~"{{ .OperatorPodPrefix }}.*",
+              condition="true"
+            } == 1)
+          for: 5m
+          labels:
+            severity: critical
+            namespace: "{{ .OperatorNamespace }}"
+          annotations:
+            summary: "Monitoring operator pod is unavailable"
+            description: "No ready operator pod in {{ .OperatorNamespace }} for 5 minutes. This indicates operator crashes, restarts, or node issues. The webhook is unavailable. With failurePolicy: Ignore, new ServiceMonitors/PodMonitors are admitted without the monitoring.opendatahub.io/scrape label and will not be scraped."
+            triage: "https://github.com/opendatahub-io/opendatahub-operator/blob/main/docs/troubleshooting.md#monitoring-operator-pod-unavailable"
+
+        - alert: MonitoringWebhookAdmissionErrors
+          expr: |
+            rate(controller_runtime_webhook_requests_total{
+              namespace="{{ .OperatorNamespace }}",
+              pod=~"{{ .OperatorPodPrefix }}.*",
+              code="500"
+            }[5m]) > 0
+          for: 2m
+          labels:
+            severity: warning
+            namespace: "{{ .OperatorNamespace }}"
+          annotations:
+            summary: "Monitoring webhook is experiencing admission errors"
+            description: "The label-injection webhook is returning errors for ServiceMonitor/PodMonitor admission requests in {{ .OperatorNamespace }}. Some monitors may be admitted without labels and will not be scraped."
+            triage: "https://github.com/opendatahub-io/opendatahub-operator/blob/main/docs/troubleshooting.md#monitoring-webhook-admission-errors"
+
+

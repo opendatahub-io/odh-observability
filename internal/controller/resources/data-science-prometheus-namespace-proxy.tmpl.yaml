@@ -1,27 +1,28 @@
-# Aggregated ClusterRole granting "create" on metrics.k8s.io/pods.
+# Namespace-scoped Prometheus proxy.
 #
-# Perses uses POST for Prometheus queries. The namespace proxy's kube-rbac-proxy
-# derives the SAR verb from the HTTP method (POST -> "create"). OpenShift's
-# built-in view/edit/admin roles already grant "get" (covering GET requests),
-# but not "create". The metrics.k8s.io API is read-only so granting "create"
-# has no side-effects -- it only satisfies the SAR authorization check.
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: data-science-metrics-view
-  labels:
-    rbac.authorization.k8s.io/aggregate-to-admin: "true"
-    rbac.authorization.k8s.io/aggregate-to-edit: "true"
-    rbac.authorization.k8s.io/aggregate-to-view: "true"
-    platform.opendatahub.io/part-of: monitoring
-rules:
-  - apiGroups:
-      - metrics.k8s.io
-    resources:
-      - pods
-    verbs:
-      - create
+# Only GET and HEAD are allowed. A method-gate sidecar sits between
+# kube-rbac-proxy and prom-label-proxy and returns 403 for every other method
+# BEFORE the request reaches prom-label-proxy. The gate runs the operator's own
+# image ("manager method-gate" subcommand), so no extra container image has to be
+# shipped or mirrored for disconnected installs. This enforcement is independent
+# of RBAC: even if a role were ever to grant users "create" on
+# metrics.k8s.io/pods (which would make kube-rbac-proxy authorize a POST), the
+# gate still rejects the request.
+#
+# Why this matters: prom-label-proxy's --query-param uses ParseForm, which
+# merges the URL query AND the POST body. Without the gate, a POST body
+# "namespace" value could be OR'd into the enforced label matcher
+# (namespace=~"authorized|attacker") even though kube-rbac-proxy only authorized
+# the URL-query namespace. Dropping non-GET/HEAD methods removes that vector at
+# the proxy layer. RBAC (no "create" grant) remains as defense in depth.
+#
+# Request path: kube-rbac-proxy (:8443, authn/authz) -> method-gate (:9092,
+# GET/HEAD only) -> prom-label-proxy (:9091, label enforcement) -> Prometheus.
+#
+# Clients must use GET with the namespace in the URL query:
+#   /api/v1/query?query=<promql>&namespace=<namespace-name>
+# GET maps to the "get" verb, which OpenShift's built-in view/edit/admin roles
+# already grant on metrics.k8s.io/pods.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -111,7 +112,8 @@ spec:
           image: {{.KubeRBACProxyImage}}
           args:
             - --secure-listen-address=0.0.0.0:8443
-            - --upstream=http://127.0.0.1:9091/
+            # Forward to the method gate (GET/HEAD only), which proxies to prom-label-proxy.
+            - --upstream=http://127.0.0.1:9092/
             - --config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml
             - --tls-cert-file=/etc/tls/private/tls.crt
             - --tls-private-key-file=/etc/tls/private/tls.key
@@ -150,12 +152,45 @@ spec:
                 - ALL
             readOnlyRootFilesystem: true
             runAsNonRoot: true
+        # Method gate: allows only GET/HEAD, rejects everything else with 403,
+        # independent of RBAC, before prom-label-proxy parses the request.
+        - name: method-gate
+          image: {{.HTTPMethodGateImage}}
+          # Runs the operator binary's "method-gate" subcommand: a minimal reverse
+          # proxy that forwards only GET/HEAD to prom-label-proxy and returns 403
+          # for everything else. No config file or writable filesystem needed.
+          command:
+            - /manager
+            - method-gate
+            - --listen=127.0.0.1:9092
+            - --upstream=http://127.0.0.1:9091
+          ports:
+            - containerPort: 9092
+              name: method-gate
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 100m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          terminationMessagePolicy: FallbackToLogsOnError
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
         - name: prom-label-proxy
           image: {{.PromLabelProxyImage}}
           args:
             - --insecure-listen-address=127.0.0.1:9091
             - --upstream=https://prometheus-operated.{{.Namespace}}.svc:9090
             - --label=namespace
+            - --query-param=namespace
+            - --error-on-replace
             - --enable-label-apis
             # Reject duplicate namespace values from URL and POST form data.
             - --regex-match

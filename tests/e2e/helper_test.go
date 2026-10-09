@@ -1,7 +1,13 @@
 package e2e_test
 
 import (
+	"context"
+	"crypto/tls"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,7 +15,9 @@ import (
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/olm"
 	"github.com/stretchr/testify/require"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -896,3 +904,106 @@ var (
 	_ = withEmptyMetrics
 	_ = withNoCollectorReplicas
 )
+
+// mintScopedMetricsGetToken provisions a ServiceAccount authorized for only "get"
+// (not "create") on pods.metrics.k8s.io in the given namespace and returns a bearer
+// token for it. Because kube-rbac-proxy maps the HTTP method to the SAR verb
+// (GET -> get, POST -> create), such a token is accepted for GET but must be
+// rejected for POST. Created RBAC is removed via t.Cleanup.
+func (tc *MonitoringTestCtx) mintScopedMetricsGetToken(t *testing.T, namespace string) string {
+	t.Helper()
+	// Only "get": "create" is omitted so POST (verb "create") is denied at the RBAC layer.
+	return tc.mintScopedMetricsToken(t, "ns-isolation-probe-get", namespace, "get")
+}
+
+// mintScopedMetricsCreateToken provisions a ServiceAccount authorized for "create"
+// on pods.metrics.k8s.io in the given namespace and returns a bearer token for it.
+// POST maps to the SAR verb "create", so kube-rbac-proxy WOULD authorize a POST
+// whose URL-query namespace matches this grant. Used to prove the method gate
+// rejects POST (403) independently of RBAC. Created RBAC is removed via t.Cleanup.
+func (tc *MonitoringTestCtx) mintScopedMetricsCreateToken(t *testing.T, namespace string) string {
+	t.Helper()
+	return tc.mintScopedMetricsToken(t, "ns-isolation-probe-create", namespace, "create")
+}
+
+// mintScopedMetricsToken provisions a ServiceAccount + namespaced Role/RoleBinding
+// granting the given verbs on pods.metrics.k8s.io and returns a bearer token for it.
+func (tc *MonitoringTestCtx) mintScopedMetricsToken(t *testing.T, name, namespace string, verbs ...string) string {
+	t.Helper()
+
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+	}
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{"metrics.k8s.io"},
+			Resources: []string{"pods"},
+			Verbs:     verbs,
+		}},
+	}
+	rb := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name},
+		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: name, Namespace: namespace}},
+	}
+
+	for _, obj := range []client.Object{sa, role, rb} {
+		require.NoError(t, client.IgnoreAlreadyExists(tc.Client().Create(tc.Context(), obj)))
+	}
+	t.Cleanup(func() {
+		_ = tc.Client().Delete(tc.Context(), rb)
+		_ = tc.Client().Delete(tc.Context(), role)
+		_ = tc.Client().Delete(tc.Context(), sa)
+	})
+
+	tr := &authenticationv1.TokenRequest{}
+	require.NoError(t, tc.Client().SubResource("token").Create(tc.Context(), sa, tr))
+	require.NotEmpty(t, tr.Status.Token, "minted ServiceAccount token must not be empty")
+
+	return tr.Status.Token
+}
+
+// routeHost returns the external host of the named Route in the monitoring namespace.
+func (tc *MonitoringTestCtx) routeHost(t *testing.T, name string) string {
+	t.Helper()
+
+	route := tc.FetchResource(
+		WithMinimalObject(gvk.Route, types.NamespacedName{Name: name, Namespace: tc.MonitoringNamespace}),
+	)
+	host, found, err := unstructured.NestedString(route.Object, "spec", "host")
+	require.NoError(t, err)
+	require.True(t, found && host != "", "Route %s must expose spec.host", name)
+
+	return host
+}
+
+// postPromQLForm issues a POST to the namespace proxy with the namespace supplied
+// both as a URL query parameter and inside the form body, returning the HTTP status.
+func postPromQLForm(ctx context.Context, host, token, queryNamespace, bodyNamespace string) (int, error) {
+	form := url.Values{}
+	form.Set("query", "up")
+	form.Set("namespace", bodyNamespace)
+
+	reqURL := fmt.Sprintf("https://%s/api/v1/query?namespace=%s", host, url.QueryEscape(queryNamespace))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	httpClient := &http.Client{
+		//nolint:gosec // This assertion checks an authorization 403, not TLS trust; the route uses a reencrypt serving cert.
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}},
+		Timeout:   30 * time.Second,
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	return resp.StatusCode, nil
+}
