@@ -35,12 +35,33 @@ metadata:
 spec:
   endpoints:
     - port: prometheus
-      honorLabels: true
       scheme: https
       tlsConfig:
         caFile: /etc/prometheus/secrets/prometheus-web-tls-ca/service-ca.crt
         serverName: "data-science-collector-prometheus.{{.Namespace}}.svc"
       bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      # Promote the workload's namespace/pod identity to the canonical
+      # namespace/pod labels so namespace-restricted queries via the
+      # prometheus proxy work. The k8s_namespace_name/k8s_pod_name labels are
+      # derived server-side by the collector: the k8s.namespace.name/
+      # k8s.pod.name resource attributes come from k8sattributes pod
+      # association and/or the prometheus receiver's Kubernetes discovery
+      # mapping (depending on scrape path and collector version), and the
+      # exporter's resource_to_telemetry_conversion exposes them as labels.
+      # The transform/sanitize_k8s_labels processor strips workload-supplied
+      # attributes with the same names and excludes the dcgm-exporter job,
+      # so only collector-derived workload values are promoted. Workload-
+      # supplied namespace/pod/job labels keep receiving the exported_ prefix
+      # from this scrape, exactly as before (Korrel8r relies on
+      # exported_namespace/exported_pod). Do NOT set honorLabels: it would
+      # trust workload-supplied labels and drop those exported_ labels.
+      metricRelabelings:
+        - sourceLabels: [k8s_namespace_name]
+          regex: (.+)
+          targetLabel: namespace
+        - sourceLabels: [k8s_pod_name]
+          regex: (.+)
+          targetLabel: pod
   namespaceSelector:
     matchNames:
       - {{.Namespace}}
