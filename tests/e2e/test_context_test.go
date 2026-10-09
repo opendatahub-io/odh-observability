@@ -874,18 +874,34 @@ func (tc *TestContext) ensureCSVSucceeded(namespace string, subscriptionNN types
 }
 
 func installPlanMatchesSource(installPlan *unstructured.Unstructured, source, csvName string) bool {
-	planSource, found, err := unstructured.NestedString(installPlan.Object, "spec", "source")
-	if err != nil || !found || planSource != source {
-		return false
-	}
-
 	phase, found, err := unstructured.NestedString(installPlan.Object, "status", "phase")
 	if err != nil || !found || phase != "Complete" {
 		return false
 	}
 
 	csvNames, found, err := unstructured.NestedStringSlice(installPlan.Object, "spec", "clusterServiceVersionNames")
-	return err == nil && found && slices.Contains(csvNames, csvName)
+	if err != nil || !found || !slices.Contains(csvNames, csvName) {
+		return false
+	}
+
+	steps, found, err := unstructured.NestedSlice(installPlan.Object, "status", "plan")
+	if err != nil || !found {
+		return false
+	}
+	// OLM leaves spec.source unset; the CSV step records its catalog source.
+	for _, step := range steps {
+		stepMap, ok := step.(map[string]any)
+		if !ok {
+			continue
+		}
+		kind, _, _ := unstructured.NestedString(stepMap, "resource", "kind")
+		name, _, _ := unstructured.NestedString(stepMap, "resource", "name")
+		planSource, _, _ := unstructured.NestedString(stepMap, "resource", "sourceName")
+		if kind == "ClusterServiceVersion" && name == csvName && planSource == source {
+			return true
+		}
+	}
+	return false
 }
 
 func (tc *TestContext) EnsureOperatorInstalled(namespace, name, channel string) {
