@@ -147,6 +147,40 @@ spec:
             statements:
               - set(datapoint.value_double, datapoint.value_double / 100) where metric.name == "DCGM_FI_DEV_GPU_UTIL"
               - set(datapoint.value_double, datapoint.value_double / 100) where metric.name == "DCGM_FI_DEV_MEM_COPY_UTIL"
+      # Workloads control their exposition labels and pushed metric
+      # attributes, so a datapoint attribute named k8s_namespace_name or
+      # k8s_pod_name must never be trusted: the collector ServiceMonitor
+      # promotes those labels to namespace/pod for namespace-restricted
+      # queries. Strip them here so collector-side enrichment (k8sattributes
+      # pod association and/or the prometheus receiver's Kubernetes discovery
+      # mapping, depending on scrape path and collector version) is the sole
+      # source. If enrichment fails, the labels are absent and the series
+      # stay under the monitoring namespace: fail-closed. Residual: an OTLP
+      # pusher in the monitoring namespace (the NetworkPolicy restricts
+      # pushers to it) may set the k8s.namespace.name resource attribute:
+      # k8sattributes only fills absent/empty attributes, so the value flows
+      # through and is promoted; the NetworkPolicy is the containment.
+      # The resource block below excludes the dcgm-exporter job from the
+      # promotion: its k8s.namespace.name/k8s.pod.name identify the exporter
+      # pod in nvidia-gpu-operator, not the workload consuming the GPU (that
+      # attribution already reaches Prometheus as exported_namespace/
+      # exported_pod). Deleting the attributes makes the ServiceMonitor
+      # promotion a no-op for accelerator series (its regex (.+) requires the
+      # label to exist), keeping them on their existing labels. node and
+      # component are untouched because Korrel8r correlates DCGM series by
+      # node. service.name is set by the prometheus receiver from the job
+      # target label assigned by the dcgm scrape job's relabeling.
+      transform/sanitize_k8s_labels:
+        error_mode: propagate
+        metric_statements:
+          - context: datapoint
+            statements:
+              - delete_key(attributes, "k8s_namespace_name")
+              - delete_key(attributes, "k8s_pod_name")
+          - context: resource
+            statements:
+              - delete_key(attributes, "k8s.namespace.name") where attributes["service.name"] == "rhoai-accelerator-metrics"
+              - delete_key(attributes, "k8s.pod.name") where attributes["service.name"] == "rhoai-accelerator-metrics"
     exporters:
       prometheus/monitoring:
         endpoint: 0.0.0.0:8890
@@ -214,6 +248,6 @@ spec:
       {{- if .Metrics }}
         metrics:
           receivers: [prometheus, otlp]
-          processors: [memory_limiter, k8sattributes, resourcedetection, transform/gpu_metrics, batch]
+          processors: [memory_limiter, k8sattributes, transform/sanitize_k8s_labels, resourcedetection, transform/gpu_metrics, batch]
           exporters: [{{- if .MetricsStorage }}prometheus{{- if .MetricsExporterNames }}, {{ end }}{{- end }}{{- range $i, $name := .MetricsExporterNames }}{{- if $i }}, {{ end }}{{ $name }}{{- end }}]
       {{- end }}

@@ -204,6 +204,193 @@ func TestOpenTelemetryCollectorTemplateRendersValidGPUConfig(t *testing.T) {
 	}
 }
 
+// TestCollectorStripsWorkloadSuppliedK8sLabelAttributes guards the trust
+// boundary of the namespace/pod label promotion configured by the collector
+// ServiceMonitor's metricRelabelings: workloads control their exposition
+// labels, so datapoint attributes named k8s_namespace_name/k8s_pod_name must
+// never survive to export. The transform processor makes the k8sattributes
+// resource attributes the sole source of those labels.
+func TestCollectorStripsWorkloadSuppliedK8sLabelAttributes(t *testing.T) {
+	collector := renderCollectorTemplate(t)
+
+	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
+	if err != nil || !found {
+		t.Fatalf("collector config must be present in rendered resource: found=%t, error=%v", found, err)
+	}
+	processors, found, err := unstructured.NestedMap(config, "processors")
+	if err != nil || !found {
+		t.Fatalf("collector processors must be present: found=%t, error=%v", found, err)
+	}
+	transform, found, err := unstructured.NestedMap(processors, "transform/sanitize_k8s_labels")
+	if err != nil || !found {
+		t.Fatalf("k8s label sanitize transform processor must be present: found=%t, error=%v", found, err)
+	}
+	metricStatements, ok := transform["metric_statements"].([]any)
+	if !ok || len(metricStatements) != 2 {
+		t.Fatalf("k8s label sanitize transform must contain two metric statement blocks (datapoint and resource), got %v", transform["metric_statements"])
+	}
+	var statementBlock map[string]any
+	for _, rawBlock := range metricStatements {
+		block, ok := rawBlock.(map[string]any)
+		if !ok {
+			t.Fatalf("k8s label sanitize statement block has unexpected type: %T", rawBlock)
+		}
+		if block["context"] == "datapoint" {
+			statementBlock = block
+		}
+	}
+	if statementBlock == nil {
+		t.Fatal("k8s label sanitize transform must contain a datapoint statement block")
+	}
+	statements, ok := statementBlock["statements"].([]any)
+	if !ok {
+		t.Fatalf("k8s label sanitize statements have unexpected type: %T", statementBlock["statements"])
+	}
+	expectedStatements := []string{
+		`delete_key(attributes, "k8s_namespace_name")`,
+		`delete_key(attributes, "k8s_pod_name")`,
+	}
+	if len(statements) != len(expectedStatements) {
+		t.Fatalf("expected %d k8s label sanitize statements, got %d", len(expectedStatements), len(statements))
+	}
+	for index, expected := range expectedStatements {
+		if statements[index] != expected {
+			t.Errorf("k8s label sanitize statement %d: got %v, want %s", index, statements[index], expected)
+		}
+	}
+
+	pipelines, found, err := unstructured.NestedMap(config, "service", "pipelines", "metrics")
+	if err != nil || !found {
+		t.Fatalf("metrics pipeline must be present: found=%t, error=%v", found, err)
+	}
+	pipelineProcessors, ok := pipelines["processors"].([]any)
+	if !ok {
+		t.Fatalf("metrics pipeline processors have unexpected type: %T", pipelines["processors"])
+	}
+	sanitizeIndex, batchIndex := -1, -1
+	for index, name := range pipelineProcessors {
+		switch name {
+		case "transform/sanitize_k8s_labels":
+			sanitizeIndex = index
+		case "batch":
+			batchIndex = index
+		}
+	}
+	if sanitizeIndex == -1 {
+		t.Fatal("metrics pipeline must invoke the k8s label sanitize transform processor")
+	}
+	if batchIndex == -1 || sanitizeIndex > batchIndex {
+		t.Error("k8s label sanitize transform must run in the metrics pipeline before batch")
+	}
+}
+
+// TestSanitizeTransformExcludesDCGMExporterK8sLabels guards the DCGM
+// scope-out of the namespace/pod promotion: the dcgm-exporter scrape job's
+// k8s.namespace.name/k8s.pod.name resource attributes identify the exporter
+// pod in nvidia-gpu-operator, not the workload consuming the GPU, so they
+// must not be promoted to namespace/pod by the collector ServiceMonitor.
+// The resource-context statements delete them for that job, making the
+// promotion a no-op for accelerator series, while node/component are
+// preserved (Korrel8r correlates DCGM series by node).
+func TestSanitizeTransformExcludesDCGMExporterK8sLabels(t *testing.T) {
+	collector := renderCollectorTemplate(t)
+
+	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
+	if err != nil || !found {
+		t.Fatalf("collector config must be present in rendered resource: found=%t, error=%v", found, err)
+	}
+	processors, found, err := unstructured.NestedMap(config, "processors")
+	if err != nil || !found {
+		t.Fatalf("collector processors must be present in rendered resource: found=%t, error=%v", found, err)
+	}
+	transform, found, err := unstructured.NestedMap(processors, "transform/sanitize_k8s_labels")
+	if err != nil || !found {
+		t.Fatalf("k8s label sanitize transform processor must be present: found=%t, error=%v", found, err)
+	}
+	metricStatements, ok := transform["metric_statements"].([]any)
+	if !ok {
+		t.Fatalf("k8s label sanitize transform must contain metric statement blocks, got %v", transform["metric_statements"])
+	}
+	var resourceBlock map[string]any
+	for _, rawBlock := range metricStatements {
+		block, ok := rawBlock.(map[string]any)
+		if !ok {
+			t.Fatalf("k8s label sanitize statement block has unexpected type: %T", rawBlock)
+		}
+		if block["context"] == "resource" {
+			resourceBlock = block
+		}
+	}
+	if resourceBlock == nil {
+		t.Fatal("k8s label sanitize transform must contain a resource statement block")
+	}
+	statements, ok := resourceBlock["statements"].([]any)
+	if !ok {
+		t.Fatalf("resource-context statements have unexpected type: %T", resourceBlock["statements"])
+	}
+
+	// The DCGM job name scoping the statements must match the job target
+	// label assigned by the dcgm scrape job's relabeling, so renaming one
+	// without the other fails here.
+	dcgmJobName := dcgmScrapeJobName(t, collector)
+	expectedStatements := []string{
+		fmt.Sprintf(`delete_key(attributes, "k8s.namespace.name") where attributes["service.name"] == %q`, dcgmJobName),
+		fmt.Sprintf(`delete_key(attributes, "k8s.pod.name") where attributes["service.name"] == %q`, dcgmJobName),
+	}
+	if len(statements) != len(expectedStatements) {
+		t.Fatalf("expected %d resource-context statements, got %d", len(expectedStatements), len(statements))
+	}
+	for index, expected := range expectedStatements {
+		if statements[index] != expected {
+			t.Errorf("resource-context statement %d: got %v, want %s", index, statements[index], expected)
+		}
+	}
+	for _, statement := range statements {
+		if strings.Contains(fmt.Sprint(statement), "k8s.node.name") {
+			t.Errorf("resource-context statements must not delete k8s.node.name (Korrel8r correlates DCGM series by node): %v", statement)
+		}
+	}
+}
+
+// dcgmScrapeJobName returns the job label value the dcgm scrape job's
+// relabeling assigns; the prometheus receiver exposes it as the service.name
+// resource attribute.
+func dcgmScrapeJobName(t *testing.T, collector unstructured.Unstructured) string {
+	t.Helper()
+	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
+	if err != nil || !found {
+		t.Fatalf("collector config must be present in rendered resource: found=%t, error=%v", found, err)
+	}
+	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus", "config", "scrape_configs")
+	if err != nil || !found {
+		t.Fatalf("expected scrape configs in rendered resource: found=%t, error=%v", found, err)
+	}
+	for _, rawScrapeConfig := range scrapeConfigs {
+		scrapeConfig, ok := rawScrapeConfig.(map[string]any)
+		if !ok || scrapeConfig["job_name"] != "dcgm-exporter-accelerator-metrics" {
+			continue
+		}
+		relabelConfigs, found, err := unstructured.NestedSlice(scrapeConfig, "relabel_configs")
+		if err != nil || !found {
+			t.Fatalf("DCGM relabel configs must be present: found=%t, error=%v", found, err)
+		}
+		for _, rawRule := range relabelConfigs {
+			rule, ok := rawRule.(map[string]any)
+			if !ok || rule["target_label"] != "job" {
+				continue
+			}
+			jobName, _ := rule["replacement"].(string)
+			if jobName == "" {
+				t.Fatalf("DCGM job relabel rule must set a replacement: %v", rule)
+			}
+			return jobName
+		}
+		t.Fatal("DCGM scrape config must assign a job target label")
+	}
+	t.Fatal("DCGM scrape config must be present")
+	return ""
+}
+
 func TestDCGMMetricRelabelingPreservesDRAAttributionLabels(t *testing.T) {
 	collector := renderCollectorTemplate(t)
 	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
