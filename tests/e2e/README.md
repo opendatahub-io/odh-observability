@@ -4,6 +4,26 @@
 
 `TestLLMInferenceService` is a separate RHOAI integration suite. The monitoring commands below select `TestMonitoring` so they do not provision inference resources.
 
+`TestCOOVersionCompatibility` is the RHOAI 3.6 / COO 1.5 release gate. It validates fixed operator CSV lines (`cluster-observability-operator.v1.5`, `rhods-operator.3.6`), the RHOAI-pinned Perses image, Perses operand health, and mandatory dashboard paths after metrics are enabled: Prometheus dashboard Route host, namespace-proxy PromQL (`up` with `namespace=`), Perses health and projects APIs, and the Dashboards UIPlugin when installed. COO and RHOAI CSV prefixes and dashboard probes cannot be overridden through flags or `E2E_TEST_*` environment variables. It restores monitoring configuration like `TestMonitoring` but does not run the full regression matrix.
+
+```bash
+make e2e-test-coo-compatibility
+```
+
+DSC mode on a cluster with RHOAI already installed:
+
+```bash
+make e2e-test-coo-compatibility E2E_TEST_FLAGS="-api-mode=dsc -install-operators=false"
+```
+
+Optional COO catalog channel and compatibility report path:
+
+```bash
+go test ./tests/e2e/ -v -timeout 90m -count=1 -run '^TestCOOVersionCompatibility$' \
+  -coo-channel=stable \
+  -compatibility-report=coo-compatibility.json
+```
+
 ## Prerequisites
 
 - A reachable OpenShift cluster with `KUBECONFIG` set and permissions to manage the tested resources.
@@ -53,6 +73,14 @@ Pass test flags through `E2E_TEST_FLAGS` for local Make targets. The container r
 | `-eventually-poll-interval` | `2s` | Default wait polling interval |
 | `-consistently-timeout` | `30s` | Default consistency check duration |
 | `-consistently-poll-interval` | `2s` | Default consistency polling interval |
+| `-coo-channel` | `stable` | OLM channel for Cluster Observability Operator when `-install-operators=true` |
+| `-compatibility-report` | _(empty)_ | Optional JSON diagnostics filename or relative path under `ARTIFACTS` / `E2E_ARTIFACTS` / `e2e-artifacts` (report is always logged when the test fails) |
+
+`TestCOOVersionCompatibility` always requires COO CSV prefix `cluster-observability-operator.v1.5`, RHOAI CSV prefix `rhods-operator.3.6`, the RHOAI-pinned Perses image digest, and Perses plus Prometheus dashboard proxy checks. Those requirements are not configurable.
+
+### Bumping the release gate (e.g. RHOAI 3.7 / COO 1.6)
+
+Edit the `releaseGateContract` struct in `tests/e2e/config_test.go` (three fields only). In the same PR: update `TestReleaseGateCOOCSVVersions` / `TestReleaseGateRHOAICSVVersions` expected pass/fail examples if the minor version changes, align `PersesImage` with the operator’s pinned Perses default when that moves, run `make e2e-test-coo-compatibility` on a clean target cluster, and link the PR to the release milestone. No flags or `E2E_TEST_*` overrides—reviewers see the version bump in one diff hunk.
 
 ## Test groups
 

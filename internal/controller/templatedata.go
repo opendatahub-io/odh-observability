@@ -632,7 +632,7 @@ func getPersesImage() string {
 		return image
 	}
 
-	return "registry.redhat.io/cluster-observability-operator/perses-rhel9@sha256:27553fd6d4b4983475a0d9a4ccc7d7fa63b1bd4b48f0e5cb2d18963fe232cfd5"
+	return "registry.redhat.io/cluster-observability-operator/perses-rhel9@sha256:a811b9345d884ba1c575584bec9be1d2a237902164a99887458a82d07e7c2376"
 }
 
 // resolvePersesAPIVersion probes the cluster for the installed Perses CRD API version.
