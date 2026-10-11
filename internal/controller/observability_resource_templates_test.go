@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -163,6 +164,7 @@ func TestDeployMonitoringStackWithQuerierIncludesTelemetryResources(t *testing.T
 		PrometheusNamespaceProxyTemplate,
 		PrometheusNamespaceProxyNetworkPolicyTemplate,
 		ThanosQuerierTemplate,
+		ThanosQuerierNetworkPolicyTemplate,
 		ThanosQuerierProxyTemplate,
 		ThanosQuerierProxyNetworkPolicyTemplate,
 		ThanosQuerierRouteTemplate,
@@ -269,6 +271,87 @@ func TestThanosQuerierProxyNetworkPolicyTemplateContract(t *testing.T) {
 	ports := asMap(t, portValues[0])
 	if ports["protocol"] != "TCP" || ports["port"] != int64(8443) {
 		t.Fatalf("Thanos proxy NetworkPolicy must allow router HTTPS ingress: %#v", ports)
+	}
+}
+
+func TestThanosQuerierNetworkPolicyTemplateContract(t *testing.T) {
+	resources := renderObservabilityTemplate(t, ThanosQuerierNetworkPolicyTemplate, map[string]any{
+		"Namespace": testMonitoringNamespace,
+	})
+	policy := findRenderedResource(t, resources, "NetworkPolicy", "data-science-thanos-querier-ingress")
+	if policy.GetNamespace() != testMonitoringNamespace {
+		t.Fatalf("Thanos Querier NetworkPolicy must be in the monitoring namespace, got %q", policy.GetNamespace())
+	}
+
+	selector, found, err := unstructured.NestedStringMap(policy.Object, "spec", "podSelector", "matchLabels")
+	wantSelector := map[string]string{
+		"app.kubernetes.io/part-of":   "ThanosQuerier",
+		"app.kubernetes.io/managed-by": "observability-operator",
+	}
+	if err != nil || !found || !reflect.DeepEqual(selector, wantSelector) {
+		t.Fatalf("Thanos Querier NetworkPolicy must select the Querier pods: got %#v, error=%v", selector, err)
+	}
+	policyTypes := nestedSlice(t, policy, "spec", "policyTypes")
+	if len(policyTypes) != 1 || policyTypes[0] != "Ingress" {
+		t.Fatalf("Thanos Querier NetworkPolicy must isolate ingress, got %#v", policyTypes)
+	}
+
+	ingress := nestedSlice(t, policy, "spec", "ingress")
+	if len(ingress) != 1 {
+		t.Fatalf("Thanos Querier NetworkPolicy must have one ingress rule, got %d", len(ingress))
+	}
+	rule := asMap(t, ingress[0])
+	ports, ok := rule["ports"].([]any)
+	if !ok || len(ports) != 1 {
+		t.Fatalf("Thanos Querier NetworkPolicy must have one ingress port, got %#v", rule["ports"])
+	}
+	port := asMap(t, ports[0])
+	if port["protocol"] != "TCP" || port["port"] != int64(10902) {
+		t.Fatalf("Thanos Querier NetworkPolicy must allow only TCP/10902, got %#v", port)
+	}
+
+	peers, ok := rule["from"].([]any)
+	if !ok || len(peers) != 4 {
+		t.Fatalf("Thanos Querier NetworkPolicy must allow only four internal sources, got %#v", rule["from"])
+	}
+	prometheusPolicy := findRenderedResource(t,
+		renderObservabilityTemplate(t, PrometheusNetworkPolicyTemplate, map[string]any{"Namespace": testMonitoringNamespace}),
+		"NetworkPolicy", "data-science-prometheus-instance-ingress")
+	prometheusSelector, found, err := unstructured.NestedStringMap(
+		prometheusPolicy.Object, "spec", "podSelector", "matchLabels")
+	if err != nil || !found {
+		t.Fatalf("Prometheus NetworkPolicy must select the Prometheus pods: found=%t error=%v", found, err)
+	}
+	wantSources := []map[string]string{
+		prometheusSelector,
+		{"instance": "data-science-perses", "app.kubernetes.io/name": "perses"},
+		{"app": "data-science-thanos-querier-proxy"},
+		{"app.kubernetes.io/name": "korrel8r", "app.kubernetes.io/component": "correlation", "app.kubernetes.io/part-of": "monitoring"},
+	}
+	for _, rawPeer := range peers {
+		peer := asMap(t, rawPeer)
+		if len(peer) != 1 {
+			t.Fatalf("Thanos Querier ingress peer must use only a same-namespace pod selector, got %#v", peer)
+		}
+		podSelector := asMap(t, peer["podSelector"])
+		labels, found, err := unstructured.NestedStringMap(podSelector, "matchLabels")
+		if err != nil || !found {
+			t.Fatalf("Thanos Querier ingress peer must have pod labels: %#v, error=%v", peer, err)
+		}
+		matched := false
+		for i, want := range wantSources {
+			if reflect.DeepEqual(labels, want) {
+				wantSources = append(wantSources[:i], wantSources[i+1:]...)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Fatalf("Thanos Querier ingress has an unexpected source: %#v", labels)
+		}
+	}
+	if len(wantSources) != 0 {
+		t.Fatalf("Thanos Querier ingress is missing sources: %#v", wantSources)
 	}
 }
 

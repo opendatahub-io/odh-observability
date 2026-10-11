@@ -63,6 +63,7 @@ const (
 	PrometheusWebTLSServiceTemplate                  = "resources/prometheus-web-tls-service.tmpl.yaml"
 	PrometheusSelfServiceMonitorTemplate             = "resources/prometheus-self-servicemonitor.tmpl.yaml"
 	ThanosQuerierTemplate                            = "resources/thanos-querier-cr.tmpl.yaml"
+	ThanosQuerierNetworkPolicyTemplate               = "resources/data-science-thanos-querier-network-policy.tmpl.yaml"
 	ThanosQuerierRouteTemplate                       = "resources/thanos-querier-route.tmpl.yaml"
 	PersesTemplate                                   = "resources/perses.tmpl.yaml"
 	PersesTempoDatasourceTemplate                    = "resources/perses-tempo-datasource.tmpl.yaml"
@@ -169,6 +170,7 @@ func deployMonitoringStackWithQuerierAndRestrictions(
 		src(PrometheusNamespaceProxyTemplate),
 		src(PrometheusNamespaceProxyNetworkPolicyTemplate),
 		src(ThanosQuerierTemplate),
+		src(ThanosQuerierNetworkPolicyTemplate),
 		src(ThanosQuerierProxyTemplate),
 		src(ThanosQuerierProxyNetworkPolicyTemplate),
 		src(ThanosQuerierRouteTemplate),
