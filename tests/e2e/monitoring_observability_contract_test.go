@@ -232,10 +232,9 @@ func (tc *MonitoringTestCtx) ValidateMonitoringPartialSignalConditions(t *testin
 	)
 }
 
-// ValidateClusterLogForwarderContract is report-only until the target cluster
-// has a working Cluster Logging installation. A missing optional capability is
-// an explicit skip; once the operator reports the contract as available, a
-// missing or unready Vector DaemonSet is a product failure.
+// ValidateClusterLogForwarderContract skips only when the target cluster lacks
+// the optional Cluster Logging prerequisites. Once log forwarding is configured,
+// Monitoring must report the ClusterLogForwarder contract as available.
 func (tc *MonitoringTestCtx) ValidateClusterLogForwarderContract(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
@@ -261,10 +260,14 @@ func (tc *MonitoringTestCtx) ValidateClusterLogForwarderContract(t *testing.T) {
 
 	status, reason, message, found := tc.waitForMonitoringCondition(t, conditions.ConditionClusterLogForwarderAvailable)
 	if !found {
-		t.Skipf("ClusterLogForwarder contract is not activated: Monitoring condition %s was not reported", conditions.ConditionClusterLogForwarderAvailable)
+		t.Fatalf("ClusterLogForwarder contract must report Monitoring condition %s after log forwarding was configured", conditions.ConditionClusterLogForwarderAvailable)
 	}
 	if status != metav1.ConditionTrue {
-		t.Skipf("ClusterLogForwarder contract is not activated: status=%s reason=%s message=%s", status, reason, message)
+		t.Fatalf(
+			"ClusterLogForwarder condition %s is not True after log forwarding was configured: "+
+				"status=%s reason=%s message=%s",
+			conditions.ConditionClusterLogForwarderAvailable, status, reason, message,
+		)
 	}
 
 	tc.EnsureResourceExists(

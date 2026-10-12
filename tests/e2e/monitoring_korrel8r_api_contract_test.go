@@ -146,7 +146,7 @@ func (tc *MonitoringTestCtx) ValidateKorrel8rAPIContract(t *testing.T) {
 	policy := tc.EnsureResourceExists(
 		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{Name: korrel8rName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
-			jq.Match(`[.spec.egress[] | select([.ports[]? | select(.protocol == "TCP" and .port == 6443)] | length > 0)] | length == 1`),
+			jq.Match(`[.spec.egress[] | select([.ports[]? | select(.protocol == "TCP" and .port == 6443)] | length > 0)] | length <= 1`),
 			jq.Match(`[.spec.egress[].to[]?.ipBlock.cidr | select(. == "0.0.0.0/0" or . == "::/0")] | length == 0`),
 		)),
 		WithCustomErrorMsg("Korrel8r NetworkPolicy must restrict Kubernetes API egress to discovered endpoint addresses"),

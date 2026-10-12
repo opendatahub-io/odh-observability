@@ -247,7 +247,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 
 func assertAuthorizedThanosPost(t *testing.T, rootCAs *x509.CertPool, routeHost, token, namespace string) {
 	t.Helper()
-	probe, err := probeThanosRoutePostWithError(rootCAs, routeHost, token, "", namespace, thanosRouteProbeQuery)
+	probe, err := probeThanosRoutePostWithError(rootCAs, routeHost, token, namespace, "", thanosRouteProbeQuery)
 	if err != nil {
 		t.Fatalf("authorized POST probe failed: %v", err)
 	}
@@ -452,7 +452,9 @@ func probeThanosRoutePostWithError(rootCAs *x509.CertPool, routeHost, token, url
 	endpoint.RawQuery = query.Encode()
 
 	form := url.Values{}
-	form.Set("namespace", formNamespace)
+	if formNamespace != "" {
+		form.Set("namespace", formNamespace)
+	}
 	form.Set("query", promQL)
 	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint.String(), strings.NewReader(form.Encode()))
 	if err != nil {
