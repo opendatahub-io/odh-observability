@@ -223,6 +223,11 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 		}
 	}
 
+	// Exercise the successful POST form separately from the conflicting-value
+	// rejection below. A GET-only contract would not prove that the proxy keeps
+	// the same namespace boundary when PromQL is submitted as form data.
+	assertAuthorizedThanosPost(t, rootCAs, routeHost, authorizedToken, tc.MonitoringNamespace)
+
 	duplicateNamespace, err := probeThanosRoutePostWithError(
 		rootCAs,
 		routeHost,
@@ -237,6 +242,26 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 	logThanosRouteEvidence(t, "authorized-duplicate-namespace-post", duplicateNamespace)
 	if duplicateNamespace.HTTPStatus != http.StatusBadRequest {
 		t.Fatalf("POST with conflicting URL and form namespace values must be rejected, got %d", duplicateNamespace.HTTPStatus)
+	}
+}
+
+func assertAuthorizedThanosPost(t *testing.T, rootCAs *x509.CertPool, routeHost, token, namespace string) {
+	t.Helper()
+	probe, err := probeThanosRoutePostWithError(rootCAs, routeHost, token, "", namespace, thanosRouteProbeQuery)
+	if err != nil {
+		t.Fatalf("authorized POST probe failed: %v", err)
+	}
+	logThanosRouteEvidence(t, "authorized-post", probe)
+	if probe.HTTPStatus != http.StatusOK || probe.PrometheusStatus != "success" {
+		t.Fatalf("authorized POST query should be a successful Prometheus request, got http_status=%d prometheus_status=%q", probe.HTTPStatus, probe.PrometheusStatus)
+	}
+	if len(probe.Labels) == 0 {
+		t.Fatalf("authorized POST query returned no metric series")
+	}
+	for _, labels := range probe.Labels {
+		if labels["namespace"] != namespace {
+			t.Fatalf("authorized POST response escaped the namespace boundary: namespace=%q", labels["namespace"])
+		}
 	}
 }
 
@@ -421,7 +446,9 @@ func probeThanosRoutePostWithError(rootCAs *x509.CertPool, routeHost, token, url
 		Path:   "/api/v1/query",
 	}
 	query := endpoint.Query()
-	query.Set("namespace", urlNamespace)
+	if urlNamespace != "" {
+		query.Set("namespace", urlNamespace)
+	}
 	endpoint.RawQuery = query.Encode()
 
 	form := url.Values{}

@@ -23,7 +23,7 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 
 	t.Run("Group 11: Usage Logs Collection", func(t *testing.T) {
 		tc = tc.WithT(t)
-		const sharedSecretName = "test-loki-shared-secret"
+		const sharedSecretName = usageLogsSharedSecretName
 		const lifecycleSecretName = "test-loki-lifecycle-secret"
 		t.Cleanup(tc.cleanupSeaweedFS)
 		t.Cleanup(func() {
@@ -73,6 +73,7 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 		t.Run("Validate Usage Logs Collector configuration", tc.ValidateUsageLogsCollectorConfiguration)
 		t.Run("Validate Usage Logs Collector RBAC", tc.ValidateUsageLogsCollectorRBACConfiguration)
 		t.Run("Validate Usage Logs Collector network policies", tc.ValidateUsageLogsCollectorNetworkPolicies)
+		t.Run("Validate optional ClusterLogForwarder and Vector contract", tc.ValidateClusterLogForwarderContract)
 
 		// Lifecycle test modifies state, run last
 		t.Run("Test Usage Logs lifecycle (LokiStack + Collector)", tc.ValidateUsageLogsLifecycle)

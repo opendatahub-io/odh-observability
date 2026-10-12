@@ -26,6 +26,7 @@ func (tc *MonitoringTestCtx) runNegativeConditionTests(t *testing.T) {
 		t.Run("NodeMetrics negative conditions", tc.ValidateMonitoringNodeMetricsNegativeConditions)
 		t.Run("OpenTelemetry negative conditions", tc.ValidateMonitoringOpenTelemetryNegativeConditions)
 		t.Run("Usage Logs negative conditions", tc.ValidateMonitoringUsageLogsNegativeConditions)
+		t.Run("Partial signal conditions preserve independent traces", tc.ValidateMonitoringPartialSignalConditions)
 	})
 }
 

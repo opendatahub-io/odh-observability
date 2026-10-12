@@ -74,6 +74,7 @@ func (tc *MonitoringTestCtx) runBaseConfigurationTests(t *testing.T) {
 		})
 
 		t.Run("Test Traces default content", tc.ValidateMonitoringCRDefaultTracesContent)
+		t.Run("Test active operand namespace and readiness contract", tc.ValidateMonitoringOperandNamespaceContract)
 	})
 }
 
@@ -396,6 +397,10 @@ func (tc *MonitoringTestCtx) runCollectorTests(t *testing.T) {
 		})
 
 		t.Run("Test OpenTelemetry Collector Configurations", tc.ValidateOpenTelemetryCollectorConfigurations)
+		// The configuration subtests reset optional Monitoring fields after each
+		// case, so restore metrics before validating the signal-specific contract.
+		tc.setupMetrics(t)
+		t.Run("Test signal-specific collector contract", tc.ValidateSignalSpecificCollectorContract)
 		t.Run("Test OpenTelemetry Collector replicas", tc.ValidateMonitoringCRCollectorReplicas)
 		t.Run("Test Metrics TLS is always enabled for Prometheus exporter", tc.ValidateMetricsTLSAlwaysEnabled)
 		t.Run("Test Monitoring TLS is always enabled for internal telemetry exporter", tc.ValidateMonitoringTLSAlwaysEnabled)
@@ -1435,6 +1440,7 @@ func (tc *MonitoringTestCtx) runTracesWithPVBackendTests(t *testing.T) {
 		t.Run("Test TempoMonolithic CR Creation with PV backend", tc.ValidateTempoMonolithicCRCreation)
 		t.Run("Test Collector MLflow integration RBAC", tc.ValidateCollectorMLflowIntegrationRBAC)
 		t.Run("Test Collector Tempo trace export RBAC", tc.ValidateCollectorTempoTraceExportRBAC)
+		t.Run("Test Tempo gateway tenant and authentication wiring", tc.ValidateTempoGatewayTenantConfiguration)
 	})
 }
 
