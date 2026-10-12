@@ -285,7 +285,7 @@ func TestThanosQuerierNetworkPolicyTemplateContract(t *testing.T) {
 
 	selector, found, err := unstructured.NestedStringMap(policy.Object, "spec", "podSelector", "matchLabels")
 	wantSelector := map[string]string{
-		"app.kubernetes.io/part-of":   "ThanosQuerier",
+		"app.kubernetes.io/part-of":    "ThanosQuerier",
 		"app.kubernetes.io/managed-by": "observability-operator",
 	}
 	if err != nil || !found || !reflect.DeepEqual(selector, wantSelector) {
