@@ -397,8 +397,8 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 
 func TestLokiStackApplicationLogsProjectRoleContract(t *testing.T) {
 	resources := renderObservabilityTemplate(t, LokiStackTemplate, map[string]any{
-		"LokiStackName":              "data-science-lokistack",
-		"Namespace":                  testMonitoringNamespace,
+		"LokiStackName":             "test-lokistack",
+		"Namespace":                 testMonitoringNamespace,
 		"LokiStorageCredentialMode": "static",
 		"LokiStorageSecretName":     "loki-storage",
 		"LokiStorageType":           "s3",
