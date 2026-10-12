@@ -122,7 +122,7 @@ func (tc *MonitoringTestCtx) assertReadyThanosPodLabels(t *testing.T, name, podP
 			}
 		}
 		return fmt.Errorf("no ready generated %s pod with selector labels %v", name, selector)
-	}).WithTimeout(3*time.Minute).WithPolling(5*time.Second).Should(Succeed())
+	}).WithTimeout(3 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
 }
 
 func (tc *MonitoringTestCtx) runThanosIngressProbe(t *testing.T, name, namespace string, labels map[string]string, endpoint string, allowed bool) {
@@ -176,6 +176,6 @@ echo "curl exit=$result connections:http=$connection"
 				"Thanos ingress probe %s/%s failed", namespace, probeName)
 		}
 		return fmt.Errorf("Thanos ingress probe %s/%s is %s", namespace, probeName, current.Status.Phase)
-	}).WithTimeout(3*time.Minute).WithPolling(2*time.Second).Should(Succeed())
+	}).WithTimeout(3 * time.Minute).WithPolling(2 * time.Second).Should(Succeed())
 	t.Logf("Thanos ingress probe %s from %s completed (allowed=%t)", name, namespace, allowed)
 }
