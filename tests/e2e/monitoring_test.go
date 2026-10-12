@@ -961,6 +961,7 @@ func (tc *MonitoringTestCtx) runThanosQuerierTests(t *testing.T) {
 		t.Run("Test ThanosQuerier deployment with metrics", tc.ValidateThanosQuerierDeployment)
 		t.Run("Test ThanosQuerier route authorization boundary", tc.ValidateThanosQuerierRouteAuthorizationBoundary)
 		t.Run("Test ThanosQuerier route namespace isolation", tc.ValidateThanosQuerierRouteNamespaceIsolation)
+		t.Run("Test ThanosQuerier ingress NetworkPolicy connectivity", tc.ValidateThanosQuerierIngressConnectivity)
 		t.Run("Test Prometheus NetworkPolicy allows Thanos Querier on gRPC port", tc.ValidatePrometheusNetworkPolicyAllowsThanosQuerier)
 
 		t.Run("Component Isolation — Thanos", func(t *testing.T) {
