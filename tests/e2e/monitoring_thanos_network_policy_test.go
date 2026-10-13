@@ -24,7 +24,7 @@ import (
 func (tc *MonitoringTestCtx) ValidateThanosQuerierIngressConnectivity(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
-	t.Cleanup(tc.resetMonitoringConfigToManaged)
+	t.Cleanup(tc.resetMonitoringConfigToMetrics)
 	tc.updateMonitoringConfig(withManagementState(common.Managed), tc.withMetricsConfig())
 
 	tc.EnsureResourceExists(
@@ -58,7 +58,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierIngressConnectivity(t *testing
 			podPrefix: persesPodName,
 			selector: map[string]string{
 				"instance":               PersesName,
-				"app.kubernetes.io/name": "perses",
+				"app.kubernetes.io/name": PersesName,
 			},
 		},
 		{

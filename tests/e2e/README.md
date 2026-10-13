@@ -34,10 +34,10 @@ For containerized runs, use `make e2e-test-container` or `make e2e-test-containe
 To focus on a monitoring group while debugging, use Go's subtest selector:
 
 ```bash
-go test ./tests/e2e/ -v -timeout 120m -count=1 -run 'TestMonitoring/Traces_with_Cloud_Storage' -api-mode=dsc -install-operators=false
+go test ./tests/e2e/ -v -timeout 120m -count=1 -run 'TestMonitoring/Metrics_ready/Thanos_Querier' -api-mode=dsc -install-operators=false
 ```
 
-The full monitoring suite takes roughly 30–60 minutes depending on cluster performance. Storage and OLM installation can take longer; adjust the timeout flags below if needed.
+The selected phase performs its own setup and cleanup. To run an off/on case in isolation, select `TestMonitoring/Lifecycle/Group_13:_Lifecycle/Target_Allocator`. The full monitoring suite takes roughly 30–60 minutes depending on cluster performance. Storage and OLM installation can take longer; adjust the timeout flags below if needed.
 
 ## Configuration
 
@@ -130,23 +130,18 @@ than a clean one. `-cleanup-test-state` changes no assertions.
 
 ## Test groups
 
-The 14 top-level groups run in order. Subtests share cluster state within a group, so a focused subtest may still need its group's setup.
+The phases run in order. The no-metrics phase checks defaults and absent components. The metrics phase starts Prometheus once, runs the steady-state integrations, then removes the operands. Transition checks that disable or recreate metrics run later in Lifecycle. A phase waits for old Prometheus pods to leave before enabling metrics and for the new StatefulSet and pods to become ready before dependent checks; each wait allows up to 12 minutes for a slow termination or rollout.
 
-| Group | Coverage |
+| Phase | Coverage |
 |-------|----------|
-| 1. Base Configuration | Monitoring defaults |
-| 2. Metrics & MonitoringStack | Metrics, rules, replicas, reconciliation stability |
-| 3. Korrel8r | TLS query service and network policy |
-| 4. OpenTelemetry Collector | Collector configuration and TLS |
-| 5. Target Allocator | Deployment, lifecycle, and RBAC |
-| 6. Thanos Querier | Deployment and networking |
-| 7. Traces with PV Backend | TempoMonolithic and trace integration |
-| 8. Traces with Cloud Storage | TempoStack on S3 and GCS, Perses TLS |
-| 9. Perses | Dashboards, datasources, and lifecycle |
-| 10. Networking and RBAC | Proxy, node metrics, and access rules |
-| 11. Webhooks | Admission behavior and label injection |
-| 12. Usage Logs Collection | LokiStack and collector configuration and lifecycle |
-| 13. Negative Conditions | Status when features are not configured |
-| 14. Disabled | Operand removal when monitoring is disabled |
+| Baseline without metrics | Monitoring defaults, negative conditions, absent Target Allocator, Thanos, and Perses |
+| Metrics ready | MonitoringStack, Korrel8r, Collector, Target Allocator, Thanos route and Prometheus networking, RBAC |
+| Traces with PV Backend | TempoMonolithic and trace integration |
+| Traces with Cloud Storage | TempoStack on S3 and GCS, Perses TLS |
+| Perses | Dashboards, datasources, and Thanos ingress connectivity using a ready Perses pod |
+| Webhooks | Admission behavior and label injection |
+| Usage Logs Collection | LokiStack and collector configuration and lifecycle |
+| Lifecycle | Metrics replicas, Target Allocator, Perses, datasource, Prometheus rules, and disabled webhook transitions |
+| Disabled | Operand removal when monitoring is disabled |
 
 The S3 cases deploy SeaweedFS in the monitoring namespace and create a local bucket for Tempo or Loki. The GCS case deploys fake-gcs-server and points TempoStack at its local endpoint. Fixture pods, services, and secrets are removed after their groups. The suite restores the pre-test Monitoring spec in module mode or `DSCI.spec.monitoring` in DSC mode. If it created a Monitoring CR in module mode, it deletes that CR at the end. Operators installed through OLM remain installed.

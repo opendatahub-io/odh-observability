@@ -33,7 +33,6 @@ func (tc *MonitoringTestCtx) runNegativeConditionTests(t *testing.T) {
 func (tc *MonitoringTestCtx) ValidateMonitoringMetricsNegativeConditions(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
-	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -55,7 +54,6 @@ func (tc *MonitoringTestCtx) ValidateMonitoringMetricsNegativeConditions(t *test
 func (tc *MonitoringTestCtx) ValidateMonitoringTracesNegativeConditions(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
-	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -77,7 +75,6 @@ func (tc *MonitoringTestCtx) ValidateMonitoringTracesNegativeConditions(t *testi
 func (tc *MonitoringTestCtx) ValidateMonitoringAlertingNegativeConditions(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
-	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -95,7 +92,6 @@ func (tc *MonitoringTestCtx) ValidateMonitoringAlertingNegativeConditions(t *tes
 func (tc *MonitoringTestCtx) ValidateMonitoringPersesNegativeConditions(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
-	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -122,7 +118,6 @@ func (tc *MonitoringTestCtx) ValidateMonitoringPersesNegativeConditions(t *testi
 func (tc *MonitoringTestCtx) ValidateMonitoringNodeMetricsNegativeConditions(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
-	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -144,7 +139,6 @@ func (tc *MonitoringTestCtx) ValidateMonitoringNodeMetricsNegativeConditions(t *
 func (tc *MonitoringTestCtx) ValidateMonitoringOpenTelemetryNegativeConditions(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
-	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),
@@ -167,7 +161,6 @@ func (tc *MonitoringTestCtx) ValidateMonitoringOpenTelemetryNegativeConditions(t
 func (tc *MonitoringTestCtx) ValidateMonitoringUsageLogsNegativeConditions(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
-	t.Cleanup(tc.resetMonitoringConfigToManaged)
 
 	tc.updateMonitoringConfig(
 		withManagementState(common.Managed),

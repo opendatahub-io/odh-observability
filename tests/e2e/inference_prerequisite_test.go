@@ -22,7 +22,9 @@ import (
 
 func readInferenceManifest(t *testing.T, name string) map[string]any {
 	t.Helper()
-	file, err := os.Open(filepath.Join("prerequisites", "inference", name))
+	projectRoot, err := findProjectRoot()
+	require.NoError(t, err)
+	file, err := os.Open(filepath.Join(inferencePrerequisiteDir(projectRoot), name))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, file.Close()) })
 

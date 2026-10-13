@@ -324,7 +324,7 @@ func TestThanosQuerierNetworkPolicyTemplateContract(t *testing.T) {
 	}
 	wantSources := []map[string]string{
 		prometheusSelector,
-		{"instance": "data-science-perses", "app.kubernetes.io/name": "perses"},
+		{"instance": "data-science-perses", "app.kubernetes.io/name": "data-science-perses"},
 		{"app": "data-science-thanos-querier-proxy"},
 		{"app.kubernetes.io/name": "korrel8r", "app.kubernetes.io/component": "correlation", "app.kubernetes.io/part-of": "monitoring"},
 	}

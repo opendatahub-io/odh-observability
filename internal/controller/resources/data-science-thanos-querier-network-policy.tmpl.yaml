@@ -22,7 +22,7 @@ spec:
         - podSelector:
             matchLabels:
               instance: data-science-perses
-              app.kubernetes.io/name: perses
+              app.kubernetes.io/name: data-science-perses
         - podSelector:
             matchLabels:
               app: data-science-thanos-querier-proxy

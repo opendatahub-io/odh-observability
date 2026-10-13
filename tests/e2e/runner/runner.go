@@ -219,8 +219,6 @@ func (r *Runner) execPackages(args []string) int {
 		cmdArgs = append(cmdArgs, "-t", "-p", pkg.Name, pkg.Binary)
 		cmdArgs = append(cmdArgs, testArgs...)
 
-		r.logf("running: %s %s", test2jsonBin, strings.Join(cmdArgs, " "))
-
 		cmd := exec.CommandContext(context.Background(), test2jsonBin, cmdArgs...)
 		cmd.Stdout = r.stdout
 		cmd.Stderr = r.stderr

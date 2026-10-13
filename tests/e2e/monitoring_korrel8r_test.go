@@ -38,10 +38,6 @@ func (tc *MonitoringTestCtx) runKorrel8rTests(t *testing.T) {
 
 	t.Run("Korrel8r resources", func(t *testing.T) {
 		tc = tc.WithT(t)
-		tc.setupMetrics(t)
-		t.Cleanup(func() {
-			tc.cleanupGroup(t, "")
-		})
 
 		t.Run("reconciles a ready TLS query service", tc.ValidateKorrel8rResources)
 		t.Run("serves bounded authenticated API requests", tc.ValidateKorrel8rAPIContract)

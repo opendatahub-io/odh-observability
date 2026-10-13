@@ -98,13 +98,18 @@ func TestInstallPlanMatchesSource(t *testing.T) {
 		want        bool
 	}{
 		{
-			name: "complete plan from requested source contains current CSV",
+			name: "complete OLM plan from requested source contains current CSV",
 			installPlan: &unstructured.Unstructured{Object: map[string]any{
 				"spec": map[string]any{
-					"source":                     "redhat-operators",
 					"clusterServiceVersionNames": []any{"rhcl-operator.v1.0.0"},
 				},
-				"status": map[string]any{"phase": "Complete"},
+				"status": map[string]any{
+					"phase":          "Complete",
+					"catalogSources": []any{"redhat-operators"},
+					"plan": []any{map[string]any{"resource": map[string]any{
+						"kind": "ClusterServiceVersion", "name": "rhcl-operator.v1.0.0", "sourceName": "redhat-operators",
+					}}},
+				},
 			}},
 			source:  "redhat-operators",
 			csvName: "rhcl-operator.v1.0.0",
@@ -114,10 +119,15 @@ func TestInstallPlanMatchesSource(t *testing.T) {
 			name: "stale plan from previous source",
 			installPlan: &unstructured.Unstructured{Object: map[string]any{
 				"spec": map[string]any{
-					"source":                     "certified-operators",
 					"clusterServiceVersionNames": []any{"rhcl-operator.v1.0.0"},
 				},
-				"status": map[string]any{"phase": "Complete"},
+				"status": map[string]any{
+					"phase":          "Complete",
+					"catalogSources": []any{"redhat-operators", "certified-operators"},
+					"plan": []any{map[string]any{"resource": map[string]any{
+						"kind": "ClusterServiceVersion", "name": "rhcl-operator.v1.0.0", "sourceName": "certified-operators",
+					}}},
+				},
 			}},
 			source:  "redhat-operators",
 			csvName: "rhcl-operator.v1.0.0",
@@ -127,10 +137,14 @@ func TestInstallPlanMatchesSource(t *testing.T) {
 			name: "requested plan is not complete",
 			installPlan: &unstructured.Unstructured{Object: map[string]any{
 				"spec": map[string]any{
-					"source":                     "redhat-operators",
 					"clusterServiceVersionNames": []any{"rhcl-operator.v1.0.0"},
 				},
-				"status": map[string]any{"phase": "Installing"},
+				"status": map[string]any{
+					"phase": "Installing",
+					"plan": []any{map[string]any{"resource": map[string]any{
+						"kind": "ClusterServiceVersion", "name": "rhcl-operator.v1.0.0", "sourceName": "redhat-operators",
+					}}},
+				},
 			}},
 			source:  "redhat-operators",
 			csvName: "rhcl-operator.v1.0.0",
@@ -140,10 +154,14 @@ func TestInstallPlanMatchesSource(t *testing.T) {
 			name: "requested plan does not contain current CSV",
 			installPlan: &unstructured.Unstructured{Object: map[string]any{
 				"spec": map[string]any{
-					"source":                     "redhat-operators",
 					"clusterServiceVersionNames": []any{"rhcl-operator.v1.0.1"},
 				},
-				"status": map[string]any{"phase": "Complete"},
+				"status": map[string]any{
+					"phase": "Complete",
+					"plan": []any{map[string]any{"resource": map[string]any{
+						"kind": "ClusterServiceVersion", "name": "rhcl-operator.v1.0.1", "sourceName": "redhat-operators",
+					}}},
+				},
 			}},
 			source:  "redhat-operators",
 			csvName: "rhcl-operator.v1.0.0",
@@ -158,4 +176,24 @@ func TestInstallPlanMatchesSource(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRebaseForDSCIWithNumericConfig(t *testing.T) {
+	dsci := &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{
+			"monitoring": map[string]any{"managementState": "Managed"},
+		},
+	}}
+
+	if err := rebaseForDSCI(withMetricsReplicas(1))(dsci); err != nil {
+		t.Fatalf("rebaseForDSCI: %v", err)
+	}
+
+	replicas, found, err := unstructured.NestedInt64(dsci.Object, "spec", "monitoring", "metrics", "replicas")
+	if err != nil || !found || replicas != 1 {
+		t.Fatalf("replicas: got %d, found %t, error %v", replicas, found, err)
+	}
+
+	// A subsequent client patch deep-copies this unstructured object.
+	dsci.DeepCopy()
 }
