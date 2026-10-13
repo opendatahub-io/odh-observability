@@ -352,24 +352,28 @@ func (tc *MonitoringTestCtx) clusterLogForwarderCRDAvailable(t *testing.T) bool 
 
 func (tc *MonitoringTestCtx) waitForMonitoringCondition(t *testing.T, conditionType string) (metav1.ConditionStatus, string, string, bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Minute)
 	var latestStatus metav1.ConditionStatus
 	var latestReason, latestMessage string
 	var found bool
-	for time.Now().Before(deadline) {
+	tc.g.Eventually(func() error {
 		monitoring := &unstructured.Unstructured{}
 		monitoring.SetGroupVersionKind(gvk.Monitoring)
-		if err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: tc.MonitoringCRName}, monitoring); err == nil {
-			status, reason, message, conditionFound := monitoringCondition(monitoring, conditionType)
-			if conditionFound {
-				latestStatus, latestReason, latestMessage, found = status, reason, message, true
-				if status == metav1.ConditionTrue {
-					return status, reason, message, true
-				}
+		if err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: tc.MonitoringCRName}, monitoring); err != nil {
+			if k8serr.IsNotFound(err) {
+				return err
+			}
+			return StopErr(err, "failed to read Monitoring resource %s", tc.MonitoringCRName)
+		}
+
+		status, reason, message, conditionFound := monitoringCondition(monitoring, conditionType)
+		if conditionFound {
+			latestStatus, latestReason, latestMessage, found = status, reason, message, true
+			if status == metav1.ConditionTrue {
+				return nil
 			}
 		}
-		time.Sleep(2 * time.Second)
-	}
+		return fmt.Errorf("Monitoring condition %s is not True", conditionType)
+	}).WithContext(tc.Context()).WithTimeout(2 * time.Minute).WithPolling(2 * time.Second).Should(Succeed())
 	return latestStatus, latestReason, latestMessage, found
 }
 
