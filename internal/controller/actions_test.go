@@ -1339,6 +1339,7 @@ func TestDeployUsageLogsCollector_LokiStackNotReady(t *testing.T) {
 	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
 	if c == nil {
 		t.Fatal("expected UsageLogsCollectorAvailable condition to be set")
+		return
 	}
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
@@ -1378,6 +1379,7 @@ func TestDeployUsageLogsCollector_CRDMissing(t *testing.T) {
 	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
 	if c == nil {
 		t.Fatal("expected UsageLogsCollectorAvailable condition to be set")
+		return
 	}
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
@@ -1732,6 +1734,7 @@ func TestDeployKorrel8r_MarksAvailableWhenServiceReady(t *testing.T) {
 	condition := findCondition(m, conditions.ConditionKorrel8rAvailable)
 	if condition == nil {
 		t.Fatal("expected Korrel8rAvailable condition")
+		return
 	}
 	if condition.Status != metav1.ConditionTrue {
 		t.Fatalf("status: want True, got %s", condition.Status)
