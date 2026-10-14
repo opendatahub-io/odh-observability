@@ -52,6 +52,7 @@ import (
 
 const (
 	opentelemetryOperator        = "opentelemetry-operator"
+	certManagerOperator          = "cert-manager-operator"
 	clusterObservabilityOperator = "cluster-observability-operator"
 	tempoOperator                = "tempo-operator"
 	lokiOperator                 = "loki-operator"
@@ -394,6 +395,18 @@ func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitori
 
 	if monitoring.Spec.Metrics != nil || monitoring.Spec.Traces != nil || usageLogsConfigured {
 		if err := checkOperator(opentelemetryOperator, conditions.OpenTelemetryCollectorOperatorMissingMessage); err != nil {
+			return err
+		}
+	}
+
+	// Metrics TargetAllocator mTLS is always cert-manager-backed. Check the
+	// operator explicitly so a missing dependency is reported before the
+	// OpenTelemetry admission webhook rejects the collector resource.
+	if monitoring.Spec.Metrics != nil {
+		if err := checkOperatorNames(
+			[]string{certManagerOperator, "openshift-cert-manager-operator"},
+			conditions.CertManagerOperatorMissingMessage,
+		); err != nil {
 			return err
 		}
 	}

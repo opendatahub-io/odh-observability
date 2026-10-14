@@ -26,24 +26,27 @@ import (
 
 // Constants for monitoring resource names.
 const (
-	MonitoringStackName               = "data-science-monitoringstack"
-	OpenTelemetryCollectorName        = "data-science-collector"
-	TargetAllocatorDeploymentName     = "data-science-collector-targetallocator"
-	CollectorServiceAccount           = "data-science-collector-collector"
-	TargetAllocatorServiceAccount     = "data-science-collector-targetallocator"
-	TempoMonolithicName               = "data-science-tempomonolithic"
-	TempoStackName                    = "data-science-tempostack"
-	InstrumentationName               = "data-science-instrumentation"
-	ThanosQuerierName                 = "data-science-thanos-querier"
-	ThanosQuerierRouteName            = "data-science-thanos-querier-route"
-	ThanosQuerierProxyName            = "data-science-thanos-querier-proxy"
-	PersesName                        = "data-science-perses"
-	PersesDatasourceName              = "data-science-prometheus-datasource"
-	ClusterPrometheusDatasourceName   = "cluster-prometheus-datasource"
-	ClusterPrometheusDatasourceSecret = "cluster-prometheus-datasource-secret"
-	UsageLogsCollectorName            = "data-science-usage-logs"
-	UsageLogsCollectorServiceAccount  = "data-science-usage-logs-collector"
-	LokiStackName                     = "data-science-lokistack"
+	MonitoringStackName                  = "data-science-monitoringstack"
+	OpenTelemetryCollectorName           = "data-science-collector"
+	TargetAllocatorDeploymentName        = "data-science-collector-targetallocator"
+	TargetAllocatorCACertificateName     = OpenTelemetryCollectorName + "-ca-cert"
+	TargetAllocatorClientCertificateName = OpenTelemetryCollectorName + "-ta-client-cert"
+	TargetAllocatorServerCertificateName = OpenTelemetryCollectorName + "-ta-server-cert"
+	CollectorServiceAccount              = "data-science-collector-collector"
+	TargetAllocatorServiceAccount        = "data-science-collector-targetallocator"
+	TempoMonolithicName                  = "data-science-tempomonolithic"
+	TempoStackName                       = "data-science-tempostack"
+	InstrumentationName                  = "data-science-instrumentation"
+	ThanosQuerierName                    = "data-science-thanos-querier"
+	ThanosQuerierRouteName               = "data-science-thanos-querier-route"
+	ThanosQuerierProxyName               = "data-science-thanos-querier-proxy"
+	PersesName                           = "data-science-perses"
+	PersesDatasourceName                 = "data-science-prometheus-datasource"
+	ClusterPrometheusDatasourceName      = "cluster-prometheus-datasource"
+	ClusterPrometheusDatasourceSecret    = "cluster-prometheus-datasource-secret"
+	UsageLogsCollectorName               = "data-science-usage-logs"
+	UsageLogsCollectorServiceAccount     = "data-science-usage-logs-collector"
+	LokiStackName                        = "data-science-lokistack"
 
 	UsageLogsCollectorNetworkPolicyName = UsageLogsCollectorName + "-collector-allow"
 	UsageLogsLokiStackNetworkPolicyName = LokiStackName + "-allow"
@@ -912,6 +915,7 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 		"cluster-observability-operator",
 		"tempo-operator",
 		"opentelemetry-operator",
+		"cert-manager-operator",
 		"loki-operator",
 	} {
 		if testOpts.installOperators {

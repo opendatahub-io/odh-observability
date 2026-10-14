@@ -102,6 +102,7 @@ const (
 	TempoOperatorMissingMessage                  = "Tempo Operator is required for traces; install it from OperatorHub"
 	COOMissingMessage                            = "Cluster Observability Operator is required for metrics; install it from OperatorHub"
 	OpenTelemetryCollectorOperatorMissingMessage = "Red Hat build of OpenTelemetry is required for metrics, traces, and usage logs; install it from OperatorHub"
+	CertManagerOperatorMissingMessage            = "cert-manager Operator is required for metrics TargetAllocator mTLS; install it from OperatorHub"
 	LokiOperatorMissingMessage                   = "Loki Operator is required for logs and usage logs; install it from OperatorHub"
 	ClusterLoggingOperatorMissingMessage         = "Red Hat OpenShift Logging Operator is required for logs; install it from OperatorHub"
 )

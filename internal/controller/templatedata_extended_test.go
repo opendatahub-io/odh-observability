@@ -148,6 +148,26 @@ func TestCheckPreconditions_MetricsRequiresOTelAndCOO(t *testing.T) {
 	if !strings.Contains(errStr, "Cluster Observability Operator") {
 		t.Errorf("expected COO error, got: %s", errStr)
 	}
+	if !strings.Contains(errStr, "cert-manager Operator") {
+		t.Errorf("expected cert-manager error, got: %s", errStr)
+	}
+}
+
+func TestCheckPreconditions_MetricsRequiresCertManager(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorCondition(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		newOperatorCondition("opentelemetry-operator.v0.158.0-1"),
+		newOperatorCondition("cluster-observability-operator.v1.5.2"),
+	).Build()
+	err := checkMonitoringPreconditions(context.Background(), cli, m)
+	if err == nil || !strings.Contains(err.Error(), "cert-manager Operator") {
+		t.Fatalf("expected missing cert-manager error, got: %v", err)
+	}
 }
 
 func TestCheckPreconditions_ExportersOnlyMetricsDoesNotRequireCOO(t *testing.T) {
@@ -163,6 +183,7 @@ func TestCheckPreconditions_ExportersOnlyMetricsDoesNotRequireCOO(t *testing.T) 
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
 		newOperatorCondition("opentelemetry-operator.v0.158.0-1"),
+		newOperatorCondition("cert-manager-operator.v1.20.1"),
 	).Build()
 	if err := checkMonitoringPreconditions(context.Background(), cli, m); err != nil {
 		t.Fatalf("exporters-only metrics should not require COO, got: %v", err)
@@ -227,8 +248,9 @@ func TestCheckPreconditions_AllOperatorsPresent(t *testing.T) {
 	otel := newOperatorCondition("opentelemetry-operator.v0.100.0")
 	coo := newOperatorCondition("cluster-observability-operator.v1.0.0")
 	tempo := newOperatorCondition("tempo-operator.v2.0.0")
+	certManager := newOperatorCondition("cert-manager-operator.v1.20.1")
 
-	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(otel, coo, tempo).Build()
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(otel, coo, tempo, certManager).Build()
 	err := checkMonitoringPreconditions(context.Background(), cli, m)
 	if err != nil {
 		t.Fatalf("expected no error when all operators present, got: %v", err)
@@ -252,6 +274,7 @@ func TestCheckPreconditions_OLMv1OperatorsPresent(t *testing.T) {
 		newInstalledClusterExtension("otel", opentelemetryOperator),
 		newInstalledClusterExtension("coo", clusterObservabilityOperator),
 		newInstalledClusterExtension("tempo", tempoOperator),
+		newInstalledClusterExtension("cert-manager", certManagerOperator),
 	}
 	cli := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objects...).Build()
 
@@ -406,6 +429,7 @@ func TestCheckPreconditions_AllFeaturesAndOperatorsPresent(t *testing.T) {
 		newOperatorCondition("opentelemetry-operator.v0.158.0-1"),
 		newOperatorCondition("cluster-observability-operator.v1.5.2"),
 		newOperatorCondition("tempo-operator.v0.22.0-2"),
+		newOperatorCondition("cert-manager-operator.v1.20.1"),
 		newOperatorCondition("loki-operator.v6.6.1"),
 		newOperatorCondition("cluster-logging.v6.6.1"),
 	).Build()
@@ -439,6 +463,7 @@ func TestCheckPreconditions_AllFeaturesReportEachMissingOperatorOnce(t *testing.
 	for _, operatorName := range []string{
 		"Red Hat build of OpenTelemetry",
 		"Cluster Observability Operator",
+		"cert-manager Operator",
 		"Tempo Operator",
 		"Loki Operator",
 		"Red Hat OpenShift Logging Operator",

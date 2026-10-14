@@ -10,6 +10,11 @@ spec:
   targetAllocator:
     enabled: true
     serviceAccount: {{.TargetAllocatorServiceAccount}}
+    mtls:
+      enabled: true
+      useCertManager: true
+    # Auth secrets must only be transferred over the mTLS connection.
+    allowInsecureAuthSecrets: false
     prometheusCR:
       enabled: true
       denyFSAccessThroughSMs: true

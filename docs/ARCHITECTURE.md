@@ -45,14 +45,15 @@ Before any feature deployment, the reconciler verifies prerequisite operators th
 | `cluster-observability-operator` | Metrics configured |
 | `tempo-operator` | Traces configured |
 | `opentelemetry-operator` | Metrics, traces, or usage logs configured |
+| `cert-manager` | Operator webhook and metrics TargetAllocator mTLS certificates |
 | `loki-operator` | Usage logs or cluster log forwarding configured |
 | `cluster-logging` | Cluster log forwarding configured |
 
 If any required operator is missing, `MonitoringDependenciesReady` is set to False with the missing operator names and OperatorHub installation guidance. Reconciliation then stops without error (no retry -- the CRD watch will trigger re-reconciliation when operators are installed). The legacy `MonitoringAvailable` condition is updated in parallel for compatibility.
 
-The metrics TargetAllocator selects labeled ServiceMonitors and PodMonitors cluster-wide because KServe creates its scheduler monitors and per-workload TLS monitors in inference workload namespaces. The collector ServiceAccount has no Secret permissions. A separate TargetAllocator ServiceAccount receives namespace-scoped Roles for the current namespace set and is configured with the same `secretNamespaces` allowlist; namespace events trigger reconciliation so new namespaces receive the binding. `denyFSAccessThroughSMs` prevents selected monitors from making the collector expose file-backed credentials.
+The metrics TargetAllocator selects labeled ServiceMonitors and PodMonitors cluster-wide because KServe creates its scheduler monitors and per-workload TLS monitors in inference workload namespaces. The collector ServiceAccount has no Secret permissions. A separate TargetAllocator ServiceAccount receives the OpenTelemetry Operator discovery permissions through a dedicated ClusterRole plus namespace-scoped Roles for the current namespace set; it is configured with the same `secretNamespaces` allowlist, and namespace events trigger reconciliation so new namespaces receive the binding. `denyFSAccessThroughSMs` prevents selected monitors from making the collector expose file-backed credentials.
 
-The TargetAllocator currently uses its non-mTLS connection mode. TargetAllocator mTLS is deferred until the supported OpenTelemetry Operator webhook bundle can handle cert-manager-backed admission for this configuration.
+The TargetAllocator uses mTLS by default, with cert-manager provisioning its CA, serving, and client certificates. The collector is configured only with the HTTPS TargetAllocator endpoint. The upstream TargetAllocator may also expose its non-mTLS discovery port, but `allowInsecureAuthSecrets` remains disabled so authenticated ServiceMonitor credentials cannot be returned over plaintext HTTP.
 
 ## Action Functions
 

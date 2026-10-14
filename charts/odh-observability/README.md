@@ -12,7 +12,7 @@ The chart deploys:
 
 - OpenShift 4.14+ or Kubernetes 1.27+
 - Helm 3
-- cert-manager (if `webhook.enabled` is true)
+- cert-manager (for the webhook and metrics TargetAllocator mTLS)
 
 ## Installation
 

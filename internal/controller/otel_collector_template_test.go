@@ -75,14 +75,18 @@ func TestDCGMMetricsAreRetainedWithOriginalNames(t *testing.T) {
 }
 
 //nolint:gocyclo // The test validates the complete rendered scrape configuration.
-func TestPrometheusScrapeConfigExcludesEPPSchedulerPods(t *testing.T) {
+func TestPrometheusScrapeConfigAndTargetAllocatorSecurity(t *testing.T) {
 	collector := renderCollectorTemplate(t)
 	targetAllocator, found, err := unstructured.NestedMap(collector.Object, "spec", "targetAllocator")
 	if err != nil || !found {
 		t.Fatalf("target allocator config must be present in rendered resource: found=%t, error=%v", found, err)
 	}
-	if _, found, err := unstructured.NestedMap(targetAllocator, "mtls"); err != nil || found {
-		t.Fatalf("target allocator mTLS must be omitted for the non-mTLS metrics path: found=%t, error=%v", found, err)
+	mtls, found, err := unstructured.NestedMap(targetAllocator, "mtls")
+	if err != nil || !found || mtls["enabled"] != true || mtls["useCertManager"] != true {
+		t.Fatalf("target allocator mTLS must be enabled with cert-manager: found=%t, config=%v, error=%v", found, mtls, err)
+	}
+	if targetAllocator["allowInsecureAuthSecrets"] != false {
+		t.Errorf("target allocator must disable auth secrets over plaintext HTTP, got %v", targetAllocator["allowInsecureAuthSecrets"])
 	}
 
 	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
