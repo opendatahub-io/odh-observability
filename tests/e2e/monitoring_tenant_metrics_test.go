@@ -15,19 +15,23 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	authenticationv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
+	jq "github.com/opendatahub-io/odh-observability/tests/e2e/matchers/jq"
 
 	. "github.com/onsi/gomega" //nolint:revive // dot import is idiomatic for gomega matchers
 )
@@ -49,6 +53,15 @@ const (
 	tenantMetricsQueryMetric = "prometheus_build_info"
 
 	prometheusRouteName = "data-science-prometheus-route"
+
+	// otlpIdentitySpoofPodName names the one-shot curl pod in the monitoring
+	// namespace that pushes an OTLP metric with forged identity attributes.
+	otlpIdentitySpoofPodName = "otlp-identity-spoof-probe"
+	// otlpIdentitySpoofedPodName is the fake pod identity the probe forges.
+	otlpIdentitySpoofedPodName = "totally-not-the-sender-pod"
+	// otlpIdentitySpoofMetricPrefix prefixes the pushed metric name; a unique
+	// suffix per run keeps stale series from earlier runs irrelevant.
+	otlpIdentitySpoofMetricPrefix = "odh_observability_otlp_identity_probe"
 )
 
 // ValidateTenantWorkloadMetricsNamespaceRestriction proves the end-to-end
@@ -119,6 +132,171 @@ func (tc *MonitoringTestCtx) ValidateTenantWorkloadMetricsNamespaceRestriction(t
 	require.Equal(t, http.StatusOK, status)
 	require.Empty(t, parsed.Data.Result,
 		"privileged query for namespace %s must return no tenant series", tenantMetricsForeignNamespace)
+}
+
+// ValidateOTLPMetricIdentityCannotBeSpoofed proves the OTLP trust boundary:
+// a workload in the monitoring namespace (the only namespace the
+// NetworkPolicy lets push telemetry) sends a uniquely named metric whose
+// resource attributes claim a foreign tenant namespace/pod identity, in both
+// dotted and underscored spellings, plus a forged pod-IP association hint.
+// The series must still arrive — attributed to the sender's real pod in the
+// monitoring namespace — and the tenant's authorized query for its own
+// namespace must never see the injected series. Absence of the series does
+// not count as success: the delivery check runs first.
+func (tc *MonitoringTestCtx) ValidateOTLPMetricIdentityCannotBeSpoofed(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.setupMetrics(t)
+	tc.ensureTenantMetricsEnvironment(t)
+
+	otlpHost := tc.discoverCollectorOTLPHTTPHost(t)
+
+	// Unique metric name and timestamp per run so stale series from earlier
+	// runs can never satisfy either assertion.
+	runID := strconv.FormatInt(time.Now().UnixNano(), 10)
+	metricName := otlpIdentitySpoofMetricPrefix + "_" + runID
+
+	// Forged identity, in every spelling the promotion chain could pick up:
+	// the dotted semconv attributes, the underscored labels the exporter's
+	// resource_to_telemetry_conversion emits, a bogus association hint, and
+	// the datapoint-level bare and exported_-prefixed identity labels.
+	payload := `{"resourceMetrics":[{"resource":{"attributes":[` +
+		`{"key":"k8s.namespace.name","value":{"stringValue":"` + tenantMetricsNamespace + `"}},` +
+		`{"key":"k8s.pod.name","value":{"stringValue":"` + otlpIdentitySpoofedPodName + `"}},` +
+		`{"key":"k8s.pod.ip","value":{"stringValue":"192.0.2.1"}},` +
+		`{"key":"k8s_namespace_name","value":{"stringValue":"` + tenantMetricsNamespace + `"}},` +
+		`{"key":"k8s_pod_name","value":{"stringValue":"` + otlpIdentitySpoofedPodName + `"}},` +
+		`{"key":"exported_namespace","value":{"stringValue":"` + tenantMetricsNamespace + `"}},` +
+		`{"key":"exported_pod","value":{"stringValue":"` + otlpIdentitySpoofedPodName + `"}}]},` +
+		`"scopeMetrics":[{"scope":{"name":"odh-observability-e2e-spoof-probe"},` +
+		`"metrics":[{"name":"` + metricName + `","gauge":{"dataPoints":[` +
+		`{"timeUnixNano":"` + runID + `","asDouble":1,"attributes":[` +
+		`{"key":"namespace","value":{"stringValue":"` + tenantMetricsNamespace + `"}},` +
+		`{"key":"pod","value":{"stringValue":"` + otlpIdentitySpoofedPodName + `"}},` +
+		`{"key":"exported_namespace","value":{"stringValue":"` + tenantMetricsNamespace + `"}},` +
+		`{"key":"exported_pod","value":{"stringValue":"` + otlpIdentitySpoofedPodName + `"}}]}]}}]}]}]}`
+
+	// The probe pod itself lives in the monitoring namespace: that is exactly
+	// the NetworkPolicy's trust boundary for OTLP pushers, so this test
+	// covers the strongest attacker the deployment model allows.
+	tc.deleteFixtureResources(otlpIdentitySpoofPodName)
+	t.Cleanup(func() {
+		tc.deleteFixtureResources(otlpIdentitySpoofPodName)
+	})
+	script := fmt.Sprintf(
+		`i=0; until curl -fsS -X POST -H 'Content-Type: application/json' -d '%s' 'http://%s/v1/metrics'; do i=$((i+1)); [ "$i" -lt 60 ] || exit 1; sleep 2; done`,
+		payload, otlpHost,
+	)
+	tc.createFixtureResource(t, gvk.Pod, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      otlpIdentitySpoofPodName,
+			Namespace: tc.MonitoringNamespace,
+			Labels:    map[string]string{"app": otlpIdentitySpoofPodName},
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy:   corev1.RestartPolicyNever,
+			SecurityContext: fixturePodSecurityContext(),
+			Containers: []corev1.Container{{
+				Name:            "otlp-spoof-probe",
+				Image:           fakeGCSClientImage,
+				Command:         []string{"/bin/sh", "-c"},
+				Args:            []string{script},
+				SecurityContext: fixtureContainerSecurityContext(),
+			}},
+		},
+	})
+	// Waiting for Succeeded or Failed (rather than only Succeeded) makes a
+	// failing probe exit fast instead of burning the full timeout.
+	probePod := tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Pod, types.NamespacedName{
+			Name:      otlpIdentitySpoofPodName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.status.phase == "Succeeded" or .status.phase == "Failed"`)),
+		WithEventuallyTimeout(5*time.Minute),
+		WithCustomErrorMsg("OTLP spoof probe pod must finish"),
+	)
+	// Succeeded means the collector accepted the push (curl -f fails on
+	// non-2xx): the transport-level positive control.
+	probePhase, found, err := unstructured.NestedString(probePod.Object, "status", "phase")
+	require.NoError(t, err, "failed to read the OTLP spoof probe pod phase")
+	require.True(t, found, "OTLP spoof probe pod must report a phase")
+	require.Equal(t, "Succeeded", probePhase, "OTLP spoof probe pod must push successfully")
+
+	routeHost := tc.fetchPrometheusRouteHost(t)
+	rootCAs := clusterIngressCAPool(t, tc)
+	adminToken := getAuthToken(tc.TestContext)
+	tenantToken := tc.requestServiceAccountToken(t, tenantMetricsNamespace, tenantMetricsServiceAccount)
+
+	// Delivery control: the pushed series must be visible under the sender's
+	// real namespace, with the pod label derived from the actual sender pod —
+	// proving connection-based association won over the forged attributes.
+	// The exporter expires metrics five minutes after the last push, so the
+	// polling window stays well inside that.
+	tc.g.Eventually(func() error {
+		status, parsed, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, adminToken, tc.MonitoringNamespace, metricName)
+		if err != nil {
+			return err
+		}
+		if status != http.StatusOK {
+			return fmt.Errorf("admin query via %s returned status %d", routeHost, status)
+		}
+		if len(parsed.Data.Result) == 0 {
+			return fmt.Errorf("no %s series visible in namespace %s yet", metricName, tc.MonitoringNamespace)
+		}
+		for _, result := range parsed.Data.Result {
+			if result.Metric["namespace"] != tc.MonitoringNamespace {
+				return fmt.Errorf("series %v has namespace=%q, want the sender's real namespace %q", result.Metric, result.Metric["namespace"], tc.MonitoringNamespace)
+			}
+			if result.Metric["pod"] != otlpIdentitySpoofPodName {
+				return fmt.Errorf("series %v has pod=%q, want the sender's real pod %q", result.Metric, result.Metric["pod"], otlpIdentitySpoofPodName)
+			}
+			if result.Metric["exported_namespace"] != "" || result.Metric["exported_pod"] != "" {
+				return fmt.Errorf("series %v carries forged exported_ identity labels", result.Metric)
+			}
+		}
+		return nil
+	}, 4*time.Minute, 10*time.Second).Should(Succeed(),
+		fmt.Sprintf("pushed metric %s must be attributed to the sender pod %s in namespace %s", metricName, otlpIdentitySpoofPodName, tc.MonitoringNamespace))
+
+	// Spoof control: the tenant is authorized for its own namespace, so an
+	// injected series would be visible to it. It must see none.
+	status, parsed, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, tenantToken, tenantMetricsNamespace, metricName)
+	require.NoError(t, err, "tenant query for its own namespace must reach the proxy")
+	require.Equal(t, http.StatusOK, status)
+	require.Empty(t, parsed.Data.Result,
+		"tenant %s must not see series injected via forged OTLP resource attributes", tenantMetricsNamespace)
+}
+
+// discoverCollectorOTLPHTTPHost finds the metrics collector's
+// operator-managed Service exposing the OTLP HTTP receiver (port 4318) and
+// returns its in-cluster DNS host. The instance label pins the discovery to
+// the data-science-collector CR so co-located collectors (e.g. the usage
+// logs collector, which also listens on 4318) cannot be picked.
+func (tc *MonitoringTestCtx) discoverCollectorOTLPHTTPHost(t *testing.T) string {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	serviceList := &corev1.ServiceList{}
+	err := tc.Client().List(tc.Context(), serviceList,
+		client.InNamespace(tc.MonitoringNamespace),
+		client.MatchingLabels{
+			"app.kubernetes.io/managed-by": "opentelemetry-operator",
+			"app.kubernetes.io/instance":   tc.MonitoringNamespace + ".data-science-collector",
+		},
+	)
+	require.NoError(t, err, "failed to list collector services in namespace %s", tc.MonitoringNamespace)
+
+	for i := range serviceList.Items {
+		for _, port := range serviceList.Items[i].Spec.Ports {
+			if port.Port == 4318 {
+				return fmt.Sprintf("%s.%s.svc:4318", serviceList.Items[i].Name, tc.MonitoringNamespace)
+			}
+		}
+	}
+	t.Fatalf("no data-science-collector service exposing the OTLP HTTP receiver port 4318 found in namespace %s", tc.MonitoringNamespace)
+	return ""
 }
 
 // ensureTenantMetricsEnvironment creates the tenant workload, its

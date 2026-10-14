@@ -451,8 +451,9 @@ func (tc *MonitoringTestCtx) ValidateOpenTelemetryCollectorConfigurations(t *tes
 			monitoringCondition: jq.Match(`.spec.metrics != null`),
 			validation: jq.Match(`
 				(.spec.config.exporters | has("prometheus") and has("debug") and has("%s")) and
-				(.spec.config.service.pipelines.metrics.exporters | length == 3 and contains(["prometheus", "debug", "%s"]))
-			`, OtlpCustomExporter, OtlpCustomExporter),
+				(.spec.config.service.pipelines."metrics/scrape".exporters | length == 3 and contains(["prometheus", "debug", "%s"])) and
+				(.spec.config.service.pipelines."metrics/otlp".exporters | length == 3 and contains(["prometheus", "debug", "%s"]))
+			`, OtlpCustomExporter, OtlpCustomExporter, OtlpCustomExporter),
 		},
 		{
 			name: "Custom Traces Exporters",
@@ -2491,6 +2492,7 @@ func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 		t.Run("Prometheus restricted resource configuration", tc.ValidatePrometheusRestrictedResourceConfiguration)
 		t.Run("Prometheus secure proxy authentication", tc.ValidatePrometheusSecureProxyAuthentication)
 		t.Run("Tenant workload metrics namespace restriction", tc.ValidateTenantWorkloadMetricsNamespaceRestriction)
+		t.Run("OTLP metric identity cannot be spoofed", tc.ValidateOTLPMetricIdentityCannotBeSpoofed)
 		t.Run("Node metrics endpoint deployment", tc.ValidateNodeMetricsEndpointDeployment)
 		t.Run("Node metrics endpoint RBAC configuration", tc.ValidateNodeMetricsEndpointRBACConfiguration)
 	})
