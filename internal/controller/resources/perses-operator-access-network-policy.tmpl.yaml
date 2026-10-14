@@ -8,7 +8,9 @@ metadata:
 spec:
   podSelector:
     matchLabels:
+      app.kubernetes.io/instance: data-science-perses
       app.kubernetes.io/managed-by: perses-operator
+      app.kubernetes.io/name: data-science-perses
   policyTypes:
     - Ingress
   ingress:

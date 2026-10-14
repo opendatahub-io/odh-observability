@@ -376,6 +376,69 @@ func TestPrometheusNamespaceProxyNetworkPolicyTemplateContract(t *testing.T) {
 	}
 }
 
+func TestKorrel8rNetworkPolicyTemplateContract(t *testing.T) {
+	t.Parallel()
+
+	resources := renderObservabilityTemplate(t, Korrel8rNetworkPolicyTemplate, map[string]any{
+		"Namespace":              testMonitoringNamespace,
+		"Korrel8rServiceName":    "korrel8r",
+		"Korrel8rAPIServerCIDRs": []string{"172.20.0.1/32"},
+	})
+	policy := findRenderedResource(t, resources, "NetworkPolicy", "korrel8r")
+
+	selector, found, err := unstructured.NestedStringMap(policy.Object, "spec", "podSelector", "matchLabels")
+	wantSelector := map[string]string{"app.kubernetes.io/name": "korrel8r"}
+	if err != nil || !found || !reflect.DeepEqual(selector, wantSelector) {
+		t.Fatalf("Korrel8r NetworkPolicy must select only Korrel8r pods: got %#v, error=%v", selector, err)
+	}
+
+	ingress := nestedSlice(t, policy, "spec", "ingress")
+	if len(ingress) != 0 {
+		t.Fatalf("Korrel8r NetworkPolicy must deny ingress because no stable in-cluster caller exists, got %#v", ingress)
+	}
+}
+
+func TestPersesOperatorAccessNetworkPolicyTemplateContract(t *testing.T) {
+	t.Parallel()
+
+	resources := renderObservabilityTemplate(t, PersesOperatorAccessNetworkPolicyTemplate, map[string]any{
+		"Namespace": testMonitoringNamespace,
+	})
+	policy := findRenderedResource(t, resources, "NetworkPolicy", "perses-operator-access")
+
+	selector, found, err := unstructured.NestedStringMap(policy.Object, "spec", "podSelector", "matchLabels")
+	wantSelector := map[string]string{
+		"app.kubernetes.io/instance":   "data-science-perses",
+		"app.kubernetes.io/managed-by": "perses-operator",
+		"app.kubernetes.io/name":       "data-science-perses",
+	}
+	if err != nil || !found || !reflect.DeepEqual(selector, wantSelector) {
+		t.Fatalf("Perses access NetworkPolicy must select only the intended operand: got %#v, error=%v", selector, err)
+	}
+}
+
+func TestPersesTemplateContract(t *testing.T) {
+	t.Parallel()
+
+	resources := renderObservabilityTemplate(t, PersesTemplate, map[string]any{
+		"Namespace":        testMonitoringNamespace,
+		"PersesAPIVersion": "v1alpha2",
+		"PersesImage":      "example.invalid/perses:test",
+	})
+	perses := findRenderedResource(t, resources, "Perses", "data-science-perses")
+
+	labels, found, err := unstructured.NestedStringMap(perses.Object, "spec", "metadata", "labels")
+	wantLabels := map[string]string{
+		"instance":                     "data-science-perses",
+		"app.kubernetes.io/instance":   "data-science-perses",
+		"app.kubernetes.io/managed-by": "perses-operator",
+		"app.kubernetes.io/name":       "data-science-perses",
+	}
+	if err != nil || !found || !reflect.DeepEqual(labels, wantLabels) {
+		t.Fatalf("Perses pod labels must match the access NetworkPolicy selector: got %#v, error=%v", labels, err)
+	}
+}
+
 func TestThanosQuerierRouteUsesAuthorizedProxy(t *testing.T) {
 	route := findRenderedResource(t, renderObservabilityTemplate(t, ThanosQuerierRouteTemplate, proxyTemplateData()), "Route", "data-science-thanos-querier-route")
 

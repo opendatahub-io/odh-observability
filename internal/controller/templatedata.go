@@ -32,6 +32,7 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-multierror"
+	pkgtls "github.com/opendatahub-io/odh-platform-utilities/framework/tls"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/olm"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/openshift"
 	"gopkg.in/yaml.v3"
@@ -47,7 +48,6 @@ import (
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
-	pkgtls "github.com/opendatahub-io/odh-observability/pkg/tls"
 )
 
 const (
@@ -604,7 +604,7 @@ func getKorrel8rImage() string {
 }
 
 func addTLSData(ctx context.Context, c client.Client, templateData map[string]any) error {
-	minVersion, cipherSuites, err := pkgtls.FromAPIServer(ctx, c, pkgtls.FormatGo)
+	minVersion, cipherSuites, err := pkgtls.FromAPIServerWithAdherence(ctx, c, pkgtls.FormatGo)
 	if err != nil {
 		return err
 	}
@@ -632,7 +632,7 @@ func getPersesImage() string {
 		return image
 	}
 
-	return "registry.redhat.io/cluster-observability-operator/perses-rhel9@sha256:27553fd6d4b4983475a0d9a4ccc7d7fa63b1bd4b48f0e5cb2d18963fe232cfd5"
+	return "registry.redhat.io/cluster-observability-operator/perses-rhel9@sha256:a811b9345d884ba1c575584bec9be1d2a237902164a99887458a82d07e7c2376"
 }
 
 // resolvePersesAPIVersion probes the cluster for the installed Perses CRD API version.

@@ -49,6 +49,13 @@ const (
 	UsageLogsLokiStackNetworkPolicyName = LokiStackName + "-allow"
 )
 
+func cooOperatorChannel() string {
+	if testOpts.cooChannel != "" {
+		return testOpts.cooChannel
+	}
+	return observabilityOpChannel
+}
+
 // OLM operator constants for dependent operators.
 const (
 	observabilityOpName      = "cluster-observability-operator"
@@ -327,10 +334,14 @@ func (tc *MonitoringTestCtx) setupMetrics(t *testing.T) {
 	if !metricsPresent {
 		tc.waitForPrometheusPodsGone(t)
 	}
-	tc.updateMonitoringConfig(
+	transforms := []jq.TransformFn{
 		withManagementState(common.Managed),
 		tc.withMetricsConfig(),
-	)
+	}
+	if tc.expectedDefaultReplicas > 0 {
+		transforms = append(transforms, withMetricsReplicas(tc.expectedDefaultReplicas))
+	}
+	tc.updateMonitoringConfig(transforms...)
 	tc.waitForPrometheusReady(t)
 }
 
@@ -722,7 +733,9 @@ func (tc *TestContext) withMetricsConfig() jq.TransformFn {
 }
 
 func withMetricsReplicas(replicas int) jq.TransformFn {
-	return jq.Transform(`.spec.metrics.replicas = %d`, replicas)
+	return func(u *unstructured.Unstructured) error {
+		return unstructured.SetNestedField(u.Object, int64(replicas), "spec", "metrics", "replicas")
+	}
 }
 
 func withNamespace(namespace string) jq.TransformFn {
@@ -971,7 +984,7 @@ func (tc *TestContext) installDependentOperators(t *testing.T) {
 	}
 
 	operators := []operator{
-		{observabilityOpNamespace, observabilityOpName, observabilityOpChannel},
+		{observabilityOpNamespace, observabilityOpName, cooOperatorChannel()},
 		{tempoOpNamespace, tempoOpName, tempoOpChannel},
 		{opentelemetryOpNamespace, opentelemetryOpName, opentelemetryOpChannel},
 		{certManagerOpNamespace, certManagerOpName, certManagerOpChannel},

@@ -17,14 +17,40 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"strings"
 	"testing"
 
+	configv1 "github.com/openshift/api/config/v1"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func rawExt(yaml string) runtime.RawExtension {
 	return runtime.RawExtension{Raw: []byte(yaml)}
+}
+
+func TestAddTLSDataHonorsStrictAPIServerProfile(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, configv1.Install(scheme))
+	apiServer := &configv1.APIServer{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+		Spec: configv1.APIServerSpec{
+			TLSAdherence:       configv1.TLSAdherencePolicyStrictAllComponents,
+			TLSSecurityProfile: &configv1.TLSSecurityProfile{Type: configv1.TLSProfileModernType},
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(apiServer).Build()
+	templateData := map[string]any{}
+
+	require.NoError(t, addTLSData(context.Background(), cli, templateData))
+	assert.Equal(t, "VersionTLS13", templateData["TLSMinVersion"])
+	assert.NotEmpty(t, templateData["TLSCipherSuites"])
 }
 
 func TestValidateExporters_ValidOTLP(t *testing.T) {

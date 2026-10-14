@@ -33,7 +33,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierIngressConnectivity(t *testing
 			Namespace: tc.MonitoringNamespace,
 		}),
 	)
-	tc.assertReadyThanosPodLabels(t, "querier", thanosQuerierDeploymentName+"-", map[string]string{
+	tc.assertReadyPodLabels(t, "querier", thanosQuerierDeploymentName+"-", map[string]string{
 		"app.kubernetes.io/part-of":    "ThanosQuerier",
 		"app.kubernetes.io/managed-by": "observability-operator",
 	})
@@ -82,7 +82,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierIngressConnectivity(t *testing
 	for _, source := range clients {
 		t.Run(source.name, func(t *testing.T) {
 			tc := tc.WithT(t)
-			tc.assertReadyThanosPodLabels(t, source.name, source.podPrefix, source.selector)
+			tc.assertReadyPodLabels(t, source.name, source.podPrefix, source.selector)
 			tc.runThanosIngressProbe(t, source.name, tc.MonitoringNamespace, source.selector, endpoint, true)
 		})
 	}
@@ -103,7 +103,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierIngressConnectivity(t *testing
 	})
 }
 
-func (tc *MonitoringTestCtx) assertReadyThanosPodLabels(t *testing.T, name, podPrefix string, selector map[string]string) {
+func (tc *MonitoringTestCtx) assertReadyPodLabels(t *testing.T, name, podPrefix string, selector map[string]string) {
 	t.Helper()
 	tc.g.Eventually(func() error {
 		pods := &corev1.PodList{}
@@ -116,7 +116,7 @@ func (tc *MonitoringTestCtx) assertReadyThanosPodLabels(t *testing.T, name, podP
 			}
 			for _, condition := range pod.Status.Conditions {
 				if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
-					t.Logf("Thanos ingress client %s: ready pod %s has selector labels %v", name, pod.Name, selector)
+					t.Logf("%s: ready pod %s has selector labels %v", name, pod.Name, selector)
 					return nil
 				}
 			}
