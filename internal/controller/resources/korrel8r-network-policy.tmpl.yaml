@@ -12,14 +12,9 @@ spec:
   policyTypes:
     - Ingress
     - Egress
-  ingress:
-    - from:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{.Namespace}}
-      ports:
-        - protocol: TCP
-          port: 8443
+  # No stable in-cluster caller is owned or exposed by this module. Keep the
+  # query service ingress-denied until an approved caller has stable labels.
+  ingress: []
   egress:
     - to:
         - namespaceSelector:

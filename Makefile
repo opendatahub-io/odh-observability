@@ -65,6 +65,10 @@ e2e-test: ## Run e2e tests against a cluster (requires KUBECONFIG).
 e2e-test-monitoring: ## Run only the monitoring e2e suite against a cluster.
 	go test ./tests/e2e/ -v -timeout 120m -count=1 $(E2E_TEST_FLAGS) -run '^TestMonitoring$$'
 
+.PHONY: e2e-test-coo-compatibility
+e2e-test-coo-compatibility: ## Run COO 1.5 / RHOAI 3.6 compatibility release-gate test (fixed CSV and Perses image contract).
+	go test ./tests/e2e/ -v -timeout 90m -count=1 $(E2E_TEST_FLAGS) -run '^TestCOOVersionCompatibility$$'
+
 BIN_DIR  ?= $(LOCALBIN)
 OATS_BIN ?= $(BIN_DIR)/oats
 

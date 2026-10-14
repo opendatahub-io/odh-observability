@@ -31,3 +31,7 @@ func TestMain(m *testing.M) {
 func TestMonitoring(t *testing.T) {
 	monitoringTestSuite(t)
 }
+
+func TestCOOVersionCompatibility(t *testing.T) {
+	cooVersionCompatibilitySuite(t)
+}

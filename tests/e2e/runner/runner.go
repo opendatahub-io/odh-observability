@@ -46,6 +46,8 @@ const (
 	envTestConsistentlyTimeout      = "E2E_TEST_CONSISTENTLY_TIMEOUT"
 	envTestConsistentlyPollInterval = "E2E_TEST_CONSISTENTLY_POLL_INTERVAL"
 	envTestOLMTimeout               = "E2E_TEST_OLM_TIMEOUT"
+	envTestCOOChannel               = "E2E_TEST_COO_CHANNEL"
+	envTestCompatibilityReport      = "E2E_TEST_COMPATIBILITY_REPORT"
 )
 
 // TestPackages is set at build time via -ldflags.
@@ -258,6 +260,8 @@ func (r *Runner) envToFlags() []string {
 		envTestConsistentlyTimeout:      "-consistently-timeout",
 		envTestConsistentlyPollInterval: "-consistently-poll-interval",
 		envTestOLMTimeout:               "-olm-timeout",
+		envTestCOOChannel:               "-coo-channel",
+		envTestCompatibilityReport:      "-compatibility-report",
 	}
 
 	var flags []string

@@ -17,9 +17,13 @@ limitations under the License.
 package e2e_test
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	corev1 "k8s.io/api/core/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -106,10 +110,64 @@ func (tc *MonitoringTestCtx) ValidateKorrel8rResources(t *testing.T) {
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{Name: korrel8rName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
-			jq.Match(`[.spec.ingress[]?.ports[]? | select(.port == 8443 and .protocol == "TCP")] | length == 1`),
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/name" == "korrel8r"`),
+			jq.Match(`[.spec.ingress[]?] | length == 0`),
 			jq.Match(`[.spec.egress[] | select(([.ports[]? | select(.port == 6443 and .protocol == "TCP")] | length > 0) and ([.to[]?.ipBlock.cidr] | length > 0))] | length == 1`),
 			jq.Match(`[.spec.egress[]?.to[]?.ipBlock.cidr | select(. == "0.0.0.0/0" or . == "::/0")] | length == 0`),
 		)),
-		WithCustomErrorMsg("Korrel8r NetworkPolicy should permit only TCP/6443 egress to discovered API endpoints"),
+		WithCustomErrorMsg("Korrel8r NetworkPolicy should deny ingress and permit only discovered API endpoint egress"),
 	)
+
+	tc.validateKorrel8rIngressDenied(t)
+}
+
+func (tc *MonitoringTestCtx) validateKorrel8rIngressDenied(t *testing.T) {
+	t.Helper()
+
+	probeName := fmt.Sprintf("korrel8r-ingress-%x", time.Now().UnixNano())
+	endpoint := fmt.Sprintf("https://korrel8r.%s.svc.cluster.local:8443", tc.MonitoringNamespace)
+	script := fmt.Sprintf(`
+connection=$(curl --noproxy '*' -skS --connect-timeout 5 --max-time 8 -o /dev/null -w '%%{num_connects}:%%{http_code}' %q)
+result=$?
+echo "curl exit=$result connections:http=$connection"
+[ "$connection" = "0:000" ] && { [ "$result" -eq 7 ] || [ "$result" -eq 28 ]; }
+`, endpoint)
+	probe := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: probeName, Namespace: tc.MonitoringNamespace},
+		Spec: corev1.PodSpec{
+			RestartPolicy:                corev1.RestartPolicyNever,
+			AutomountServiceAccountToken: new(false),
+			SecurityContext:              fixturePodSecurityContext(),
+			Containers: []corev1.Container{{
+				Name:                     "curl",
+				Image:                    fakeGCSClientImage,
+				Command:                  []string{"/bin/sh", "-c"},
+				Args:                     []string{script},
+				SecurityContext:          fixtureContainerSecurityContext(),
+				TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+			}},
+		},
+	}
+	tc.createFixtureResource(t, gvk.Pod, probe)
+	t.Cleanup(func() {
+		if err := tc.Client().Delete(tc.Context(), probe); err != nil && !k8serr.IsNotFound(err) {
+			t.Logf("clean up Korrel8r ingress probe %s: %v", probeName, err)
+		}
+	})
+	tc.g.Eventually(func() error {
+		current := &corev1.Pod{}
+		if err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: probeName, Namespace: tc.MonitoringNamespace}, current); err != nil {
+			return err
+		}
+		switch current.Status.Phase {
+		case corev1.PodSucceeded:
+			return nil
+		case corev1.PodFailed:
+			return StopErr(fmt.Errorf("pod failed: %v", current.Status.ContainerStatuses),
+				"Korrel8r ingress probe %s failed", probeName)
+		default:
+			return fmt.Errorf("Korrel8r ingress probe %s is %s", probeName, current.Status.Phase)
+		}
+	}).WithTimeout(3 * time.Minute).WithPolling(2 * time.Second).Should(Succeed())
+	t.Logf("same-namespace Korrel8r ingress probe denied: %s", probeName)
 }

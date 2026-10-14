@@ -2245,7 +2245,9 @@ func (tc *MonitoringTestCtx) ValidatePersesNetworkPolicy(t *testing.T) {
 		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{Name: "perses-operator-access", Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
 			jq.Match(`.metadata.labels["platform.opendatahub.io/part-of"] == "monitoring"`),
+			jq.Match(`.spec.podSelector.matchLabels["app.kubernetes.io/instance"] == "data-science-perses"`),
 			jq.Match(`.spec.podSelector.matchLabels["app.kubernetes.io/managed-by"] == "perses-operator"`),
+			jq.Match(`.spec.podSelector.matchLabels["app.kubernetes.io/name"] == "data-science-perses"`),
 			jq.Match(`.spec.policyTypes[0] == "Ingress"`),
 			jq.Match(`.spec.ingress[0].from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"] == "openshift-cluster-observability-operator"`),
 			jq.Match(`.spec.ingress[0].from[0].podSelector.matchLabels["app.kubernetes.io/name"] == "perses-operator"`),
@@ -2256,6 +2258,11 @@ func (tc *MonitoringTestCtx) ValidatePersesNetworkPolicy(t *testing.T) {
 		)),
 		WithCustomErrorMsg("Perses NetworkPolicy should be created with correct configuration allowing perses-operator access"),
 	)
+	tc.assertReadyPodLabels(t, "Perses", PersesName+"-", map[string]string{
+		"app.kubernetes.io/instance":   "data-science-perses",
+		"app.kubernetes.io/managed-by": "perses-operator",
+		"app.kubernetes.io/name":       "data-science-perses",
+	})
 }
 
 // ValidatePersesDatasourceCreationWithTraces tests that Perses datasource is created when traces are configured.
