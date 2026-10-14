@@ -2,11 +2,19 @@ package e2e_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -66,12 +74,16 @@ func (tc *MonitoringTestCtx) ValidateTenantWorkloadMetricsNamespaceRestriction(t
 
 	routeHost := tc.fetchPrometheusRouteHost(t)
 	tenantToken := tc.requestServiceAccountToken(t, tenantMetricsNamespace, tenantMetricsServiceAccount)
+	// Route certificates are signed by the cluster ingress CA, which is not
+	// necessarily part of the runner's system CA bundle. Resolve it once and
+	// reuse the pool for every query below.
+	rootCAs := clusterIngressCAPool(t, tc)
 
 	// The full pipeline (ServiceMonitor discovery by the target allocator,
 	// scrape, export, Prometheus ingestion) is eventually consistent; poll
 	// until the tenant's series appear under the promoted namespace label.
 	tc.g.Eventually(func() error {
-		status, parsed, err := queryMetricsViaNamespaceProxy(tc.Context(), routeHost, tenantToken, tenantMetricsNamespace, tenantMetricsQueryMetric)
+		status, parsed, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, tenantToken, tenantMetricsNamespace, tenantMetricsQueryMetric)
 		if err != nil {
 			return err
 		}
@@ -95,14 +107,14 @@ func (tc *MonitoringTestCtx) ValidateTenantWorkloadMetricsNamespaceRestriction(t
 
 	// The tenant's token must be rejected for a namespace it cannot view:
 	// kube-rbac-proxy performs a SubjectAccessReview per query.
-	status, _, err := queryMetricsViaNamespaceProxy(tc.Context(), routeHost, tenantToken, tenantMetricsForeignNamespace, tenantMetricsQueryMetric)
+	status, _, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, tenantToken, tenantMetricsForeignNamespace, tenantMetricsQueryMetric)
 	require.NoError(t, err, "query for foreign namespace must reach the proxy")
 	require.Equal(t, http.StatusForbidden, status,
 		"tenant service account must be forbidden to query metrics of namespace %s", tenantMetricsForeignNamespace)
 
 	// Even a privileged query must not see the tenant's series under a
 	// foreign namespace: prom-label-proxy enforces the namespace label.
-	status, parsed, err := queryMetricsViaNamespaceProxy(tc.Context(), routeHost, getAuthToken(tc.TestContext), tenantMetricsForeignNamespace, tenantMetricsQueryMetric)
+	status, parsed, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, getAuthToken(tc.TestContext), tenantMetricsForeignNamespace, tenantMetricsQueryMetric)
 	require.NoError(t, err, "privileged query for foreign namespace must reach the proxy")
 	require.Equal(t, http.StatusOK, status)
 	require.Empty(t, parsed.Data.Result,
@@ -321,11 +333,13 @@ func (tc *MonitoringTestCtx) requestServiceAccountToken(t *testing.T, namespace,
 
 // queryMetricsViaNamespaceProxy sends a namespace-restricted instant query
 // through the data-science-prometheus-route and returns the HTTP status along
-// with the parsed response. A non-200 status is returned, not errored, so
-// callers can assert on authorization and filtering behavior; the response
-// body is only JSON-parsed for successful queries because kube-rbac-proxy
-// authorization failures (401/403) return plain-text bodies.
-func queryMetricsViaNamespaceProxy(ctx context.Context, routeHost, token, namespace, query string) (int, prometheusQueryResponse, error) {
+// with the parsed response. rootCAs must contain the CA that signed the route
+// certificate (see clusterIngressCAPool); it replaces the system pool. A
+// non-200 status is returned, not errored, so callers can assert on
+// authorization and filtering behavior; the response body is only JSON-parsed
+// for successful queries because kube-rbac-proxy authorization failures
+// (401/403) return plain-text bodies.
+func queryMetricsViaNamespaceProxy(ctx context.Context, rootCAs *x509.CertPool, routeHost, token, namespace, query string) (int, prometheusQueryResponse, error) {
 	var parsed prometheusQueryResponse
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+routeHost+"/api/v1/query", nil)
@@ -339,9 +353,13 @@ func queryMetricsViaNamespaceProxy(ctx context.Context, routeHost, token, namesp
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	httpClient := &http.Client{
-		// ROSA route certificates are trusted by the runner's system CA bundle.
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}},
-		Timeout:   30 * time.Second,
+		// The route certificate is signed by the cluster ingress CA, which
+		// private clusters do not add to the runner's system CA bundle.
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    rootCAs,
+		}},
+		Timeout: 30 * time.Second,
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -361,4 +379,76 @@ func queryMetricsViaNamespaceProxy(ctx context.Context, routeHost, token, namesp
 			query, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return resp.StatusCode, parsed, nil
+}
+
+// TestQueryMetricsViaNamespaceProxyTLS proves locally that
+// queryMetricsViaNamespaceProxy honors the supplied CA pool: a server whose
+// certificate chains to the pool must be queried successfully, while a pool
+// without the signing CA must fail the TLS handshake instead of silently
+// falling back to the system roots.
+func TestQueryMetricsViaNamespaceProxyTLS(t *testing.T) {
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err, "failed to generate CA key")
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "tenant-metrics-test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	require.NoError(t, err, "failed to create CA certificate")
+	caCert, err := x509.ParseCertificate(caDER)
+	require.NoError(t, err, "failed to parse CA certificate")
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err, "failed to generate server key")
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:     []string{"localhost"},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)
+	require.NoError(t, err, "failed to create server certificate")
+
+	responseBody := `{"status":"success","data":{"result":[{"metric":{"namespace":"trusted-ns","pod":"trusted-pod"}}]}}`
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, responseBody)
+	}))
+	server.TLS = &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		Certificates: []tls.Certificate{{
+			Certificate: [][]byte{leafDER},
+			PrivateKey:  leafKey,
+		}},
+	}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	routeHost := strings.TrimPrefix(server.URL, "https://")
+
+	trustedPool := x509.NewCertPool()
+	trustedPool.AddCert(caCert)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+
+	status, parsed, err := queryMetricsViaNamespaceProxy(ctx, trustedPool, routeHost, "token", "trusted-ns", "up")
+	require.NoError(t, err, "query against server trusted by the supplied pool must succeed")
+	require.Equal(t, http.StatusOK, status)
+	require.Len(t, parsed.Data.Result, 1)
+	require.Equal(t, "trusted-ns", parsed.Data.Result[0].Metric["namespace"])
+
+	// A non-nil pool without the signing CA must not fall back to the system
+	// roots: the handshake has to fail instead.
+	untrustedPool := x509.NewCertPool()
+	_, _, err = queryMetricsViaNamespaceProxy(ctx, untrustedPool, routeHost, "token", "trusted-ns", "up")
+	require.Error(t, err, "query against a server whose CA is absent from the pool must fail the TLS handshake")
 }
