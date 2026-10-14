@@ -193,7 +193,9 @@ func (cm *ConditionsManager) MarkUnknown(condType string) {
 // Conditions with ConditionSeverityInfo (intentionally not configured features)
 // are excluded from Degraded aggregation — they represent user intent, not failures.
 //
-// Ready = True when MonitoringDependenciesReady is True and no configured feature is actively failing.
+// Ready = False when MonitoringDependenciesReady is not True. A failed configured
+// feature leaves Ready=True and sets Degraded=True to report partial availability.
+// Ready is Unknown while a configured feature is initializing and none is failing.
 // ProvisioningSucceeded = True when MonitoringDependenciesReady is True (manifests applied without error).
 // Degraded = True when a configured feature is failing (CRD missing, operator unavailable, etc.).
 func (cm *ConditionsManager) AggregateReady() {

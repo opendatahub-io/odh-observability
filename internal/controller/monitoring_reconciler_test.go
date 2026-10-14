@@ -27,6 +27,7 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	appsv1 "k8s.io/api/apps/v1"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -140,6 +141,18 @@ func operatorConditionListForbidden() interceptor.Funcs {
 	}
 }
 
+func selfSubjectRulesReviewInterceptor(reviewErr error) interceptor.Funcs {
+	return interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*authorizationv1.SelfSubjectRulesReview); ok {
+				// An empty rule set models a clean namespace with no collectable resources.
+				return reviewErr
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	}
+}
+
 func TestReadPlatformVersion(t *testing.T) {
 	const ns = "apps-ns"
 
@@ -226,7 +239,8 @@ func TestReconcile_Removed(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.ManagementState = platformcommon.Removed
 
-	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build())
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
+		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(nil)).Build())
 
 	_, err := r.reconcile(context.Background(), m)
 	if err != nil {
@@ -252,6 +266,21 @@ func TestReconcile_Removed(t *testing.T) {
 	}
 	if dependenciesReady != string(metav1.ConditionFalse) {
 		t.Errorf("MonitoringDependenciesReady: want False, got %q", dependenciesReady)
+	}
+}
+
+func TestReconcile_Removed_CleanupError(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.ManagementState = platformcommon.Removed
+	cleanupErr := errors.New("rule review failed")
+
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
+		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(cleanupErr)).Build())
+
+	_, err := r.reconcile(context.Background(), m)
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("expected cleanup error to be returned for retry, got %v", err)
 	}
 }
 
@@ -390,7 +419,8 @@ func TestReconcile_NothingConfigured(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	// No Metrics/Traces configured: no operator precondition checks triggered.
 
-	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build())
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
+		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(nil)).Build())
 
 	_, err := r.reconcile(context.Background(), m)
 	if err != nil {
@@ -421,6 +451,19 @@ func TestReconcile_NothingConfigured(t *testing.T) {
 	}
 	if legacyAvailable != dependenciesReady {
 		t.Errorf("legacy MonitoringAvailable status %q does not match MonitoringDependenciesReady %q", legacyAvailable, dependenciesReady)
+	}
+}
+
+func TestReconcile_GarbageCollectionError(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	cleanupErr := errors.New("rule review failed")
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
+		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(cleanupErr)).Build())
+
+	_, err := r.reconcile(context.Background(), m)
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("expected garbage collection error to be returned for retry, got %v", err)
 	}
 }
 
@@ -504,7 +547,8 @@ func TestReconcile_ReleasesPopulated(t *testing.T) {
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 
-	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build())
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
+		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(nil)).Build())
 
 	_, err := r.reconcile(context.Background(), m)
 	if err != nil {
@@ -548,7 +592,8 @@ func TestReconcile_PlatformVersionStampedIntoStatus(t *testing.T) {
 
 	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).
 		WithObjects(m, platformConfigMap(ns, version)).
-		WithStatusSubresource(m).Build())
+		WithStatusSubresource(m).
+		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(nil)).Build())
 
 	_, err := r.reconcile(context.Background(), m)
 	if err != nil {
@@ -743,7 +788,7 @@ func TestGarbageCollectionOwnershipAndNamespaceScope(t *testing.T) {
 	staleTargetBinding := ownedGarbageCollectionTestObject(controllergvk.RoleBinding, "team-a", targetAllocatorSecretRBACName, monitoring.UID)
 	otherMonitoringRole := ownedGarbageCollectionTestObject(controllergvk.Role, "team-a", targetAllocatorSecretRBACName, types.UID("other-monitoring"))
 	staleMonitoringConfigMap := ownedGarbageCollectionTestObject(schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}, monitoring.Spec.Namespace, "stale-config", monitoring.UID)
-	clusterRole := ownedGarbageCollectionTestObject(controllergvk.ClusterRole, "", "stale-cluster-role", monitoring.UID)
+	clusterRole := ownedGarbageCollectionTestObject(controllergvk.ClusterRole, "", "data-science-metrics-view", monitoring.UID)
 
 	desiredTargetRole := resourceKey{
 		gvk:       staleTargetRole.GroupVersionKind(),
@@ -907,7 +952,8 @@ func TestReconcile_ObservedGenerationSet(t *testing.T) {
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Generation = 7
 
-	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).Build())
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
+		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(nil)).Build())
 
 	_, err := r.reconcile(context.Background(), m)
 	if err != nil {

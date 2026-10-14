@@ -51,9 +51,14 @@ webhooks:
         namespace: {{ .Values.operatorNamespace }}
         path: /mutate-prometheus-monitors
         port: 9443
-    failurePolicy: Ignore
+    failurePolicy: Fail
+    timeoutSeconds: 5
     namespaceSelector:
       matchExpressions:
+        - key: monitoring.opendatahub.io/scrape
+          operator: In
+          values:
+            - "true"
         - key: kubernetes.io/metadata.name
           operator: NotIn
           values:
@@ -74,9 +79,14 @@ webhooks:
         namespace: {{ .Values.operatorNamespace }}
         path: /mutate-prometheus-monitors
         port: 9443
-    failurePolicy: Ignore
+    failurePolicy: Fail
+    timeoutSeconds: 5
     namespaceSelector:
       matchExpressions:
+        - key: monitoring.opendatahub.io/scrape
+          operator: In
+          values:
+            - "true"
         - key: kubernetes.io/metadata.name
           operator: NotIn
           values:

@@ -114,30 +114,30 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 	registerProbeCleanup(restrictedSA)
 	setupRestrictedProbeAccess(t, tc, restrictedName, identitySuffix, registerProbeCleanup)
 
-	postRole := &rbacv1.Role{
+	metricsRole := &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      authorizedName + "-post",
+			Name:      authorizedName + "-metrics",
 			Namespace: tc.MonitoringNamespace,
 		},
 		Rules: []rbacv1.PolicyRule{{
 			APIGroups: []string{"metrics.k8s.io"},
 			Resources: []string{"pods"},
-			Verbs:     []string{"get", "create"},
+			Verbs:     []string{"get"},
 		}},
 	}
-	if err := tc.Client().Create(tc.Context(), postRole); err != nil {
-		t.Fatalf("failed to create POST probe Role: %v", err)
+	if err := tc.Client().Create(tc.Context(), metricsRole); err != nil {
+		t.Fatalf("failed to create metrics probe Role: %v", err)
 	}
-	registerProbeCleanup(postRole)
-	postRoleBinding := &rbacv1.RoleBinding{
+	registerProbeCleanup(metricsRole)
+	metricsRoleBinding := &rbacv1.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      authorizedName + "-post",
+			Name:      authorizedName + "-metrics",
 			Namespace: tc.MonitoringNamespace,
 		},
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "Role",
-			Name:     postRole.Name,
+			Name:     metricsRole.Name,
 		},
 		Subjects: []rbacv1.Subject{{
 			Kind:      "ServiceAccount",
@@ -145,10 +145,10 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 			Namespace: tc.MonitoringNamespace,
 		}},
 	}
-	if err := tc.Client().Create(tc.Context(), postRoleBinding); err != nil {
-		t.Fatalf("failed to create POST probe RoleBinding: %v", err)
+	if err := tc.Client().Create(tc.Context(), metricsRoleBinding); err != nil {
+		t.Fatalf("failed to create metrics probe RoleBinding: %v", err)
 	}
-	registerProbeCleanup(postRoleBinding)
+	registerProbeCleanup(metricsRoleBinding)
 
 	authorizedToken := authorizedThanosProbeToken(t, tc, authorizedName)
 	restrictedToken := serviceAccountToken(t, tc, restrictedName)
@@ -182,11 +182,22 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 		return nil
 	}).WithTimeout(5*time.Minute).WithPolling(5*time.Second).Should(Succeed(), "authorized Thanos route query should return populated namespace data")
 	logThanosRouteEvidence(t, "authorized", authorized)
-	for _, labels := range authorized.Labels {
-		if labels["namespace"] != tc.MonitoringNamespace {
-			t.Fatalf("authorized response returned a series outside %q: namespace=%q", tc.MonitoringNamespace, labels["namespace"])
-		}
+	assertThanosRouteNamespaceSeries(t, "authorized", authorized.Labels, tc.MonitoringNamespace)
+
+	// Prometheus POST queries are read-only and must work with only the metrics
+	// get permission granted above.
+	authorizedPOST, err := probeThanosRoutePostWithError(rootCAs, routeHost, authorizedToken, tc.MonitoringNamespace, "", thanosRouteProbeQuery)
+	if err != nil {
+		t.Fatalf("authorized POST probe failed: %v", err)
 	}
+	logThanosRouteEvidence(t, "authorized-post", authorizedPOST)
+	if authorizedPOST.HTTPStatus != http.StatusOK || authorizedPOST.PrometheusStatus != "success" || len(authorizedPOST.Labels) == 0 {
+		t.Fatalf(
+			"authorized POST query should return namespace data, got http_status=%d prometheus_status=%q series_count=%d",
+			authorizedPOST.HTTPStatus, authorizedPOST.PrometheusStatus, len(authorizedPOST.Labels),
+		)
+	}
+	assertThanosRouteNamespaceSeries(t, "authorized POST", authorizedPOST.Labels, tc.MonitoringNamespace)
 
 	// Keep the selector broad enough to match the known series returned above;
 	// otherwise an empty response would make the namespace-boundary assertion vacuous.
@@ -198,11 +209,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 	if len(crafted.Labels) == 0 {
 		t.Fatalf("authorized crafted-selector query returned no metric series")
 	}
-	for _, labels := range crafted.Labels {
-		if labels["namespace"] != tc.MonitoringNamespace {
-			t.Fatalf("crafted selector escaped the authorized namespace boundary: namespace=%q", labels["namespace"])
-		}
-	}
+	assertThanosRouteNamespaceSeries(t, "crafted selector", crafted.Labels, tc.MonitoringNamespace)
 
 	duplicateNamespace, err := probeThanosRoutePostWithError(
 		rootCAs,
@@ -218,6 +225,15 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 	logThanosRouteEvidence(t, "authorized-duplicate-namespace-post", duplicateNamespace)
 	if duplicateNamespace.HTTPStatus != http.StatusBadRequest {
 		t.Fatalf("POST with conflicting URL and form namespace values must be rejected, got %d", duplicateNamespace.HTTPStatus)
+	}
+}
+
+func assertThanosRouteNamespaceSeries(t *testing.T, persona string, series []map[string]string, namespace string) {
+	t.Helper()
+	for _, labels := range series {
+		if labels["namespace"] != namespace {
+			t.Fatalf("%s response returned a series outside %q: namespace=%q", persona, namespace, labels["namespace"])
+		}
 	}
 }
 
@@ -254,7 +270,7 @@ func setupRestrictedProbeAccess(t *testing.T, tc *MonitoringTestCtx, restrictedN
 		Rules: []rbacv1.PolicyRule{{
 			APIGroups: []string{"metrics.k8s.io"},
 			Resources: []string{"pods"},
-			Verbs:     []string{"get", "create"},
+			Verbs:     []string{"get"},
 		}},
 	}
 	createAndRegisterProbeObject(t, tc, restrictedMetricsRole, "restricted probe metrics Role", registerCleanup)
@@ -466,7 +482,9 @@ func probeThanosRoutePostWithError(rootCAs *x509.CertPool, routeHost, token, url
 	endpoint.RawQuery = query.Encode()
 
 	form := url.Values{}
-	form.Set("namespace", formNamespace)
+	if formNamespace != "" {
+		form.Set("namespace", formNamespace)
+	}
 	form.Set("query", promQL)
 	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint.String(), strings.NewReader(form.Encode()))
 	if err != nil {

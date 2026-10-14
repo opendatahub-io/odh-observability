@@ -203,7 +203,8 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	if monitoring.Spec.ManagementState == platformcommon.Removed {
 		log.Info("ManagementState is Removed, deleting all owned resources")
 		if err := r.deleteAllOwned(ctx, monitoring); err != nil {
-			log.Error(err, "Failed to delete owned resources, will retry on next reconcile")
+			log.Error(err, "Failed to delete owned resources during Removed state cleanup")
+			return ctrl.Result{}, err
 		}
 		cm.MarkNotConfigured(conditions.ConditionMonitoringDependenciesReady, "Removed", "Monitoring is in Removed state")
 		cm.MarkNotConfigured(conditions.ConditionMonitoringAvailable, "Removed", "Monitoring is in Removed state")
@@ -308,7 +309,7 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 
 	// Garbage-collect stale owned resources via API discovery.
 	if err := r.collectGarbage(ctx, monitoring, desired); err != nil {
-		log.Error(err, "Garbage collection encountered errors")
+		return ctrl.Result{}, fmt.Errorf("collecting stale owned resources: %w", err)
 	}
 
 	r.syncPostDeployResources(ctx, monitoring, cm)

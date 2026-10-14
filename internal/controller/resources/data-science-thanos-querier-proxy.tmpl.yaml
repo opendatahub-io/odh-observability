@@ -57,6 +57,7 @@ data:
       resourceAttributes:
         apiGroup: metrics.k8s.io
         resource: pods
+        verb: get
         namespace: "{{ "{{ .Value }}" }}"
 ---
 # REQUIRED QUERY FORMAT: /api/v1/query?query=<promql>&namespace=<namespace-name>
