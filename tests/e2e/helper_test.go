@@ -772,6 +772,13 @@ func withNoUsageLogs() jq.TransformFn {
 	return jq.Transform(`del(.spec.usageLogs)`)
 }
 
+func withLogsStorage(storageType, secretName, storageClassName string) jq.TransformFn {
+	if storageClassName == "" {
+		return jq.Transform(`.spec.logs = {"storage": {"type": "%s", "secretName": "%s"}}`, storageType, secretName)
+	}
+	return jq.Transform(`.spec.logs = {"storage": {"type": "%s", "secretName": "%s", "storageClassName": "%s"}}`, storageType, secretName, storageClassName)
+}
+
 func withUsageLogsStorage(storageType, secretName, storageClassName string) jq.TransformFn {
 	if storageClassName == "" {
 		return jq.Transform(`.spec.usageLogs.storage = {"type": "%s", "secretName": "%s"}`, storageType, secretName)

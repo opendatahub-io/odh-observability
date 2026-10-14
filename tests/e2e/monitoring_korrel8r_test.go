@@ -44,6 +44,7 @@ func (tc *MonitoringTestCtx) runKorrel8rTests(t *testing.T) {
 		tc = tc.WithT(t)
 
 		t.Run("reconciles a ready TLS query service", tc.ValidateKorrel8rResources)
+		t.Run("serves bounded authenticated API requests", tc.ValidateKorrel8rAPIContract)
 	})
 }
 
