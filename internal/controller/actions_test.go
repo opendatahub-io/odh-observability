@@ -1857,6 +1857,7 @@ func assertKorrel8rTLSEndpoint(t *testing.T, deployment, service, networkPolicy 
 	t.Helper()
 	if deployment == nil || service == nil || networkPolicy == nil {
 		t.Fatal("rendered Korrel8r resources are incomplete")
+		return
 	}
 	containers, found, err := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
 	if err != nil || !found || len(containers) != 1 {

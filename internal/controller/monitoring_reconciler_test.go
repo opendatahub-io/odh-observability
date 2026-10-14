@@ -298,6 +298,7 @@ func TestReconcile_PreconditionsFailed(t *testing.T) {
 	}
 	if dependenciesReady == nil {
 		t.Fatal("MonitoringDependenciesReady condition was not reported")
+		return
 	}
 	if dependenciesReady.Status != metav1.ConditionFalse {
 		t.Errorf("MonitoringDependenciesReady: want False, got %q", dependenciesReady.Status)
@@ -363,6 +364,7 @@ func TestReconcile_LoggingPreconditionsFailed(t *testing.T) {
 	}
 	if dependenciesReady == nil {
 		t.Fatal("MonitoringDependenciesReady condition was not reported")
+		return
 	}
 	if dependenciesReady.Status != metav1.ConditionFalse || dependenciesReady.Reason != "MissingOperator" {
 		t.Errorf("MonitoringDependenciesReady: want False/MissingOperator, got %s/%s",
