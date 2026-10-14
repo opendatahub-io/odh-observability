@@ -1,7 +1,9 @@
 package e2e_test
 
 import (
+	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -934,12 +936,11 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 	} {
 		if testOpts.installOperators {
 			tc.g.Eventually(func() error {
-				_, err := olm.OperatorExists(tc.Context(), tc.Client(), name)
-				return err
+				return operatorExists(tc.Context(), tc.Client(), name)
 			}).WithTimeout(tc.Timeouts.olmOperationTimeout).Should(Succeed(),
 				"required OLM operator %s should be installed", name)
 		} else {
-			_, err := olm.OperatorExists(tc.Context(), tc.Client(), name)
+			err := operatorExists(tc.Context(), tc.Client(), name)
 			require.NoError(t, err, "required OLM operator %s is missing", name)
 		}
 	}
@@ -967,6 +968,30 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 
 	tc.ensureNamespaceExists(tc.MonitoringNamespace)
 	tc.resetMonitoringConfigToManaged()
+}
+
+// operatorExists checks the OLM OperatorCondition API version served by the
+// cluster before falling back to the shared OLM detector. Some OpenShift OLM
+// environments serve OperatorCondition as v1, while newer environments may
+// expose the v2 or ClusterExtension APIs used by olm.OperatorExists.
+func operatorExists(ctx context.Context, cli client.Reader, operatorPrefix string) error {
+	conditions := &unstructured.UnstructuredList{}
+	conditions.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "operators.coreos.com", Version: "v1", Kind: "OperatorCondition",
+	})
+	if err := cli.List(ctx, conditions); err == nil {
+		expectedPrefix := operatorPrefix + "."
+		for _, condition := range conditions.Items {
+			if strings.HasPrefix(condition.GetName(), expectedPrefix) {
+				return nil
+			}
+		}
+	} else if !meta.IsNoMatchError(err) {
+		return err
+	}
+
+	_, err := olm.OperatorExists(ctx, cli, operatorPrefix)
+	return err
 }
 
 // installDependentOperators installs required OLM operators. Cert-manager is
