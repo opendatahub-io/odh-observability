@@ -553,18 +553,18 @@ func queryMetricsViaNamespaceProxy(ctx context.Context, rootCAs *x509.CertPool, 
 		return resp.StatusCode, parsed, nil
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return resp.StatusCode, parsed, fmt.Errorf("query %q returned status %d with unparsable body: %s",
-			query, resp.StatusCode, strings.TrimSpace(string(body)))
+		return resp.StatusCode, parsed, fmt.Errorf("query %q returned status %d with %d unparsable bytes: %w",
+			query, resp.StatusCode, len(body), err)
 	}
 	return resp.StatusCode, parsed, nil
 }
 
-// TestQueryMetricsViaNamespaceProxyTLS proves locally that
-// queryMetricsViaNamespaceProxy honors the supplied CA pool: a server whose
-// certificate chains to the pool must be queried successfully, while a pool
-// without the signing CA must fail the TLS handshake instead of silently
-// falling back to the system roots.
-func TestQueryMetricsViaNamespaceProxyTLS(t *testing.T) {
+// startQueriedTLSServer starts a local TLS server whose certificate chains
+// to a freshly generated CA, returning the server and a pool trusting that
+// CA. It exists to exercise queryMetricsViaNamespaceProxy without a cluster.
+func startQueriedTLSServer(t *testing.T, handler http.HandlerFunc) (*httptest.Server, *x509.CertPool) {
+	t.Helper()
+
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err, "failed to generate CA key")
 	caTemplate := &x509.Certificate{
@@ -596,11 +596,7 @@ func TestQueryMetricsViaNamespaceProxyTLS(t *testing.T) {
 	leafDER, err := x509.CreateCertificate(rand.Reader, leafTemplate, caCert, &leafKey.PublicKey, caKey)
 	require.NoError(t, err, "failed to create server certificate")
 
-	responseBody := `{"status":"success","data":{"result":[{"metric":{"namespace":"trusted-ns","pod":"trusted-pod"}}]}}`
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, responseBody)
-	}))
+	server := httptest.NewUnstartedServer(handler)
 	server.TLS = &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		Certificates: []tls.Certificate{{
@@ -611,10 +607,23 @@ func TestQueryMetricsViaNamespaceProxyTLS(t *testing.T) {
 	server.StartTLS()
 	t.Cleanup(server.Close)
 
-	routeHost := strings.TrimPrefix(server.URL, "https://")
-
 	trustedPool := x509.NewCertPool()
 	trustedPool.AddCert(caCert)
+	return server, trustedPool
+}
+
+// TestQueryMetricsViaNamespaceProxyTLS proves locally that
+// queryMetricsViaNamespaceProxy honors the supplied CA pool: a server whose
+// certificate chains to the pool must be queried successfully, while a pool
+// without the signing CA must fail the TLS handshake instead of silently
+// falling back to the system roots.
+func TestQueryMetricsViaNamespaceProxyTLS(t *testing.T) {
+	server, trustedPool := startQueriedTLSServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":"success","data":{"result":[{"metric":{"namespace":"trusted-ns","pod":"trusted-pod"}}]}}`)
+	})
+
+	routeHost := strings.TrimPrefix(server.URL, "https://")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 
@@ -629,4 +638,27 @@ func TestQueryMetricsViaNamespaceProxyTLS(t *testing.T) {
 	untrustedPool := x509.NewCertPool()
 	_, _, err = queryMetricsViaNamespaceProxy(ctx, untrustedPool, routeHost, "token", "trusted-ns", "up")
 	require.Error(t, err, "query against a server whose CA is absent from the pool must fail the TLS handshake")
+}
+
+// TestQueryMetricsViaNamespaceProxyMalformedBody proves locally that JSON
+// decode failures produce a diagnostic error carrying the HTTP status, the
+// body size and the decode error — but never the response body itself, which
+// the proxy does not control and which may contain sensitive content.
+func TestQueryMetricsViaNamespaceProxyMalformedBody(t *testing.T) {
+	const sentinel = "SECRET-SENSITIVE-BODY-CONTENT"
+	server, trustedPool := startQueriedTLSServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, "not json: "+sentinel)
+	})
+
+	routeHost := strings.TrimPrefix(server.URL, "https://")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+
+	status, _, err := queryMetricsViaNamespaceProxy(ctx, trustedPool, routeHost, "token", "any-ns", "up")
+	require.Error(t, err, "a 200 response with an unparsable body must produce a decode error")
+	require.Equal(t, http.StatusOK, status)
+	require.Contains(t, err.Error(), "status 200", "the error must carry the HTTP status")
+	require.Contains(t, err.Error(), "unparsable bytes", "the error must carry the body size")
+	require.NotContains(t, err.Error(), sentinel, "the error must not embed the response body")
 }
