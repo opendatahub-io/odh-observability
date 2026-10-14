@@ -955,9 +955,11 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 	tc.resetMonitoringConfigToManaged()
 }
 
-// installDependentOperators installs required OLM operators in parallel sub-tests.
-// Each operator gets its own namespace, OperatorGroup, and Subscription when it is
-// not already present.
+// installDependentOperators installs required OLM operators. Cert-manager is
+// installed first because the OpenTelemetry Operator detects cert-manager only
+// during startup. The remaining operators are installed in parallel sub-tests.
+// Each operator gets its own namespace, OperatorGroup, and Subscription when it
+// is not already present.
 func (tc *TestContext) installDependentOperators(t *testing.T) {
 	t.Helper()
 
@@ -967,11 +969,20 @@ func (tc *TestContext) installDependentOperators(t *testing.T) {
 		channel   string
 	}
 
+	t.Run(certManagerOpName, func(t *testing.T) {
+		t.Helper()
+		tc.EnsureOperatorInstalled(certManagerOpNamespace, certManagerOpName, certManagerOpChannel)
+	})
+	// The OpenTelemetry Operator checks the cert-manager API group and its own
+	// permissions while starting its webhook. Do not start it until the CRD is
+	// visible, otherwise its one-time autodetection can cache cert-manager as
+	// unavailable for the rest of the test.
+	tc.ensureCRDExists(t, gvk.CertManagerCertificate)
+
 	operators := []operator{
 		{observabilityOpNamespace, observabilityOpName, observabilityOpChannel},
 		{tempoOpNamespace, tempoOpName, tempoOpChannel},
 		{opentelemetryOpNamespace, opentelemetryOpName, opentelemetryOpChannel},
-		{certManagerOpNamespace, certManagerOpName, certManagerOpChannel},
 	}
 
 	t.Run("install-dependent-operators", func(t *testing.T) {
