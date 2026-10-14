@@ -1680,6 +1680,7 @@ func TestDeployKorrel8r_GatedBySignalConfiguration(t *testing.T) {
 			condition := findCondition(m, conditions.ConditionKorrel8rAvailable)
 			if condition == nil {
 				t.Fatal("expected Korrel8rAvailable condition")
+				return
 			}
 			if condition.Status != tt.wantStatus {
 				t.Errorf("status: want %s, got %s", tt.wantStatus, condition.Status)
