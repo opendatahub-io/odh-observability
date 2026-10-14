@@ -915,7 +915,7 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 		"cluster-observability-operator",
 		"tempo-operator",
 		"opentelemetry-operator",
-		"cert-manager-operator",
+		certManagerOpName,
 		"loki-operator",
 	} {
 		if testOpts.installOperators {
