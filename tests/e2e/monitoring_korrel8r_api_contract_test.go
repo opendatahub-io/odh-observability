@@ -32,7 +32,8 @@ auth="Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/
 
 status=$(curl --noproxy '*' -sS --max-time 30 --cacert "$ca" -H "$auth" -o /tmp/domains -w '%{http_code}' "$base/api/v1alpha1/domains") || fail "domains request transport"
 [ "$status" = "200" ] || fail "domains returned HTTP $status"
-grep -Eq '"(k8s|metric)"' /tmp/domains || fail "domains response omitted configured domains"
+grep -Eq '"k8s"' /tmp/domains || fail "domains response omitted the k8s domain"
+grep -Eq '"metric"' /tmp/domains || fail "domains response omitted the metric domain"
 
 status=$(curl --noproxy '*' -sS --max-time 30 --cacert "$ca" -H "$auth" -o /dev/null -w '%{http_code}' "$base/api/v1alpha1/config") || fail "config request transport"
 [ "$status" = "404" ] || fail "config returned HTTP $status instead of 404"
