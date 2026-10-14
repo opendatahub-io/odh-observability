@@ -74,6 +74,7 @@ const (
 	opentelemetryOpChannel   = "stable"
 
 	certManagerOpName      = "openshift-cert-manager-operator"
+	certManagerOpPackage   = "cert-manager-operator"
 	certManagerOpNamespace = "cert-manager-operator"
 	certManagerOpChannel   = "stable-v1"
 
@@ -928,7 +929,7 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 		"cluster-observability-operator",
 		"tempo-operator",
 		"opentelemetry-operator",
-		certManagerOpName,
+		certManagerOpPackage,
 		"loki-operator",
 	} {
 		if testOpts.installOperators {
@@ -990,7 +991,12 @@ func (tc *TestContext) installDependentOperators(t *testing.T) {
 	// permissions while starting its webhook. Do not start it until the CRD is
 	// visible, otherwise its one-time autodetection can cache cert-manager as
 	// unavailable for the rest of the test.
-	tc.ensureCRDExists(t, gvk.CertManagerCertificate)
+	tc.g.Eventually(func() error {
+		certificates := &unstructured.UnstructuredList{}
+		certificates.SetGroupVersionKind(gvk.CertManagerCertificate)
+		return tc.client.List(tc.ctx, certificates, client.Limit(1))
+	}).WithTimeout(tc.Timeouts.olmOperationTimeout).Should(Succeed(),
+		"cert-manager Certificate API should be discoverable before OpenTelemetry starts")
 
 	operators := []operator{
 		{observabilityOpNamespace, observabilityOpName, cooOperatorChannel()},
