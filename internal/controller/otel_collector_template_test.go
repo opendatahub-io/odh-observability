@@ -377,18 +377,10 @@ func metricsPipelines(t *testing.T, collector unstructured.Unstructured) map[str
 	return result
 }
 
-// TestOTLPPipelineSanitizesClientSuppliedIdentity guards the OTLP metrics
-// trust boundary. Pushers control the resource attributes they send, and the
-// collector ServiceMonitor promotes k8s.namespace.name/k8s.pod.name (exported
-// as k8s_namespace_name/k8s_pod_name) to namespace/pod, so the OTLP pipeline
-// must strip every spelling of client-supplied identity attributes before
-// enrichment runs and must associate pods from the network connection only:
-// the default association would consult client-supplied k8s.pod.ip first.
-// The scrape pipeline keeps the shared processors and must not run the OTLP
-// sanitizer, because its k8s attributes come from trusted Kubernetes
-// discovery metadata.
-func TestOTLPPipelineSanitizesClientSuppliedIdentity(t *testing.T) {
-	collector := renderCollectorTemplate(t)
+// renderedProcessors returns the processors section of the rendered
+// collector, failing the test unless it is present.
+func renderedProcessors(t *testing.T, collector unstructured.Unstructured) map[string]any {
+	t.Helper()
 
 	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
 	if err != nil || !found {
@@ -398,6 +390,20 @@ func TestOTLPPipelineSanitizesClientSuppliedIdentity(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("collector processors must be present in rendered resource: found=%t, error=%v", found, err)
 	}
+	return processors
+}
+
+// TestOTLPPipelineSanitizesClientSuppliedIdentity guards the OTLP metrics
+// trust boundary. Pushers control the resource attributes they send, and the
+// collector ServiceMonitor promotes k8s.namespace.name/k8s.pod.name (exported
+// as k8s_namespace_name/k8s_pod_name) to namespace/pod, so the OTLP
+// pipeline's sanitizer must strip every spelling of client-supplied identity
+// attributes before enrichment runs, and its k8sattributes/otlp processor
+// must associate pods from the network connection only: the default
+// association would consult client-supplied k8s.pod.ip first.
+func TestOTLPPipelineSanitizesClientSuppliedIdentity(t *testing.T) {
+	collector := renderCollectorTemplate(t)
+	processors := renderedProcessors(t, collector)
 
 	k8sAttributes, found, err := unstructured.NestedMap(processors, "k8sattributes/otlp")
 	if err != nil || !found {
@@ -431,30 +437,15 @@ func TestOTLPPipelineSanitizesClientSuppliedIdentity(t *testing.T) {
 	if !ok || len(metricStatements) != 2 {
 		t.Fatalf("OTLP identity sanitize transform must contain two metric statement blocks (resource and datapoint), got %v", transform["metric_statements"])
 	}
-	var resourceBlock, datapointBlock map[string]any
-	for _, rawBlock := range metricStatements {
-		block, ok := rawBlock.(map[string]any)
-		if !ok {
-			t.Fatalf("OTLP identity sanitize statement block has unexpected type: %T", rawBlock)
-		}
-		switch block["context"] {
-		case "resource":
-			resourceBlock = block
-		case "datapoint":
-			datapointBlock = block
-		}
-	}
+	blocks := statementBlocksByContext(t, metricStatements)
+	resourceBlock, datapointBlock := blocks["resource"], blocks["datapoint"]
 	if resourceBlock == nil {
 		t.Fatal("OTLP identity sanitize transform must contain a resource statement block")
 	}
 	if datapointBlock == nil {
 		t.Fatal("OTLP identity sanitize transform must contain a datapoint statement block")
 	}
-	resourceStatements, ok := resourceBlock["statements"].([]any)
-	if !ok {
-		t.Fatalf("OTLP identity sanitize resource statements have unexpected type: %T", resourceBlock["statements"])
-	}
-	expectedResourceStatements := []string{
+	requireStatements(t, "OTLP identity sanitize resource", resourceBlock, []string{
 		`delete_key(attributes, "k8s.namespace.name")`,
 		`delete_key(attributes, "k8s.pod.name")`,
 		`delete_key(attributes, "k8s.pod.uid")`,
@@ -470,33 +461,21 @@ func TestOTLPPipelineSanitizesClientSuppliedIdentity(t *testing.T) {
 		`delete_key(attributes, "pod")`,
 		`delete_key(attributes, "exported_namespace")`,
 		`delete_key(attributes, "exported_pod")`,
-	}
-	if len(resourceStatements) != len(expectedResourceStatements) {
-		t.Fatalf("expected %d OTLP identity sanitize resource statements, got %d", len(expectedResourceStatements), len(resourceStatements))
-	}
-	for index, expected := range expectedResourceStatements {
-		if resourceStatements[index] != expected {
-			t.Errorf("OTLP identity sanitize resource statement %d: got %v, want %s", index, resourceStatements[index], expected)
-		}
-	}
-	datapointStatements, ok := datapointBlock["statements"].([]any)
-	if !ok {
-		t.Fatalf("OTLP identity sanitize datapoint statements have unexpected type: %T", datapointBlock["statements"])
-	}
-	expectedDatapointStatements := []string{
+	})
+	requireStatements(t, "OTLP identity sanitize datapoint", datapointBlock, []string{
 		`delete_key(attributes, "namespace")`,
 		`delete_key(attributes, "pod")`,
 		`delete_key(attributes, "exported_namespace")`,
 		`delete_key(attributes, "exported_pod")`,
-	}
-	if len(datapointStatements) != len(expectedDatapointStatements) {
-		t.Fatalf("expected %d OTLP identity sanitize datapoint statements, got %d", len(expectedDatapointStatements), len(datapointStatements))
-	}
-	for index, expected := range expectedDatapointStatements {
-		if datapointStatements[index] != expected {
-			t.Errorf("OTLP identity sanitize datapoint statement %d: got %v, want %s", index, datapointStatements[index], expected)
-		}
-	}
+	})
+}
+
+// TestOTLPMetricsPipelineWiring guards the pipeline split itself: OTLP
+// metrics must enter through metrics/otlp so they cannot bypass the identity
+// sanitizer, scrape metrics must not pass through it, the sanitizer must run
+// before enrichment, and both pipelines must share exporters.
+func TestOTLPMetricsPipelineWiring(t *testing.T) {
+	collector := renderCollectorTemplate(t)
 
 	pipelines := metricsPipelines(t, collector)
 	scrapePipeline, otlpPipeline := pipelines["metrics/scrape"], pipelines["metrics/otlp"]
@@ -550,6 +529,42 @@ func TestOTLPPipelineSanitizesClientSuppliedIdentity(t *testing.T) {
 
 	if !reflect.DeepEqual(scrapePipeline["exporters"], otlpPipeline["exporters"]) {
 		t.Errorf("metrics pipelines must share exporters, scrape=%v otlp=%v", scrapePipeline["exporters"], otlpPipeline["exporters"])
+	}
+}
+
+// statementBlocksByContext indexes a transform's metric_statements blocks by
+// their context name.
+func statementBlocksByContext(t *testing.T, metricStatements []any) map[string]map[string]any {
+	t.Helper()
+
+	blocks := make(map[string]map[string]any, len(metricStatements))
+	for _, rawBlock := range metricStatements {
+		block, ok := rawBlock.(map[string]any)
+		if !ok {
+			t.Fatalf("transform statement block has unexpected type: %T", rawBlock)
+		}
+		context, _ := block["context"].(string)
+		blocks[context] = block
+	}
+	return blocks
+}
+
+// requireStatements asserts that a transform statement block carries exactly
+// the expected OTTL statements, in order.
+func requireStatements(t *testing.T, description string, block map[string]any, expected []string) {
+	t.Helper()
+
+	statements, ok := block["statements"].([]any)
+	if !ok {
+		t.Fatalf("%s statements have unexpected type: %T", description, block["statements"])
+	}
+	if len(statements) != len(expected) {
+		t.Fatalf("expected %d %s statements, got %d", len(expected), description, len(statements))
+	}
+	for index, want := range expected {
+		if statements[index] != want {
+			t.Errorf("%s statement %d: got %v, want %s", description, index, statements[index], want)
+		}
 	}
 }
 
