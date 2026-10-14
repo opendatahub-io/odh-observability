@@ -879,6 +879,7 @@ func TestDeployClusterLogForwarder_CRDMissing(t *testing.T) {
 	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
 	if c == nil {
 		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
+		return
 	}
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
@@ -922,6 +923,7 @@ func TestDeployClusterLogForwarder_LokiStackNotReady(t *testing.T) {
 	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
 	if c == nil {
 		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
+		return
 	}
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
@@ -980,6 +982,7 @@ func TestDeployClusterLogForwarder_CLFExistsButNotReady(t *testing.T) {
 	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
 	if c == nil {
 		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
+		return
 	}
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
