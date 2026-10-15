@@ -96,7 +96,12 @@ type MonitoringReconciler struct {
 // +kubebuilder:rbac:groups=perses.dev,resources=perses;persesdatasources;persesdashboards,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings;mutatingwebhookconfigurations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cert-manager.io,resources=issuers;certificates,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings;clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings;clusterroles;clusterrolebindings,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,resourceNames=data-science-collector-targetallocator-secrets,verbs=update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames=data-science-collector-mlflow-trace-export;data-science-collector-tempo-trace-export;data-science-metrics-view;data-science-usage-logs-processor;generate-processors-role;korrel8r-query,verbs=update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,resourceNames=data-science-cluster-log-forwarder-collector-collect-app-logs;data-science-cluster-log-forwarder-collector-loki-writer;data-science-collector-mlflow-trace-export;data-science-collector-tempo-trace-export;data-science-monitoringstack-alertmanager-prometheus-metrics-reader;data-science-prometheus-cluster-proxy;data-science-prometheus-cluster-proxy-auth-delegator;data-science-prometheus-namespace-proxy;data-science-prometheus-namespace-proxy-auth-delegator;data-science-usage-logs-processor;generate-processors-collector-rolebinding;generate-processors-targetallocator-rolebinding;korrel8r-auth-delegator;korrel8r-query,verbs=update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames=usage-logs-processor,verbs=delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,resourceNames=usage-logs-processor;usage-logs-loki-writer;data-science-usage-logs-loki-writer,verbs=delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
