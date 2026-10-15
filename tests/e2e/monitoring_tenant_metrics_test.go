@@ -1,6 +1,7 @@
 package e2e_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -9,29 +10,36 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/remotecommand"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
-	jq "github.com/opendatahub-io/odh-observability/tests/e2e/matchers/jq"
 
 	. "github.com/onsi/gomega" //nolint:revive // dot import is idiomatic for gomega matchers
 )
@@ -54,11 +62,10 @@ const (
 
 	prometheusRouteName = "data-science-prometheus-route"
 
-	// otlpIdentitySpoofPodName names the one-shot curl pod in the monitoring
-	// namespace that pushes an OTLP metric with forged identity attributes.
-	otlpIdentitySpoofPodName = "otlp-identity-spoof-probe"
-	// otlpIdentitySpoofedPodName is the fake pod identity the probe forges.
-	otlpIdentitySpoofedPodName = "totally-not-the-sender-pod"
+	// otlpIdentitySpoofPodName names the persistent curl pod that pushes OTLP
+	// metrics from inside the monitoring namespace.
+	otlpIdentitySpoofPodName       = "otlp-identity-spoof-probe"
+	otlpIdentityProbeContainerName = "otlp-spoof-probe"
 	// otlpIdentitySpoofMetricPrefix prefixes the pushed metric name; a unique
 	// suffix per run keeps stale series from earlier runs irrelevant.
 	otlpIdentitySpoofMetricPrefix = "odh_observability_otlp_identity_probe"
@@ -138,57 +145,343 @@ func (tc *MonitoringTestCtx) ValidateTenantWorkloadMetricsNamespaceRestriction(t
 // ValidateOTLPMetricIdentityCannotBeSpoofed proves the OTLP trust boundary:
 // a workload in the monitoring namespace (the only namespace the
 // NetworkPolicy lets push telemetry) sends a uniquely named metric whose
-// resource attributes claim a foreign tenant namespace/pod identity, in both
-// dotted and underscored spellings, plus a forged pod-IP association hint.
-// The series must still arrive — attributed to the sender's real pod in the
-// monitoring namespace — and the tenant's authorized query for its own
-// namespace must never see the injected series. Absence of the series does
-// not count as success: the delivery check runs first.
+// resource attributes claim a real victim workload's namespace/pod identity,
+// in dotted and underscored spellings, plus forged pod IP/UID association hints.
+// The series must arrive, identify the sender, and remain invisible to an
+// authorized tenant. Delivery, attribution, sanitization, and isolation are
+// reported independently so one failure does not hide the others.
 func (tc *MonitoringTestCtx) ValidateOTLPMetricIdentityCannotBeSpoofed(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
+
+	evidence := &otlpIdentityEvidence{}
+	var sender, victim otlpPodIdentity
+	defer func() {
+		if t.Failed() {
+			tc.logOTLPIdentityDiagnostics(t, evidence, sender, victim)
+		}
+	}()
 
 	tc.setupMetrics(t)
 	tc.ensureTenantMetricsEnvironment(t)
 
 	otlpHost := tc.discoverCollectorOTLPHTTPHost(t)
-
-	// Unique metric name and timestamp per run so stale series from earlier
-	// runs can never satisfy either assertion.
 	runID := strconv.FormatInt(time.Now().UnixNano(), 10)
-	metricName := otlpIdentitySpoofMetricPrefix + "_" + runID
+	// Validate the tenant route before using an empty query as evidence of
+	// isolation: the authorized tenant identity must be able to see real data.
+	routeHost := tc.fetchPrometheusRouteHost(t)
+	rootCAs := clusterIngressCAPool(t, tc)
+	viewerToken := tc.metricsViewerToken(t, "otlp-identity-viewer", tc.MonitoringNamespace)
+	tenantToken := tc.requestServiceAccountToken(t, tenantMetricsNamespace, tenantMetricsServiceAccount)
+	victim = tc.readyTenantMetricsPodIdentity(t)
+	tc.requireTenantMetricsPositiveControl(t, rootCAs, routeHost, tenantToken, victim)
 
-	// Forged identity, in every spelling the promotion chain could pick up:
-	// the dotted semconv attributes, the underscored labels the exporter's
-	// resource_to_telemetry_conversion emits, a bogus association hint, and
-	// the datapoint-level bare and exported_-prefixed identity labels.
-	payload := `{"resourceMetrics":[{"resource":{"attributes":[` +
-		`{"key":"k8s.namespace.name","value":{"stringValue":"` + tenantMetricsNamespace + `"}},` +
-		`{"key":"k8s.pod.name","value":{"stringValue":"` + otlpIdentitySpoofedPodName + `"}},` +
-		`{"key":"k8s.pod.ip","value":{"stringValue":"192.0.2.1"}},` +
-		`{"key":"k8s_namespace_name","value":{"stringValue":"` + tenantMetricsNamespace + `"}},` +
-		`{"key":"k8s_pod_name","value":{"stringValue":"` + otlpIdentitySpoofedPodName + `"}},` +
-		`{"key":"exported_namespace","value":{"stringValue":"` + tenantMetricsNamespace + `"}},` +
-		`{"key":"exported_pod","value":{"stringValue":"` + otlpIdentitySpoofedPodName + `"}}]},` +
-		`"scopeMetrics":[{"scope":{"name":"odh-observability-e2e-spoof-probe"},` +
-		`"metrics":[{"name":"` + metricName + `","gauge":{"dataPoints":[` +
-		`{"timeUnixNano":"` + runID + `","asDouble":1,"attributes":[` +
-		`{"key":"namespace","value":{"stringValue":"` + tenantMetricsNamespace + `"}},` +
-		`{"key":"pod","value":{"stringValue":"` + otlpIdentitySpoofedPodName + `"}},` +
-		`{"key":"exported_namespace","value":{"stringValue":"` + tenantMetricsNamespace + `"}},` +
-		`{"key":"exported_pod","value":{"stringValue":"` + otlpIdentitySpoofedPodName + `"}}]}]}}]}]}]}`
+	// Run probe from the monitoring namespace, matching the only OTLP ingress
+	// allowed by the collector NetworkPolicy. Keep it alive for warm-up and
+	// repeated attack submissions.
+	tc.createOTLPIdentityProbe(t)
+	probe := tc.readyOTLPIdentityProbe(t)
+	sender = podIdentity(probe)
+	require.NotEmpty(t, sender.IP, "OTLP identity probe must have a pod IP")
 
-	// The probe pod itself lives in the monitoring namespace: that is exactly
-	// the NetworkPolicy's trust boundary for OTLP pushers, so this test
-	// covers the strongest attacker the deployment model allows.
-	tc.deleteFixtureResources(otlpIdentitySpoofPodName)
-	t.Cleanup(func() {
-		tc.deleteFixtureResources(otlpIdentitySpoofPodName)
+	collectorPods := tc.readyCollectorReplicaPods(t)
+	scrapeInterval := tc.collectorPrometheusScrapeInterval(t)
+	warmupResults := tc.warmCollectorReplicas(t, collectorPods, runID, sender, scrapeInterval, rootCAs, routeHost, viewerToken)
+	evidence.warmups = warmupResults
+
+	metricName := otlpIdentitySpoofMetricPrefix + "_attack_" + runID
+	resourceAttributes := map[string]string{
+		"k8s.namespace.name": tenantMetricsNamespace,
+		"k8s.pod.name":       victim.Name,
+		"k8s.pod.uid":        string(victim.UID),
+		"k8s.pod.ip":         victim.IP,
+		"k8s_namespace_name": tenantMetricsNamespace,
+		"k8s_pod_name":       victim.Name,
+		"namespace":          tenantMetricsNamespace,
+		"pod":                victim.Name,
+		"exported_namespace": tenantMetricsNamespace,
+		"exported_pod":       victim.Name,
+	}
+	observationWindow := 3 * scrapeInterval
+	pollInterval := max(time.Second, min(scrapeInterval/3, 10*time.Second))
+	observationWindow += pollInterval
+	t.Logf("observing OTLP delivery and tenant isolation for %s (Prometheus scrape interval %s)", observationWindow, scrapeInterval)
+
+	started := time.Now()
+	deadline := started.Add(observationWindow)
+	for attempt := 1; ; attempt++ {
+		datapointAttributes := map[string]string{
+			"namespace":          tenantMetricsNamespace,
+			"pod":                victim.Name,
+			"exported_namespace": tenantMetricsNamespace,
+			"exported_pod":       victim.Name,
+			"k8s_namespace_name": tenantMetricsNamespace,
+			"k8s_pod_name":       victim.Name,
+			"probe_attempt":      strconv.Itoa(attempt),
+		}
+		payload, payloadErr := buildOTLPMetricsPayload(metricName, time.Now(), resourceAttributes, datapointAttributes)
+		if payloadErr != nil {
+			evidence.lastPushError = payloadErr.Error()
+		} else {
+			push := tc.pushOTLPMetrics(t, otlpHost, payload)
+			evidence.pushAttempts++
+			evidence.lastPushStatus = push.status
+			if push.err == nil {
+				evidence.acceptedPushes++
+				evidence.lastPushError = ""
+			} else {
+				evidence.lastPushError = push.err.Error()
+			}
+		}
+
+		snapshot := otlpIdentitySnapshot{
+			at:         time.Now(),
+			monitoring: queryOTLPMetric(tc.Context(), rootCAs, routeHost, viewerToken, tc.MonitoringNamespace, metricName),
+			tenant:     queryOTLPMetric(tc.Context(), rootCAs, routeHost, tenantToken, tenantMetricsNamespace, metricName),
+		}
+		evidence.snapshots = append(evidence.snapshots, snapshot)
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(pollInterval)
+	}
+
+	for _, warmup := range warmupResults {
+		result := warmup
+		t.Run("collector replica warm-up/"+result.collectorPod, func(t *testing.T) {
+			require.True(t, result.attributed,
+				"warm-up metric must be attributed to sender %s/%s on collector replica %s; last push error: %s",
+				sender.Namespace, sender.Name, result.collectorPod, result.lastPushError)
+		})
+	}
+	t.Run("OTLP delivery", func(t *testing.T) {
+		require.NoError(t, otlpDeliveryError(evidence, metricName))
 	})
-	script := fmt.Sprintf(
-		`i=0; until curl -fsS -X POST -H 'Content-Type: application/json' -d '%s' 'http://%s/v1/metrics'; do i=$((i+1)); [ "$i" -lt 60 ] || exit 1; sleep 2; done`,
-		payload, otlpHost,
-	)
+	t.Run("sender attribution", func(t *testing.T) {
+		require.NoError(t, otlpAttributionError(evidence.snapshots, sender))
+	})
+	t.Run("forged identity sanitization", func(t *testing.T) {
+		require.NoError(t, otlpSanitizationError(evidence.snapshots, sender))
+	})
+	t.Run("tenant isolation", func(t *testing.T) {
+		require.NoError(t, otlpTenantIsolationError(evidence.snapshots, 3*scrapeInterval),
+			"authorized tenant queries must stay empty for injected metric %s", metricName)
+	})
+}
+
+type otlpPodIdentity struct {
+	Namespace string
+	Name      string
+	UID       types.UID
+	IP        string
+}
+
+type otlpAnyValue struct {
+	StringValue string `json:"stringValue"`
+}
+
+type otlpKeyValue struct {
+	Key   string       `json:"key"`
+	Value otlpAnyValue `json:"value"`
+}
+
+type otlpDataPoint struct {
+	TimeUnixNano string         `json:"timeUnixNano"`
+	AsDouble     float64        `json:"asDouble"`
+	Attributes   []otlpKeyValue `json:"attributes"`
+}
+
+type otlpGauge struct {
+	DataPoints []otlpDataPoint `json:"dataPoints"`
+}
+
+type otlpMetric struct {
+	Name  string    `json:"name"`
+	Gauge otlpGauge `json:"gauge"`
+}
+
+type otlpScope struct {
+	Name string `json:"name"`
+}
+
+type otlpScopeMetrics struct {
+	Scope   otlpScope    `json:"scope"`
+	Metrics []otlpMetric `json:"metrics"`
+}
+
+type otlpResource struct {
+	Attributes []otlpKeyValue `json:"attributes"`
+}
+
+type otlpResourceMetrics struct {
+	Resource     otlpResource       `json:"resource"`
+	ScopeMetrics []otlpScopeMetrics `json:"scopeMetrics"`
+}
+
+type otlpExportMetricsRequest struct {
+	ResourceMetrics []otlpResourceMetrics `json:"resourceMetrics"`
+}
+
+type otlpQueryObservation struct {
+	status int
+	series []map[string]string
+	err    error
+}
+
+func (observation otlpQueryObservation) successful() bool {
+	return observation.err == nil && observation.status == http.StatusOK
+}
+
+type otlpIdentitySnapshot struct {
+	at         time.Time
+	monitoring otlpQueryObservation
+	tenant     otlpQueryObservation
+}
+
+type otlpWarmupResult struct {
+	collectorPod    string
+	instance        string
+	attributed      bool
+	lastPushStatus  int
+	lastPushError   string
+	lastQueryError  string
+	lastQuerySeries []map[string]string
+}
+
+type otlpIdentityEvidence struct {
+	pushAttempts   int
+	acceptedPushes int
+	lastPushStatus int
+	lastPushError  string
+	snapshots      []otlpIdentitySnapshot
+	warmups        []otlpWarmupResult
+}
+
+type otlpPushObservation struct {
+	status int
+	err    error
+}
+
+func buildOTLPMetricsPayload(metricName string, timestamp time.Time, resourceAttributes, datapointAttributes map[string]string) ([]byte, error) {
+	datapoint := otlpDataPoint{
+		TimeUnixNano: strconv.FormatInt(timestamp.UnixNano(), 10),
+		AsDouble:     1,
+		Attributes:   otlpKeyValues(datapointAttributes),
+	}
+	request := otlpExportMetricsRequest{
+		ResourceMetrics: []otlpResourceMetrics{{
+			Resource: otlpResource{Attributes: otlpKeyValues(resourceAttributes)},
+			ScopeMetrics: []otlpScopeMetrics{{
+				Scope: otlpScope{Name: "odh-observability-e2e-spoof-probe"},
+				Metrics: []otlpMetric{{
+					Name:  metricName,
+					Gauge: otlpGauge{DataPoints: []otlpDataPoint{datapoint}},
+				}},
+			}},
+		}},
+	}
+	return json.Marshal(request)
+}
+
+func otlpKeyValues(attributes map[string]string) []otlpKeyValue {
+	keys := make([]string, 0, len(attributes))
+	for key := range attributes {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	values := make([]otlpKeyValue, 0, len(keys))
+	for _, key := range keys {
+		values = append(values, otlpKeyValue{Key: key, Value: otlpAnyValue{StringValue: attributes[key]}})
+	}
+	return values
+}
+
+func queryOTLPMetric(ctx context.Context, rootCAs *x509.CertPool, routeHost, token, namespace, query string) otlpQueryObservation {
+	status, parsed, err := queryMetricsViaNamespaceProxy(ctx, rootCAs, routeHost, token, namespace, query)
+	observation := otlpQueryObservation{status: status, err: err}
+	if err == nil && status == http.StatusOK && parsed.Status != "success" {
+		observation.err = fmt.Errorf("Prometheus query returned status %q", parsed.Status)
+	}
+	for _, result := range parsed.Data.Result {
+		observation.series = append(observation.series, result.Metric)
+	}
+	return observation
+}
+
+func podIdentity(pod corev1.Pod) otlpPodIdentity {
+	return otlpPodIdentity{
+		Namespace: pod.Namespace,
+		Name:      pod.Name,
+		UID:       pod.UID,
+		IP:        pod.Status.PodIP,
+	}
+}
+
+func podIsReady(pod corev1.Pod) bool {
+	if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
+		return false
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func (tc *MonitoringTestCtx) readyTenantMetricsPodIdentity(t *testing.T) otlpPodIdentity {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	var identity otlpPodIdentity
+	tc.g.Eventually(func() error {
+		pods := &corev1.PodList{}
+		if err := tc.Client().List(tc.Context(), pods,
+			client.InNamespace(tenantMetricsNamespace),
+			client.MatchingLabels{"app": tenantMetricsWorkloadName},
+		); err != nil {
+			return fmt.Errorf("list tenant workload pods: %w", err)
+		}
+		for i := range pods.Items {
+			if podIsReady(pods.Items[i]) {
+				identity = podIdentity(pods.Items[i])
+				return nil
+			}
+		}
+		return fmt.Errorf("no ready %s pod in namespace %s", tenantMetricsWorkloadName, tenantMetricsNamespace)
+	}, 5*time.Minute, 5*time.Second).Should(Succeed(), "tenant metrics workload pod must be ready")
+	return identity
+}
+
+func (tc *MonitoringTestCtx) requireTenantMetricsPositiveControl(t *testing.T, rootCAs *x509.CertPool, routeHost, tenantToken string, victim otlpPodIdentity) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.g.Eventually(func() error {
+		observation := queryOTLPMetric(tc.Context(), rootCAs, routeHost, tenantToken, tenantMetricsNamespace, tenantMetricsQueryMetric)
+		if observation.err != nil {
+			return observation.err
+		}
+		if observation.status != http.StatusOK {
+			return fmt.Errorf("tenant positive-control query returned HTTP %d", observation.status)
+		}
+		for _, series := range observation.series {
+			if series["namespace"] == victim.Namespace && series["pod"] == victim.Name {
+				return nil
+			}
+		}
+		return fmt.Errorf("tenant query has not returned real workload pod %s/%s", victim.Namespace, victim.Name)
+	}, 5*time.Minute, 10*time.Second).Should(Succeed(),
+		"authorized tenant query must see real workload metrics before isolation is checked")
+}
+
+func (tc *MonitoringTestCtx) createOTLPIdentityProbe(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.deleteFixtureResources(otlpIdentitySpoofPodName)
+	t.Cleanup(func() { tc.deleteFixtureResources(otlpIdentitySpoofPodName) })
 	tc.createFixtureResource(t, gvk.Pod, &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      otlpIdentitySpoofPodName,
@@ -196,78 +489,525 @@ func (tc *MonitoringTestCtx) ValidateOTLPMetricIdentityCannotBeSpoofed(t *testin
 			Labels:    map[string]string{"app": otlpIdentitySpoofPodName},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy:   corev1.RestartPolicyNever,
-			SecurityContext: fixturePodSecurityContext(),
+			RestartPolicy:                corev1.RestartPolicyNever,
+			AutomountServiceAccountToken: new(false),
+			SecurityContext:              fixturePodSecurityContext(),
 			Containers: []corev1.Container{{
-				Name:            "otlp-spoof-probe",
+				Name:            otlpIdentityProbeContainerName,
 				Image:           fakeGCSClientImage,
 				Command:         []string{"/bin/sh", "-c"},
-				Args:            []string{script},
+				Args:            []string{"sleep 1800"},
 				SecurityContext: fixtureContainerSecurityContext(),
 			}},
 		},
 	})
-	// Waiting for Succeeded or Failed (rather than only Succeeded) makes a
-	// failing probe exit fast instead of burning the full timeout.
-	probePod := tc.EnsureResourceExists(
-		WithMinimalObject(gvk.Pod, types.NamespacedName{
-			Name:      otlpIdentitySpoofPodName,
-			Namespace: tc.MonitoringNamespace,
-		}),
-		WithCondition(jq.Match(`.status.phase == "Succeeded" or .status.phase == "Failed"`)),
-		WithEventuallyTimeout(5*time.Minute),
-		WithCustomErrorMsg("OTLP spoof probe pod must finish"),
-	)
-	// Succeeded means the collector accepted the push (curl -f fails on
-	// non-2xx): the transport-level positive control.
-	probePhase, found, err := unstructured.NestedString(probePod.Object, "status", "phase")
-	require.NoError(t, err, "failed to read the OTLP spoof probe pod phase")
-	require.True(t, found, "OTLP spoof probe pod must report a phase")
-	require.Equal(t, "Succeeded", probePhase, "OTLP spoof probe pod must push successfully")
+}
 
-	routeHost := tc.fetchPrometheusRouteHost(t)
-	rootCAs := clusterIngressCAPool(t, tc)
-	viewerToken := tc.metricsViewerToken(t, "otlp-identity-viewer", tc.MonitoringNamespace)
-	tenantToken := tc.requestServiceAccountToken(t, tenantMetricsNamespace, tenantMetricsServiceAccount)
+func (tc *MonitoringTestCtx) readyOTLPIdentityProbe(t *testing.T) corev1.Pod {
+	t.Helper()
+	tc = tc.WithT(t)
 
-	// Delivery control: the pushed series must be visible under the sender's
-	// real namespace, with the pod label derived from the actual sender pod —
-	// proving connection-based association won over the forged attributes.
-	// The exporter expires metrics five minutes after the last push, so the
-	// polling window stays well inside that.
+	var probe corev1.Pod
 	tc.g.Eventually(func() error {
-		status, parsed, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, viewerToken, tc.MonitoringNamespace, metricName)
-		if err != nil {
+		if err := tc.Client().Get(tc.Context(), types.NamespacedName{
+			Name: otlpIdentitySpoofPodName, Namespace: tc.MonitoringNamespace,
+		}, &probe); err != nil {
 			return err
 		}
-		if status != http.StatusOK {
-			return fmt.Errorf("viewer query via %s returned status %d", routeHost, status)
+		if !podIsReady(probe) {
+			return fmt.Errorf("OTLP probe pod phase=%s is not Ready", probe.Status.Phase)
 		}
-		if len(parsed.Data.Result) == 0 {
-			return fmt.Errorf("no %s series visible in namespace %s yet", metricName, tc.MonitoringNamespace)
-		}
-		for _, result := range parsed.Data.Result {
-			if result.Metric["namespace"] != tc.MonitoringNamespace {
-				return fmt.Errorf("series %v has namespace=%q, want the sender's real namespace %q", result.Metric, result.Metric["namespace"], tc.MonitoringNamespace)
-			}
-			if result.Metric["pod"] != otlpIdentitySpoofPodName {
-				return fmt.Errorf("series %v has pod=%q, want the sender's real pod %q", result.Metric, result.Metric["pod"], otlpIdentitySpoofPodName)
-			}
-			if result.Metric["exported_namespace"] != "" || result.Metric["exported_pod"] != "" {
-				return fmt.Errorf("series %v carries forged exported_ identity labels", result.Metric)
+		for _, status := range probe.Status.ContainerStatuses {
+			if status.Name == otlpIdentityProbeContainerName && status.Ready {
+				return nil
 			}
 		}
-		return nil
-	}, 4*time.Minute, 10*time.Second).Should(Succeed(),
-		fmt.Sprintf("pushed metric %s must be attributed to the sender pod %s in namespace %s", metricName, otlpIdentitySpoofPodName, tc.MonitoringNamespace))
+		return fmt.Errorf("OTLP probe container %s is not Ready", otlpIdentityProbeContainerName)
+	}, 5*time.Minute, 5*time.Second).Should(Succeed(), "OTLP identity probe must become ready")
+	return probe
+}
 
-	// Spoof control: the tenant is authorized for its own namespace, so an
-	// injected series would be visible to it. It must see none.
-	status, parsed, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, tenantToken, tenantMetricsNamespace, metricName)
-	require.NoError(t, err, "tenant query for its own namespace must reach the proxy")
-	require.Equal(t, http.StatusOK, status)
-	require.Empty(t, parsed.Data.Result,
-		"tenant %s must not see series injected via forged OTLP resource attributes", tenantMetricsNamespace)
+func (tc *MonitoringTestCtx) readyCollectorReplicaPods(t *testing.T) []corev1.Pod {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	collectorLabels := client.MatchingLabels{
+		"app.kubernetes.io/component":  "opentelemetry-collector",
+		"app.kubernetes.io/instance":   tc.MonitoringNamespace + ".data-science-collector",
+		"app.kubernetes.io/managed-by": "opentelemetry-operator",
+		"app.kubernetes.io/part-of":    "opentelemetry",
+	}
+	var readyPods []corev1.Pod
+	tc.g.Eventually(func() error {
+		statefulSets := &appsv1.StatefulSetList{}
+		if err := tc.Client().List(tc.Context(), statefulSets,
+			client.InNamespace(tc.MonitoringNamespace),
+			client.MatchingLabels{
+				"app.kubernetes.io/instance":   tc.MonitoringNamespace + ".data-science-collector",
+				"app.kubernetes.io/managed-by": "opentelemetry-operator",
+			},
+		); err != nil {
+			return fmt.Errorf("list collector StatefulSets: %w", err)
+		}
+		if len(statefulSets.Items) != 1 {
+			return fmt.Errorf("found %d collector StatefulSets, want exactly one", len(statefulSets.Items))
+		}
+		statefulSet := statefulSets.Items[0]
+		desiredReplicas := int32(1)
+		if statefulSet.Spec.Replicas != nil {
+			desiredReplicas = *statefulSet.Spec.Replicas
+		}
+		if statefulSet.Status.ObservedGeneration < statefulSet.Generation || statefulSet.Status.ReadyReplicas < desiredReplicas {
+			return fmt.Errorf("collector StatefulSet ready=%d desired=%d observedGeneration=%d generation=%d",
+				statefulSet.Status.ReadyReplicas, desiredReplicas,
+				statefulSet.Status.ObservedGeneration, statefulSet.Generation)
+		}
+
+		pods := &corev1.PodList{}
+		if err := tc.Client().List(tc.Context(), pods, client.InNamespace(tc.MonitoringNamespace), collectorLabels); err != nil {
+			return fmt.Errorf("list collector pods: %w", err)
+		}
+		readyPods = readyPods[:0]
+		var readyPodCount int32
+		for i := range pods.Items {
+			if podIsReady(pods.Items[i]) {
+				readyPods = append(readyPods, pods.Items[i])
+				readyPodCount++
+			}
+		}
+		if readyPodCount < desiredReplicas {
+			return fmt.Errorf("found %d Ready collector pods, want at least %d", len(readyPods), desiredReplicas)
+		}
+		sort.Slice(readyPods, func(i, j int) bool { return readyPods[i].Name < readyPods[j].Name })
+		return nil
+	}, 10*time.Minute, 5*time.Second).Should(Succeed(), "all collector replicas must be Ready before OTLP warm-up")
+	return readyPods
+}
+
+func (tc *MonitoringTestCtx) collectorPrometheusScrapeInterval(t *testing.T) time.Duration {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	monitor := tc.FetchResource(WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
+		Name: "data-science-prometheus-monitor", Namespace: tc.MonitoringNamespace,
+	}))
+	endpoints, found, err := unstructured.NestedSlice(monitor.Object, "spec", "endpoints")
+	require.NoError(t, err, "read collector ServiceMonitor endpoints")
+	require.True(t, found && len(endpoints) > 0, "collector ServiceMonitor must define a scrape endpoint")
+	endpoint, ok := endpoints[0].(map[string]any)
+	require.True(t, ok, "collector ServiceMonitor endpoint must be an object")
+	interval, found, err := unstructured.NestedString(endpoint, "interval")
+	require.NoError(t, err, "read collector ServiceMonitor interval")
+	if found && interval != "" {
+		parsed, parseErr := time.ParseDuration(interval)
+		require.NoError(t, parseErr, "parse ServiceMonitor interval %q", interval)
+		t.Logf("collector Prometheus scrape interval: %s (ServiceMonitor)", parsed)
+		return parsed
+	}
+
+	for _, group := range []string{"monitoring.coreos.com", "monitoring.rhobs"} {
+		for _, name := range []string{MonitoringStackName, "prometheus-" + MonitoringStackName} {
+			prometheus := &unstructured.Unstructured{}
+			prometheus.SetGroupVersionKind(schema.GroupVersionKind{Group: group, Version: "v1", Kind: "Prometheus"})
+			err := tc.Client().Get(tc.Context(), types.NamespacedName{
+				Name: name, Namespace: tc.MonitoringNamespace,
+			}, prometheus)
+			if err != nil {
+				if meta.IsNoMatchError(err) || k8serr.IsNotFound(err) {
+					continue
+				}
+				require.NoError(t, err, "read generated Prometheus scrape interval")
+			}
+			interval, found, err := unstructured.NestedString(prometheus.Object, "spec", "scrapeInterval")
+			require.NoError(t, err, "read generated Prometheus scrape interval")
+			if found && interval != "" {
+				parsed, parseErr := time.ParseDuration(interval)
+				require.NoError(t, parseErr, "parse Prometheus scrape interval %q", interval)
+				t.Logf("collector Prometheus scrape interval: %s (Prometheus resource)", parsed)
+				return parsed
+			}
+			break
+		}
+	}
+
+	// Prometheus Operator defaults PrometheusSpec.scrapeInterval to 30s.
+	t.Log("collector Prometheus scrape interval: 30s (Prometheus Operator default)")
+	return 30 * time.Second
+}
+
+func (tc *MonitoringTestCtx) warmCollectorReplicas(
+	t *testing.T,
+	collectors []corev1.Pod,
+	runID string,
+	sender otlpPodIdentity,
+	scrapeInterval time.Duration,
+	rootCAs *x509.CertPool,
+	routeHost, viewerToken string,
+) []otlpWarmupResult {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	results := make([]otlpWarmupResult, 0, len(collectors))
+	for _, collector := range collectors {
+		result := otlpWarmupResult{
+			collectorPod: collector.Name,
+			instance:     net.JoinHostPort(collector.Status.PodIP, "8889"),
+		}
+		warmupQuery := fmt.Sprintf(`{__name__=~"%s_%s_warm_[0-9]+"}`, otlpIdentitySpoofMetricPrefix, runID)
+		deadline := time.Now().Add(3*scrapeInterval + 30*time.Second)
+		for attempt := 1; time.Now().Before(deadline); attempt++ {
+			metricName := fmt.Sprintf("%s_%s_warm_%d", otlpIdentitySpoofMetricPrefix, runID, attempt)
+			payload, err := buildOTLPMetricsPayload(metricName, time.Now(), nil, nil)
+			if err != nil {
+				result.lastPushError = err.Error()
+				break
+			}
+			push := tc.pushOTLPMetrics(t, net.JoinHostPort(collector.Status.PodIP, "4318"), payload)
+			result.lastPushStatus = push.status
+			if push.err != nil {
+				result.lastPushError = push.err.Error()
+			} else {
+				result.lastPushError = ""
+			}
+
+			query := queryOTLPMetric(tc.Context(), rootCAs, routeHost, viewerToken, tc.MonitoringNamespace, warmupQuery)
+			result.lastQuerySeries = query.series
+			switch {
+			case query.err != nil:
+				result.lastQueryError = query.err.Error()
+			case query.status != http.StatusOK:
+				result.lastQueryError = fmt.Sprintf("Prometheus query returned HTTP %d", query.status)
+			default:
+				result.lastQueryError = ""
+			}
+			for _, series := range query.series {
+				if series["instance"] != result.instance {
+					continue
+				}
+				if otlpSeriesAttributionError(series, sender) == nil {
+					result.attributed = true
+					break
+				}
+			}
+			if result.attributed {
+				break
+			}
+			time.Sleep(5 * time.Second)
+		}
+		results = append(results, result)
+		t.Logf("collector warm-up pod=%s instance=%s attributed=%t lastPushStatus=%d lastPushError=%q lastQueryError=%q labels=%v",
+			result.collectorPod, result.instance, result.attributed, result.lastPushStatus,
+			result.lastPushError, result.lastQueryError, result.lastQuerySeries)
+	}
+	return results
+}
+
+func (tc *MonitoringTestCtx) pushOTLPMetrics(t *testing.T, address string, payload []byte) otlpPushObservation {
+	t.Helper()
+	stdout, stderr, err := tc.execOTLPProbe(t, []string{
+		"curl", "--silent", "--show-error", "--max-time", "15",
+		"--request", "POST", "--header", "Content-Type: application/json",
+		"--data-binary", "@-", "--write-out", "\\n%{http_code}", "http://" + address + "/v1/metrics",
+	}, payload)
+	status, body, responseErr := parseOTLPHTTPResponse(stdout)
+	if err != nil {
+		return otlpPushObservation{status: status, err: fmt.Errorf("exec OTLP curl: %w: %s", err, strings.TrimSpace(stderr))}
+	}
+	if responseErr != nil {
+		return otlpPushObservation{status: status, err: responseErr}
+	}
+	if body != "" {
+		var response struct {
+			PartialSuccess *struct {
+				RejectedDataPoints json.RawMessage `json:"rejectedDataPoints"`
+				ErrorMessage       string          `json:"errorMessage"`
+			} `json:"partialSuccess"`
+		}
+		if err := json.Unmarshal([]byte(body), &response); err != nil {
+			return otlpPushObservation{status: status, err: fmt.Errorf("decode OTLP response: %w", err)}
+		}
+		if response.PartialSuccess != nil {
+			rejected, err := jsonInt64(response.PartialSuccess.RejectedDataPoints)
+			if err != nil {
+				return otlpPushObservation{status: status, err: fmt.Errorf("decode rejected OTLP data-point count: %w", err)}
+			}
+			if rejected > 0 || response.PartialSuccess.ErrorMessage != "" {
+				return otlpPushObservation{status: status, err: fmt.Errorf("collector partially rejected OTLP request: rejected=%d error=%q", rejected, response.PartialSuccess.ErrorMessage)}
+			}
+		}
+	}
+	return otlpPushObservation{status: status}
+}
+
+func jsonInt64(value json.RawMessage) (int64, error) {
+	value = bytes.TrimSpace(value)
+	if len(value) == 0 || string(value) == "null" {
+		return 0, nil
+	}
+	if value[0] == '"' {
+		var stringValue string
+		if err := json.Unmarshal(value, &stringValue); err != nil {
+			return 0, err
+		}
+		return strconv.ParseInt(stringValue, 10, 64)
+	}
+	return strconv.ParseInt(string(value), 10, 64)
+}
+
+func parseOTLPHTTPResponse(output string) (int, string, error) {
+	separator := strings.LastIndexByte(output, '\n')
+	if separator < 0 {
+		return 0, "", errors.New("curl response did not include HTTP status")
+	}
+	status, err := strconv.Atoi(strings.TrimSpace(output[separator+1:]))
+	if err != nil {
+		return 0, "", fmt.Errorf("parse curl HTTP status: %w", err)
+	}
+	body := strings.TrimSpace(output[:separator])
+	if status < http.StatusOK || status >= http.StatusMultipleChoices {
+		return status, body, fmt.Errorf("collector returned HTTP %d", status)
+	}
+	return status, body, nil
+}
+
+func (tc *MonitoringTestCtx) execOTLPProbe(t *testing.T, command []string, stdin []byte) (string, string, error) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	cfg, err := ctrlcfg.GetConfig()
+	if err != nil {
+		return "", "", fmt.Errorf("load kubeconfig for pod exec: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return "", "", fmt.Errorf("create Kubernetes client for pod exec: %w", err)
+	}
+	request := clientset.CoreV1().RESTClient().Post().
+		Resource("pods").Name(otlpIdentitySpoofPodName).
+		Namespace(tc.MonitoringNamespace).SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: otlpIdentityProbeContainerName,
+			Command:   command,
+			Stdin:     stdin != nil,
+			Stdout:    true,
+			Stderr:    true,
+		}, clientgoscheme.ParameterCodec)
+	executor, err := remotecommand.NewSPDYExecutor(cfg, http.MethodPost, request.URL())
+	if err != nil {
+		return "", "", fmt.Errorf("create Kubernetes pod exec stream: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(tc.Context(), 30*time.Second)
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	err = executor.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdin:  bytes.NewReader(stdin),
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	return stdout.String(), stderr.String(), err
+}
+
+func otlpVisibleSeries(snapshots []otlpIdentitySnapshot) []map[string]string {
+	var series []map[string]string
+	for _, snapshot := range snapshots {
+		if snapshot.monitoring.successful() {
+			series = append(series, snapshot.monitoring.series...)
+		}
+		if snapshot.tenant.successful() {
+			series = append(series, snapshot.tenant.series...)
+		}
+	}
+	return series
+}
+
+func monitoringNamespaceObserved(snapshots []otlpIdentitySnapshot) bool {
+	for _, snapshot := range snapshots {
+		if snapshot.monitoring.successful() && len(snapshot.monitoring.series) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func otlpSeriesAttributionError(series map[string]string, sender otlpPodIdentity) error {
+	for _, expected := range []struct{ label, value string }{
+		{label: "namespace", value: sender.Namespace},
+		{label: "pod", value: sender.Name},
+		{label: "k8s_namespace_name", value: sender.Namespace},
+		{label: "k8s_pod_name", value: sender.Name},
+	} {
+		if got := series[expected.label]; got != expected.value {
+			return fmt.Errorf("label %s=%q, want sender identity %q", expected.label, got, expected.value)
+		}
+	}
+	return nil
+}
+
+func otlpSeriesSanitizationError(series map[string]string, sender otlpPodIdentity) error {
+	if err := otlpSeriesAttributionError(series, sender); err != nil {
+		return fmt.Errorf("identity labels were not replaced with the sender identity: %w", err)
+	}
+	for _, label := range []string{"exported_namespace", "exported_pod"} {
+		if got := series[label]; got != "" {
+			return fmt.Errorf("forged label %s=%q remains on series", label, got)
+		}
+	}
+	for _, expected := range []struct{ label, value string }{
+		{label: "k8s_pod_ip", value: sender.IP},
+		{label: "k8s_pod_uid", value: string(sender.UID)},
+	} {
+		if got := series[expected.label]; got != "" && got != expected.value {
+			return fmt.Errorf("forged label %s=%q remains on series; expected sender value %q or no label", expected.label, got, expected.value)
+		}
+	}
+	return nil
+}
+
+func otlpDeliveryError(evidence *otlpIdentityEvidence, metricName string) error {
+	if evidence.acceptedPushes == 0 {
+		return fmt.Errorf("collector accepted no OTLP pushes; last error: %s", evidence.lastPushError)
+	}
+	if !monitoringNamespaceObserved(evidence.snapshots) {
+		return fmt.Errorf("accepted metric %s was never observed under the monitoring namespace", metricName)
+	}
+	return nil
+}
+
+func otlpAttributionError(snapshots []otlpIdentitySnapshot, sender otlpPodIdentity) error {
+	series := otlpVisibleSeries(snapshots)
+	if len(series) == 0 {
+		return errors.New("no attack series observed to verify sender attribution")
+	}
+	for _, labels := range series {
+		if err := otlpSeriesAttributionError(labels, sender); err != nil {
+			return fmt.Errorf("series %v: %w", labels, err)
+		}
+	}
+	return nil
+}
+
+func otlpSanitizationError(snapshots []otlpIdentitySnapshot, sender otlpPodIdentity) error {
+	series := otlpVisibleSeries(snapshots)
+	if len(series) == 0 {
+		return errors.New("no attack series observed to verify forged-identity sanitization")
+	}
+	for _, labels := range series {
+		if err := otlpSeriesSanitizationError(labels, sender); err != nil {
+			return fmt.Errorf("series %v: %w", labels, err)
+		}
+	}
+	return nil
+}
+
+func otlpTenantIsolationError(snapshots []otlpIdentitySnapshot, minObservationSpan time.Duration) error {
+	var emptyQueries []time.Time
+	for _, snapshot := range snapshots {
+		if !snapshot.tenant.successful() {
+			continue
+		}
+		if len(snapshot.tenant.series) > 0 {
+			return fmt.Errorf("tenant query observed injected series: %v", snapshot.tenant.series)
+		}
+		emptyQueries = append(emptyQueries, snapshot.at)
+	}
+	if len(emptyQueries) < 4 {
+		return fmt.Errorf("only %d successful empty tenant queries; need at least 4", len(emptyQueries))
+	}
+	span := emptyQueries[len(emptyQueries)-1].Sub(emptyQueries[0])
+	if span < minObservationSpan {
+		return fmt.Errorf("successful empty tenant queries span %s, want at least %s", span, minObservationSpan)
+	}
+	return nil
+}
+
+func (tc *MonitoringTestCtx) logOTLPIdentityDiagnostics(t *testing.T, evidence *otlpIdentityEvidence, sender, victim otlpPodIdentity) {
+	t.Helper()
+	t.Logf("OTLP identity evidence: sender=%+v victim=%+v pushes=%d accepted=%d lastPushStatus=%d lastPushError=%q snapshots=%d",
+		sender, victim, evidence.pushAttempts, evidence.acceptedPushes, evidence.lastPushStatus,
+		evidence.lastPushError, len(evidence.snapshots))
+	for _, warmup := range evidence.warmups {
+		t.Logf("warm-up evidence: collector=%s instance=%s attributed=%t lastPushStatus=%d lastPushError=%q lastQueryError=%q labels=%v",
+			warmup.collectorPod, warmup.instance, warmup.attributed, warmup.lastPushStatus,
+			warmup.lastPushError, warmup.lastQueryError, warmup.lastQuerySeries)
+	}
+	if len(evidence.snapshots) > 0 {
+		last := evidence.snapshots[len(evidence.snapshots)-1]
+		t.Logf("last monitoring query: status=%d error=%v series=%v", last.monitoring.status, last.monitoring.err, last.monitoring.series)
+		t.Logf("last tenant query: status=%d error=%v series=%v", last.tenant.status, last.tenant.err, last.tenant.series)
+	}
+
+	diagnosticContext, cancel := context.WithTimeout(tc.Context(), 45*time.Second)
+	defer cancel()
+	diagnosticTC := *tc
+	diagnosticTC.ctx = diagnosticContext
+	for _, identity := range []otlpPodIdentity{sender, victim} {
+		if identity.Name == "" {
+			continue
+		}
+		pod := &corev1.Pod{}
+		err := diagnosticTC.Client().Get(diagnosticTC.Context(), types.NamespacedName{
+			Name: identity.Name, Namespace: identity.Namespace,
+		}, pod)
+		if err != nil {
+			t.Logf("read probe identity pod %s/%s for diagnostics: %v", identity.Namespace, identity.Name, err)
+			continue
+		}
+		t.Logf("identity pod: name=%s ip=%s uid=%s phase=%s conditions=%v containerStatuses=%v",
+			pod.Name, pod.Status.PodIP, pod.UID, pod.Status.Phase, pod.Status.Conditions, pod.Status.ContainerStatuses)
+	}
+
+	collector, err := diagnosticTC.fetchResource(t, gvk.OpenTelemetryCollector, types.NamespacedName{
+		Name: OpenTelemetryCollectorName, Namespace: tc.MonitoringNamespace,
+	})
+	if err != nil {
+		t.Logf("read collector config for diagnostics: %v", err)
+	} else if pipelines, found, err := unstructured.NestedMap(collector.Object, "spec", "config", "service", "pipelines"); err != nil {
+		t.Logf("read collector pipeline config for diagnostics: %v", err)
+	} else if found {
+		t.Logf("collector metrics/otlp pipeline: %#v", pipelines["metrics/otlp"])
+	}
+
+	cfg, err := ctrlcfg.GetConfig()
+	if err != nil {
+		t.Logf("load kubeconfig for collector diagnostics: %v", err)
+		return
+	}
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		t.Logf("create client for collector diagnostics: %v", err)
+		return
+	}
+	pods := &corev1.PodList{}
+	if err := diagnosticTC.Client().List(diagnosticTC.Context(), pods, client.InNamespace(tc.MonitoringNamespace), client.MatchingLabels{
+		"app.kubernetes.io/component":  "opentelemetry-collector",
+		"app.kubernetes.io/instance":   tc.MonitoringNamespace + ".data-science-collector",
+		"app.kubernetes.io/managed-by": "opentelemetry-operator",
+	}); err != nil {
+		t.Logf("list collector pods for diagnostics: %v", err)
+		return
+	}
+	tailLines := int64(100)
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		t.Logf("collector pod: name=%s ip=%s phase=%s containers=%v conditions=%v containerStatuses=%v",
+			pod.Name, pod.Status.PodIP, pod.Status.Phase, pod.Spec.Containers, pod.Status.Conditions, pod.Status.ContainerStatuses)
+		for _, container := range pod.Spec.Containers {
+			stream, err := clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+				Container: container.Name, TailLines: &tailLines,
+			}).Stream(diagnosticTC.Context())
+			if err != nil {
+				t.Logf("read collector logs pod=%s container=%s: %v", pod.Name, container.Name, err)
+				continue
+			}
+			logs, readErr := io.ReadAll(io.LimitReader(stream, 64<<10))
+			closeErr := stream.Close()
+			t.Logf("collector logs pod=%s container=%s (last 64KiB): %s", pod.Name, container.Name, strings.TrimSpace(string(logs)))
+			if readErr != nil || closeErr != nil {
+				t.Logf("finish reading collector logs pod=%s container=%s: read=%v close=%v", pod.Name, container.Name, readErr, closeErr)
+			}
+		}
+	}
 }
 
 // discoverCollectorOTLPHTTPHost finds the metrics collector's
