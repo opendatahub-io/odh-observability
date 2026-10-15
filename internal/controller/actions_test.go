@@ -102,6 +102,20 @@ func findCondition(m *v1alpha1.Monitoring, condType string) *platformcommon.Cond
 	return libconditions.FindStatusCondition(m, condType)
 }
 
+// mustFindCondition returns the named status condition, failing the test when
+// it is absent. The explicit nil guard keeps staticcheck's SA5011 happy: it
+// cannot see that t.Fatal terminates the test, so a bare nil check followed
+// by field access looks like a possible nil pointer dereference.
+func mustFindCondition(t *testing.T, m *v1alpha1.Monitoring, condType string) *platformcommon.Condition {
+	t.Helper()
+
+	c := findCondition(m, condType)
+	if c == nil {
+		t.Fatalf("expected %s condition to be set", condType)
+	}
+	return c
+}
+
 // --- deployMonitoringStackWithQuerierAndRestrictions ---
 
 func TestDeployMonitoringStack_NoMetrics(t *testing.T) {
@@ -876,11 +890,7 @@ func TestDeployClusterLogForwarder_CRDMissing(t *testing.T) {
 		t.Errorf("expected no sources when CLF CRD is missing, got %d", len(sources))
 	}
 
-	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
-	if c == nil {
-		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
-		return
-	}
+	c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable)
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
 	}
@@ -920,11 +930,7 @@ func TestDeployClusterLogForwarder_LokiStackNotReady(t *testing.T) {
 		t.Errorf("expected no sources when LokiStack is not ready, got %d", len(sources))
 	}
 
-	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
-	if c == nil {
-		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
-		return
-	}
+	c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable)
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
 	}
@@ -979,11 +985,7 @@ func TestDeployClusterLogForwarder_CLFExistsButNotReady(t *testing.T) {
 		t.Errorf("expected 2 sources (CLF + RBAC) even when CLF is not ready, got %d", len(sources))
 	}
 
-	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
-	if c == nil {
-		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
-		return
-	}
+	c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable)
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
 	}
