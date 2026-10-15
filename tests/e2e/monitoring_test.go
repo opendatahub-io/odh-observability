@@ -305,8 +305,9 @@ func (tc *MonitoringTestCtx) ValidateReconciliationStability(t *testing.T) {
 		{gvk.MonitoringStack, MonitoringStackName, tc.MonitoringNamespace, "MonitoringStack", true, false},
 		{gvk.ClusterRoleBinding, "data-science-monitoringstack-alertmanager-prometheus-metrics-reader", "", "alertmanager ClusterRoleBinding", true, true},
 		{gvk.ClusterRoleBinding, "generate-processors-collector-rolebinding", "", "collector ClusterRoleBinding", false, true},
+		{gvk.ClusterRoleBinding, "generate-processors-targetallocator-rolebinding", "", "legacy TargetAllocator ClusterRoleBinding", false, true},
 		{gvk.ClusterRole, "generate-processors-targetallocator-role", "", "TargetAllocator ClusterRole", false, true},
-		{gvk.ClusterRoleBinding, "generate-processors-targetallocator-rolebinding", "", "TargetAllocator ClusterRoleBinding", false, true},
+		{gvk.ClusterRoleBinding, "generate-processors-targetallocator-discovery-rolebinding", "", "TargetAllocator discovery ClusterRoleBinding", false, true},
 		{gvk.Service, "data-science-collector-prometheus", tc.MonitoringNamespace, "collector prometheus Service", true, true},
 		{gvk.ConfigMap, "prometheus-web-tls-ca", tc.MonitoringNamespace, "prometheus TLS CA ConfigMap", true, true},
 	}
@@ -927,11 +928,23 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorRBACConfiguration(t *testing
 			Name: "generate-processors-targetallocator-rolebinding",
 		}),
 		WithCondition(And(
+			jq.Match(`.roleRef.name == "generate-processors-role"`),
+			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
+			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("legacy TargetAllocator ClusterRoleBinding should retain its original role"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "generate-processors-targetallocator-discovery-rolebinding",
+		}),
+		WithCondition(And(
 			jq.Match(`.roleRef.name == "generate-processors-targetallocator-role"`),
 			jq.Match(`.subjects[0].name == "%s"`, TargetAllocatorServiceAccount),
 			jq.Match(`.subjects[0].namespace == "%s"`, tc.MonitoringNamespace),
 		)),
-		WithCustomErrorMsg("ClusterRoleBinding should bind discovery permissions to the TargetAllocator ServiceAccount"),
+		WithCustomErrorMsg("TargetAllocator discovery ClusterRoleBinding should grant the dedicated role"),
 	)
 
 	tc.EnsureResourceExists(
@@ -939,8 +952,8 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorRBACConfiguration(t *testing
 			Name: "generate-processors-targetallocator-role",
 		}),
 		WithCondition(And(
-			jq.Match(`.rules[] | select((.apiGroups // []) | contains(["monitoring.coreos.com"])) | .resources | contains(["podmonitors", "servicemonitors"])`),
-			jq.Match(`.rules[] | select((.apiGroups // []) | contains(["monitoring.coreos.com"])) | .verbs | contains(["*"])`),
+			jq.Match(`.rules[] | select((.apiGroups // []) | contains(["monitoring.coreos.com"])) | .resources | contains(["podmonitors", "servicemonitors", "scrapeconfigs"])`),
+			jq.Match(`.rules[] | select((.apiGroups // []) | contains(["monitoring.coreos.com"])) | .verbs | contains(["get", "list", "watch"])`),
 			jq.Match(`[.rules[] | select((.apiGroups // []) | contains(["monitoring.coreos.com"])) | .resources | contains(["probes"])] | any`),
 			jq.Match(`[.rules[] | select((.apiGroups // []) | contains(["monitoring.coreos.com"])) | .verbs | contains(["get", "list", "watch"])] | any`),
 			jq.Match(`.rules[] | select((.apiGroups // []) | contains([""])) | .resources | contains(["nodes", "nodes/metrics", "services", "endpoints", "pods", "namespaces"])`),

@@ -66,6 +66,22 @@ subjects:
   namespace: {{.Namespace}}
 {{ if .Metrics }}
 ---
+# Keep this legacy binding and roleRef. ClusterRoleBinding.roleRef is immutable,
+# so changing it would break upgrades of installations created before the
+# dedicated TargetAllocator role was introduced.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: generate-processors-targetallocator-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: generate-processors-role
+subjects:
+- kind: ServiceAccount
+  name: {{.TargetAllocatorServiceAccount}}
+  namespace: {{.Namespace}}
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -111,8 +127,11 @@ rules:
   resources:
   - podmonitors
   - servicemonitors
+  - scrapeconfigs
   verbs:
-  - "*"
+  - get
+  - watch
+  - list
 - apiGroups:
   - monitoring.coreos.com
   resources:
@@ -133,7 +152,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: generate-processors-targetallocator-rolebinding
+  name: generate-processors-targetallocator-discovery-rolebinding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole

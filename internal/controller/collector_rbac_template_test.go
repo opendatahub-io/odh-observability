@@ -8,7 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-//nolint:gocyclo // The test validates each rendered RBAC object and rule boundary.
+//nolint:gocyclo,maintidx // The test validates each rendered RBAC object and rule boundary.
 func TestCollectorRBACAllowsTargetAllocatorSecretInformer(t *testing.T) {
 	resources, err := rendertemplate.Render(context.Background(), nil, []rendertemplate.TemplateSource{{
 		FS:   resourcesFS,
@@ -27,7 +27,8 @@ func TestCollectorRBACAllowsTargetAllocatorSecretInformer(t *testing.T) {
 	var targetAllocatorClusterRole unstructured.Unstructured
 	var targetAllocatorRole unstructured.Unstructured
 	var collectorBinding unstructured.Unstructured
-	var targetAllocatorBinding unstructured.Unstructured
+	var legacyTargetAllocatorBinding unstructured.Unstructured
+	var targetAllocatorDiscoveryBinding unstructured.Unstructured
 	var secretRoles int
 	var secretRoleBindings int
 	for _, resource := range resources {
@@ -44,7 +45,9 @@ func TestCollectorRBACAllowsTargetAllocatorSecretInformer(t *testing.T) {
 		case kind == "ClusterRoleBinding" && name == "generate-processors-collector-rolebinding":
 			collectorBinding = resource
 		case kind == "ClusterRoleBinding" && name == "generate-processors-targetallocator-rolebinding":
-			targetAllocatorBinding = resource
+			legacyTargetAllocatorBinding = resource
+		case kind == "ClusterRoleBinding" && name == "generate-processors-targetallocator-discovery-rolebinding":
+			targetAllocatorDiscoveryBinding = resource
 		case kind == "Role" && name == "data-science-collector-targetallocator-secrets":
 			secretRoles++
 			targetAllocatorRole = resource
@@ -91,8 +94,8 @@ func TestCollectorRBACAllowsTargetAllocatorSecretInformer(t *testing.T) {
 	if !hasRBACRule(targetAllocatorRules, "networking.k8s.io", []string{"ingresses"}, []string{"get", "list", "watch"}) {
 		t.Error("TargetAllocator ClusterRole must allow ingress discovery")
 	}
-	if !hasRBACRule(targetAllocatorRules, "monitoring.coreos.com", []string{"podmonitors", "servicemonitors"}, []string{"*"}) {
-		t.Error("TargetAllocator ClusterRole must allow Prometheus monitor discovery")
+	if !hasRBACRule(targetAllocatorRules, "monitoring.coreos.com", []string{"podmonitors", "servicemonitors", "scrapeconfigs"}, []string{"get", "list", "watch"}) {
+		t.Error("TargetAllocator ClusterRole must allow Prometheus monitor and ScrapeConfig discovery")
 	}
 	if !hasRBACRule(targetAllocatorRules, "monitoring.coreos.com", []string{"probes"}, []string{"get", "list", "watch"}) {
 		t.Error("TargetAllocator ClusterRole must allow Prometheus probe discovery")
@@ -119,10 +122,10 @@ func TestCollectorRBACAllowsTargetAllocatorSecretInformer(t *testing.T) {
 		t.Errorf("TargetAllocator Secret Role must grant get/list/watch on Secrets: %v", secretRule)
 	}
 
-	if collectorBinding.Object == nil || targetAllocatorBinding.Object == nil {
-		t.Fatal("both collector and TargetAllocator ClusterRoleBindings must render")
+	if collectorBinding.Object == nil || legacyTargetAllocatorBinding.Object == nil || targetAllocatorDiscoveryBinding.Object == nil {
+		t.Fatal("collector and both TargetAllocator ClusterRoleBindings must render")
 	}
-	subjects, found, err := unstructured.NestedSlice(targetAllocatorBinding.Object, "subjects")
+	subjects, found, err := unstructured.NestedSlice(targetAllocatorDiscoveryBinding.Object, "subjects")
 	if err != nil || !found || len(subjects) != 1 {
 		t.Fatalf("TargetAllocator ClusterRoleBinding must have one subject: found=%t, error=%v, subjects=%v", found, err, subjects)
 	}
@@ -130,9 +133,13 @@ func TestCollectorRBACAllowsTargetAllocatorSecretInformer(t *testing.T) {
 	if !ok || subject["name"] != targetAllocatorServiceAccountName {
 		t.Errorf("TargetAllocator ClusterRoleBinding must target %q", targetAllocatorServiceAccountName)
 	}
-	targetAllocatorRoleRef, found, err := unstructured.NestedString(targetAllocatorBinding.Object, "roleRef", "name")
+	targetAllocatorRoleRef, found, err := unstructured.NestedString(targetAllocatorDiscoveryBinding.Object, "roleRef", "name")
 	if err != nil || !found || targetAllocatorRoleRef != "generate-processors-targetallocator-role" {
-		t.Errorf("TargetAllocator binding must use the dedicated role, got %q (found=%t, error=%v)", targetAllocatorRoleRef, found, err)
+		t.Errorf("TargetAllocator discovery binding must use the dedicated role, got %q (found=%t, error=%v)", targetAllocatorRoleRef, found, err)
+	}
+	legacyRoleRef, found, err := unstructured.NestedString(legacyTargetAllocatorBinding.Object, "roleRef", "name")
+	if err != nil || !found || legacyRoleRef != "generate-processors-role" {
+		t.Errorf("legacy TargetAllocator binding must retain its original role, got %q (found=%t, error=%v)", legacyRoleRef, found, err)
 	}
 }
 
@@ -191,6 +198,7 @@ func TestCollectorRBACOmitsTargetAllocatorResourcesWithoutMetrics(t *testing.T) 
 	for _, resource := range resources {
 		if resource.GetName() == targetAllocatorServiceAccountName ||
 			resource.GetName() == "generate-processors-targetallocator-rolebinding" ||
+			resource.GetName() == "generate-processors-targetallocator-discovery-rolebinding" ||
 			resource.GetName() == "generate-processors-targetallocator-role" ||
 			resource.GetName() == "data-science-collector-targetallocator-secrets" {
 			t.Errorf("TargetAllocator resource %s must not render without metrics", resource.GetName())

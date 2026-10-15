@@ -51,7 +51,7 @@ Before any feature deployment, the reconciler verifies prerequisite operators th
 
 If any required operator is missing, `MonitoringDependenciesReady` is set to False with the missing operator names and OperatorHub installation guidance. Reconciliation then stops without error (no retry -- the CRD watch will trigger re-reconciliation when operators are installed). The legacy `MonitoringAvailable` condition is updated in parallel for compatibility.
 
-The metrics TargetAllocator selects labeled ServiceMonitors and PodMonitors cluster-wide because KServe creates its scheduler monitors and per-workload TLS monitors in inference workload namespaces. The collector ServiceAccount has no Secret permissions. A separate TargetAllocator ServiceAccount receives the OpenTelemetry Operator discovery permissions through a dedicated ClusterRole plus namespace-scoped Roles for the current namespace set; it is configured with the same `secretNamespaces` allowlist, and namespace events trigger reconciliation so new namespaces receive the binding. `denyFSAccessThroughSMs` prevents selected monitors from making the collector expose file-backed credentials.
+The metrics TargetAllocator selects labeled ServiceMonitors and PodMonitors cluster-wide because KServe creates its scheduler monitors and per-workload TLS monitors in inference workload namespaces. The collector ServiceAccount has no Secret permissions. A separate TargetAllocator ServiceAccount receives the OpenTelemetry Operator discovery permissions through a dedicated ClusterRole plus namespace-scoped Roles for the current namespace set; an upgrade-safe legacy binding is retained because ClusterRoleBinding role references are immutable. It is configured with the same `secretNamespaces` allowlist, and namespace events trigger reconciliation so new namespaces receive the binding. `denyFSAccessThroughSMs` prevents selected monitors from making the collector expose file-backed credentials.
 
 The TargetAllocator uses mTLS by default, with cert-manager provisioning its CA, serving, and client certificates. The collector is configured only with the HTTPS TargetAllocator endpoint. The upstream TargetAllocator may also expose its non-mTLS discovery port, but `allowInsecureAuthSecrets` remains disabled so authenticated ServiceMonitor credentials cannot be returned over plaintext HTTP.
 
@@ -111,7 +111,7 @@ All templates are embedded via `//go:embed` and rendered with Go's `text/templat
 | Template | Resources Created |
 |----------|-------------------|
 | `opentelemetry-collector.tmpl.yaml` | OpenTelemetryCollector CR |
-| `collector-rbac.tmpl.yaml` | Collector discovery RBAC, dedicated TargetAllocator ServiceAccount, and namespace-scoped Secret RBAC |
+| `collector-rbac.tmpl.yaml` | Collector discovery RBAC, dedicated TargetAllocator ServiceAccount, upgrade-safe discovery bindings, and namespace-scoped Secret RBAC |
 | `collector-servicemonitors.tmpl.yaml` | ServiceMonitors for collector metrics |
 | `collector-prometheus-service.tmpl.yaml` | Prometheus receiver service |
 

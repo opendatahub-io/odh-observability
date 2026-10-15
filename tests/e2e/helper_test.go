@@ -75,7 +75,7 @@ const (
 	opentelemetryOpNamespace   = "openshift-opentelemetry-operator"
 	opentelemetryOpChannel     = "stable"
 	otelOperatorServiceAccount = "opentelemetry-operator-controller-manager"
-	otelCertManagerRole        = "opentelemetry-operator-cert-manager"
+	otelCertManagerRole        = "odh-observability-opentelemetry-cert-manager"
 
 	certManagerOpName      = "openshift-cert-manager-operator"
 	certManagerOpPackage   = "cert-manager-operator"
@@ -1032,8 +1032,9 @@ func (tc *TestContext) installDependentOperators(t *testing.T) {
 	}).WithTimeout(tc.Timeouts.olmOperationTimeout).Should(Succeed(),
 		"cert-manager Certificate API should be discoverable before OpenTelemetry starts")
 	// Some Red Hat OpenTelemetry Operator CSVs omit the cert-manager rules
-	// required by the operator's autodetection. Create the supplemental binding
-	// before the OTel deployment starts so TargetAllocator mTLS can use cert-manager.
+	// required by the operator's autodetection. Create the same supplemental
+	// binding shipped by the production Helm chart before the OTel deployment
+	// starts so TargetAllocator mTLS can use cert-manager.
 	tc.ensureOpenTelemetryCertManagerRBAC(t)
 
 	operators := []operator{
@@ -1070,9 +1071,10 @@ func (tc *TestContext) installDependentOperators(t *testing.T) {
 }
 
 // ensureOpenTelemetryCertManagerRBAC supplies the certificate permissions
-// required by the OpenTelemetry Operator's cert-manager autodetection. The
-// permissions are intentionally limited to the resources and verbs checked by
-// the upstream operator.
+// required by the OpenTelemetry Operator's cert-manager autodetection. This
+// mirrors charts/odh-observability/templates/opentelemetry-cert-manager-rbac.yaml;
+// the permissions are intentionally limited to the resources and verbs checked
+// by the upstream operator.
 func (tc *TestContext) ensureOpenTelemetryCertManagerRBAC(t *testing.T) {
 	t.Helper()
 
