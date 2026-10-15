@@ -49,12 +49,12 @@ func (tc *MonitoringTestCtx) createMonitorsEnvironment(t *testing.T, namespaceLa
 
 	t.Logf("Pre-test cleanup: removing %s namespace and monitors if they exist", TestNamespaceName)
 	tc.DeleteResource(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{Name: TestPodMonitorName, Namespace: TestNamespaceName}),
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{Name: TestPodMonitorName, Namespace: TestNamespaceName}),
 		WithIgnoreNotFound(true),
 		WithWaitForDeletion(true),
 	)
 	tc.DeleteResource(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{Name: TestServiceMonitorName, Namespace: TestNamespaceName}),
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{Name: TestServiceMonitorName, Namespace: TestNamespaceName}),
 		WithIgnoreNotFound(true),
 		WithWaitForDeletion(true),
 	)
@@ -88,7 +88,7 @@ func (tc *MonitoringTestCtx) createMonitorsEnvironment(t *testing.T, namespaceLa
 	)
 
 	tc.EventuallyResourceCreatedOrPatched(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{
 			Name:      TestPodMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -104,7 +104,7 @@ func (tc *MonitoringTestCtx) createMonitorsEnvironment(t *testing.T, namespaceLa
 	)
 
 	tc.EventuallyResourceCreatedOrPatched(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
 			Name:      TestServiceMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -127,14 +127,14 @@ func (tc *MonitoringTestCtx) cleanupMonitoringAdmissionResources(t *testing.T, p
 	t.Cleanup(func() {
 		if podMonitorName != "" {
 			tc.DeleteResource(
-				WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{Name: podMonitorName, Namespace: TestNamespaceName}),
+				WithMinimalObject(gvk.PodMonitor, types.NamespacedName{Name: podMonitorName, Namespace: TestNamespaceName}),
 				WithIgnoreNotFound(true),
 				WithWaitForDeletion(true),
 			)
 		}
 		if serviceMonitorName != "" {
 			tc.DeleteResource(
-				WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{Name: serviceMonitorName, Namespace: TestNamespaceName}),
+				WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{Name: serviceMonitorName, Namespace: TestNamespaceName}),
 				WithIgnoreNotFound(true),
 				WithWaitForDeletion(true),
 			)
@@ -201,12 +201,12 @@ func (tc *MonitoringTestCtx) ValidateMonitoringLabelValueEnforcementOnMonitors(t
 	tc = tc.WithT(t)
 
 	tc.DeleteResource(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{Name: "test-invalid-podmonitor", Namespace: TestNamespaceName}),
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{Name: "test-invalid-podmonitor", Namespace: TestNamespaceName}),
 		WithIgnoreNotFound(true),
 		WithWaitForDeletion(true),
 	)
 	tc.DeleteResource(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{Name: "test-invalid-servicemonitor", Namespace: TestNamespaceName}),
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{Name: "test-invalid-servicemonitor", Namespace: TestNamespaceName}),
 		WithIgnoreNotFound(true),
 		WithWaitForDeletion(true),
 	)
@@ -220,7 +220,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringLabelValueEnforcementOnMonitors(t
 	}
 
 	invalidPodMonitor := &unstructured.Unstructured{}
-	invalidPodMonitor.SetGroupVersionKind(gvk.CoreosPodMonitor)
+	invalidPodMonitor.SetGroupVersionKind(gvk.PodMonitor)
 	invalidPodMonitor.SetName("test-invalid-podmonitor")
 	invalidPodMonitor.SetNamespace(TestNamespaceName)
 	invalidPodMonitor.SetLabels(invalidLabels)
@@ -238,7 +238,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringLabelValueEnforcementOnMonitors(t
 	tc.g.Expect(err).To(MatchError(ContainSubstring("must be set to 'true' or 'false'")), "Error message should indicate valid values for PodMonitor")
 
 	invalidServiceMonitor := &unstructured.Unstructured{}
-	invalidServiceMonitor.SetGroupVersionKind(gvk.CoreosServiceMonitor)
+	invalidServiceMonitor.SetGroupVersionKind(gvk.ServiceMonitor)
 	invalidServiceMonitor.SetName("test-invalid-servicemonitor")
 	invalidServiceMonitor.SetNamespace(TestNamespaceName)
 	invalidServiceMonitor.SetLabels(invalidLabels)
@@ -267,7 +267,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjection(t *testing.T) {
 	tc.createMonitorsEnvironment(t, nsLabels, nil)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{
 			Name:      TestPodMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -276,7 +276,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjection(t *testing.T) {
 	)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
 			Name:      TestServiceMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -301,7 +301,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorsCreationWithCustomLabels(t *testing
 	tc.createMonitorsEnvironment(t, nsLabels, customLabels)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{
 			Name:      TestPodMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -314,7 +314,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorsCreationWithCustomLabels(t *testing
 	)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
 			Name:      TestServiceMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -338,7 +338,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjectionOnUpdate(t *testing.T)
 	tc.createMonitorsEnvironment(t, nsLabels, nil)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{
 			Name:      TestPodMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -354,7 +354,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjectionOnUpdate(t *testing.T)
 	)
 
 	tc.EventuallyResourcePatched(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{
 			Name:      TestPodMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -364,7 +364,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjectionOnUpdate(t *testing.T)
 	)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{
 			Name:      TestPodMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -373,7 +373,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjectionOnUpdate(t *testing.T)
 	)
 
 	tc.EventuallyResourcePatched(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
 			Name:      TestServiceMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -383,7 +383,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjectionOnUpdate(t *testing.T)
 	)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
 			Name:      TestServiceMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -408,7 +408,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjectionOnUpdateWithCustomLabe
 	tc.createMonitorsEnvironment(t, nsLabels, customLabels)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{
 			Name:      TestPodMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -428,7 +428,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjectionOnUpdateWithCustomLabe
 	)
 
 	tc.EventuallyResourcePatched(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{
 			Name:      TestPodMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -438,7 +438,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjectionOnUpdateWithCustomLabe
 	)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{
 			Name:      TestPodMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -451,7 +451,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjectionOnUpdateWithCustomLabe
 	)
 
 	tc.EventuallyResourcePatched(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
 			Name:      TestServiceMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -461,7 +461,7 @@ func (tc *MonitoringTestCtx) ValidateMonitorLabelInjectionOnUpdateWithCustomLabe
 	)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
 			Name:      TestServiceMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -485,7 +485,7 @@ func (tc *MonitoringTestCtx) ValidateWebhookSkipsNonMonitoredNamespace(t *testin
 	tc.createMonitorsEnvironment(t, nsLabels, nil)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{
 			Name:      TestPodMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -494,7 +494,7 @@ func (tc *MonitoringTestCtx) ValidateWebhookSkipsNonMonitoredNamespace(t *testin
 	)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
 			Name:      TestServiceMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -514,7 +514,7 @@ func (tc *MonitoringTestCtx) ValidateWebhookSkipsExplicitlyOptedOutNamespace(t *
 	tc.createMonitorsEnvironment(t, nsLabels, nil)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{
 			Name:      TestPodMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -523,7 +523,7 @@ func (tc *MonitoringTestCtx) ValidateWebhookSkipsExplicitlyOptedOutNamespace(t *
 	)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
 			Name:      TestServiceMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -547,7 +547,7 @@ func (tc *MonitoringTestCtx) ValidateWebhookRespectsUserOptOut(t *testing.T) {
 	tc.createMonitorsEnvironment(t, nsLabels, userOptOutLabels)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{
 			Name:      TestPodMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -556,7 +556,7 @@ func (tc *MonitoringTestCtx) ValidateWebhookRespectsUserOptOut(t *testing.T) {
 	)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
 			Name:      TestServiceMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -580,7 +580,7 @@ func (tc *MonitoringTestCtx) ValidateWebhookIdempotency(t *testing.T) {
 	tc.createMonitorsEnvironment(t, nsLabels, existingLabels)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{
 			Name:      TestPodMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -589,7 +589,7 @@ func (tc *MonitoringTestCtx) ValidateWebhookIdempotency(t *testing.T) {
 	)
 
 	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
 			Name:      TestServiceMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -619,7 +619,7 @@ func (tc *MonitoringTestCtx) ValidateWebhookSkipsWhenMonitoringDisabled(t *testi
 	tc.createMonitorsEnvironment(t, nsLabels, noLabels)
 
 	podMonitor := tc.FetchResource(
-		WithMinimalObject(gvk.CoreosPodMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{
 			Name:      TestPodMonitorName,
 			Namespace: TestNamespaceName,
 		}),
@@ -628,7 +628,7 @@ func (tc *MonitoringTestCtx) ValidateWebhookSkipsWhenMonitoringDisabled(t *testi
 		"Webhook should NOT inject monitoring=true when monitoring is disabled (PodMonitor)")
 
 	serviceMonitor := tc.FetchResource(
-		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+		WithMinimalObject(gvk.ServiceMonitor, types.NamespacedName{
 			Name:      TestServiceMonitorName,
 			Namespace: TestNamespaceName,
 		}),

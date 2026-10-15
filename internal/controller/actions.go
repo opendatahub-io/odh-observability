@@ -76,6 +76,7 @@ const (
 	TempoServiceCAConfigMapTemplate                  = "resources/tempo-service-ca-configmap.tmpl.yaml"
 	PersesOperatorAccessNetworkPolicyTemplate        = "resources/perses-operator-access-network-policy.tmpl.yaml"
 	OperatorPrometheusRulesTemplate                  = "monitoring/operator-prometheusrules.tmpl.yaml"
+	WebhookHealthProbeTemplate                       = "resources/webhook-health-probe.tmpl.yaml"
 	AcceleratorRecordingRulesTemplate                = "resources/accelerator-recording-rules.tmpl.yaml"
 	UsageLogsOpenTelemetryCollectorTemplate          = "resources/usage-logs-opentelemetry-collector.tmpl.yaml"
 	UsageLogsOpenTelemetryCollectorRBACTemplate      = "resources/usage-logs-opentelemetry-collector-rbac.tmpl.yaml"
@@ -293,6 +294,30 @@ func deployOpenTelemetryCollector(
 	return nil
 }
 
+// deployOperatorMonitoring deploys PrometheusRules for operator self-monitoring
+// (webhook health, pod availability). These rules are internal monitoring for the
+// operator itself and are deployed regardless of user alerting config.
+func deployOperatorMonitoring(
+	ctx context.Context,
+	c client.Client,
+	_ *v1alpha1.Monitoring,
+	_ *conditions.ConditionsManager,
+	sources *[]rendertemplate.TemplateSource,
+) error {
+	// Check if PrometheusRule CRD exists (installed by RHOBS/Prometheus Operator)
+	exists, err := hasCRD(ctx, c, gvk.PrometheusRule)
+	if err != nil {
+		return fmt.Errorf("checking PrometheusRule CRD: %w", err)
+	}
+	if !exists {
+		// Silently skip if CRD not found - operator monitoring is best-effort
+		return nil
+	}
+
+	*sources = append(*sources, src(OperatorPrometheusRulesTemplate))
+	return nil
+}
+
 // deployAlerting deploys operator-level PrometheusRules when alerting is configured.
 // Per-component rules are intentionally dropped in the standalone module.
 func deployAlerting(
@@ -319,7 +344,6 @@ func deployAlerting(
 	}
 
 	cm.MarkTrue(conditions.ConditionAlertingAvailable)
-	*sources = append(*sources, src(OperatorPrometheusRulesTemplate))
 	return nil
 }
 
@@ -788,6 +812,25 @@ func deployWebhookInfrastructure(
 	}
 
 	cm.MarkTrue(conditions.ConditionWebhookAvailable)
+	return nil
+}
+
+func deployWebhookHealthProbe(
+	ctx context.Context,
+	c client.Client,
+	_ *v1alpha1.Monitoring,
+	_ *conditions.ConditionsManager,
+	sources *[]rendertemplate.TemplateSource,
+) error {
+	exists, err := hasCRD(ctx, c, gvk.PodMonitor)
+	if err != nil {
+		return fmt.Errorf("checking PodMonitor CRD: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+
+	*sources = append(*sources, src(WebhookHealthProbeTemplate))
 	return nil
 }
 

@@ -1,0 +1,18 @@
+apiVersion: monitoring.rhobs/v1
+kind: PodMonitor
+metadata:
+  name: webhook-health-probe
+  namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+    webhook-health-probe: "true"
+    monitoring.opendatahub.io/scrape: "true"
+  annotations:
+    description: "Health probe for webhook admission path - do not delete"
+spec:
+  selector:
+    matchLabels:
+      app: webhook-health-probe-nonexistent
+  podMetricsEndpoints:
+    - port: metrics
+      interval: 30s

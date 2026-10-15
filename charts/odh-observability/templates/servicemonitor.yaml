@@ -1,0 +1,22 @@
+apiVersion: monitoring.rhobs/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "odh-observability.fullname" . }}-metrics
+  namespace: {{ include "odh-observability.monitoringNamespace" . }}
+  labels:
+    {{- include "odh-observability.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+    monitoring.opendatahub.io/scrape: "true"
+spec:
+  endpoints:
+    - path: /metrics
+      port: metrics
+      scheme: http
+      interval: 30s
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.operatorNamespace }}
+  selector:
+    matchLabels:
+      {{- include "odh-observability.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: metrics

@@ -113,6 +113,11 @@
           "minimum": 1,
           "maximum": 65535,
           "description": "Webhook listener port"
+        },
+        "failurePolicy": {
+          "type": "string",
+          "enum": ["Ignore", "Fail"],
+          "description": "Webhook failure policy: Ignore (fail open) or Fail (fail closed)"
         }
       }
     },

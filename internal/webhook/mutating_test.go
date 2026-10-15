@@ -43,22 +43,30 @@ func newTestScheme() *runtime.Scheme {
 	utilruntime.Must(clientgoscheme.AddToScheme(s))
 	utilruntime.Must(v1alpha1.AddToScheme(s))
 
-	// CoreOS monitor GVKs are external types the webhook intercepts; register as
-	// unstructured so the fake client can handle them.
-	s.AddKnownTypeWithName(gvk.CoreosServiceMonitor, &unstructured.Unstructured{})
-	listSM := schema.GroupVersionKind{Group: gvk.CoreosServiceMonitor.Group, Version: gvk.CoreosServiceMonitor.Version, Kind: "ServiceMonitorList"}
+	// Monitor GVKs (both RHOBS and upstream) are external types the webhook intercepts;
+	// register as unstructured so the fake client can handle them.
+	s.AddKnownTypeWithName(gvk.ServiceMonitor, &unstructured.Unstructured{})
+	listSM := schema.GroupVersionKind{Group: gvk.ServiceMonitor.Group, Version: gvk.ServiceMonitor.Version, Kind: "ServiceMonitorList"}
 	s.AddKnownTypeWithName(listSM, &unstructured.UnstructuredList{})
 
-	s.AddKnownTypeWithName(gvk.CoreosPodMonitor, &unstructured.Unstructured{})
-	listPM := schema.GroupVersionKind{Group: gvk.CoreosPodMonitor.Group, Version: gvk.CoreosPodMonitor.Version, Kind: "PodMonitorList"}
+	s.AddKnownTypeWithName(gvk.ServiceMonitorCoreos, &unstructured.Unstructured{})
+	listSMCoreos := schema.GroupVersionKind{Group: gvk.ServiceMonitorCoreos.Group, Version: gvk.ServiceMonitorCoreos.Version, Kind: "ServiceMonitorList"}
+	s.AddKnownTypeWithName(listSMCoreos, &unstructured.UnstructuredList{})
+
+	s.AddKnownTypeWithName(gvk.PodMonitor, &unstructured.Unstructured{})
+	listPM := schema.GroupVersionKind{Group: gvk.PodMonitor.Group, Version: gvk.PodMonitor.Version, Kind: "PodMonitorList"}
 	s.AddKnownTypeWithName(listPM, &unstructured.UnstructuredList{})
+
+	s.AddKnownTypeWithName(gvk.PodMonitorCoreos, &unstructured.Unstructured{})
+	listPMCoreos := schema.GroupVersionKind{Group: gvk.PodMonitorCoreos.Group, Version: gvk.PodMonitorCoreos.Version, Kind: "PodMonitorList"}
+	s.AddKnownTypeWithName(listPMCoreos, &unstructured.UnstructuredList{})
 
 	return s
 }
 
 func newServiceMonitor(namespace, name string, labels map[string]string) *unstructured.Unstructured {
 	obj := &unstructured.Unstructured{}
-	obj.SetGroupVersionKind(gvk.CoreosServiceMonitor)
+	obj.SetGroupVersionKind(gvk.ServiceMonitor)
 	obj.SetNamespace(namespace)
 	obj.SetName(name)
 	if labels != nil {
@@ -69,7 +77,29 @@ func newServiceMonitor(namespace, name string, labels map[string]string) *unstru
 
 func newPodMonitor(namespace, name string, labels map[string]string) *unstructured.Unstructured {
 	obj := &unstructured.Unstructured{}
-	obj.SetGroupVersionKind(gvk.CoreosPodMonitor)
+	obj.SetGroupVersionKind(gvk.PodMonitor)
+	obj.SetNamespace(namespace)
+	obj.SetName(name)
+	if labels != nil {
+		obj.SetLabels(labels)
+	}
+	return obj
+}
+
+func newServiceMonitorCoreos(namespace, name string, labels map[string]string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(gvk.ServiceMonitorCoreos)
+	obj.SetNamespace(namespace)
+	obj.SetName(name)
+	if labels != nil {
+		obj.SetLabels(labels)
+	}
+	return obj
+}
+
+func newPodMonitorCoreos(namespace, name string, labels map[string]string) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(gvk.PodMonitorCoreos)
 	obj.SetNamespace(namespace)
 	obj.SetName(name)
 	if labels != nil {
@@ -108,7 +138,7 @@ func TestHandle_NilDecoder(t *testing.T) {
 	}
 
 	req := makeAdmissionRequest(t, admissionv1.Create, metav1.GroupVersionKind{
-		Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor",
+		Group: "monitoring.rhobs", Version: "v1", Kind: "ServiceMonitor",
 	}, newServiceMonitor("test-ns", "sm", nil))
 
 	resp := injector.Handle(context.Background(), req)
@@ -124,7 +154,7 @@ func TestHandle_NilClient(t *testing.T) {
 	}
 
 	req := makeAdmissionRequest(t, admissionv1.Create, metav1.GroupVersionKind{
-		Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor",
+		Group: "monitoring.rhobs", Version: "v1", Kind: "ServiceMonitor",
 	}, newServiceMonitor("test-ns", "sm", nil))
 
 	resp := injector.Handle(context.Background(), req)
@@ -141,7 +171,7 @@ func TestHandle_UnexpectedKind(t *testing.T) {
 	}
 
 	obj := &unstructured.Unstructured{}
-	obj.SetGroupVersionKind(gvk.CoreosServiceMonitor)
+	obj.SetGroupVersionKind(gvk.ServiceMonitor)
 	obj.SetNamespace("test-ns")
 	obj.SetName("sm")
 	raw, err := json.Marshal(obj)
@@ -178,7 +208,7 @@ func TestHandle_NamespaceNotLabeled(t *testing.T) {
 
 	sm := newServiceMonitor("unlabeled-ns", "my-sm", nil)
 	req := makeAdmissionRequest(t, admissionv1.Create, metav1.GroupVersionKind{
-		Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor",
+		Group: "monitoring.rhobs", Version: "v1", Kind: "ServiceMonitor",
 	}, sm)
 
 	resp := injector.Handle(context.Background(), req)
@@ -206,7 +236,7 @@ func TestHandle_InjectsLabelOnServiceMonitor(t *testing.T) {
 
 	sm := newServiceMonitor("monitored-ns", "my-sm", nil)
 	req := makeAdmissionRequest(t, admissionv1.Create, metav1.GroupVersionKind{
-		Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor",
+		Group: "monitoring.rhobs", Version: "v1", Kind: "ServiceMonitor",
 	}, sm)
 
 	resp := injector.Handle(context.Background(), req)
@@ -248,7 +278,7 @@ func TestHandle_InjectsLabelOnPodMonitor(t *testing.T) {
 
 	pm := newPodMonitor("monitored-ns", "my-pm", nil)
 	req := makeAdmissionRequest(t, admissionv1.Create, metav1.GroupVersionKind{
-		Group: "monitoring.coreos.com", Version: "v1", Kind: "PodMonitor",
+		Group: "monitoring.rhobs", Version: "v1", Kind: "PodMonitor",
 	}, pm)
 
 	resp := injector.Handle(context.Background(), req)
@@ -281,7 +311,7 @@ func TestHandle_PreservesExistingLabel(t *testing.T) {
 		"other":         "label",
 	})
 	req := makeAdmissionRequest(t, admissionv1.Create, metav1.GroupVersionKind{
-		Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor",
+		Group: "monitoring.rhobs", Version: "v1", Kind: "ServiceMonitor",
 	}, sm)
 
 	resp := injector.Handle(context.Background(), req)
@@ -307,7 +337,7 @@ func TestHandle_MonitoringCRMissing(t *testing.T) {
 
 	sm := newServiceMonitor("monitored-ns", "my-sm", nil)
 	req := makeAdmissionRequest(t, admissionv1.Create, metav1.GroupVersionKind{
-		Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor",
+		Group: "monitoring.rhobs", Version: "v1", Kind: "ServiceMonitor",
 	}, sm)
 
 	resp := injector.Handle(context.Background(), req)
@@ -336,7 +366,7 @@ func TestHandle_MonitoringRemoved(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := makeAdmissionRequest(t, admissionv1.Create, metav1.GroupVersionKind{
-				Group: "monitoring.coreos.com", Version: "v1", Kind: tc.kind,
+				Group: "monitoring.rhobs", Version: "v1", Kind: tc.kind,
 			}, tc.obj)
 			resp := injector.Handle(context.Background(), req)
 			if !resp.Allowed || len(resp.Patches) != 0 {
@@ -356,12 +386,96 @@ func TestHandle_DeleteOperation(t *testing.T) {
 
 	sm := newServiceMonitor("test-ns", "sm", nil)
 	req := makeAdmissionRequest(t, admissionv1.Delete, metav1.GroupVersionKind{
-		Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor",
+		Group: "monitoring.rhobs", Version: "v1", Kind: "ServiceMonitor",
 	}, sm)
 
 	resp := injector.Handle(context.Background(), req)
 	if !resp.Allowed {
 		t.Errorf("expected allowed for delete, got denied: %v", resp.Result)
+	}
+}
+
+func TestHandle_InjectsLabelOnCoreosServiceMonitor(t *testing.T) {
+	scheme := newTestScheme()
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "monitored-ns",
+			Labels: map[string]string{labelMonitoring: "true"},
+		},
+	}
+	monCR := monitoringCR()
+	monCR.Spec.ManagementState = platformcommon.Managed
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ns).WithObjects(monCR).Build()
+	injector := &Injector{
+		Client:  cli,
+		Decoder: admission.NewDecoder(scheme),
+	}
+
+	sm := newServiceMonitorCoreos("monitored-ns", "my-coreos-sm", nil)
+	req := makeAdmissionRequest(t, admissionv1.Create, metav1.GroupVersionKind{
+		Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor",
+	}, sm)
+
+	resp := injector.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected allowed for coreos ServiceMonitor, got denied: %v", resp.Result)
+	}
+	if len(resp.Patches) == 0 {
+		t.Fatal("expected patches for label injection on coreos ServiceMonitor")
+	}
+
+	hasLabelPatch := false
+	for _, p := range resp.Patches {
+		if p.Path == "/metadata/labels" || p.Path == "/metadata/labels/monitoring.opendatahub.io~1scrape" {
+			hasLabelPatch = true
+			break
+		}
+	}
+	if !hasLabelPatch {
+		t.Errorf("expected label patch on coreos ServiceMonitor, got patches: %v", resp.Patches)
+	}
+}
+
+func TestHandle_InjectsLabelOnCoreosPodMonitor(t *testing.T) {
+	scheme := newTestScheme()
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "monitored-ns",
+			Labels: map[string]string{labelMonitoring: "true"},
+		},
+	}
+	monCR := monitoringCR()
+	monCR.Spec.ManagementState = platformcommon.Managed
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ns).WithObjects(monCR).Build()
+	injector := &Injector{
+		Client:  cli,
+		Decoder: admission.NewDecoder(scheme),
+	}
+
+	pm := newPodMonitorCoreos("monitored-ns", "my-coreos-pm", nil)
+	req := makeAdmissionRequest(t, admissionv1.Create, metav1.GroupVersionKind{
+		Group: "monitoring.coreos.com", Version: "v1", Kind: "PodMonitor",
+	}, pm)
+
+	resp := injector.Handle(context.Background(), req)
+	if !resp.Allowed {
+		t.Fatalf("expected allowed for coreos PodMonitor, got denied: %v", resp.Result)
+	}
+	if len(resp.Patches) == 0 {
+		t.Fatal("expected patches for label injection on coreos PodMonitor")
+	}
+
+	hasLabelPatch := false
+	for _, p := range resp.Patches {
+		if p.Path == "/metadata/labels" || p.Path == "/metadata/labels/monitoring.opendatahub.io~1scrape" {
+			hasLabelPatch = true
+			break
+		}
+	}
+	if !hasLabelPatch {
+		t.Errorf("expected label patch on coreos PodMonitor, got patches: %v", resp.Patches)
 	}
 }
 
@@ -372,6 +486,16 @@ func TestIsExpectedKind(t *testing.T) {
 		want bool
 	}{
 		{
+			name: "rhobs ServiceMonitor",
+			kind: metav1.GroupVersionKind{Group: "monitoring.rhobs", Version: "v1", Kind: "ServiceMonitor"},
+			want: true,
+		},
+		{
+			name: "rhobs PodMonitor",
+			kind: metav1.GroupVersionKind{Group: "monitoring.rhobs", Version: "v1", Kind: "PodMonitor"},
+			want: true,
+		},
+		{
 			name: "coreos ServiceMonitor",
 			kind: metav1.GroupVersionKind{Group: "monitoring.coreos.com", Version: "v1", Kind: "ServiceMonitor"},
 			want: true,
@@ -380,11 +504,6 @@ func TestIsExpectedKind(t *testing.T) {
 			name: "coreos PodMonitor",
 			kind: metav1.GroupVersionKind{Group: "monitoring.coreos.com", Version: "v1", Kind: "PodMonitor"},
 			want: true,
-		},
-		{
-			name: "rhobs ServiceMonitor (not expected)",
-			kind: metav1.GroupVersionKind{Group: "monitoring.rhobs", Version: "v1", Kind: "ServiceMonitor"},
-			want: false,
 		},
 		{
 			name: "random kind",

@@ -88,7 +88,7 @@ spec:
           image: {{.KubeRBACProxyImage}}
           args:
             - --secure-listen-address=0.0.0.0:8443
-            - --upstream=http://127.0.0.1:9091/
+            - --upstream=http://127.0.0.1:9092/
             - --config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml
             - --tls-cert-file=/etc/tls/private/tls.crt
             - --tls-private-key-file=/etc/tls/private/tls.key
@@ -124,14 +124,43 @@ spec:
                 - ALL
             readOnlyRootFilesystem: true
             runAsNonRoot: true
+        - name: method-gate
+          image: {{.HTTPMethodGateImage}}
+          command:
+            - /manager
+            - method-gate
+          args:
+            - --listen=127.0.0.1:9092
+            - --upstream=http://127.0.0.1:9091
+          ports:
+            - containerPort: 9092
+              name: method-gate
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 100m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          terminationMessagePolicy: FallbackToLogsOnError
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
         - name: prom-label-proxy
           image: {{.PromLabelProxyImage}}
           args:
             - --insecure-listen-address=127.0.0.1:9091
             - --upstream=http://thanos-querier-data-science-thanos-querier.{{.Namespace}}.svc.cluster.local:10902
             - --label=namespace
+            - --query-param=namespace
+            - --error-on-replace
             - --enable-label-apis
-            # Reject duplicate namespace values from URL and POST form data.
+            # Enable regex matching for label matchers.
             - --regex-match
           resources:
             limits:

@@ -52,8 +52,8 @@ const (
 	webhookPath = "/mutate-prometheus-monitors"
 )
 
-//+kubebuilder:webhook:path=/mutate-prometheus-monitors,mutating=true,failurePolicy=fail,groups=monitoring.coreos.com,resources=podmonitors,verbs=create;update,versions=v1,name=podmonitor-injector.opendatahub.io,sideEffects=None,admissionReviewVersions=v1
-//+kubebuilder:webhook:path=/mutate-prometheus-monitors,mutating=true,failurePolicy=fail,groups=monitoring.coreos.com,resources=servicemonitors,verbs=create;update,versions=v1,name=servicemonitor-injector.opendatahub.io,sideEffects=None,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/mutate-prometheus-monitors,mutating=true,failurePolicy=ignore,groups=monitoring.rhobs;monitoring.coreos.com,resources=podmonitors,verbs=create;update,versions=v1,name=podmonitor-injector.opendatahub.io,sideEffects=None,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/mutate-prometheus-monitors,mutating=true,failurePolicy=ignore,groups=monitoring.rhobs;monitoring.coreos.com,resources=servicemonitors,verbs=create;update,versions=v1,name=servicemonitor-injector.opendatahub.io,sideEffects=None,admissionReviewVersions=v1
 
 // Injector is a mutating admission webhook that injects the monitoring label
 // into ServiceMonitor and PodMonitor resources in opted-in namespaces.
@@ -160,8 +160,10 @@ func (i *Injector) inject(ctx context.Context, req *admission.Request, obj *unst
 
 func isExpectedKind(kind metav1.GroupVersionKind) bool {
 	supported := []schema.GroupVersionKind{
-		gvk.CoreosServiceMonitor,
-		gvk.CoreosPodMonitor,
+		gvk.ServiceMonitor,
+		gvk.ServiceMonitorCoreos,
+		gvk.PodMonitor,
+		gvk.PodMonitorCoreos,
 	}
 	return slices.Contains(supported, schema.GroupVersionKind{
 		Group:   kind.Group,

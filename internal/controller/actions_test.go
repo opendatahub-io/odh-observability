@@ -504,13 +504,51 @@ func TestDeployAlerting_CRDPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 1 {
-		t.Errorf("expected 1 source for alerting, got %d", len(sources))
+	if len(sources) != 0 {
+		t.Errorf("expected 0 sources for alerting, got %d", len(sources))
 	}
 
 	alertC := findCondition(m, conditions.ConditionAlertingAvailable)
 	if alertC == nil || alertC.Status != metav1.ConditionTrue {
 		t.Error("AlertingAvailable should be True")
+	}
+}
+
+func TestDeployOperatorMonitoring_CRDPresent(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.PrometheusRule)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployOperatorMonitoring(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 1 {
+		t.Errorf("expected 1 source for operator monitoring, got %d", len(sources))
+	}
+}
+
+func TestDeployWebhookHealthProbe_CRDPresent(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.PodMonitor)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployWebhookHealthProbe(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 1 {
+		t.Errorf("expected 1 source for webhook health probe, got %d", len(sources))
 	}
 }
 
@@ -879,6 +917,7 @@ func TestDeployClusterLogForwarder_CRDMissing(t *testing.T) {
 	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
 	if c == nil {
 		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
+		return
 	}
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
@@ -922,6 +961,7 @@ func TestDeployClusterLogForwarder_LokiStackNotReady(t *testing.T) {
 	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
 	if c == nil {
 		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
+		return
 	}
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
@@ -980,6 +1020,7 @@ func TestDeployClusterLogForwarder_CLFExistsButNotReady(t *testing.T) {
 	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
 	if c == nil {
 		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
+		return
 	}
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
