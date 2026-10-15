@@ -71,9 +71,11 @@ const (
 	tempoOpNamespace = "openshift-tempo-operator"
 	tempoOpChannel   = "stable"
 
-	opentelemetryOpName      = "opentelemetry-product"
-	opentelemetryOpNamespace = "openshift-opentelemetry-operator"
-	opentelemetryOpChannel   = "stable"
+	opentelemetryOpName        = "opentelemetry-product"
+	opentelemetryOpNamespace   = "openshift-opentelemetry-operator"
+	opentelemetryOpChannel     = "stable"
+	otelOperatorServiceAccount = "opentelemetry-operator-controller-manager"
+	otelCertManagerRole        = "opentelemetry-operator-cert-manager"
 
 	certManagerOpName      = "openshift-cert-manager-operator"
 	certManagerOpPackage   = "cert-manager-operator"
@@ -1029,6 +1031,10 @@ func (tc *TestContext) installDependentOperators(t *testing.T) {
 		return tc.client.List(tc.ctx, certificates, client.Limit(1))
 	}).WithTimeout(tc.Timeouts.olmOperationTimeout).Should(Succeed(),
 		"cert-manager Certificate API should be discoverable before OpenTelemetry starts")
+	// Some Red Hat OpenTelemetry Operator CSVs omit the cert-manager rules
+	// required by the operator's autodetection. Create the supplemental binding
+	// before the OTel deployment starts so TargetAllocator mTLS can use cert-manager.
+	tc.ensureOpenTelemetryCertManagerRBAC(t)
 
 	operators := []operator{
 		{observabilityOpNamespace, observabilityOpName, cooOperatorChannel()},
@@ -1045,7 +1051,99 @@ func (tc *TestContext) installDependentOperators(t *testing.T) {
 		}
 	})
 
+	tc.restartOpenTelemetryOperator(t)
+	for _, name := range []string{
+		"opentelemetry-operator-controller-manager",
+		"opentelemetry-operator-webhook",
+	} {
+		tc.EnsureDeploymentReady(
+			WithMinimalObject(gvk.Deployment, types.NamespacedName{
+				Name:      name,
+				Namespace: opentelemetryOpNamespace,
+			}),
+			WithEventuallyTimeout(tc.Timeouts.olmOperationTimeout),
+			WithCustomErrorMsg("OpenTelemetry Operator deployment %s should be ready", name),
+		)
+	}
+
 	tc.ensureLokiOperatorInstalled(t)
+}
+
+// ensureOpenTelemetryCertManagerRBAC supplies the certificate permissions
+// required by the OpenTelemetry Operator's cert-manager autodetection. The
+// permissions are intentionally limited to the resources and verbs checked by
+// the upstream operator.
+func (tc *TestContext) ensureOpenTelemetryCertManagerRBAC(t *testing.T) {
+	t.Helper()
+
+	rules := []any{map[string]any{
+		"apiGroups": []any{"cert-manager.io"},
+		"resources": []any{"issuers", "certificaterequests", "certificates"},
+		"verbs":     []any{"create", "get", "list", "watch", "update", "patch", "delete"},
+	}}
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{Name: otelCertManagerRole}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			return unstructured.SetNestedSlice(u.Object, rules, "rules")
+		}),
+		WithEventuallyTimeout(tc.Timeouts.olmOperationTimeout),
+		WithCustomErrorMsg("OpenTelemetry Operator cert-manager ClusterRole should exist"),
+	)
+
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{Name: otelCertManagerRole}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			if err := unstructured.SetNestedMap(u.Object, map[string]any{
+				"apiGroup": "rbac.authorization.k8s.io",
+				"kind":     "ClusterRole",
+				"name":     otelCertManagerRole,
+			}, "roleRef"); err != nil {
+				return err
+			}
+			return unstructured.SetNestedSlice(u.Object, []any{map[string]any{
+				"kind":      "ServiceAccount",
+				"name":      otelOperatorServiceAccount,
+				"namespace": opentelemetryOpNamespace,
+			}}, "subjects")
+		}),
+		WithEventuallyTimeout(tc.Timeouts.olmOperationTimeout),
+		WithCustomErrorMsg("OpenTelemetry Operator cert-manager ClusterRoleBinding should exist"),
+	)
+}
+
+// restartOpenTelemetryOperator forces a fresh cert-manager autodetection. This
+// is needed when the OTel Operator was already installed before the dependency
+// was made available; new installations also take the same deterministic path.
+func (tc *TestContext) restartOpenTelemetryOperator(t *testing.T) {
+	t.Helper()
+	rolloutToken := time.Now().UTC().Format(time.RFC3339Nano)
+
+	for _, name := range []string{
+		"opentelemetry-operator-controller-manager",
+		"opentelemetry-operator-webhook",
+	} {
+		deployment, err := tc.fetchResource(t, gvk.Deployment, types.NamespacedName{
+			Name:      name,
+			Namespace: opentelemetryOpNamespace,
+		})
+		if k8serr.IsNotFound(err) {
+			continue
+		}
+		require.NoError(t, err, "failed to fetch OpenTelemetry Operator deployment %s", name)
+
+		original := deployment.DeepCopy()
+		annotations, _, err := unstructured.NestedStringMap(deployment.Object, "spec", "template", "metadata", "annotations")
+		require.NoError(t, err, "failed to read OpenTelemetry Operator deployment %s annotations", name)
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		annotations["e2e.opendatahub.io/cert-manager-rbac"] = rolloutToken
+		require.NoError(t,
+			unstructured.SetNestedStringMap(deployment.Object, annotations, "spec", "template", "metadata", "annotations"),
+			"failed to update OpenTelemetry Operator deployment %s annotations", name)
+		require.NoError(t, tc.client.Patch(tc.ctx, deployment, client.MergeFrom(original)),
+			"failed to restart OpenTelemetry Operator deployment %s", name)
+	}
 }
 
 // ensureLokiOperatorInstalled installs the Loki Operator unless the LokiStack CRD is
