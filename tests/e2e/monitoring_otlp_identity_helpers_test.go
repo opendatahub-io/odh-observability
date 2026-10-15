@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestBuildOTLPMetricsPayload(t *testing.T) {
@@ -117,6 +119,17 @@ func TestOTLPSeriesIdentityChecks(t *testing.T) {
 			} else {
 				require.NoError(t, sanitizationErr)
 			}
+			for _, diagnosticErr := range []error{attributionErr, sanitizationErr} {
+				if diagnosticErr == nil {
+					continue
+				}
+				for _, value := range test.labels {
+					if value != "" {
+						require.NotContains(t, diagnosticErr.Error(), value,
+							"identity diagnostics must not expose metric label values")
+					}
+				}
+			}
 		})
 	}
 }
@@ -131,20 +144,20 @@ func TestOTLPDeliveryRequiresAcceptedPushAndMonitoringSeries(t *testing.T) {
 
 	t.Run("accepted and observed", func(t *testing.T) {
 		evidence := &otlpIdentityEvidence{acceptedPushes: 1, snapshots: []otlpIdentitySnapshot{snapshot}}
-		require.NoError(t, otlpDeliveryError(evidence, "odh_identity_probe"))
+		require.NoError(t, otlpDeliveryError(evidence))
 	})
 	t.Run("query alone is not delivery", func(t *testing.T) {
 		evidence := &otlpIdentityEvidence{snapshots: []otlpIdentitySnapshot{snapshot}}
-		require.Error(t, otlpDeliveryError(evidence, "odh_identity_probe"))
+		require.Error(t, otlpDeliveryError(evidence))
 	})
 	t.Run("accepted push without observed series is not delivery", func(t *testing.T) {
 		evidence := &otlpIdentityEvidence{acceptedPushes: 1}
-		require.Error(t, otlpDeliveryError(evidence, "odh_identity_probe"))
+		require.Error(t, otlpDeliveryError(evidence))
 	})
 	t.Run("non-success query is not delivery", func(t *testing.T) {
 		failed := otlpIdentitySnapshot{monitoring: otlpQueryObservation{status: http.StatusForbidden}}
 		evidence := &otlpIdentityEvidence{acceptedPushes: 1, snapshots: []otlpIdentitySnapshot{failed}}
-		require.Error(t, otlpDeliveryError(evidence, "odh_identity_probe"))
+		require.Error(t, otlpDeliveryError(evidence))
 	})
 }
 
@@ -164,7 +177,10 @@ func TestOTLPTenantIsolationRequiresSuccessfulEmptyQueries(t *testing.T) {
 	t.Run("injected series fails immediately", func(t *testing.T) {
 		injected := append([]otlpIdentitySnapshot(nil), emptySnapshots...)
 		injected[1].tenant.series = []map[string]string{{"namespace": "tenant-ns", "pod": "victim-pod"}}
-		require.Error(t, otlpTenantIsolationError(injected, minSpan))
+		err := otlpTenantIsolationError(injected, minSpan)
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), "tenant-ns")
+		require.NotContains(t, err.Error(), "victim-pod")
 	})
 	t.Run("query error is not an empty success", func(t *testing.T) {
 		observations := append([]otlpIdentitySnapshot(nil), emptySnapshots[:3]...)
@@ -184,6 +200,70 @@ func TestOTLPTenantIsolationRequiresSuccessfulEmptyQueries(t *testing.T) {
 		observations := append([]otlpIdentitySnapshot(nil), emptySnapshots...)
 		require.Error(t, otlpTenantIsolationError(observations, minSpan+time.Second))
 	})
+}
+
+func TestPodDiagnosticSummaryOmitsSensitivePodFields(t *testing.T) {
+	const (
+		secretPodName        = "secret-pod-name"
+		secretNamespace      = "secret-namespace"
+		secretUID            = "secret-pod-uid"
+		secretIP             = "192.0.2.17"
+		secretImage          = "registry.example/private-image"
+		secretArgument       = "--token=secret-argument"
+		secretEnvironment    = "secret-environment-value"
+		secretCondition      = "secret-condition-message"
+		secretContainerState = "secret-container-message"
+		secretImageID        = "sha256:private-image-id"
+		secretContainerID    = "cri-o://private-container-id"
+	)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretPodName,
+			Namespace: secretNamespace,
+			UID:       secretUID,
+		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name:  "collector",
+			Image: secretImage,
+			Args:  []string{secretArgument},
+			Env:   []corev1.EnvVar{{Name: "API_TOKEN", Value: secretEnvironment}},
+		}}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			PodIP: secretIP,
+			Conditions: []corev1.PodCondition{{
+				Type:    corev1.PodReady,
+				Status:  corev1.ConditionFalse,
+				Message: secretCondition,
+			}},
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:         "collector",
+				Image:        secretImage,
+				ImageID:      secretImageID,
+				ContainerID:  secretContainerID,
+				Ready:        false,
+				RestartCount: 2,
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason:  "CrashLoopBackOff",
+					Message: secretContainerState,
+				}},
+			}},
+		},
+	}
+
+	summary := podDiagnosticSummary(pod)
+	require.Contains(t, summary, "phase=Running")
+	require.Contains(t, summary, "ready=false")
+	require.Contains(t, summary, "reason=CrashLoopBackOff")
+	require.Contains(t, summary, "restarts=2")
+	for _, sensitive := range []string{
+		secretPodName, secretNamespace, secretUID, secretIP, secretImage, secretArgument,
+		secretEnvironment, secretCondition, secretContainerState, secretImageID, secretContainerID,
+	} {
+		require.NotContains(t, summary, sensitive)
+	}
+	require.Equal(t, "other", safePodPhase(corev1.PodPhase("secret-phase")))
+	require.Equal(t, "other", safeContainerReason("secret-runtime-reason"))
 }
 
 func TestQueryOTLPMetricRejectsPrometheusErrorStatus(t *testing.T) {
