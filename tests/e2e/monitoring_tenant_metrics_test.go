@@ -125,13 +125,14 @@ func (tc *MonitoringTestCtx) ValidateTenantWorkloadMetricsNamespaceRestriction(t
 	require.Equal(t, http.StatusForbidden, status,
 		"tenant service account must be forbidden to query metrics of namespace %s", tenantMetricsForeignNamespace)
 
-	// Even a privileged query must not see the tenant's series under a
-	// foreign namespace: prom-label-proxy enforces the namespace label.
-	status, parsed, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, getAuthToken(tc.TestContext), tenantMetricsForeignNamespace, tenantMetricsQueryMetric)
-	require.NoError(t, err, "privileged query for foreign namespace must reach the proxy")
+	// Even a viewer authorized for the foreign namespace must not see the
+	// tenant's series under it: prom-label-proxy enforces the namespace label.
+	foreignViewerToken := tc.metricsViewerToken(t, "tenant-metrics-foreign-viewer", tenantMetricsForeignNamespace)
+	status, parsed, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, foreignViewerToken, tenantMetricsForeignNamespace, tenantMetricsQueryMetric)
+	require.NoError(t, err, "viewer query for foreign namespace must reach the proxy")
 	require.Equal(t, http.StatusOK, status)
 	require.Empty(t, parsed.Data.Result,
-		"privileged query for namespace %s must return no tenant series", tenantMetricsForeignNamespace)
+		"viewer query for namespace %s must return no tenant series", tenantMetricsForeignNamespace)
 }
 
 // ValidateOTLPMetricIdentityCannotBeSpoofed proves the OTLP trust boundary:
@@ -226,7 +227,7 @@ func (tc *MonitoringTestCtx) ValidateOTLPMetricIdentityCannotBeSpoofed(t *testin
 
 	routeHost := tc.fetchPrometheusRouteHost(t)
 	rootCAs := clusterIngressCAPool(t, tc)
-	adminToken := getAuthToken(tc.TestContext)
+	viewerToken := tc.metricsViewerToken(t, "otlp-identity-viewer", tc.MonitoringNamespace)
 	tenantToken := tc.requestServiceAccountToken(t, tenantMetricsNamespace, tenantMetricsServiceAccount)
 
 	// Delivery control: the pushed series must be visible under the sender's
@@ -235,12 +236,12 @@ func (tc *MonitoringTestCtx) ValidateOTLPMetricIdentityCannotBeSpoofed(t *testin
 	// The exporter expires metrics five minutes after the last push, so the
 	// polling window stays well inside that.
 	tc.g.Eventually(func() error {
-		status, parsed, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, adminToken, tc.MonitoringNamespace, metricName)
+		status, parsed, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, viewerToken, tc.MonitoringNamespace, metricName)
 		if err != nil {
 			return err
 		}
 		if status != http.StatusOK {
-			return fmt.Errorf("admin query via %s returned status %d", routeHost, status)
+			return fmt.Errorf("viewer query via %s returned status %d", routeHost, status)
 		}
 		if len(parsed.Data.Result) == 0 {
 			return fmt.Errorf("no %s series visible in namespace %s yet", metricName, tc.MonitoringNamespace)
@@ -355,6 +356,10 @@ func (tc *MonitoringTestCtx) ensureTenantMetricsEnvironment(t *testing.T) {
 		WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: tenantMetricsForeignNamespace}),
 	)
 
+	// The Prometheus image's /prometheus TSDB directory is owned by the image
+	// user, which the random UID of OpenShift's restricted SCCs cannot write.
+	// Mount an emptyDir there and pin the restricted security context, like
+	// every other workload fixture in this suite.
 	tc.EventuallyResourceCreatedOrPatched(
 		WithMinimalObject(gvk.Deployment, types.NamespacedName{
 			Name:      tenantMetricsWorkloadName,
@@ -367,6 +372,10 @@ func (tc *MonitoringTestCtx) ensureTenantMetricsEnvironment(t *testing.T) {
 				"template": map[string]any{
 					"metadata": map[string]any{"labels": map[string]any{"app": tenantMetricsWorkloadName}},
 					"spec": map[string]any{
+						"securityContext": map[string]any{
+							"runAsNonRoot":   true,
+							"seccompProfile": map[string]any{"type": "RuntimeDefault"},
+						},
 						"containers": []any{map[string]any{
 							"name":  tenantMetricsWorkloadName,
 							"image": tenantMetricsImage,
@@ -379,6 +388,18 @@ func (tc *MonitoringTestCtx) ensureTenantMetricsEnvironment(t *testing.T) {
 								"requests": map[string]any{"cpu": "50m", "memory": "128Mi"},
 								"limits":   map[string]any{"cpu": "200m", "memory": "512Mi"},
 							},
+							"volumeMounts": []any{map[string]any{
+								"name":      "data",
+								"mountPath": "/prometheus",
+							}},
+							"securityContext": map[string]any{
+								"allowPrivilegeEscalation": false,
+								"capabilities":             map[string]any{"drop": []any{"ALL"}},
+							},
+						}},
+						"volumes": []any{map[string]any{
+							"name":     "data",
+							"emptyDir": map[string]any{},
 						}},
 					},
 				},
@@ -507,6 +528,55 @@ func (tc *MonitoringTestCtx) requestServiceAccountToken(t *testing.T, namespace,
 	require.NotEmpty(t, tokenRequest.Status.Token, "token request returned an empty token")
 
 	return tokenRequest.Status.Token
+}
+
+// metricsViewerToken mints a TokenRequest token for a service account that is
+// authorized to view the given namespace. Proxy queries must not depend on how
+// the test runner authenticates to Kubernetes: on CI clusters the kubeconfig
+// credential is not accepted by kube-rbac-proxy's TokenReview (constant 401),
+// so authorized queries use minted service-account tokens instead — the same
+// approach as the Thanos route probes.
+func (tc *MonitoringTestCtx) metricsViewerToken(t *testing.T, name, namespace string) string {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.ServiceAccount, types.NamespacedName{
+			Name:      name,
+			Namespace: tc.MonitoringNamespace,
+		}),
+	)
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.RoleBinding, types.NamespacedName{
+			Name:      name,
+			Namespace: namespace,
+		}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			u.Object["roleRef"] = map[string]any{
+				"apiGroup": "rbac.authorization.k8s.io",
+				"kind":     "ClusterRole",
+				"name":     "view",
+			}
+			u.Object["subjects"] = []any{map[string]any{
+				"kind":      "ServiceAccount",
+				"name":      name,
+				"namespace": tc.MonitoringNamespace,
+			}}
+			return nil
+		}),
+	)
+	t.Cleanup(func() {
+		tc.DeleteResource(
+			WithMinimalObject(gvk.RoleBinding, types.NamespacedName{Name: name, Namespace: namespace}),
+			WithIgnoreNotFound(true),
+		)
+		tc.DeleteResource(
+			WithMinimalObject(gvk.ServiceAccount, types.NamespacedName{Name: name, Namespace: tc.MonitoringNamespace}),
+			WithIgnoreNotFound(true),
+		)
+	})
+
+	return tc.requestServiceAccountToken(t, tc.MonitoringNamespace, name)
 }
 
 // queryMetricsViaNamespaceProxy sends a namespace-restricted instant query

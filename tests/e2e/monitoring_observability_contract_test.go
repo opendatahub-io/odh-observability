@@ -78,9 +78,9 @@ func (tc *MonitoringTestCtx) ValidateMonitoringOperandNamespaceContract(t *testi
 
 // ValidateSignalSpecificCollectorContract covers the operator-owned collector
 // contract for metrics. It deliberately checks the rendered receivers,
-// processors, exporter TLS files, and both internal and stored metrics pipelines,
-// rather than treating the OpenTelemetryCollector CR's existence as ingestion
-// evidence.
+// processors, exporter TLS files, and the internal, scrape, and OTLP metrics
+// pipelines, rather than treating the OpenTelemetryCollector CR's existence as
+// ingestion evidence.
 func (tc *MonitoringTestCtx) ValidateSignalSpecificCollectorContract(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
@@ -94,14 +94,18 @@ func (tc *MonitoringTestCtx) ValidateSignalSpecificCollectorContract(t *testing.
 			jq.Match(`.metadata.labels."platform.opendatahub.io/part-of" == "monitoring"`),
 			jq.Match(`.spec.config.receivers | has("prometheus") and has("prometheus/self") and has("otlp")`),
 			jq.Match(`.spec.config.receivers.prometheus.config.scrape_configs[0].bearer_token_file == "/var/run/secrets/kubernetes.io/serviceaccount/token"`),
-			jq.Match(`.spec.config.processors | has("memory_limiter") and has("k8sattributes") and has("resourcedetection") and has("batch")`),
+			jq.Match(`.spec.config.processors | has("memory_limiter") and has("k8sattributes") and has("k8sattributes/otlp")`),
+			jq.Match(`.spec.config.processors | has("transform/sanitize_otlp_identity") and has("resourcedetection") and has("batch")`),
 			jq.Match(`.spec.config.exporters.prometheus.endpoint == "0.0.0.0:8889"`),
 			jq.Match(`.spec.config.exporters.prometheus.tls.cert_file == "/etc/otel-collector/tls/tls.crt"`),
 			jq.Match(`.spec.config.exporters.prometheus.tls.key_file == "/etc/otel-collector/tls/tls.key"`),
 			jq.Match(`.spec.config.service.pipelines."metrics/internal".receivers | contains(["prometheus/self"])`),
 			jq.Match(`.spec.config.service.pipelines."metrics/internal".exporters | contains(["prometheus/monitoring"])`),
-			jq.Match(`.spec.config.service.pipelines.metrics.receivers | contains(["prometheus", "otlp"])`),
-			jq.Match(`.spec.config.service.pipelines.metrics.exporters | contains(["prometheus"])`),
+			jq.Match(`.spec.config.service.pipelines."metrics/scrape".receivers | contains(["prometheus"]) and (contains(["otlp"]) | not)`),
+			jq.Match(`.spec.config.service.pipelines."metrics/scrape".exporters | contains(["prometheus"])`),
+			jq.Match(`.spec.config.service.pipelines."metrics/otlp".receivers | contains(["otlp"]) and (contains(["prometheus"]) | not)`),
+			jq.Match(`.spec.config.service.pipelines."metrics/otlp".processors | contains(["transform/sanitize_otlp_identity", "k8sattributes/otlp"])`),
+			jq.Match(`.spec.config.service.pipelines."metrics/otlp".exporters | contains(["prometheus"])`),
 			jq.Match(`.spec.volumes[] | select(.name == "tls-certs") | .secret.secretName == "data-science-collector-tls"`),
 		)),
 		WithCustomErrorMsg("metrics collector contract must retain authenticated scrape, TLS export, and signal pipelines"),
