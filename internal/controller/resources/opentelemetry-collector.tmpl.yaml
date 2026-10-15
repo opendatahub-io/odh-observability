@@ -76,6 +76,7 @@ spec:
         config:
           scrape_configs:
             - job_name: 'data-science-collector-prometheus'
+              scheme: http
               bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
               kubernetes_sd_configs:
                 - role: pod
@@ -96,10 +97,9 @@ spec:
                   target_label: __address__
               scrape_interval: 30s
               scrape_timeout: 10s
-              tls_config:
-                insecure_skip_verify: true
             {{- if .AcceleratorMetrics }}
             - job_name: 'dcgm-exporter-accelerator-metrics'
+              scheme: http
               bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
               kubernetes_sd_configs:
                 - role: pod
@@ -132,8 +132,6 @@ spec:
                   action: keep
               scrape_interval: 30s
               scrape_timeout: 10s
-              tls_config:
-                insecure_skip_verify: true
             {{- end }}
       {{- end }}
       otlp:
