@@ -100,6 +100,20 @@ for TokenReview or direct pod-log traffic. Treat an authenticated request that
 hangs or times out as a NetworkPolicy validation failure; do not record the
 expected `200` until the actual API-server path is allow-listed.
 
+The rendered `korrel8r` NetworkPolicy records this decision in its metadata:
+EndpointSlice addresses are the only standard-NetworkPolicy API-server peers
+(`platform.opendatahub.io/api-server-access=endpoint-slice-addresses`), while
+node-sourced API-server traffic is an explicit exception
+(`platform.opendatahub.io/api-server-node-source=explicit-exception`). That
+annotation is descriptive only; it does not change NetworkPolicy evaluation.
+The operator does not install a host-network NetworkPolicy or an
+`AdminNetworkPolicy` for this path. The owning control, when present, is the
+cluster platform/network-admin configuration for host-network or external
+control-plane traffic, whose scope must cover the API-server-to-workload path.
+If that control is absent, qualify the exception against the live cluster and
+report direct Kubernetes API traffic as an explicit limitation rather than as
+standard-NetworkPolicy protection.
+
 In a second terminal, use the caller’s token. Korrel8r forwards the bearer
 token to Loki and Tempo; it does not use only its ServiceAccount token as a
 cross-tenant proxy. The service certificate is valid for the service DNS name,

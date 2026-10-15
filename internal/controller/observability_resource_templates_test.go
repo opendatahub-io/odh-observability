@@ -355,24 +355,66 @@ func TestThanosQuerierNetworkPolicyTemplateContract(t *testing.T) {
 	}
 }
 
-func TestPrometheusNamespaceProxyNetworkPolicyTemplateContract(t *testing.T) {
-	resources := renderObservabilityTemplate(t, PrometheusNamespaceProxyNetworkPolicyTemplate, proxyTemplateData())
-	policy := findRenderedResource(t, resources, "NetworkPolicy", "data-science-prometheus-proxy-ingress")
-	ingress := nestedSlice(t, policy, "spec", "ingress")
-	if len(ingress) < 1 {
-		t.Fatalf("Prometheus namespace proxy NetworkPolicy must have router ingress, got %d rules", len(ingress))
-	}
+func TestGatewayNetworkPolicyTemplatesUseDeploymentGatewayNamespace(t *testing.T) {
+	t.Parallel()
 
-	firstRule := asMap(t, ingress[0])
-	fromValues, ok := firstRule["from"].([]any)
-	if !ok || len(fromValues) != 1 {
-		t.Fatalf("Prometheus namespace proxy NetworkPolicy router ingress must have one source, got %#v", firstRule["from"])
+	variants := []struct {
+		name             string
+		gatewayNamespace string
+	}{
+		{name: "ODH", gatewayNamespace: "openshift-ingress"},
+		{name: "RHOAI", gatewayNamespace: "redhat-ods-applications"},
 	}
-	from := asMap(t, fromValues[0])
-	namespaceSelector := asMap(t, from["namespaceSelector"])
-	matchLabels := asMap(t, namespaceSelector["matchLabels"])
-	if len(matchLabels) != 1 || matchLabels["policy-group.network.openshift.io/ingress"] != "" {
-		t.Fatalf("Prometheus namespace proxy NetworkPolicy must select the OpenShift ingress policy group: %#v", matchLabels)
+	for _, variant := range variants {
+		t.Run(variant.name, func(t *testing.T) {
+			t.Parallel()
+
+			data := proxyTemplateData()
+			data["GatewayNamespace"] = variant.gatewayNamespace
+			for _, template := range []string{
+				PrometheusNamespaceProxyNetworkPolicyTemplate,
+				ThanosQuerierProxyNetworkPolicyTemplate,
+			} {
+				resources := renderObservabilityTemplate(t, template, data)
+				policyName := "data-science-prometheus-proxy-ingress"
+				if template == ThanosQuerierProxyNetworkPolicyTemplate {
+					policyName = "data-science-thanos-querier-proxy-ingress"
+				}
+				policy := findRenderedResource(t, resources, "NetworkPolicy", policyName)
+				ingress := nestedSlice(t, policy, "spec", "ingress")
+				if len(ingress) == 0 {
+					t.Fatalf("%s must have gateway ingress", policyName)
+				}
+
+				firstRule := asMap(t, ingress[0])
+				fromValues, ok := firstRule["from"].([]any)
+				if !ok || len(fromValues) != 1 {
+					t.Fatalf("%s gateway ingress must have one source, got %#v", policyName, firstRule["from"])
+				}
+				from := asMap(t, fromValues[0])
+				if len(from) != 1 {
+					t.Fatalf("%s gateway ingress must not include an unrestricted peer: %#v", policyName, from)
+				}
+				namespaceSelector := asMap(t, from["namespaceSelector"])
+				matchLabels := asMap(t, namespaceSelector["matchLabels"])
+				wantLabels := map[string]any{"kubernetes.io/metadata.name": variant.gatewayNamespace}
+				if !reflect.DeepEqual(matchLabels, wantLabels) {
+					t.Fatalf("%s must select configured gateway namespace: want %#v, got %#v", policyName, wantLabels, matchLabels)
+				}
+				policyTypes := nestedSlice(t, policy, "spec", "policyTypes")
+				if len(policyTypes) != 1 || policyTypes[0] != "Ingress" {
+					t.Fatalf("%s must be ingress-only, got %#v", policyName, policyTypes)
+				}
+				ports, ok := firstRule["ports"].([]any)
+				if !ok || len(ports) != 1 {
+					t.Fatalf("%s gateway rule must have one port, got %#v", policyName, ports)
+				}
+				port := asMap(t, ports[0])
+				if port["protocol"] != "TCP" || port["port"] != int64(8443) {
+					t.Fatalf("%s gateway rule must allow only TCP/8443, got %#v", policyName, port)
+				}
+			}
+		})
 	}
 }
 
@@ -817,6 +859,7 @@ func assertPersesDatasourceQueryParameter(t *testing.T, datasource unstructured.
 func proxyTemplateData() map[string]any {
 	return map[string]any{
 		"Namespace":           testMonitoringNamespace,
+		"GatewayNamespace":    "",
 		"KubeRBACProxyImage":  "example.invalid/kube-rbac-proxy:test",
 		"PromLabelProxyImage": "example.invalid/prom-label-proxy:test",
 		"TLSMinVersion":       "VersionTLS12",

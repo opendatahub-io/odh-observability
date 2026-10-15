@@ -228,7 +228,7 @@ The `buildTemplateData()` function transforms the CR spec and cluster state into
 | Source | Data Produced |
 |--------|---------------|
 | CR spec | Namespace, feature flags (Metrics/Traces booleans), storage config, TLS config |
-| Environment variables | `POD_NAMESPACE`, `OPERATOR_NAME`, `RELATED_IMAGE_*` for operand images |
+| Environment variables | `POD_NAMESPACE`, `OPERATOR_NAME`, optional `GATEWAY_NAMESPACE`, and `RELATED_IMAGE_*` for operand images |
 | Cluster probing | SNO detection (single-node OpenShift), Perses API version (v1alpha1 vs v1alpha2) |
 | Defaults | Resource limits, retention periods, sample ratios, storage sizes |
 
@@ -309,7 +309,9 @@ Prometheus (port 9090)
 
 **Query isolation**: prom-label-proxy rewrites PromQL queries to inject `{namespace="<value>"}`, ensuring users only see metrics from namespaces they are authorized for, regardless of how they craft their queries. Its single-value regex mode rejects duplicate namespace values supplied across URL and POST form parameters instead of widening the enforced matcher.
 
-**Network isolation**: The Prometheus proxy NetworkPolicy restricts ingress to the OpenShift router and Alertmanager. The Thanos proxy NetworkPolicy restricts ingress to the OpenShift router.
+**Network isolation**: The Prometheus proxy NetworkPolicy restricts ingress to the configured gateway namespace and Alertmanager. The Thanos proxy NetworkPolicy restricts ingress to the configured gateway namespace. `GATEWAY_NAMESPACE` supplies the namespace identity for deployment variants; when it is empty, the policies use the OpenShift ingress policy-group label rather than assuming a namespace.
+
+**API-server and webhook paths**: Korrel8r's egress policy allows only the ready Kubernetes API EndpointSlice addresses on TCP/6443 and records the node-sourced API-server path as an explicit exception. The mutating webhook has the same platform-managed exception because admission calls originate from the control plane and standard NetworkPolicy cannot reliably express that node source; the rendered `MutatingWebhookConfiguration` records `platform.opendatahub.io/webhook-network-policy=platform-managed-exception`. These annotations are descriptive contracts, not enforcement. The operator does not install a host-network NetworkPolicy or `AdminNetworkPolicy`; the owning control, when present, is the cluster platform/network-admin configuration for host-network or external control-plane traffic, scoped to the API-server/admission path. A cluster without that complementary control must be qualified live and reported as an explicit limitation.
 
 The external `data-science-thanos-querier-route` terminates at `data-science-thanos-querier-proxy` using re-encrypt TLS; it never targets the ThanosQuerier Service directly. The controller populates the Route's destination CA from the OpenShift service CA so the router validates the proxy's serving certificate. The Thanos proxy forwards the authorized and label-constrained request to the existing Thanos Querier on port `10902`, preserving the backend used by internal consumers.
 

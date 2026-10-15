@@ -177,6 +177,7 @@ tests/e2e/                      End-to-end test suite
 | Variable | Description |
 |----------|-------------|
 | `POD_NAMESPACE` | Operator's own namespace (required for local run) |
+| `GATEWAY_NAMESPACE` | Optional namespace containing the router or gateway that reaches monitoring proxy routes |
 | `OPERATOR_VERSION` | Stamped into release status |
 | `RELATED_IMAGE_*` | Container image overrides for managed components |
 

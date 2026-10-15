@@ -5,6 +5,11 @@ metadata:
   namespace: {{.Namespace}}
   labels:
     platform.opendatahub.io/part-of: monitoring
+  annotations:
+    # Informational contract only: host-network API-server traffic is outside
+    # this workload policy and must be covered or qualified by the cluster platform.
+    platform.opendatahub.io/api-server-access: endpoint-slice-addresses
+    platform.opendatahub.io/api-server-node-source: explicit-exception
 spec:
   podSelector:
     matchLabels:

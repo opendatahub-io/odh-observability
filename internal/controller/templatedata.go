@@ -128,6 +128,10 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		persesAPIVersion = persesV1Alpha2
 	}
 	monitoringNamespace := monitoringNamespace(monitoring)
+	gatewayNamespace := os.Getenv("GATEWAY_NAMESPACE")
+	if gatewayNamespace != "" && !dns1123LabelRe.MatchString(gatewayNamespace) {
+		return nil, fmt.Errorf("invalid GATEWAY_NAMESPACE %q: expected a DNS-1123 namespace name", gatewayNamespace)
+	}
 
 	isSNO, err := openshift.IsSingleNodeCluster(ctx, c)
 	if err != nil {
@@ -136,7 +140,7 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 
 	templateData := map[string]any{
 		"Namespace":        monitoringNamespace,
-		"GatewayNamespace": getEnvOrDefault("GATEWAY_NAMESPACE", monitoringNamespace),
+		"GatewayNamespace": gatewayNamespace,
 		"Traces":           monitoring.Spec.Traces != nil,
 		"Metrics":          monitoring.Spec.Metrics != nil,
 		"MetricsStorage":   monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil,

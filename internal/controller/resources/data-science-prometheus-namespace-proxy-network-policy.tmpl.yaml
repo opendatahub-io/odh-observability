@@ -21,9 +21,15 @@ spec:
     - Ingress
   ingress:
     - from:
+      {{ if .GatewayNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{.GatewayNamespace}}
+      {{ else }}
         - namespaceSelector:
             matchLabels:
               policy-group.network.openshift.io/ingress: ""
+      {{ end }}
       ports:
         - protocol: TCP
           port: 8443

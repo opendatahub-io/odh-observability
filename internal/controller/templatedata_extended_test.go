@@ -1026,6 +1026,41 @@ func TestBuildTemplateData_BasicNoFeatures(t *testing.T) {
 	}
 }
 
+func TestBuildTemplateData_UsesConfiguredGatewayNamespace(t *testing.T) {
+	t.Setenv("GATEWAY_NAMESPACE", "redhat-ods-applications")
+
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if data["GatewayNamespace"] != "redhat-ods-applications" {
+		t.Fatalf("GatewayNamespace: want %q, got %v", "redhat-ods-applications", data["GatewayNamespace"])
+	}
+}
+
+func TestBuildTemplateData_RejectsInvalidGatewayNamespace(t *testing.T) {
+	tests := map[string]string{
+		"yaml-injection": "openshift-ingress\n- {}",
+		"uppercase":      "UPPERCASE",
+		"too-long":       strings.Repeat("a", 64),
+	}
+	for name, gatewayNamespace := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("GATEWAY_NAMESPACE", gatewayNamespace)
+
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			_, err := buildTemplateData(context.Background(), nil, m, "")
+			if err == nil || !strings.Contains(err.Error(), "invalid GATEWAY_NAMESPACE") {
+				t.Fatalf("expected invalid GATEWAY_NAMESPACE error, got %v", err)
+			}
+		})
+	}
+}
+
 func TestBuildTemplateData_UsesEffectiveMonitoringNamespace(t *testing.T) {
 	s := newTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)

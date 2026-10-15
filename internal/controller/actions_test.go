@@ -1887,6 +1887,20 @@ func assertKorrel8rTLSEndpoint(t *testing.T, deployment, service, networkPolicy 
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(networkPolicy.Object, policy); err != nil {
 		t.Fatalf("converting Korrel8r NetworkPolicy: %v", err)
 	}
+	policyAnnotations := networkPolicy.GetAnnotations()
+	if policyAnnotations["platform.opendatahub.io/api-server-access"] != "endpoint-slice-addresses" {
+		t.Errorf("Korrel8r NetworkPolicy must declare endpoint-slice API-server access, got annotations %v", policyAnnotations)
+	}
+	if policyAnnotations["platform.opendatahub.io/api-server-node-source"] != "explicit-exception" {
+		t.Errorf("Korrel8r NetworkPolicy must declare the node-sourced API-server exception, got annotations %v", policyAnnotations)
+	}
+	for _, rule := range policy.Spec.Egress {
+		for _, peer := range rule.To {
+			if peer.IPBlock != nil && (peer.IPBlock.CIDR == "0.0.0.0/0" || peer.IPBlock.CIDR == "::/0") {
+				t.Errorf("Korrel8r NetworkPolicy must not allow a universal API-server CIDR: %#v", peer.IPBlock)
+			}
+		}
+	}
 	if !networkPolicyAllowsEgress(policy, "172.20.0.1/32", 6443) {
 		t.Errorf("Korrel8r NetworkPolicy must allow the Kubernetes API endpoint on 6443: %#v", policy.Spec.Egress)
 	}
