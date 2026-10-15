@@ -24,6 +24,9 @@ rules:
     resources: ["podmonitors", "servicemonitors"]
     verbs: ["*"]
   - apiGroups: ["monitoring.coreos.com"]
+    resources: ["scrapeconfigs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["monitoring.coreos.com"]
     resources: ["probes"]
     verbs: ["get", "list", "watch"]
   # OpenShift infrastructure (SNO detection + granted via generate-processors-role)
