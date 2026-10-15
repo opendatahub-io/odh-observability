@@ -7,10 +7,11 @@ tool gotest.tools/gotestsum
 require (
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/itchyny/gojq v0.12.19
-	github.com/onsi/gomega v1.42.0
+	github.com/onsi/gomega v1.44.0
 	github.com/opendatahub-io/odh-platform-utilities v0.4.0
 	github.com/opendatahub-io/odh-platform-utilities/framework v0.0.0-20261006161300-258711fd9c1c
 	github.com/openshift/api v0.0.0-20261002115817-f8795cdde518
+	github.com/openshift/library-go v0.0.0-20261001144932-192662696fc7
 	github.com/stretchr/testify v1.11.1
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.37.1
@@ -76,7 +77,6 @@ require (
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/openshift/controller-runtime-common v0.0.0-20261005093240-b39eb7218441 // indirect
-	github.com/openshift/library-go v0.0.0-20261001144932-192662696fc7 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/prometheus/client_golang v1.24.0 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
@@ -90,7 +90,7 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
-	go.yaml.in/yaml/v3 v3.0.4 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/mod v0.41.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
