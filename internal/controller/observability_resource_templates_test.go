@@ -457,6 +457,71 @@ func TestPersesOperatorAccessNetworkPolicyTemplateContract(t *testing.T) {
 	if err != nil || !found || !reflect.DeepEqual(selector, wantSelector) {
 		t.Fatalf("Perses access NetworkPolicy must select only the intended operand: got %#v, error=%v", selector, err)
 	}
+
+	ingress := nestedSlice(t, policy, "spec", "ingress")
+	if len(ingress) != 1 {
+		t.Fatalf("Perses access NetworkPolicy must have one ingress rule, got %#v", ingress)
+	}
+
+	rule := asMap(t, ingress[0])
+	from, ok := rule["from"].([]any)
+	if !ok || len(from) != 3 {
+		t.Fatalf("Perses access NetworkPolicy must allow the supported Perses operator namespaces, got %#v", rule["from"])
+	}
+
+	wantNamespaces := map[string]struct{}{
+		"openshift-cluster-observability-operator": {},
+		"openshift-operators":                      {},
+		"openshift-operators-redhat":               {},
+	}
+	gotNamespaces := make(map[string]struct{}, len(from))
+	for i, rawFromRule := range from {
+		fromRule := asMap(t, rawFromRule)
+		if len(fromRule) != 2 {
+			t.Fatalf("Perses access NetworkPolicy ingress peer %d must contain only namespaceSelector and podSelector, got %#v", i, fromRule)
+		}
+
+		namespaceSelector := asMap(t, fromRule["namespaceSelector"])
+		if len(namespaceSelector) != 1 {
+			t.Fatalf("Perses access NetworkPolicy ingress peer %d must contain only matchLabels in namespaceSelector, got %#v", i, namespaceSelector)
+		}
+		matchLabels := asMap(t, namespaceSelector["matchLabels"])
+		if len(matchLabels) != 1 {
+			t.Fatalf("Perses access NetworkPolicy ingress peer %d must contain only the namespace name label, got %#v", i, matchLabels)
+		}
+		namespaceName, ok := matchLabels["kubernetes.io/metadata.name"].(string)
+		if !ok {
+			t.Fatalf("Perses access NetworkPolicy ingress peer %d namespace name has unexpected type %T", i, matchLabels["kubernetes.io/metadata.name"])
+		}
+		if _, duplicate := gotNamespaces[namespaceName]; duplicate {
+			t.Fatalf("Perses access NetworkPolicy contains duplicate namespace %q", namespaceName)
+		}
+		gotNamespaces[namespaceName] = struct{}{}
+
+		podSelector := asMap(t, fromRule["podSelector"])
+		if len(podSelector) != 1 {
+			t.Fatalf("Perses access NetworkPolicy ingress peer %d must contain only matchLabels in podSelector, got %#v", i, podSelector)
+		}
+		podMatchLabels := asMap(t, podSelector["matchLabels"])
+		if len(podMatchLabels) != 1 || podMatchLabels["app.kubernetes.io/name"] != "perses-operator" {
+			t.Fatalf("Perses access NetworkPolicy ingress peer %d must select only perses-operator pods, got %#v", i, podMatchLabels)
+		}
+	}
+	if !reflect.DeepEqual(gotNamespaces, wantNamespaces) {
+		t.Fatalf("Perses access NetworkPolicy must allow exactly the supported Perses operator namespaces: want %#v, got %#v", wantNamespaces, gotNamespaces)
+	}
+
+	ports, ok := rule["ports"].([]any)
+	if !ok {
+		t.Fatalf("Perses access NetworkPolicy ports have unexpected type %T", rule["ports"])
+	}
+	if len(ports) != 1 {
+		t.Fatalf("Perses access NetworkPolicy must expose one port, got %#v", rule["ports"])
+	}
+	port := asMap(t, ports[0])
+	if port["protocol"] != "TCP" || port["port"] != int64(8080) {
+		t.Fatalf("Perses access NetworkPolicy must allow only TCP/8080, got %#v", port)
+	}
 }
 
 func TestPersesTemplateContract(t *testing.T) {
