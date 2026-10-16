@@ -818,6 +818,97 @@ func TestGarbageCollectionOwnershipAndNamespaceScope(t *testing.T) {
 	}
 }
 
+func TestIsOpenTelemetryOperatorNetworkPolicy(t *testing.T) {
+	t.Parallel()
+
+	policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+		"app.kubernetes.io/component":  "opentelemetry-targetallocator",
+		"app.kubernetes.io/instance":   "opendatahub.data-science-collector",
+		"app.kubernetes.io/managed-by": "opentelemetry-operator",
+		"app.kubernetes.io/part-of":    "opentelemetry",
+	}}}
+	if !isOpenTelemetryOperatorNetworkPolicy(policy, "opendatahub", "opentelemetry-targetallocator") {
+		t.Fatal("expected the generated TargetAllocator policy to be identified")
+	}
+
+	policy.Labels["app.kubernetes.io/managed-by"] = "odh-observability"
+	if isOpenTelemetryOperatorNetworkPolicy(policy, "opendatahub", "opentelemetry-targetallocator") {
+		t.Fatal("module-owned policy must not be identified as an Operator-generated policy")
+	}
+}
+
+func TestCleanupOpenTelemetryOperatorNetworkPolicies(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	stale := &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-science-collector-targetallocator-networkpolicy",
+			Namespace: "opendatahub",
+			Labels: map[string]string{
+				"app.kubernetes.io/component":  "opentelemetry-targetallocator",
+				"app.kubernetes.io/instance":   "opendatahub.data-science-collector",
+				"app.kubernetes.io/managed-by": "opentelemetry-operator",
+				"app.kubernetes.io/part-of":    "opentelemetry",
+			},
+		},
+	}
+	reconciler := &MonitoringReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(stale).Build()}
+	if err := reconciler.cleanupOpenTelemetryOperatorNetworkPolicies(context.Background(), stale.Namespace); err != nil {
+		t.Fatalf("cleanup returned an error: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(stale), &networkingv1.NetworkPolicy{}); !k8serr.IsNotFound(err) {
+		t.Fatalf("expected generated policy to be deleted, got %v", err)
+	}
+}
+
+func TestOpenTelemetryOperatorNetworkPolicyWatch(t *testing.T) {
+	t.Setenv("MONITORING_NAMESPACE", "monitoring-test")
+	pred := predicate.NewPredicateFuncs(isOpenTelemetryOperatorNetworkPolicyEvent)
+	for _, test := range []struct {
+		name      string
+		policy    string
+		component string
+		mutate    func(*networkingv1.NetworkPolicy)
+		want      bool
+	}{
+		{name: "collector recreated", policy: "data-science-collector-collector-networkpolicy", component: "opentelemetry-collector", want: true},
+		{name: "allocator recreated", policy: "data-science-collector-targetallocator-networkpolicy", component: "opentelemetry-targetallocator", want: true},
+		{name: "other policy name", policy: "user-policy", component: "opentelemetry-collector"},
+		{name: "wrong component", policy: "data-science-collector-collector-networkpolicy", component: "opentelemetry-targetallocator"},
+		{name: "other namespace", policy: "data-science-collector-collector-networkpolicy", component: "opentelemetry-collector",
+			mutate: func(p *networkingv1.NetworkPolicy) { p.Namespace = "other" }},
+		{name: "other collector", policy: "data-science-collector-collector-networkpolicy", component: "opentelemetry-collector",
+			mutate: func(p *networkingv1.NetworkPolicy) { p.Labels["app.kubernetes.io/instance"] = "monitoring-test.other" }},
+		{name: "unlabeled policy", policy: "data-science-collector-collector-networkpolicy", component: "opentelemetry-collector",
+			mutate: func(p *networkingv1.NetworkPolicy) { p.Labels = nil }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			policy := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{
+				Name: test.policy, Namespace: "monitoring-test",
+				Labels: map[string]string{
+					"app.kubernetes.io/component":  test.component,
+					"app.kubernetes.io/instance":   "monitoring-test.data-science-collector",
+					"app.kubernetes.io/managed-by": "opentelemetry-operator",
+					"app.kubernetes.io/part-of":    "opentelemetry",
+				},
+			}}
+			if test.mutate != nil {
+				test.mutate(policy)
+			}
+			if got := pred.Create(event.CreateEvent{Object: policy}); got != test.want {
+				t.Fatalf("create event: got %t, want %t", got, test.want)
+			}
+			if got := pred.Update(event.UpdateEvent{ObjectOld: policy.DeepCopy(), ObjectNew: policy}); got != test.want {
+				t.Fatalf("update event: got %t, want %t", got, test.want)
+			}
+		})
+	}
+	if pred.Create(event.CreateEvent{Object: &corev1.ConfigMap{}}) {
+		t.Fatal("a non-NetworkPolicy event must not trigger legacy policy cleanup")
+	}
+}
+
 func ownedGarbageCollectionTestObject(gvk schema.GroupVersionKind, namespace, name string, ownerUID types.UID) unstructured.Unstructured {
 	controller := true
 	obj := unstructured.Unstructured{Object: map[string]any{}}

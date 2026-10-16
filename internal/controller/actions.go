@@ -49,6 +49,7 @@ const (
 	CollectorMonitorServiceTemplate                  = "resources/collector-monitor-service.tmpl.yaml"
 	CollectorPrometheusServiceTemplate               = "resources/collector-prometheus-service.tmpl.yaml"
 	CollectorMonitoringNetworkPolicyTemplate         = "resources/collector-monitoring-network-policy.tmpl.yaml"
+	CollectorTargetAllocatorNetworkPolicyTemplate    = "resources/collector-targetallocator-network-policy.tmpl.yaml"
 	CollectorRBACTemplate                            = "resources/collector-rbac.tmpl.yaml"
 	CollectorMLflowRBACTemplate                      = "resources/collector-mlflow-rbac.tmpl.yaml"
 	CollectorTempoRBACTemplate                       = "resources/collector-tempo-rbac.tmpl.yaml"
@@ -271,6 +272,7 @@ func deployOpenTelemetryCollector(
 		// Service for internal telemetry re-exported on :8890 with TLS (always-on)
 		src(CollectorMonitorServiceTemplate),
 		src(CollectorMonitoringNetworkPolicyTemplate),
+		src(CollectorTargetAllocatorNetworkPolicyTemplate),
 	)
 
 	// ServiceMonitors (monitoring.rhobs) and the local prometheus Service (:8889)

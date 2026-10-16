@@ -170,7 +170,39 @@ tests/e2e/                      End-to-end test suite
 - **Embedded templates** — resource templates are embedded via `//go:embed`
 - **Condition aggregation** — per-feature conditions are aggregated into top-level Ready/Degraded status
 - **TLS-only collector scraping** — the OTel Collector's internal telemetry is re-exported through a TLS-enabled pipeline exporter on `:8890` (service `data-science-collector-monitoring`, cert via OpenShift service-CA) because the Go SDK Prometheus pull exporter does not support TLS natively. Prometheus scrapes this endpoint over HTTPS.
-- **NetworkPolicy-guarded collector ingress** — `data-science-collector-monitoring-ingress` is the only policy selecting the collector pods, so it acts as the collector's sole ingress gate on clusters with NetworkPolicy enforcement. It allows Prometheus to scrape `:8889`/`:8890` and permits OTLP on `:4317`/`:4318`; OTLP is intentionally restricted to the monitoring namespace.
+- **NetworkPolicy-guarded collector ingress** — `data-science-collector-monitoring-ingress` is the only policy selecting the collector pods, so it acts as the collector's sole ingress gate on clusters with NetworkPolicy enforcement. It allows the Prometheus pod selector to scrape the active TLS endpoints on `:8889`/`:8890`; the operator-created `:8888` Service is not an active pod-IP listener and is not admitted. OTLP `:4317`/`:4318` requires an administrator-enrolled namespace and the KServe inference or scheduler pod labels. The TargetAllocator has a separate policy allowing only collector pods on `:8080` and discovered Kubernetes API endpoint egress.
+
+### Enrolling inference namespaces for OTLP
+
+Before upgrading, install the enrollment guard from the new checkout and audit
+existing enrollment labels. Admission validates future changes; a label set
+before the guard existed is not evidence of administrator approval.
+
+```sh
+oc apply -f internal/controller/resources/monitoring-admission-policies.tmpl.yaml
+oc get namespaces -l monitoring.opendatahub.io/otlp --show-labels
+```
+
+A monitoring administrator must remove any unapproved enrollment labels before
+deploying the new collector policy. Then enroll every approved namespace hosting
+supported inference or scheduler pods that export to the main collector. Enroll
+new inference namespaces as part of their provisioning:
+
+```sh
+oc label namespace <inference-namespace> monitoring.opendatahub.io/otlp=true
+```
+
+The admission policy requires cluster-level permission to update
+`monitorings.services.platform.opendatahub.io` to change this label. It protects
+Namespace mutations, their subresources, and the OpenShift Project API. Ordinary
+metadata updates that preserve enrollment remain permitted. Remove the label to
+revoke access; allow time for the CNI to reconcile NetworkPolicy changes.
+
+Enrollment trusts the namespace to submit telemetry to the shared collector.
+The pod labels are an additional filter and can be copied by users with pod
+creation rights inside an enrolled namespace. The module does not automatically
+enroll namespaces based on pods or tenant-created inference resources. Prometheus
+scraping and ClusterLogForwarder-to-Loki delivery do not require this label.
 
 ## Environment Variables
 

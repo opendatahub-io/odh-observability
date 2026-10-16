@@ -1860,7 +1860,7 @@ func (tc *MonitoringTestCtx) ValidateInstrumentationCRTracesLifecycle(t *testing
 		WithCustomErrorMsg("Monitoring resource should be updated with traces configuration"),
 	)
 
-	expectedEndpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:4317", OpenTelemetryCollectorName, tc.MonitoringNamespace)
+	expectedEndpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:4317", OpenTelemetryCollectorServiceName, tc.MonitoringNamespace)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Instrumentation, types.NamespacedName{Name: InstrumentationName, Namespace: tc.MonitoringNamespace}),
@@ -2492,6 +2492,8 @@ func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 		t.Run("Prometheus secure proxy authentication", tc.ValidatePrometheusSecureProxyAuthentication)
 		t.Run("Node metrics endpoint deployment", tc.ValidateNodeMetricsEndpointDeployment)
 		t.Run("Node metrics endpoint RBAC configuration", tc.ValidateNodeMetricsEndpointRBACConfiguration)
+		t.Run("Collector and TargetAllocator NetworkPolicy contract", tc.ValidateCollectorNetworkPolicyContract)
+		t.Run("Collector OTLP namespace authorization", tc.ValidateCollectorOTLPNamespaceBoundary)
 	})
 }
 

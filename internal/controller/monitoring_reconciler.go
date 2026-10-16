@@ -61,12 +61,17 @@ import (
 )
 
 const (
-	monitoringFinalizer           = "monitoring.opendatahub.io/cleanup"
-	monitoringPartOf              = "monitoring"
-	platformType                  = "OpenDataHub"
-	platformConfigName            = "odh-" + v1alpha1.MonitoringServiceName + "-config"
-	platformVersionKey            = "platformVersion"
-	targetAllocatorSecretRBACName = "data-science-collector-targetallocator-secrets"
+	monitoringFinalizer                   = "monitoring.opendatahub.io/cleanup"
+	monitoringPartOf                      = "monitoring"
+	platformType                          = "OpenDataHub"
+	platformConfigName                    = "odh-" + v1alpha1.MonitoringServiceName + "-config"
+	platformVersionKey                    = "platformVersion"
+	targetAllocatorSecretRBACName         = "data-science-collector-targetallocator-secrets"
+	openTelemetryCollectorComponent       = "opentelemetry-collector"
+	openTelemetryTargetAllocatorComponent = "opentelemetry-targetallocator"
+	openTelemetryPartOf                   = "opentelemetry"
+	collectorOperatorNetworkPolicyName    = "data-science-collector-collector-networkpolicy"
+	targetAllocatorOperatorPolicyName     = "data-science-collector-targetallocator-networkpolicy"
 )
 
 func operatorVersion() string {
@@ -309,6 +314,9 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("applying resources: %w", err)
 	}
+	if err := r.cleanupOpenTelemetryOperatorNetworkPolicies(ctx, monitoring.Spec.Namespace); err != nil {
+		return ctrl.Result{}, fmt.Errorf("cleaning up OpenTelemetry Operator NetworkPolicies: %w", err)
+	}
 
 	// Garbage-collect stale owned resources via API discovery.
 	if err := r.collectGarbage(ctx, monitoring, desired); err != nil {
@@ -358,6 +366,64 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// cleanupOpenTelemetryOperatorNetworkPolicies removes policies left behind by
+// the OpenTelemetry Operator when its NetworkPolicy generation is disabled.
+// The operator owns these objects through the TargetAllocator/collector, so
+// the module garbage collector cannot safely identify them as its own stale
+// resources. Deleting only the well-known, label-verified objects avoids
+// touching user-created policies.
+func (r *MonitoringReconciler) cleanupOpenTelemetryOperatorNetworkPolicies(ctx context.Context, namespace string) error {
+	policies := []struct {
+		name      string
+		component string
+	}{
+		{name: collectorOperatorNetworkPolicyName, component: openTelemetryCollectorComponent},
+		{name: targetAllocatorOperatorPolicyName, component: openTelemetryTargetAllocatorComponent},
+	}
+
+	for _, item := range policies {
+		policy := &networkingv1.NetworkPolicy{}
+		err := r.Get(ctx, types.NamespacedName{Name: item.name, Namespace: namespace}, policy)
+		if k8serr.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("getting %s/%s: %w", namespace, item.name, err)
+		}
+		if !isOpenTelemetryOperatorNetworkPolicy(policy, namespace, item.component) {
+			continue
+		}
+		if err := r.Delete(ctx, policy); err != nil && !k8serr.IsNotFound(err) {
+			return fmt.Errorf("deleting %s/%s: %w", namespace, item.name, err)
+		}
+	}
+	return nil
+}
+
+func isOpenTelemetryOperatorNetworkPolicy(policy *networkingv1.NetworkPolicy, namespace, component string) bool {
+	labels := policy.GetLabels()
+	return labels["app.kubernetes.io/component"] == component &&
+		labels["app.kubernetes.io/instance"] == namespace+".data-science-collector" &&
+		labels["app.kubernetes.io/managed-by"] == opentelemetryOperator &&
+		labels["app.kubernetes.io/part-of"] == openTelemetryPartOf
+}
+
+func isOpenTelemetryOperatorNetworkPolicyEvent(obj client.Object) bool {
+	policy, ok := obj.(*networkingv1.NetworkPolicy)
+	namespace := getEnvOrDefault("MONITORING_NAMESPACE", defaultMonitoringNamespace)
+	if !ok || policy.Namespace != namespace {
+		return false
+	}
+	switch policy.Name {
+	case collectorOperatorNetworkPolicyName:
+		return isOpenTelemetryOperatorNetworkPolicy(policy, namespace, openTelemetryCollectorComponent)
+	case targetAllocatorOperatorPolicyName:
+		return isOpenTelemetryOperatorNetworkPolicy(policy, namespace, openTelemetryTargetAllocatorComponent)
+	default:
+		return false
+	}
 }
 
 func (r *MonitoringReconciler) syncPostDeployResources(
@@ -638,6 +704,11 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	managedPredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		return obj.GetLabels()[odhLabels.PlatformPartOf] == monitoringPartOf
 	})
+	// An in-flight OpenTelemetry reconcile can recreate a legacy policy after
+	// cleanup. Observe those policies too so cleanup does not depend on an
+	// unrelated Monitoring update or periodic log-discovery reconciliation.
+	networkPolicyPredicate := predicate.Or(managedPredicate,
+		predicate.NewPredicateFuncs(isOpenTelemetryOperatorNetworkPolicyEvent))
 	platformConfigPredicate := predicate.NewPredicateFuncs(isPlatformConfigMap)
 
 	return ctrl.NewControllerManagedBy(mgr).
@@ -647,7 +718,7 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&rbacv1.RoleBinding{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&rbacv1.ClusterRole{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&rbacv1.ClusterRoleBinding{}, toSingleton, builder.WithPredicates(managedPredicate)).
-		Watches(&networkingv1.NetworkPolicy{}, toSingleton, builder.WithPredicates(managedPredicate)).
+		Watches(&networkingv1.NetworkPolicy{}, toSingleton, builder.WithPredicates(networkPolicyPredicate)).
 		Watches(&appsv1.Deployment{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&batchv1.Job{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(managedPredicate)).

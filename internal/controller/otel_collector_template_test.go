@@ -159,6 +159,19 @@ func TestPrometheusScrapeConfigAndTargetAllocatorSecurity(t *testing.T) {
 	}
 }
 
+func TestOpenTelemetryCollectorDisablesOperatorNetworkPolicy(t *testing.T) {
+	t.Parallel()
+
+	collector := renderCollectorTemplate(t)
+	enabled, found, err := unstructured.NestedBool(collector.Object, "spec", "networkPolicy", "enabled")
+	if err != nil || !found {
+		t.Fatalf("collector NetworkPolicy setting must be rendered: found=%t error=%v", found, err)
+	}
+	if enabled {
+		t.Fatal("OpenTelemetry Operator NetworkPolicy must be disabled so the module-owned policies are authoritative")
+	}
+}
+
 func TestOpenTelemetryCollectorTemplateRendersValidGPUConfig(t *testing.T) {
 	collector := renderCollectorTemplate(t)
 

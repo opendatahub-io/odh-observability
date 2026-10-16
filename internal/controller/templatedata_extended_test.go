@@ -704,6 +704,9 @@ func TestAddTracesTemplateData_PVBackend(t *testing.T) {
 	if data["SampleRatio"] != "0.5" {
 		t.Errorf("SampleRatio: want '0.5', got %v", data["SampleRatio"])
 	}
+	if data["OtlpEndpoint"] != "http://data-science-collector-collector.test-ns.svc.cluster.local:4317" {
+		t.Errorf("OtlpEndpoint: want collector Service endpoint, got %v", data["OtlpEndpoint"])
+	}
 
 	endpoint, ok := data["TempoEndpoint"].(string)
 	if !ok || !strings.Contains(endpoint, "tempomonolithic") {

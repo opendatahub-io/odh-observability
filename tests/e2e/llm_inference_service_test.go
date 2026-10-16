@@ -511,7 +511,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 			"name": "facebook/opt-125m",
 		},
 		"tracing": map[string]any{
-			"exporterEndpoint": fmt.Sprintf("http://data-science-collector.%s.svc.cluster.local:4317", inferenceMonitoringNamespace()),
+			"exporterEndpoint": fmt.Sprintf("http://%s.%s.svc.cluster.local:4317", OpenTelemetryCollectorServiceName, inferenceMonitoringNamespace()),
 			"sampler":          "always_on",
 		},
 		"replicas": int64(1),

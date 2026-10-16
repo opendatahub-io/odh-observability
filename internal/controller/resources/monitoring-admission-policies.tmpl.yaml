@@ -32,3 +32,45 @@ spec:
   policyName: monitoring-labels-values-validation
   validationActions: ["Deny"]
 
+---
+# Namespace enrollment is an administrative decision, independent of pod labels.
+# Protect the OpenShift Project API too: it proxies namespace metadata updates.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: monitoring-otlp-namespace-authorization
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["namespaces", "namespaces/*"]
+      - apiGroups: ["project.openshift.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["projects", "projects/*"]
+  variables:
+    - name: enrollment
+      expression: >-
+        has(object.metadata.labels) && 'monitoring.opendatahub.io/otlp' in object.metadata.labels
+          ? object.metadata.labels['monitoring.opendatahub.io/otlp'] : ''
+    - name: oldEnrollment
+      expression: >-
+        oldObject != null && has(oldObject.metadata.labels) && 'monitoring.opendatahub.io/otlp' in oldObject.metadata.labels
+          ? oldObject.metadata.labels['monitoring.opendatahub.io/otlp'] : ''
+  validations:
+    - expression: >-
+        variables.enrollment == variables.oldEnrollment ||
+        authorizer.group('services.platform.opendatahub.io').resource('monitorings').check('update').allowed()
+      message: "Changing monitoring.opendatahub.io/otlp requires cluster-level permission to update monitorings.services.platform.opendatahub.io."
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: monitoring-otlp-namespace-authorization
+spec:
+  policyName: monitoring-otlp-namespace-authorization
+  validationActions: ["Deny"]

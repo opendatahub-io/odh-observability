@@ -6,6 +6,11 @@ metadata:
 spec:
   replicas: {{.CollectorReplicas}}
   mode: statefulset
+  # NetworkPolicy ownership stays with this module so the OpenTelemetry
+  # Operator cannot add an unrestricted ingress policy for the collector or
+  # TargetAllocator.
+  networkPolicy:
+    enabled: false
   {{- if .Metrics }}
   targetAllocator:
     enabled: true
