@@ -320,7 +320,7 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	// Update usageLogsEndpoint in status only when LokiStack is ready
 	requeueNeeded := false
 	if monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil {
-		lokiReady, err := isLokiStackReady(ctx, r.Client, monitoring)
+		lokiReady, err := isLokiStackReady(ctx, r.Client, monitoring, usageLokiStackName)
 		if err != nil {
 			log.Error(err, "Failed to check LokiStack readiness")
 			cm.MarkFalse(string(platformcommon.ConditionTypeReady), "LokiStackReadinessCheckFailed", err.Error())
@@ -354,6 +354,13 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	// a dedicated watch (the CRDs are optional and a static watch would
 	// crash the controller if KServe is not installed).
 	if monitoring.Spec.Logs != nil {
+		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+	}
+	if monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil {
+		// Loki Operator creates the usage gateway Service and service-CA bundle
+		// asynchronously after the LokiStack becomes Ready. Keep reconciling so
+		// the status endpoint and dependent MaaS resources converge without a
+		// manual annotation or restart.
 		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 	}
 
@@ -488,7 +495,7 @@ func (r *MonitoringReconciler) collectTargetAllocatorRBACGarbage(
 }
 
 func shouldCollectOwnedResource(
-	monitoring client.Object,
+	monitoring *v1alpha1.Monitoring,
 	obj unstructured.Unstructured,
 	desiredSet map[resourceKey]struct{},
 	namespace string,
@@ -609,6 +616,22 @@ func isKorrel8rEndpointSlice(obj client.Object) bool {
 		serviceName == Korrel8rServiceName
 }
 
+// isUsageLokiDependency watches the Service and service-CA ConfigMap created
+// by Loki Operator for the MaaS-required LokiStack named "usage". These
+// resources are not owned or labeled by this operator, so they need a focused
+// predicate in addition to the managed-resource watch.
+func isUsageLokiDependency(obj client.Object) bool {
+	if obj.GetNamespace() != getEnvOrDefault("MONITORING_NAMESPACE", defaultMonitoringNamespace) {
+		return false
+	}
+	switch obj.GetName() {
+	case usageLokiStackName + "-gateway-http", usageLokiStackName + "-gateway-ca-bundle":
+		return true
+	default:
+		return false
+	}
+}
+
 func namespaceWatchPredicate() predicate.Funcs {
 	return predicate.Funcs{
 		CreateFunc: func(event.CreateEvent) bool { return true },
@@ -651,9 +674,11 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&appsv1.Deployment{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&batchv1.Job{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(managedPredicate)).
+		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(predicate.NewPredicateFuncs(isUsageLokiDependency))).
 		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(platformConfigPredicate)).
 		Watches(&corev1.Secret{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&corev1.Service{}, toSingleton, builder.WithPredicates(managedPredicate)).
+		Watches(&corev1.Service{}, toSingleton, builder.WithPredicates(predicate.NewPredicateFuncs(isUsageLokiDependency))).
 		Watches(&discoveryv1.EndpointSlice{}, toSingleton, builder.WithPredicates(predicate.NewPredicateFuncs(isKorrel8rEndpointSlice))).
 		Watches(&corev1.ServiceAccount{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		// Namespace creation or deletion changes the TargetAllocator Secret Role allowlist.

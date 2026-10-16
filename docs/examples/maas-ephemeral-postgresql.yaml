@@ -1,0 +1,160 @@
+# Test-only MaaS PostgreSQL backend.
+#
+# The redhat-ai-gateway-infra namespace is created by the AI Gateway operator.
+# Create maas-postgres-credentials and maas-db-config first as documented in
+# docs/maas-test-setup.md. Apply this file only after that namespace exists and
+# before (or while) MaaS is enabled. The PVC-backed single replica is test-only
+# and must not be used on a shared or externally reachable cluster without
+# generating a private password and enabling TLS.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: maas-postgres-data
+  namespace: redhat-ai-gateway-infra
+  labels:
+    app.kubernetes.io/name: maas-postgres
+    app.kubernetes.io/part-of: rhoai-test-backends
+    platform.opendatahub.io/temporary: "true"
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: gp3-csi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maas-postgres
+  namespace: redhat-ai-gateway-infra
+  labels:
+    app.kubernetes.io/name: maas-postgres
+    app.kubernetes.io/part-of: rhoai-test-backends
+    platform.opendatahub.io/temporary: "true"
+spec:
+  selector:
+    app.kubernetes.io/name: maas-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      protocol: TCP
+      targetPort: postgres
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: maas-postgres-allow-maas-api
+  namespace: redhat-ai-gateway-infra
+  labels:
+    app.kubernetes.io/name: maas-postgres
+    app.kubernetes.io/part-of: rhoai-test-backends
+    platform.opendatahub.io/temporary: "true"
+spec:
+  # This selector matches the app label on the PostgreSQL pod below. The
+  # podSelector-only peer is intentionally namespace-local because maas-api
+  # is deployed in this same infrastructure namespace by MaaS.
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: maas-api
+              app.kubernetes.io/component: api
+              app.kubernetes.io/part-of: models-as-a-service
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maas-postgres
+  namespace: redhat-ai-gateway-infra
+  labels:
+    app: postgres
+    app.kubernetes.io/name: maas-postgres
+    app.kubernetes.io/part-of: rhoai-test-backends
+    platform.opendatahub.io/temporary: "true"
+spec:
+  replicas: 1
+  # The PVC is ReadWriteOnce; avoid a rolling update waiting for the old pod
+  # to release the volume before the replacement can start.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: maas-postgres
+  template:
+    metadata:
+      labels:
+        # Required by the MaaS-generated egress NetworkPolicy. The policy
+        # allows maas-api to reach PostgreSQL on port 5432 via app=postgres.
+        app: postgres
+        app.kubernetes.io/name: maas-postgres
+        app.kubernetes.io/part-of: rhoai-test-backends
+        platform.opendatahub.io/temporary: "true"
+    spec:
+      containers:
+        - name: postgres
+          image: quay.io/sclorg/postgresql-16-c9s@sha256:be17c9b604900e0a4ddc4e7b4edfd558d6fdf7e76dc71cc438c3a2f8d4740699
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          env:
+            - name: POSTGRESQL_USER
+              value: maasadmin
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  # Created separately so the password is never duplicated in
+                  # this manifest or embedded in a Deployment value.
+                  name: maas-postgres-credentials
+                  key: POSTGRESQL_PASSWORD
+            - name: POSTGRESQL_DATABASE
+              value: maasdb
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -U "$POSTGRESQL_USER" -d "$POSTGRESQL_DATABASE"
+            periodSeconds: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -U "$POSTGRESQL_USER" -d "$POSTGRESQL_DATABASE"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/pgsql/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: maas-postgres-data

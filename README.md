@@ -119,6 +119,10 @@ go test ./tests/e2e/ -v -timeout 120m -count=1 -run '^TestMonitoring$' \
   -eventually-timeout=5m
 ```
 
+For a short-lived MaaS validation cluster, an optional ephemeral PostgreSQL
+fixture and the required `app=postgres` network-policy label are documented in
+[`docs/maas-test-setup.md`](docs/maas-test-setup.md).
+
 ### Code Generation
 
 ```bash

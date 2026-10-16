@@ -4,8 +4,12 @@ import (
 	"testing"
 
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	appsv1 "k8s.io/api/apps/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
@@ -73,11 +77,112 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 		t.Run("Validate Usage Logs Collector configuration", tc.ValidateUsageLogsCollectorConfiguration)
 		t.Run("Validate Usage Logs Collector RBAC", tc.ValidateUsageLogsCollectorRBACConfiguration)
 		t.Run("Validate Usage Logs Collector network policies", tc.ValidateUsageLogsCollectorNetworkPolicies)
+		t.Run("Validate MaaS usage gateway contract", tc.ValidateMaaSUsageGatewayContract)
 		t.Run("Validate optional ClusterLogForwarder and Vector contract", tc.ValidateClusterLogForwarderContract)
 
 		// Lifecycle test modifies state, run last
 		t.Run("Test Usage Logs lifecycle (LokiStack + Collector)", tc.ValidateUsageLogsLifecycle)
 	})
+}
+
+// ValidateMaaSUsageGatewayContract covers the cross-operator resources that
+// made the runtime dashboard failure difficult to diagnose. The observability
+// operator owns LokiStack/usage; MaaS owns the Perses datasources and its
+// egress policies. Standalone monitoring tests do not install MaaS, so the
+// MaaS portion is intentionally skipped when its datasource is absent.
+func (tc *MonitoringTestCtx) ValidateMaaSUsageGatewayContract(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name: UsageLokiStackName + "-gateway-http", Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.metadata.labels."app.kubernetes.io/instance" == "%s"`, UsageLokiStackName),
+			jq.Match(`[.spec.ports[] | select(.port == 8080)] | length == 1`),
+		)),
+		WithCustomErrorMsg("MaaS usage gateway Service should be created by Loki Operator"),
+	)
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ConfigMap, types.NamespacedName{
+			Name: UsageLokiStackName + "-gateway-ca-bundle", Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.metadata.annotations."service.beta.openshift.io/inject-cabundle" == "true"`),
+			jq.Match(`.data."service-ca.crt" != null and .data."service-ca.crt" != ""`),
+		)),
+		WithCustomErrorMsg("MaaS usage gateway CA bundle should be injected by service-ca"),
+	)
+
+	datasource := &unstructured.Unstructured{}
+	datasource.SetGroupVersionKind(gvk.PersesDatasource)
+	if err := tc.Client().Get(tc.Context(), types.NamespacedName{
+		Name: "usage-logs-all", Namespace: tc.MonitoringNamespace,
+	}, datasource); err != nil {
+		if k8serr.IsNotFound(err) {
+			installed, listErr := tc.maasInstalled()
+			if listErr != nil {
+				t.Fatalf("failed to determine whether MaaS is installed: %v", listErr)
+			}
+			if !installed {
+				t.Skip("MaaS is not installed on this standalone monitoring test cluster")
+			}
+			t.Fatalf("MaaS is installed but Perses datasource usage-logs-all is missing")
+		}
+		t.Fatalf("failed to read MaaS usage Perses datasource: %v", err)
+	}
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{
+			Name: "usage-logs-all", Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.status.conditions[] | select(.type == "Available" and .status == "True")`),
+			jq.Match(`.spec.config.plugin.kind == "LokiDatasource"`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url == "https://usage-gateway-http.%s.svc:8080/api/logs/v1/application"`, tc.MonitoringNamespace),
+			jq.Match(`.spec.client.tls.enable == true`),
+			jq.Match(`.spec.client.tls.caCert.type == "configmap"`),
+			jq.Match(`.spec.client.tls.caCert.name == "usage-gateway-ca-bundle"`),
+			jq.Match(`.spec.client.tls.caCert.namespace == "%s"`, tc.MonitoringNamespace),
+			jq.Match(`.spec.client.tls.caCert.certPath == "service-ca.crt"`),
+		)),
+		WithCustomErrorMsg("MaaS admin usage datasource should route to LokiStack/usage with service-CA TLS"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{
+			Name: "usage-logs-multi-tenancy", Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.status.conditions[] | select(.type == "Available" and .status == "True")`)),
+		WithCustomErrorMsg("MaaS tenant usage datasource should be available"),
+	)
+
+	for _, name := range []string{"dashboard-4-maas-usage-logs-admin", "dashboard-5-maas-usage-logs"} {
+		tc.EnsureResourceExists(
+			WithMinimalObject(gvk.PersesDashboardV1Alpha2, types.NamespacedName{Name: name, Namespace: tc.MonitoringNamespace}),
+			WithCondition(jq.Match(`(.spec | tostring) | contains("LokiDatasource") and contains("usage-logs-")`)),
+			WithCustomErrorMsg("MaaS dashboard %s should reference a Loki usage datasource", name),
+		)
+	}
+
+	for _, name := range []string{"usage-logs-collector-egress-restrict", "usage-tenancy-proxy-egress-restrict"} {
+		tc.EnsureResourceExists(
+			WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{Name: name, Namespace: tc.MonitoringNamespace}),
+			WithCondition(jq.Match(`.spec.egress[] | select(.to != null and ([.ports[]?.port] | any(. == 8080))) | .to[]?.podSelector.matchLabels."app.kubernetes.io/instance" == "usage"`)),
+			WithCustomErrorMsg("MaaS NetworkPolicy %s should allow the usage Loki gateway", name),
+		)
+	}
+}
+
+func (tc *MonitoringTestCtx) maasInstalled() (bool, error) {
+	deployments := &appsv1.DeploymentList{}
+	if err := tc.Client().List(tc.Context(), deployments, client.MatchingLabels{
+		"app.kubernetes.io/name": "maas-api",
+	}); err != nil {
+		return false, err
+	}
+	return len(deployments.Items) > 0, nil
 }
 
 // ValidateUsageLogsCollectorNotDeployedWithoutConfig tests that the logs collector is not deployed when logs are not configured.
@@ -118,7 +223,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorNotDeployedWithoutConfig(
 
 	tc.EnsureResourceGone(
 		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name:      LokiStackName,
+			Name:      UsageLokiStackName,
 			Namespace: tc.MonitoringNamespace,
 		}),
 	)
@@ -218,7 +323,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorConfiguration(t *testing.
 			`),
 
 			// Verify exporter endpoint (auto-generated from LokiStack)
-			jq.Match(`.spec.config.exporters."otlphttp/loki".endpoint | test("https://data-science-lokistack-gateway-http\\..+\\.svc\\.cluster\\.local:8080/api/logs/v1/application/otlp")`),
+			jq.Match(`.spec.config.exporters."otlphttp/loki".endpoint | test("https://usage-gateway-http\\..+\\.svc\\.cluster\\.local:8080/api/logs/v1/application/otlp")`),
 			jq.Match(`
 				(.spec.config.exporters."otlphttp/loki".tls.ca_file == "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt") and
 				(.spec.config.exporters."otlphttp/loki".auth.authenticator == "bearertokenauth")
@@ -323,7 +428,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorNetworkPolicies(t *testin
 		WithCondition(And(
 			// Guards the gateway pods that receive the connection.
 			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/component" == "lokistack-gateway"`),
-			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, LokiStackName),
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, UsageLokiStackName),
 			jq.Match(`.spec.policyTypes == ["Ingress"]`),
 			jq.Match(`
 				[.spec.ingress[].from[] | .podSelector.matchLabels."app.kubernetes.io/name"] == ["%s"]
@@ -349,7 +454,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name:      LokiStackName,
+			Name:      UsageLokiStackName,
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithCustomErrorMsg("LokiStack should be deployed when usage logs are enabled"),
@@ -391,7 +496,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 
 	tc.EnsureResourceGone(
 		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name:      LokiStackName,
+			Name:      UsageLokiStackName,
 			Namespace: tc.MonitoringNamespace,
 		}),
 	)
@@ -426,7 +531,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name:      LokiStackName,
+			Name:      UsageLokiStackName,
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithCustomErrorMsg("LokiStack should be recreated when usage logs are re-enabled"),
@@ -469,7 +574,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLokiStackDeployment(t *testing.T) 
 	// Verify LokiStack CR is created
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name:      LokiStackName,
+			Name:      UsageLokiStackName,
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithCondition(And(
@@ -500,7 +605,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLokiStackConfiguration(t *testing.
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name:      LokiStackName,
+			Name:      UsageLokiStackName,
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithCondition(And(

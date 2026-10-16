@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -82,6 +83,7 @@ const (
 	UsageLogsOpenTelemetryCollectorNPTemplate        = "resources/usage-logs-opentelemetry-collector-network-policy.tmpl.yaml"
 	UsageLogsLokiStackNPTemplate                     = "resources/usage-logs-lokistack-network-policy.tmpl.yaml"
 	LokiStackTemplate                                = "resources/loki-stack.tmpl.yaml"
+	UsageLokiStackTemplate                           = "resources/usage-loki-stack.tmpl.yaml"
 	ClusterLogForwarderTemplate                      = "resources/cluster-log-forwarder.tmpl.yaml"
 	ClusterLogForwarderRBACTemplate                  = "resources/cluster-log-forwarder-rbac.tmpl.yaml"
 	Korrel8rDeploymentTemplate                       = "resources/korrel8r-deployment.tmpl.yaml"
@@ -97,6 +99,8 @@ const (
 	Korrel8rServiceName        = "korrel8r"
 	conditionTypeReady         = "Ready"
 	conditionStatusTrue        = "True"
+	dataScienceLokiStackName   = "data-science-lokistack"
+	usageLokiStackName         = "usage"
 )
 
 //go:embed resources monitoring
@@ -526,8 +530,14 @@ func deployUsageLogsCollector(
 		return nil
 	}
 
-	// Wait for LokiStack endpoint to be available in status (set only when Loki is ready)
-	if monitoring.Status.UsageLogsEndpoint == "" {
+	// Check the dedicated usage stack directly. Status may still contain the
+	// legacy data-science endpoint during an upgrade, so a non-empty status
+	// value alone must not allow the collector to start.
+	usageLokiReady, err := isLokiStackReady(ctx, c, monitoring, usageLokiStackName)
+	if err != nil {
+		return fmt.Errorf("checking %s LokiStack readiness: %w", usageLokiStackName, err)
+	}
+	if !usageLokiReady {
 		cm.MarkFalse(conditions.ConditionUsageLogsCollectorAvailable,
 			"LokiStackNotReady",
 			"Waiting for LokiStack to be ready")
@@ -564,8 +574,9 @@ func deployLokiStack(
 	cm *conditions.ConditionsManager,
 	sources *[]rendertemplate.TemplateSource,
 ) error {
-	needsLoki := monitoring.Spec.Logs != nil ||
-		(monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil)
+	logsConfigured := monitoring.Spec.Logs != nil && monitoring.Spec.Logs.Storage != nil
+	usageLogsConfigured := monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil
+	needsLoki := logsConfigured || usageLogsConfigured
 	if !needsLoki {
 		cm.MarkNotConfigured(conditions.ConditionLokiStackAvailable,
 			"LokiNotRequired", "Neither usage logs storage nor log forwarding configured")
@@ -583,13 +594,45 @@ func deployLokiStack(
 		return nil
 	}
 
-	// Check if LokiStack is actually ready
-	lokiReady, err := isLokiStackReady(ctx, c, monitoring)
-	if err != nil {
-		return fmt.Errorf("checking LokiStack readiness: %w", err)
+	if logsConfigured && usageLogsConfigured {
+		if err := ensureDistinctLokiStorageBuckets(ctx, c, monitoring); err != nil {
+			return err
+		}
 	}
 
-	if lokiReady {
+	// Logs and MaaS usage logs have different LokiStack contracts. Keep the
+	// general observability stack separate from the stack named "usage" that
+	// MaaS discovers for its access-log dashboards.
+	allReady := true
+	if logsConfigured {
+		lokiReady, err := isLokiStackReady(ctx, c, monitoring, dataScienceLokiStackName)
+		if err != nil {
+			return fmt.Errorf("checking %s LokiStack readiness: %w", dataScienceLokiStackName, err)
+		}
+		allReady = allReady && lokiReady
+		*sources = append(*sources, src(LokiStackTemplate))
+	}
+	if usageLogsConfigured {
+		legacySharesBucket, err := legacyUsageLokiStackSharesUsageBucket(ctx, c, monitoring)
+		if err != nil {
+			return fmt.Errorf("checking legacy %s LokiStack storage: %w", dataScienceLokiStackName, err)
+		}
+		if legacySharesBucket {
+			// The legacy stack used the usage bucket. Let garbage collection
+			// remove it before rendering the new usage stack so two LokiStacks
+			// never write the same bucket concurrently during an upgrade.
+			allReady = false
+		} else {
+			lokiReady, err := isLokiStackReady(ctx, c, monitoring, usageLokiStackName)
+			if err != nil {
+				return fmt.Errorf("checking %s LokiStack readiness: %w", usageLokiStackName, err)
+			}
+			allReady = allReady && lokiReady
+			*sources = append(*sources, src(UsageLokiStackTemplate))
+		}
+	}
+
+	if allReady {
 		cm.MarkTrue(conditions.ConditionLokiStackAvailable)
 	} else {
 		cm.MarkFalse(conditions.ConditionLokiStackAvailable,
@@ -597,8 +640,117 @@ func deployLokiStack(
 			"LokiStack is not ready yet")
 	}
 
-	*sources = append(*sources, src(LokiStackTemplate))
 	return nil
+}
+
+// ensureDistinctLokiStorageBuckets prevents two LokiStack instances from
+// sharing Loki's object-store bucket. Both storage Secrets must be present and
+// resolve to non-empty bucket names before either stack is rendered.
+func ensureDistinctLokiStorageBuckets(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) error {
+	logsStorage := monitoring.Spec.Logs.Storage
+	usageStorage := monitoring.Spec.UsageLogs.Storage
+	if logsStorage.SecretName == usageStorage.SecretName {
+		return fmt.Errorf("logs and usage LokiStacks must use distinct storage Secrets and S3 buckets, both reference %q", logsStorage.SecretName)
+	}
+
+	logsBucket, logsResolved, err := resolveLokiStorageBucket(ctx, c, monitoring, logsStorage)
+	if err != nil {
+		return fmt.Errorf("resolving logs Loki storage bucket: %w", err)
+	}
+	usageBucket, usageResolved, err := resolveLokiStorageBucket(ctx, c, monitoring, usageStorage)
+	if err != nil {
+		return fmt.Errorf("resolving usage Loki storage bucket: %w", err)
+	}
+	if !logsResolved || !usageResolved {
+		return errors.New("logs and usage Loki storage Secrets must exist and contain non-empty bucketnames values before both LokiStacks can be deployed")
+	}
+	if logsBucket != "" && logsBucket == usageBucket {
+		return fmt.Errorf("logs and usage LokiStacks must use distinct S3 buckets, both resolve to %q", logsBucket)
+	}
+	return nil
+}
+
+func resolveLokiStorageBucket(
+	ctx context.Context,
+	c client.Client,
+	monitoring *v1alpha1.Monitoring,
+	storage *v1alpha1.LokiStorageConfig,
+) (string, bool, error) {
+	secret := &corev1.Secret{}
+	err := c.Get(ctx, types.NamespacedName{
+		Name:      storage.SecretName,
+		Namespace: monitoringNamespace(monitoring),
+	}, secret)
+	if err != nil {
+		if k8serr.IsNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	bucket := strings.TrimSpace(string(secret.Data["bucketnames"]))
+	return bucket, bucket != "", nil
+}
+
+// legacyUsageLokiStackSharesUsageBucket detects an owned data-science stack
+// left by a release that stored MaaS usage logs in the general stack. The
+// caller gates creation of LokiStack/usage until the old stack has either been
+// repointed to the general-log bucket or garbage-collected.
+func legacyUsageLokiStackSharesUsageBucket(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) (bool, error) {
+	legacy := &unstructured.Unstructured{}
+	legacy.SetGroupVersionKind(gvk.LokiStack)
+	if err := c.Get(ctx, types.NamespacedName{
+		Name:      dataScienceLokiStackName,
+		Namespace: monitoringNamespace(monitoring),
+	}, legacy); err != nil {
+		if k8serr.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	legacySecretName, _, err := unstructured.NestedString(legacy.Object, "spec", "storage", "secret", "name")
+	if err != nil {
+		return false, fmt.Errorf("reading legacy storage Secret name: %w", err)
+	}
+	usageSecretName := monitoring.Spec.UsageLogs.Storage.SecretName
+	if legacySecretName == usageSecretName {
+		if !isOwnedByMonitoring(monitoring, legacy) {
+			return false, fmt.Errorf(
+				"unowned legacy %s LokiStack references usage storage Secret %q; "+
+					"remove or migrate it before enabling LokiStack/usage",
+				dataScienceLokiStackName, legacySecretName,
+			)
+		}
+		return true, nil
+	}
+	if legacySecretName == "" {
+		if !isOwnedByMonitoring(monitoring, legacy) {
+			return false, fmt.Errorf("cannot determine storage for unowned legacy %s LokiStack before enabling LokiStack/usage", dataScienceLokiStackName)
+		}
+		return true, nil
+	}
+
+	legacyBucket, legacyResolved, err := resolveLokiStorageBucket(ctx, c, monitoring, &v1alpha1.LokiStorageConfig{SecretName: legacySecretName})
+	if err != nil {
+		return false, fmt.Errorf("resolving legacy bucket: %w", err)
+	}
+	usageBucket, usageResolved, err := resolveLokiStorageBucket(ctx, c, monitoring, monitoring.Spec.UsageLogs.Storage)
+	if err != nil {
+		return false, fmt.Errorf("resolving usage bucket: %w", err)
+	}
+	if !legacyResolved || !usageResolved {
+		if !isOwnedByMonitoring(monitoring, legacy) {
+			return false, fmt.Errorf("cannot validate storage buckets for unowned legacy %s LokiStack before enabling LokiStack/usage", dataScienceLokiStackName)
+		}
+		return true, nil
+	}
+	if legacyBucket == usageBucket && !isOwnedByMonitoring(monitoring, legacy) {
+		return false, fmt.Errorf(
+			"unowned legacy %s LokiStack resolves to the usage bucket %q; "+
+				"remove or migrate it before enabling LokiStack/usage",
+			dataScienceLokiStackName, usageBucket,
+		)
+	}
+	return legacyBucket != "" && legacyBucket == usageBucket, nil
 }
 
 // deployClusterLogForwarder deploys the ClusterLogForwarder when logs are configured.
@@ -637,7 +789,7 @@ func deployClusterLogForwarder(
 		return nil
 	}
 
-	lokiReady, err := isLokiStackReady(ctx, c, monitoring)
+	lokiReady, err := isLokiStackReady(ctx, c, monitoring, dataScienceLokiStackName)
 	if err != nil {
 		return fmt.Errorf("checking LokiStack readiness for log forwarding: %w", err)
 	}
@@ -824,12 +976,12 @@ func hasReadyCondition(obj *unstructured.Unstructured) (bool, error) {
 }
 
 // isLokiStackReady checks if the LokiStack CR exists and is in a Ready state.
-func isLokiStackReady(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) (bool, error) {
+func isLokiStackReady(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring, name string) (bool, error) {
 	lokiStack := &unstructured.Unstructured{}
 	lokiStack.SetGroupVersionKind(gvk.LokiStack)
 
 	err := c.Get(ctx, types.NamespacedName{
-		Name:      "data-science-lokistack",
+		Name:      name,
 		Namespace: monitoringNamespace(monitoring),
 	}, lokiStack)
 	if err != nil {

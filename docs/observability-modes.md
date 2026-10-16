@@ -339,6 +339,49 @@ oc label ns redhat-ods-monitoring \
 
 > These labels apply to **every** Pod in `redhat-ods-monitoring`, not only the Logging collector. Limit who can create Pods in that namespace, and make sure only the Logging collector service account can use the privileged / `hostPath` SCC.
 
+For a test-only MaaS validation, the optional [`docs/maas-test-setup.md`](maas-test-setup.md)
+guide includes an ephemeral PostgreSQL backend. Its pod template deliberately
+uses `app=postgres`, matching the MaaS PostgreSQL egress peer and the fixture's
+database ingress policy. Do not use that fixture as a production database.
+
+### MaaS usage logs and dashboards
+
+Configure MaaS usage logs separately from cluster log forwarding:
+
+```yaml
+spec:
+  usageLogs:
+    storage:
+      type: s3
+      secretName: <usage-loki-s3-secret>
+      credentialMode: static
+      storageClassName: gp3-csi
+```
+
+When `usageLogs.storage` is configured, the operator creates a dedicated
+`LokiStack/usage` in the Monitoring namespace. MaaS discovers this exact name;
+the existing `data-science-lokistack` remains reserved for `spec.logs` and
+ClusterLogForwarder traffic. Use separate object-store buckets for the two
+stacks. Loki Operator should then create `usage-gateway-http` and
+`usage-gateway-ca-bundle`, which MaaS uses for the admin and tenant Perses
+datasources.
+
+Verify the cross-operator path before diagnosing dashboard queries:
+
+```bash
+oc -n redhat-ods-monitoring get lokistack usage
+oc -n redhat-ods-monitoring get svc usage-gateway-http
+oc -n redhat-ods-monitoring get cm usage-gateway-ca-bundle
+oc -n redhat-ods-monitoring get persesdatasource usage-logs-all usage-logs-multi-tenancy
+oc -n redhat-ods-monitoring get persesdashboard dashboard-4-maas-usage-logs-admin dashboard-5-maas-usage-logs
+```
+
+The `usage-logs-all` datasource must be Available, use the
+`https://usage-gateway-http.../api/logs/v1/application` URL, and trust
+`usage-gateway-ca-bundle` through `service-ca.crt`. A missing gateway Service
+or CA bundle indicates that the `usage` LokiStack is not installed or not
+ready; it is not fixed by changing dashboard queries.
+
 ### Verification
 
 1. In the OpenShift web console, go to **Workloads → Pods** and select the `redhat-ods-monitoring` project. Confirm pods similar to the following are Running:

@@ -28,6 +28,7 @@ const (
 	seaweedFSSecretKey   = "seaweedfs-test-secret"
 	tempoS3Bucket        = "tempo-traces"
 	lokiS3Bucket         = "loki-logs"
+	clusterLogsS3Bucket  = "cluster-logs"
 
 	fakeGCSPodName     = "fake-gcs-server"
 	fakeGCSServiceName = "fake-gcs-server"
@@ -148,9 +149,14 @@ func (tc *TestContext) startSeaweedFS(t *testing.T, bucket string) {
 	})
 
 	tc.waitForFixturePod(seaweedFSPodName, jq.Match(`.status.phase == "Running" and any(.status.conditions[]; .type == "Ready" and .status == "True")`))
+	tc.createSeaweedFSBucket(t, bucket, seaweedFSBucketPod)
+}
+
+func (tc *TestContext) createSeaweedFSBucket(t *testing.T, bucket, podName string) {
+	t.Helper()
 	endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/%s", seaweedFSServiceName, tc.MonitoringNamespace, seaweedFSS3Port, bucket)
 	script := fmt.Sprintf(`i=0; until curl -fsS -X PUT %q; do i=$((i+1)); [ "$i" -lt 60 ] || exit 1; sleep 2; done`, endpoint)
-	tc.createBucketPod(t, seaweedFSBucketPod, seaweedFSImage, script)
+	tc.createBucketPod(t, podName, seaweedFSImage, script)
 }
 
 func (tc *TestContext) cleanupFakeGCS() {

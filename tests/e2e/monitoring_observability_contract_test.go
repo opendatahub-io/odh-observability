@@ -28,6 +28,7 @@ const (
 	clusterLogForwarderName        = "data-science-cluster-log-forwarder"
 	clusterLogForwarderServiceAcct = clusterLogForwarderName + "-collector"
 	usageLogsSharedSecretName      = "test-loki-shared-secret"
+	clusterLogsSecretName          = "test-cluster-logs-secret"
 )
 
 // ValidateMonitoringOperandNamespaceContract verifies the namespace handoff used by
@@ -256,10 +257,18 @@ func (tc *MonitoringTestCtx) ValidateClusterLogForwarderContract(t *testing.T) {
 	t.Cleanup(func() {
 		// Preserve the shared usageLogs setup for the remaining usage-log tests.
 		tc.updateMonitoringConfig(withManagementState(common.Managed), jq.Transform(`del(.spec.logs)`))
+		tc.deleteFixtureResources("seaweedfs-cluster-logs-bucket")
+		tc.DeleteResource(
+			WithMinimalObject(gvk.Secret, types.NamespacedName{Name: clusterLogsSecretName, Namespace: tc.MonitoringNamespace}),
+			WithIgnoreNotFound(true),
+			WithWaitForDeletion(true),
+		)
 	})
+	tc.createSeaweedFSBucket(t, clusterLogsS3Bucket, "seaweedfs-cluster-logs-bucket")
+	tc.createLokiS3SecretForBucket(t, clusterLogsSecretName, tc.MonitoringNamespace, clusterLogsS3Bucket)
 	tc.updateMonitoringConfigWithoutReady(
 		withManagementState(common.Managed),
-		withLogsStorage("s3", usageLogsSharedSecretName, tc.DefaultStorageClass),
+		withLogsStorage("s3", clusterLogsSecretName, tc.DefaultStorageClass),
 	)
 
 	status, reason, message, found := tc.waitForMonitoringCondition(t, conditions.ConditionClusterLogForwarderAvailable)

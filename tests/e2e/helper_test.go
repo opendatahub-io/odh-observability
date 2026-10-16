@@ -49,9 +49,10 @@ const (
 	UsageLogsCollectorName               = "data-science-usage-logs"
 	UsageLogsCollectorServiceAccount     = "data-science-usage-logs-collector"
 	LokiStackName                        = "data-science-lokistack"
+	UsageLokiStackName                   = "usage"
 
 	UsageLogsCollectorNetworkPolicyName = UsageLogsCollectorName + "-collector-allow"
-	UsageLogsLokiStackNetworkPolicyName = LokiStackName + "-allow"
+	UsageLogsLokiStackNetworkPolicyName = UsageLokiStackName + "-allow"
 )
 
 func cooOperatorChannel() string {
@@ -433,12 +434,14 @@ func (tc *MonitoringTestCtx) resetMonitoringConfigToManaged() {
 			Name: UsageLogsCollectorName, Namespace: tc.MonitoringNamespace,
 		}),
 	)
-	tc.EnsureResourceGone(
-		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name: LokiStackName, Namespace: tc.MonitoringNamespace,
-		}),
-		WithEventuallyTimeout(15*time.Minute),
-	)
+	for _, name := range []string{LokiStackName, UsageLokiStackName} {
+		tc.EnsureResourceGone(
+			WithMinimalObject(gvk.LokiStack, types.NamespacedName{
+				Name: name, Namespace: tc.MonitoringNamespace,
+			}),
+			WithEventuallyTimeout(15*time.Minute),
+		)
+	}
 }
 
 // resetMonitoringConfigToRemoved deletes optional config fields and sets managementState=Removed.
@@ -692,6 +695,13 @@ func (tc *TestContext) createTempoGCSSecret(t *testing.T, secretName, namespace 
 // createLokiS3Secret creates an S3 secret compatible with LokiStack operator.
 func (tc *TestContext) createLokiS3Secret(t *testing.T, secretName, namespace string) {
 	t.Helper()
+	tc.createLokiS3SecretForBucket(t, secretName, namespace, lokiS3Bucket)
+}
+
+// createLokiS3SecretForBucket creates a Loki S3 Secret for a specific bucket.
+// Usage and cluster log-forwarding LokiStacks must not share object-store state.
+func (tc *TestContext) createLokiS3SecretForBucket(t *testing.T, secretName, namespace, bucket string) {
+	t.Helper()
 
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -702,7 +712,7 @@ func (tc *TestContext) createLokiS3Secret(t *testing.T, secretName, namespace st
 		Data: map[string][]byte{
 			"access_key_id":     []byte(seaweedFSAccessKey),
 			"access_key_secret": []byte(seaweedFSSecretKey),
-			"bucketnames":       []byte(lokiS3Bucket),
+			"bucketnames":       []byte(bucket),
 			"endpoint":          fmt.Appendf(nil, "http://%s.%s.svc.cluster.local:%d", seaweedFSServiceName, namespace, seaweedFSS3Port),
 			"region":            []byte("us-east-1"),
 			"insecure":          []byte("true"),

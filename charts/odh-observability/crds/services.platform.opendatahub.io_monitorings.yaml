@@ -75,9 +75,8 @@ spec:
                       type: string
                     type: array
                   storage:
-                    description: |-
-                      Storage configures the LokiStack storage backend for log forwarding.
-                      Required: the operator deploys a shared LokiStack used by both log forwarding and usage logs.
+                    description: Storage configures the data-science-lokistack storage
+                      backend for cluster log forwarding.
                     properties:
                       credentialMode:
                         default: static
@@ -262,8 +261,10 @@ spec:
                 properties:
                   storage:
                     description: |-
-                      Storage configures the LokiStack storage backend (S3).
-                      When configured, the operator deploys a LokiStack instance and auto-configures the collector endpoint.
+                      Storage configures the dedicated usage LokiStack storage backend (S3).
+                      When configured, the operator deploys a LokiStack named "usage", which is
+                      the stack discovered by MaaS for usage dashboards, and auto-configures the
+                      collector endpoint.
                     properties:
                       credentialMode:
                         default: static

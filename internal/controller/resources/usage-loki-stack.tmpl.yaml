@@ -1,0 +1,41 @@
+apiVersion: loki.grafana.com/v1
+kind: LokiStack
+metadata:
+  # MaaS discovers this LokiStack by the fixed name "usage".
+  name: {{.UsageLokiStackName}}
+  namespace: {{.Namespace}}
+spec:
+  limits:
+    global:
+      queries:
+        queryTimeout: 3m
+      otlp:
+        streamLabels:
+          resourceAttributes:
+            - name: service.name
+    tenants:
+      application:
+        otlp:
+          streamLabels:
+            resourceAttributes:
+            - name: kubernetes_namespace_name
+            - name: model
+            - name: subscription
+            - name: response_type
+            - name: gateway_namespace_name
+            - name: gateway_deployment_name
+            - name: upstream_namespace_name
+            - name: upstream_deployment_name
+  managementState: Managed
+  size: 1x.extra-small
+  storage:
+    schemas:
+    - effectiveDate: "2020-10-11"
+      version: v13
+    secret:
+      credentialMode: {{.UsageLokiStorageCredentialMode}}
+      name: {{.UsageLokiStorageSecretName}}
+      type: {{.UsageLokiStorageType}}
+  storageClassName: {{.UsageLokiStorageClassName}}
+  tenants:
+    mode: openshift-logging

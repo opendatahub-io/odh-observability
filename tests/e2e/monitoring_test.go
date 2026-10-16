@@ -2895,6 +2895,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringServiceDisabled(t *testing.T) {
 		{gvk: gvk.TempoMonolithic, name: TempoMonolithicName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.OpenTelemetryCollector, name: OpenTelemetryCollectorName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.OpenTelemetryCollector, name: UsageLogsCollectorName, namespace: tc.MonitoringNamespace},
+		{gvk: gvk.LokiStack, name: UsageLokiStackName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.Instrumentation, name: InstrumentationName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.Perses, name: PersesName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.PersesDatasource, name: PersesDatasourceName, namespace: tc.MonitoringNamespace},

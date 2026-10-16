@@ -1394,7 +1394,7 @@ func installInferenceOperators(t *testing.T, tc *TestContext) {
 	tc.EnsureOperatorInstalled(opentelemetryOpNamespace, opentelemetryOpName, opentelemetryOpChannel)
 	tc.EnsureOperatorInstalledInOwnNamespace(leaderWorkerSetOpNamespace, leaderWorkerSetOpName, leaderWorkerSetOpChannel)
 	tc.EnsureOperatorInstalledFromCatalog(connectivityLinkOpNamespace, connectivityLinkOpName, connectivityLinkOpChannel, connectivityLinkOpSource)
-	// dsci.yaml enables usageLogs, so the operator renders a LokiStack.
+	// dsci.yaml enables usageLogs, so the operator renders the MaaS LokiStack.
 	tc.ensureLokiOperatorInstalled(t)
 }
 
@@ -1508,9 +1508,9 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	}
 
 	waitFor(
-		"LokiStack "+LokiStackName+" should be Ready",
+		"LokiStack "+UsageLokiStackName+" should be Ready",
 		gvk.LokiStack,
-		types.NamespacedName{Name: LokiStackName, Namespace: inferenceMonitoringNamespace()},
+		types.NamespacedName{Name: UsageLokiStackName, Namespace: inferenceMonitoringNamespace()},
 		"Ready",
 		20*time.Minute,
 	)

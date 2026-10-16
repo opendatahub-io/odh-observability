@@ -193,28 +193,26 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		}
 	}
 
-	// LokiStack configuration
-	lokiStackName := "data-science-lokistack"
+	// LokiStack configuration. The data-science stack is used for general
+	// observability and ClusterLogForwarder traffic. MaaS discovers a separate
+	// stack by the fixed name "usage" for access-log dashboards.
+	lokiStackName := dataScienceLokiStackName
 	templateData["LokiStackName"] = lokiStackName
+	templateData["UsageLokiStackName"] = usageLokiStackName
 	// The RHOAI LokiStack is configured in OpenShift logging mode. Its
 	// application tenant is the pinned tenant for inference logs.
 	templateData["LokiTenant"] = "application"
 	templateData["ThanosQuerierEndpoint"] = fmt.Sprintf("http://thanos-querier-data-science-thanos-querier.%s.svc.cluster.local:10902", monitoringNamespace)
 	templateData["LokiQueryEndpoint"] = fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application", lokiStackName, monitoringNamespace)
-	// Resolve Loki storage: logs.Storage takes precedence, then usageLogs.Storage
-	var lokiStorage *v1alpha1.LokiStorageConfig
+	// Resolve the two Loki storage configurations independently. They may use
+	// different object-store buckets because LokiStack instances must not share
+	// a bucket across their ring/index state.
 	if logs := monitoring.Spec.Logs; logs != nil && logs.Storage != nil {
-		lokiStorage = logs.Storage
-	} else if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
-		lokiStorage = usageLogs.Storage
-	}
+		templateData["LokiStorageCredentialMode"] = logs.Storage.CredentialMode
+		templateData["LokiStorageSecretName"] = logs.Storage.SecretName
+		templateData["LokiStorageType"] = logs.Storage.Type
 
-	if lokiStorage != nil {
-		templateData["LokiStorageCredentialMode"] = lokiStorage.CredentialMode
-		templateData["LokiStorageSecretName"] = lokiStorage.SecretName
-		templateData["LokiStorageType"] = lokiStorage.Type
-
-		storageClassName := lokiStorage.StorageClassName
+		storageClassName := logs.Storage.StorageClassName
 		if storageClassName == "" {
 			storageClassName = "gp3-csi"
 		}
@@ -225,11 +223,27 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		templateData["LokiStorageType"] = ""
 		templateData["LokiStorageClassName"] = ""
 	}
+	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
+		templateData["UsageLokiStorageCredentialMode"] = usageLogs.Storage.CredentialMode
+		templateData["UsageLokiStorageSecretName"] = usageLogs.Storage.SecretName
+		templateData["UsageLokiStorageType"] = usageLogs.Storage.Type
+
+		storageClassName := usageLogs.Storage.StorageClassName
+		if storageClassName == "" {
+			storageClassName = "gp3-csi"
+		}
+		templateData["UsageLokiStorageClassName"] = storageClassName
+	} else {
+		templateData["UsageLokiStorageCredentialMode"] = ""
+		templateData["UsageLokiStorageSecretName"] = ""
+		templateData["UsageLokiStorageType"] = ""
+		templateData["UsageLokiStorageClassName"] = ""
+	}
 
 	// Usage logs collector configuration (independent of Loki storage resolution)
 	templateData["UsageLogsCollectorName"] = "data-science-usage-logs"
 	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
-		gatewayURL := fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application/otlp", lokiStackName, monitoringNamespace)
+		gatewayURL := fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application/otlp", usageLokiStackName, monitoringNamespace)
 		templateData["UsageLogs"] = true
 		templateData["UsageLogsEndpoint"] = gatewayURL
 	} else {
