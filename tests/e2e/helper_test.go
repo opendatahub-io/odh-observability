@@ -960,6 +960,11 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 		tc.ensureCRDExists(t, required)
 	}
 
+	// After COO ServiceMonitor CRD is confirmed, create operator's ServiceMonitor
+	if tc.ApiMode == APIModeModule {
+		tc.ensureOperatorServiceMonitor(t)
+	}
+
 	tc.ensureMonitoringCRExists(t)
 
 	if tc.MonitoringNamespace == "" {
@@ -1041,6 +1046,84 @@ func (tc *TestContext) ensureLokiOperatorInstalled(t *testing.T) {
 		return
 	}
 	t.Fatalf("Loki Operator is required; %s PackageManifest is missing from redhat-operators", lokiOpName)
+}
+
+// ensureOperatorServiceMonitor creates the operator's ServiceMonitor after COO is installed.
+// This enables metrics scraping for the odh-observability operator itself.
+func (tc *TestContext) ensureOperatorServiceMonitor(t *testing.T) {
+	t.Helper()
+
+	// Get the operator deployment to find its namespace
+	deployments := &unstructured.UnstructuredList{}
+	deployments.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "apps",
+		Version: "v1",
+		Kind:    "DeploymentList",
+	})
+	if err := tc.client.List(tc.ctx, deployments, client.MatchingFields{"metadata.name": "odh-observability"}); err != nil {
+		t.Fatalf("failed to list odh-observability Deployment: %v", err)
+	}
+	if len(deployments.Items) == 0 {
+		t.Fatalf("odh-observability Deployment not found")
+	}
+	operatorNS := deployments.Items[0].GetNamespace()
+
+	// Create the CA ConfigMap for service-ca injection
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.ConfigMap, types.NamespacedName{
+			Name:      "odh-observability-metrics-ca",
+			Namespace: operatorNS,
+		}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			annotations := map[string]any{
+				"service.beta.openshift.io/inject-cabundle": "true",
+			}
+			return unstructured.SetNestedMap(u.Object, annotations, "metadata", "annotations")
+		}),
+		WithCustomErrorMsg("operator metrics CA ConfigMap should be created"),
+	)
+
+	// Create the ServiceMonitor for operator metrics
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.CoreosServiceMonitor, types.NamespacedName{
+			Name:      "odh-observability-metrics",
+			Namespace: operatorNS,
+		}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			spec := map[string]any{
+				"endpoints": []any{
+					map[string]any{
+						"path":            "/metrics",
+						"port":            "https",
+						"scheme":          "https",
+						"bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token",
+						"tlsConfig": map[string]any{
+							"ca": map[string]any{
+								"configMap": map[string]any{
+									"name": "odh-observability-metrics-ca",
+									"key":  "service-ca.crt",
+								},
+							},
+							"serverName": fmt.Sprintf("odh-observability-metrics.%s.svc", operatorNS),
+						},
+					},
+				},
+				"selector": map[string]any{
+					"matchLabels": map[string]any{
+						"app.kubernetes.io/name":     "odh-observability",
+						"app.kubernetes.io/instance": "odh-observability",
+					},
+				},
+				"namespaceSelector": map[string]any{
+					"matchNames": []any{operatorNS},
+				},
+			}
+			return unstructured.SetNestedMap(u.Object, spec, "spec")
+		}),
+		WithCustomErrorMsg("operator ServiceMonitor should be created after COO CRD is available"),
+	)
+
+	t.Logf("created operator ServiceMonitor in namespace %s", operatorNS)
 }
 
 // Suppress unused warnings for transform functions used in later commits.

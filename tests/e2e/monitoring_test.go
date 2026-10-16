@@ -2,6 +2,7 @@ package e2e_test
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,10 +16,15 @@ import (
 	gTypes "github.com/onsi/gomega/types"
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/stretchr/testify/require"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
@@ -2439,6 +2445,7 @@ func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 		t.Run("Prometheus secure proxy authentication", tc.ValidatePrometheusSecureProxyAuthentication)
 		t.Run("Node metrics endpoint deployment", tc.ValidateNodeMetricsEndpointDeployment)
 		t.Run("Node metrics endpoint RBAC configuration", tc.ValidateNodeMetricsEndpointRBACConfiguration)
+		t.Run("Operator metrics authentication and authorization", tc.ValidateOperatorMetricsAuthenticationAndAuthorization)
 	})
 }
 
@@ -2758,6 +2765,179 @@ func (tc *MonitoringTestCtx) ValidateNodeMetricsEndpointRBACConfiguration(t *tes
 		)),
 		WithCustomErrorMsg("deployment should have volumes and mounts for mTLS to Prometheus"),
 	)
+}
+
+func (tc *MonitoringTestCtx) ValidateOperatorMetricsAuthenticationAndAuthorization(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.verifyOperatorMetricsRBAC(t)
+
+	operatorNS := tc.ensureOperatorDeploymentReady(t)
+	serviceHost := fmt.Sprintf("odh-observability-metrics.%s.svc:8443", operatorNS)
+
+	t.Run("Unauthenticated request returns 401", func(t *testing.T) {
+		statusCode := tc.probeOperatorMetrics(t, operatorNS, serviceHost, "")
+		if statusCode != http.StatusUnauthorized {
+			t.Errorf("unauthenticated request to /metrics should return 401, got %d", statusCode)
+		}
+	})
+
+	t.Run("Unauthorized request returns 403", func(t *testing.T) {
+		unauthorizedSA := tc.createServiceAccountForMetricsTest(t, operatorNS, "metrics-unauthorized-test")
+		unauthorizedToken := tc.getServiceAccountToken(t, operatorNS, unauthorizedSA)
+
+		statusCode := tc.probeOperatorMetrics(t, operatorNS, serviceHost, unauthorizedToken)
+		if statusCode != http.StatusForbidden {
+			t.Errorf("unauthorized request to /metrics should return 403, got %d", statusCode)
+		}
+	})
+
+	t.Run("Authorized request returns 200", func(t *testing.T) {
+		prometheusSA := fmt.Sprintf("%s-prometheus", MonitoringStackName)
+		authorizedToken := tc.getServiceAccountToken(t, tc.MonitoringNamespace, prometheusSA)
+
+		var statusCode int
+		tc.g.Eventually(func() error {
+			statusCode = tc.probeOperatorMetrics(t, operatorNS, serviceHost, authorizedToken)
+			if statusCode != http.StatusOK {
+				return fmt.Errorf("authorized request to /metrics should return 200, got %d", statusCode)
+			}
+			return nil
+		}).WithTimeout(30*time.Second).Should(Succeed(),
+			"Prometheus ServiceAccount should be able to scrape operator metrics")
+	})
+}
+
+func (tc *MonitoringTestCtx) verifyOperatorMetricsRBAC(t *testing.T) {
+	t.Helper()
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{
+			Name: "odh-observability-metrics-reader",
+		}),
+		WithCondition(And(
+			jq.Match(`.rules[] | select(.nonResourceURLs[]? == "/metrics")`),
+			jq.Match(`.rules[] | select(.verbs[]? == "get")`),
+		)),
+		WithCustomErrorMsg("ClusterRole odh-observability-metrics-reader should grant GET on /metrics"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{
+			Name: "odh-observability-metrics-reader",
+		}),
+		WithCondition(And(
+			jq.Match(`.roleRef.name == "odh-observability-metrics-reader"`),
+			jq.Match(`.subjects[] | select(.kind == "ServiceAccount" and .name == "%s")`, fmt.Sprintf("%s-prometheus", MonitoringStackName)),
+			jq.Match(`.subjects[] | select(.namespace == "%s")`, tc.MonitoringNamespace),
+		)),
+		WithCustomErrorMsg("ClusterRoleBinding should bind Prometheus SA to metrics-reader role"),
+	)
+
+	t.Logf("Operator metrics RBAC resources verified")
+}
+
+func (tc *MonitoringTestCtx) createServiceAccountForMetricsTest(t *testing.T, namespace, name string) string {
+	t.Helper()
+
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+	}
+	if err := tc.Client().Create(tc.Context(), sa); err != nil && !k8serr.IsAlreadyExists(err) {
+		t.Fatalf("failed to create test ServiceAccount %s/%s: %v", namespace, name, err)
+	}
+	t.Cleanup(func() {
+		if err := tc.Client().Delete(tc.Context(), sa); err != nil && !k8serr.IsNotFound(err) {
+			t.Logf("failed to clean up test ServiceAccount %s/%s: %v", namespace, name, err)
+		}
+	})
+	return name
+}
+
+func (tc *MonitoringTestCtx) getServiceAccountToken(t *testing.T, namespace, serviceAccountName string) string {
+	t.Helper()
+
+	config, err := ctrlcfg.GetConfig()
+	if err != nil {
+		t.Fatalf("failed to load Kubernetes config for token: %v", err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		t.Fatalf("failed to create Kubernetes client for token: %v", err)
+	}
+
+	tokenRequest, err := clientset.CoreV1().ServiceAccounts(namespace).CreateToken(
+		tc.Context(),
+		serviceAccountName,
+		&authenticationv1.TokenRequest{},
+		metav1.CreateOptions{},
+	)
+	if err != nil {
+		t.Fatalf("failed to create token for ServiceAccount %s/%s: %v", namespace, serviceAccountName, err)
+	}
+	if tokenRequest.Status.Token == "" {
+		t.Fatalf("TokenRequest for ServiceAccount %s/%s returned empty token", namespace, serviceAccountName)
+	}
+	return tokenRequest.Status.Token
+}
+
+func (tc *MonitoringTestCtx) probeOperatorMetrics(t *testing.T, namespace, serviceHost, token string) int {
+	t.Helper()
+
+	caConfigMap := &corev1.ConfigMap{}
+	if err := tc.Client().Get(tc.Context(), types.NamespacedName{
+		Name:      "odh-observability-metrics-ca",
+		Namespace: namespace,
+	}, caConfigMap); err != nil {
+		t.Fatalf("failed to get metrics CA ConfigMap: %v", err)
+	}
+
+	caCert, ok := caConfigMap.Data["service-ca.crt"]
+	if !ok {
+		t.Fatalf("service-ca.crt not found in metrics CA ConfigMap")
+	}
+
+	caCertPool := x509.NewCertPool()
+	if !caCertPool.AppendCertsFromPEM([]byte(caCert)) {
+		t.Fatalf("failed to parse service CA certificate")
+	}
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				RootCAs:    caCertPool,
+			},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	endpoint := fmt.Sprintf("https://%s/metrics", serviceHost)
+	req, err := http.NewRequestWithContext(tc.Context(), http.MethodGet, endpoint, nil)
+	if err != nil {
+		t.Fatalf("failed to create HTTP request: %v", err)
+	}
+
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		t.Logf("HTTP request to %s failed: %v", endpoint, err)
+		return 0
+	}
+	defer resp.Body.Close()
+
+	// Read response body for debugging
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10)) // Read up to 1KB
+	t.Logf("Operator metrics probe: status=%d, body_preview=%s", resp.StatusCode, string(body[:min(len(body), 200)]))
+
+	return resp.StatusCode
 }
 
 // ========================================================================
