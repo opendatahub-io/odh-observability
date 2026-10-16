@@ -1,9 +1,11 @@
 package e2e_test
 
 import (
+	"fmt"
 	"testing"
 
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -71,6 +73,7 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 		t.Run("Validate LokiStack configuration", tc.ValidateUsageLogsLokiStackConfiguration)
 		t.Run("Validate Usage Logs Collector deployment", tc.ValidateUsageLogsCollectorDeployment)
 		t.Run("Validate Usage Logs Collector configuration", tc.ValidateUsageLogsCollectorConfiguration)
+		t.Run("Validate Usage Logs receiver TLS", tc.ValidateUsageLogsReceiverTLS)
 		t.Run("Validate Usage Logs Collector RBAC", tc.ValidateUsageLogsCollectorRBACConfiguration)
 		t.Run("Validate Usage Logs Collector network policies", tc.ValidateUsageLogsCollectorNetworkPolicies)
 		t.Run("Validate optional ClusterLogForwarder and Vector contract", tc.ValidateClusterLogForwarderContract)
@@ -78,6 +81,81 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 		// Lifecycle test modifies state, run last
 		t.Run("Test Usage Logs lifecycle (LokiStack + Collector)", tc.ValidateUsageLogsLifecycle)
 	})
+}
+
+// ValidateUsageLogsReceiverTLS checks the OpenTelemetry Operator's headless Service, serving
+// certificate, receiver configuration, and live OTLP/HTTP TLS behavior.
+func (tc *MonitoringTestCtx) ValidateUsageLogsReceiverTLS(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	const serviceName = UsageLogsCollectorName + "-collector-headless"
+	const secretName = serviceName + "-tls"
+	const probeName = "usage-logs-otlp-tls-probe"
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{Name: serviceName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(jq.Match(`
+			.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == "%s" and
+			.spec.clusterIP == "None" and
+			([.spec.ports[].port] | contains([4317, 4318]))
+		`, secretName)),
+	)
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Secret, types.NamespacedName{Name: secretName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(jq.Match(`.type == "kubernetes.io/tls" and .data."tls.crt" != null and .data."tls.key" != null`)),
+	)
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{Name: UsageLogsCollectorName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(jq.Match(`
+			.spec.config.receivers.otlp.protocols.grpc.tls.cert_file == "/etc/otel-collector/otlp-tls/tls.crt" and
+			.spec.config.receivers.otlp.protocols.grpc.tls.key_file == "/etc/otel-collector/otlp-tls/tls.key" and
+			.spec.config.receivers.otlp.protocols.http.tls.cert_file == "/etc/otel-collector/otlp-tls/tls.crt" and
+			.spec.config.receivers.otlp.protocols.http.tls.key_file == "/etc/otel-collector/otlp-tls/tls.key"
+		`)),
+	)
+
+	t.Cleanup(func() {
+		tc.DeleteResource(
+			WithMinimalObject(gvk.Pod, types.NamespacedName{Name: probeName, Namespace: tc.MonitoringNamespace}),
+			WithIgnoreNotFound(true),
+			WithWaitForDeletion(true),
+		)
+	})
+
+	endpoint := fmt.Sprintf("%s.%s.svc:4318/v1/logs", serviceName, tc.MonitoringNamespace)
+	script := fmt.Sprintf(`set -eu
+curl -fsS --max-time 15 --cacert /etc/service-ca/service-ca.crt \
+  -H 'Content-Type: application/json' -d '{"resourceLogs":[]}' 'https://%s'
+if curl -fsS --max-time 5 \
+  -H 'Content-Type: application/json' -d '{"resourceLogs":[]}' 'http://%s'; then
+  echo 'plain HTTP was accepted by the OTLP receiver'
+  exit 1
+fi`, endpoint, endpoint)
+	tc.createFixtureResource(t, gvk.Pod, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: probeName, Namespace: tc.MonitoringNamespace},
+		Spec: corev1.PodSpec{
+			RestartPolicy:   corev1.RestartPolicyNever,
+			SecurityContext: fixturePodSecurityContext(),
+			Containers: []corev1.Container{{
+				Name:            "probe",
+				Image:           fakeGCSClientImage,
+				Command:         []string{"/bin/sh", "-c"},
+				Args:            []string{script},
+				SecurityContext: fixtureContainerSecurityContext(),
+				VolumeMounts: []corev1.VolumeMount{{
+					Name: "service-ca", MountPath: "/etc/service-ca", ReadOnly: true,
+				}},
+			}},
+			Volumes: []corev1.Volume{{
+				Name: "service-ca",
+				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "openshift-service-ca.crt"},
+				}},
+			}},
+		},
+	})
+	tc.waitForFixturePod(probeName, jq.Match(`.status.phase == "Succeeded"`))
 }
 
 // ValidateUsageLogsCollectorNotDeployedWithoutConfig tests that the logs collector is not deployed when logs are not configured.

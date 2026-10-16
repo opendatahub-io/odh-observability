@@ -18,6 +18,15 @@ spec:
   networkPolicy:
     enabled: false
 
+  volumeMounts:
+    - name: usage-logs-otlp-tls
+      mountPath: /etc/otel-collector/otlp-tls
+      readOnly: true
+  volumes:
+    - name: usage-logs-otlp-tls
+      secret:
+        secretName: {{.UsageLogsReceiverTLSSecretName}}
+
   config:
     extensions:
       bearertokenauth:
@@ -28,8 +37,16 @@ spec:
         protocols:
           grpc:
             endpoint: '0.0.0.0:4317'
+            tls:
+              cert_file: /etc/otel-collector/otlp-tls/tls.crt
+              key_file: /etc/otel-collector/otlp-tls/tls.key
+              reload_interval: 1h
           http:
             endpoint: '0.0.0.0:4318'
+            tls:
+              cert_file: /etc/otel-collector/otlp-tls/tls.crt
+              key_file: /etc/otel-collector/otlp-tls/tls.key
+              reload_interval: 1h
 
     processors:
       # 1. Protect pod against OOM kills under heavy log spikes

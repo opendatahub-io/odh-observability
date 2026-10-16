@@ -171,6 +171,7 @@ tests/e2e/                      End-to-end test suite
 - **Condition aggregation** — per-feature conditions are aggregated into top-level Ready/Degraded status
 - **TLS-only collector scraping** — the OTel Collector's internal telemetry is re-exported through a TLS-enabled pipeline exporter on `:8890` (service `data-science-collector-monitoring`, cert via OpenShift service-CA) because the Go SDK Prometheus pull exporter does not support TLS natively. Prometheus scrapes this endpoint over HTTPS.
 - **NetworkPolicy-guarded collector ingress** — `data-science-collector-monitoring-ingress` is the only policy selecting the collector pods, so it acts as the collector's sole ingress gate on clusters with NetworkPolicy enforcement. It allows Prometheus to scrape `:8889`/`:8890` and permits OTLP on `:4317`/`:4318`; OTLP is intentionally restricted to the monitoring namespace.
+- **Usage logs OTLP ingress** — the OpenTelemetry Operator creates the `data-science-usage-logs-collector-headless` Service with an OpenShift serving certificate. The collector mounts its generated Secret for TLS on `:4317` (gRPC) and `:4318` (HTTP). A producer must connect to `data-science-usage-logs-collector-headless.<monitoring-namespace>.svc` and trust the OpenShift service CA. Coordinate the producer update before enabling this receiver in a deployment. Receiver authentication requires a separate sender-compatible design.
 
 ## Environment Variables
 
