@@ -196,7 +196,27 @@ func getAuthToken(tc *TestContext) string {
 	return tc.AuthToken()
 }
 
-func sendCompletion(ctx context.Context, routeHost, ocToken string) error {
+func newTestTraceparent() (string, error) {
+	var traceID [16]byte
+	var parentSpanID [8]byte
+	var zeroTraceID [16]byte
+	var zeroParentSpanID [8]byte
+
+	for traceID == zeroTraceID {
+		if _, err := rand.Read(traceID[:]); err != nil {
+			return "", fmt.Errorf("generate test trace ID: %w", err)
+		}
+	}
+	for parentSpanID == zeroParentSpanID {
+		if _, err := rand.Read(parentSpanID[:]); err != nil {
+			return "", fmt.Errorf("generate test parent span ID: %w", err)
+		}
+	}
+
+	return fmt.Sprintf("00-%x-%x-01", traceID, parentSpanID), nil
+}
+
+func sendCompletion(ctx context.Context, routeHost, ocToken string, traceparent ...string) error {
 	payload := map[string]any{
 		"model":       "facebook/opt-125m",
 		"prompt":      "San Francisco is a",
@@ -219,6 +239,9 @@ func sendCompletion(ctx context.Context, routeHost, ocToken string) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+ocToken)
 	req.Header.Set("Content-Type", "application/json")
+	if len(traceparent) > 0 && traceparent[0] != "" {
+		req.Header.Set("Traceparent", traceparent[0])
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
@@ -511,7 +534,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 			"name": "facebook/opt-125m",
 		},
 		"tracing": map[string]any{
-			"exporterEndpoint": fmt.Sprintf("http://data-science-collector.%s.svc.cluster.local:4317", inferenceMonitoringNamespace()),
+			"exporterEndpoint": fmt.Sprintf("http://data-science-collector-collector.%s.svc.cluster.local:4317", inferenceMonitoringNamespace()),
 			"sampler":          "always_on",
 		},
 		"replicas": int64(1),
@@ -735,6 +758,14 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	t.Logf("[%s] LLMInferenceService is Ready; sending authenticated completion request", topology)
 	send := func() error { return sendCompletion(tc.Context(), routeHost, ocToken) }
 	g.Eventually(send, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Should successfully send completion request through OAuth proxy")
+	if topology == "single-node" {
+		traceparent, err := newTestTraceparent()
+		require.NoError(t, err, "failed to generate randomized test trace context")
+		t.Logf("[%s] Sending completion request with randomized trace context", topology)
+		g.Eventually(func() error {
+			return sendCompletion(tc.Context(), routeHost, ocToken, traceparent)
+		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Should successfully send completion request with traceparent through OAuth proxy")
+	}
 
 	// 3. Verification via OATS
 	t.Logf("[%s] Running OATS verification", topology)
