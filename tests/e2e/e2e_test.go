@@ -35,3 +35,7 @@ func TestMonitoring(t *testing.T) {
 func TestCOOVersionCompatibility(t *testing.T) {
 	cooVersionCompatibilitySuite(t)
 }
+
+func TestOLMUpgradeSurvivability(t *testing.T) {
+	olmUpgradeSurvivabilitySuite(t)
+}

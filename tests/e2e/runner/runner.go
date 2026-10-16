@@ -48,6 +48,11 @@ const (
 	envTestOLMTimeout               = "E2E_TEST_OLM_TIMEOUT"
 	envTestCOOChannel               = "E2E_TEST_COO_CHANNEL"
 	envTestCompatibilityReport      = "E2E_TEST_COMPATIBILITY_REPORT"
+	envTestUpgradeEnabled           = "E2E_TEST_UPGRADE_ENABLED"
+	envTestUpgradeOperators         = "E2E_TEST_UPGRADE_OPERATORS"
+	envTestUpgradeCOOChannel        = "E2E_TEST_UPGRADE_COO_CHANNEL"
+	envTestUpgradeTempoChannel      = "E2E_TEST_UPGRADE_TEMPO_CHANNEL"
+	envTestUpgradeReport            = "E2E_TEST_UPGRADE_REPORT"
 )
 
 // TestPackages is set at build time via -ldflags.
@@ -262,6 +267,11 @@ func (r *Runner) envToFlags() []string {
 		envTestOLMTimeout:               "-olm-timeout",
 		envTestCOOChannel:               "-coo-channel",
 		envTestCompatibilityReport:      "-compatibility-report",
+		envTestUpgradeEnabled:           "-upgrade-enabled",
+		envTestUpgradeOperators:         "-upgrade-operators",
+		envTestUpgradeCOOChannel:        "-upgrade-coo-channel",
+		envTestUpgradeTempoChannel:      "-upgrade-tempo-channel",
+		envTestUpgradeReport:            "-upgrade-report",
 	}
 
 	var flags []string
