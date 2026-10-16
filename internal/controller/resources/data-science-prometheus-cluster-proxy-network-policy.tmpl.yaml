@@ -1,0 +1,22 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: data-science-prometheus-cluster-proxy-ingress
+  namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app: data-science-prometheus-cluster-proxy
+  policyTypes:
+    - Ingress
+  ingress:
+    # The Route reaches this proxy through the OpenShift router namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              policy-group.network.openshift.io/ingress: ""
+      ports:
+        - protocol: TCP
+          port: 8443

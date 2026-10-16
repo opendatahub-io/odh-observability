@@ -123,7 +123,10 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorNotDeployedWithoutConfig(
 		}),
 	)
 
-	for _, name := range []string{UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName} {
+	for _, name := range []string{
+		UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName,
+		"data-science-lokistack-ingress", "data-science-lokistack-gateway-ingress",
+	} {
 		tc.EnsureResourceGone(
 			WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
 				Name:      name,
@@ -334,6 +337,43 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorNetworkPolicies(t *testin
 		)),
 		WithCustomErrorMsg("LokiStack gateway NetworkPolicy should only admit the usage logs collector on 8080"),
 	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+			Name:      "data-science-lokistack-ingress",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/name" == "lokistack"`),
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, LokiStackName),
+			jq.Match(`.spec.policyTypes == ["Ingress"]`),
+			jq.Match(`[.spec.ingress[] | select((.from // []) | length == 0)] | length == 0`),
+			jq.Match(`[.spec.ingress[].ports[].port] | unique | sort == [3100, 7946, 9095]`),
+		)),
+		WithCustomErrorMsg("LokiStack NetworkPolicy should restrict component ingress to declared peers"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+			Name:      "data-science-lokistack-gateway-ingress",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/component" == "lokistack-gateway"`),
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, LokiStackName),
+			jq.Match(`.spec.policyTypes == ["Ingress"]`),
+			jq.Match(`[.spec.ingress[] | select((.from // []) | length == 0)] | length == 0`),
+			jq.Match(`[.spec.ingress[].from[] | .namespaceSelector.matchLabels."kubernetes.io/metadata.name"] | map(select(. == "openshift-logging")) | length == 1`),
+			jq.Match(`
+				[.spec.ingress[].from[] | .podSelector.matchLabels |
+					select(."app.kubernetes.io/name" == "korrel8r" and
+						."app.kubernetes.io/component" == "correlation" and
+						."app.kubernetes.io/part-of" == "monitoring")] | length == 1
+			`),
+			jq.Match(`[.spec.ingress[].ports[].port] | unique == [8080]`),
+		)),
+		WithCustomErrorMsg("LokiStack gateway NetworkPolicy should admit only declared in-namespace and CLO traffic"),
+	)
 }
 
 // ValidateUsageLogsLifecycle tests the complete lifecycle of usage logs (LokiStack + collector) deployment and cleanup.
@@ -364,7 +404,10 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 		WithCustomErrorMsg("Logs collector should be deployed when usage logs are enabled"),
 	)
 
-	for _, name := range []string{UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName} {
+	for _, name := range []string{
+		UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName,
+		"data-science-lokistack-ingress", "data-science-lokistack-gateway-ingress",
+	} {
 		tc.EnsureResourceExists(
 			WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
 				Name:      name,
@@ -403,7 +446,10 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 		}),
 	)
 
-	for _, name := range []string{UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName} {
+	for _, name := range []string{
+		UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName,
+		"data-science-lokistack-ingress", "data-science-lokistack-gateway-ingress",
+	} {
 		tc.EnsureResourceGone(
 			WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
 				Name:      name,
@@ -441,7 +487,10 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLifecycle(t *testing.T) {
 		WithCustomErrorMsg("Logs collector should be recreated when usage logs are re-enabled"),
 	)
 
-	for _, name := range []string{UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName} {
+	for _, name := range []string{
+		UsageLogsCollectorNetworkPolicyName, UsageLogsLokiStackNetworkPolicyName,
+		"data-science-lokistack-ingress", "data-science-lokistack-gateway-ingress",
+	} {
 		tc.EnsureResourceExists(
 			WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
 				Name:      name,

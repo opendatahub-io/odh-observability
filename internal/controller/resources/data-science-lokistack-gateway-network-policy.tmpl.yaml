@@ -1,0 +1,52 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: data-science-lokistack-gateway-ingress
+  namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: lokistack
+      app.kubernetes.io/instance: {{.LokiStackName}}
+      app.kubernetes.io/component: lokistack-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    # Usage logs are sent by the operator-owned collector.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{.UsageLogsCollectorName}}-collector
+      ports:
+        - protocol: TCP
+          port: 8080
+    # ClusterLogForwarder is owned by this module but its Vector pods are
+    # created by CLO in the dedicated openshift-logging namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-logging
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Korrel8r queries the Loki gateway directly when log correlation is enabled.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: korrel8r
+              app.kubernetes.io/component: correlation
+              app.kubernetes.io/part-of: monitoring
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Gateway metrics are scraped by the in-namespace Prometheus.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+              app.kubernetes.io/instance: data-science-monitoringstack
+      ports:
+        - protocol: TCP
+          port: 8080

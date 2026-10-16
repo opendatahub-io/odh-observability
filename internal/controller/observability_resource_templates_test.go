@@ -161,6 +161,8 @@ func TestDeployMonitoringStackWithQuerierIncludesTelemetryResources(t *testing.T
 		PrometheusRouteTemplate,
 		PrometheusServiceOverrideTemplate,
 		PrometheusNetworkPolicyTemplate,
+		AlertmanagerNetworkPolicyTemplate,
+		PrometheusClusterProxyNetworkPolicyTemplate,
 		PrometheusNamespaceProxyTemplate,
 		PrometheusNamespaceProxyNetworkPolicyTemplate,
 		ThanosQuerierTemplate,
@@ -292,8 +294,8 @@ func TestThanosQuerierNetworkPolicyTemplateContract(t *testing.T) {
 		t.Fatalf("Thanos Querier NetworkPolicy must select the Querier pods: got %#v, error=%v", selector, err)
 	}
 	policyTypes := nestedSlice(t, policy, "spec", "policyTypes")
-	if len(policyTypes) != 1 || policyTypes[0] != "Ingress" {
-		t.Fatalf("Thanos Querier NetworkPolicy must isolate ingress, got %#v", policyTypes)
+	if len(policyTypes) != 2 || policyTypes[0] != "Ingress" || policyTypes[1] != "Egress" {
+		t.Fatalf("Thanos Querier NetworkPolicy must isolate ingress and egress, got %#v", policyTypes)
 	}
 
 	ingress := nestedSlice(t, policy, "spec", "ingress")
@@ -352,6 +354,59 @@ func TestThanosQuerierNetworkPolicyTemplateContract(t *testing.T) {
 	}
 	if len(wantSources) != 0 {
 		t.Fatalf("Thanos Querier ingress is missing sources: %#v", wantSources)
+	}
+
+	assertThanosQuerierEgressContract(t, policy, prometheusSelector)
+}
+
+func assertThanosQuerierEgressContract(t *testing.T, policy unstructured.Unstructured, prometheusSelector map[string]string) {
+	t.Helper()
+	egress := nestedSlice(t, policy, "spec", "egress")
+	if len(egress) != 2 {
+		t.Fatalf("Thanos Querier NetworkPolicy must have Prometheus and DNS egress rules, got %d", len(egress))
+	}
+	foundPrometheus, foundDNS := false, false
+	for _, rawRule := range egress {
+		egressRule := asMap(t, rawRule)
+		egressPeers := asSlice(t, egressRule["to"])
+		if len(egressPeers) != 1 {
+			t.Fatalf("Thanos Querier egress rules must have one peer, got %#v", egressRule["to"])
+		}
+		peer := asMap(t, egressPeers[0])
+		ports := asSlice(t, egressRule["ports"])
+		if egressLabels, found, err := unstructured.NestedStringMap(peer, "podSelector", "matchLabels"); found {
+			if err != nil || !reflect.DeepEqual(egressLabels, prometheusSelector) || len(ports) != 1 {
+				t.Fatalf("Thanos Querier egress must target Prometheus on TCP/10901, got peer=%#v ports=%#v error=%v", peer, ports, err)
+			}
+			egressPort := asMap(t, ports[0])
+			if egressPort["protocol"] != "TCP" || egressPort["port"] != int64(10901) {
+				t.Fatalf("Thanos Querier egress must allow Prometheus TCP/10901, got %#v", egressPort)
+			}
+			foundPrometheus = true
+			continue
+		}
+
+		namespaceName, found, err := unstructured.NestedString(peer, "namespaceSelector", "matchLabels", "kubernetes.io/metadata.name")
+		if err != nil || !found || namespaceName != "openshift-dns" || len(ports) != 2 {
+			t.Fatalf("Thanos Querier egress must target openshift-dns on TCP/UDP 5353, got peer=%#v ports=%#v error=%v", peer, ports, err)
+		}
+		protocolPorts := map[string]bool{}
+		for _, rawPort := range ports {
+			port := asMap(t, rawPort)
+			protocol, protocolOK := port["protocol"].(string)
+			portNumber, portOK := port["port"].(int64)
+			if !protocolOK || !portOK || portNumber != int64(5353) {
+				t.Fatalf("Thanos Querier DNS egress must allow TCP/UDP 5353, got %#v", port)
+			}
+			protocolPorts[protocol] = true
+		}
+		if !protocolPorts["TCP"] || !protocolPorts["UDP"] || len(protocolPorts) != 2 {
+			t.Fatalf("Thanos Querier DNS egress must contain exactly TCP/UDP 5353, got %#v", protocolPorts)
+		}
+		foundDNS = true
+	}
+	if !foundPrometheus || !foundDNS {
+		t.Fatalf("Thanos Querier egress must contain Prometheus and DNS rules: prometheus=%t dns=%t", foundPrometheus, foundDNS)
 	}
 }
 

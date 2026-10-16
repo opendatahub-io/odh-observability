@@ -271,8 +271,8 @@ func TestDeployTracingStack_PVBackend_CRDsPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 2 {
-		t.Errorf("expected 2 sources (TempoMonolithic + Instrumentation), got %d", len(sources))
+	if len(sources) != 3 {
+		t.Errorf("expected 3 sources (TempoMonolithic + NetworkPolicy + Instrumentation), got %d", len(sources))
 	}
 
 	tempoC := findCondition(m, conditions.ConditionTempoAvailable)
@@ -1228,8 +1228,8 @@ func TestDeployLokiStack_LogsOnlyNoUsageLogs(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 1 {
-		t.Fatalf("expected 1 source (LokiStackTemplate), got %d", len(sources))
+	if len(sources) != 3 {
+		t.Fatalf("expected 3 sources (LokiStackTemplate + NetworkPolicies), got %d", len(sources))
 	}
 
 	data, err := buildTemplateData(context.Background(), cli, m, "")

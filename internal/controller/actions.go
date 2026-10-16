@@ -58,12 +58,15 @@ const (
 	PrometheusNamespaceProxyNetworkPolicyTemplate    = "resources/data-science-prometheus-namespace-proxy-network-policy.tmpl.yaml"
 	PrometheusServiceOverrideTemplate                = "resources/data-science-prometheus-service-override.tmpl.yaml"
 	PrometheusNetworkPolicyTemplate                  = "resources/data-science-prometheus-network-policy.tmpl.yaml"
+	AlertmanagerNetworkPolicyTemplate                = "resources/data-science-alertmanager-network-policy.tmpl.yaml"
+	PrometheusClusterProxyNetworkPolicyTemplate      = "resources/data-science-prometheus-cluster-proxy-network-policy.tmpl.yaml"
 	ThanosQuerierProxyTemplate                       = "resources/data-science-thanos-querier-proxy.tmpl.yaml"
 	ThanosQuerierProxyNetworkPolicyTemplate          = "resources/data-science-thanos-querier-proxy-network-policy.tmpl.yaml"
 	PrometheusWebTLSServiceTemplate                  = "resources/prometheus-web-tls-service.tmpl.yaml"
 	PrometheusSelfServiceMonitorTemplate             = "resources/prometheus-self-servicemonitor.tmpl.yaml"
 	ThanosQuerierTemplate                            = "resources/thanos-querier-cr.tmpl.yaml"
 	ThanosQuerierNetworkPolicyTemplate               = "resources/data-science-thanos-querier-network-policy.tmpl.yaml"
+	TempoMonolithicNetworkPolicyTemplate             = "resources/data-science-tempo-monolithic-network-policy.tmpl.yaml"
 	ThanosQuerierRouteTemplate                       = "resources/thanos-querier-route.tmpl.yaml"
 	PersesTemplate                                   = "resources/perses.tmpl.yaml"
 	PersesTempoDatasourceTemplate                    = "resources/perses-tempo-datasource.tmpl.yaml"
@@ -81,6 +84,8 @@ const (
 	UsageLogsOpenTelemetryCollectorRBACTemplate      = "resources/usage-logs-opentelemetry-collector-rbac.tmpl.yaml"
 	UsageLogsOpenTelemetryCollectorNPTemplate        = "resources/usage-logs-opentelemetry-collector-network-policy.tmpl.yaml"
 	UsageLogsLokiStackNPTemplate                     = "resources/usage-logs-lokistack-network-policy.tmpl.yaml"
+	LokiStackNetworkPolicyTemplate                   = "resources/data-science-lokistack-network-policy.tmpl.yaml"
+	LokiStackGatewayNetworkPolicyTemplate            = "resources/data-science-lokistack-gateway-network-policy.tmpl.yaml"
 	LokiStackTemplate                                = "resources/loki-stack.tmpl.yaml"
 	ClusterLogForwarderTemplate                      = "resources/cluster-log-forwarder.tmpl.yaml"
 	ClusterLogForwarderRBACTemplate                  = "resources/cluster-log-forwarder-rbac.tmpl.yaml"
@@ -94,6 +99,7 @@ const (
 
 	defaultMonitoringNamespace = "opendatahub"
 	clusterLoggingNamespace    = "openshift-logging"
+	defaultLokiStackName       = "data-science-lokistack"
 	Korrel8rServiceName        = "korrel8r"
 	conditionTypeReady         = "Ready"
 	conditionStatusTrue        = "True"
@@ -167,6 +173,8 @@ func deployMonitoringStackWithQuerierAndRestrictions(
 		src(PrometheusRouteTemplate),
 		src(PrometheusServiceOverrideTemplate),
 		src(PrometheusNetworkPolicyTemplate),
+		src(AlertmanagerNetworkPolicyTemplate),
+		src(PrometheusClusterProxyNetworkPolicyTemplate),
 		src(PrometheusNamespaceProxyTemplate),
 		src(PrometheusNamespaceProxyNetworkPolicyTemplate),
 		src(ThanosQuerierTemplate),
@@ -234,6 +242,9 @@ func deployTracingStack(
 
 	cm.MarkTrue(conditions.ConditionTempoAvailable)
 	*sources = append(*sources, src(tempoTemplate))
+	if tempoGVK == gvk.TempoMonolithic {
+		*sources = append(*sources, src(TempoMonolithicNetworkPolicyTemplate))
+	}
 	return nil
 }
 
@@ -597,7 +608,11 @@ func deployLokiStack(
 			"LokiStack is not ready yet")
 	}
 
-	*sources = append(*sources, src(LokiStackTemplate))
+	*sources = append(*sources,
+		src(LokiStackTemplate),
+		src(LokiStackNetworkPolicyTemplate),
+		src(LokiStackGatewayNetworkPolicyTemplate),
+	)
 	return nil
 }
 
@@ -829,7 +844,7 @@ func isLokiStackReady(ctx context.Context, c client.Client, monitoring *v1alpha1
 	lokiStack.SetGroupVersionKind(gvk.LokiStack)
 
 	err := c.Get(ctx, types.NamespacedName{
-		Name:      "data-science-lokistack",
+		Name:      defaultLokiStackName,
 		Namespace: monitoringNamespace(monitoring),
 	}, lokiStack)
 	if err != nil {

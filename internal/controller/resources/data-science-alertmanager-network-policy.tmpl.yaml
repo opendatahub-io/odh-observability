@@ -1,0 +1,35 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: data-science-alertmanager-ingress
+  namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: data-science-monitoringstack
+      app.kubernetes.io/component: alertmanager
+  policyTypes:
+    - Ingress
+  ingress:
+    # Prometheus scrapes Alertmanager metrics on 9093.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+              app.kubernetes.io/instance: data-science-monitoringstack
+      ports:
+        - protocol: TCP
+          port: 9093
+    # Alertmanager replicas use the gossip port for clustering.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: data-science-monitoringstack
+              app.kubernetes.io/component: alertmanager
+      ports:
+        - protocol: TCP
+          port: 9094
+        - protocol: UDP
+          port: 9094
