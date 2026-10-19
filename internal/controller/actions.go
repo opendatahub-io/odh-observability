@@ -85,6 +85,7 @@ const (
 	UsageLogsOpenTelemetryCollectorRBACTemplate      = "resources/usage-logs-opentelemetry-collector-rbac.tmpl.yaml"
 	UsageLogsOpenTelemetryCollectorNPTemplate        = "resources/usage-logs-opentelemetry-collector-network-policy.tmpl.yaml"
 	UsageLogsLokiStackNPTemplate                     = "resources/usage-logs-lokistack-network-policy.tmpl.yaml"
+	UsageLogsLokiStackTemplate                       = "resources/usage-logs-loki-stack.tmpl.yaml"
 	LokiStackNetworkPolicyTemplate                   = "resources/data-science-lokistack-network-policy.tmpl.yaml"
 	LokiStackGatewayNetworkPolicyTemplate            = "resources/data-science-lokistack-gateway-network-policy.tmpl.yaml"
 	LokiStackTemplate                                = "resources/loki-stack.tmpl.yaml"
@@ -101,7 +102,8 @@ const (
 
 	defaultMonitoringNamespace           = "opendatahub"
 	clusterLoggingNamespace              = "openshift-logging"
-	lokiStackResourceName                = "data-science-lokistack"
+	usageLogsLokiStackResourceName       = "data-science-usage-logs-lokistack"
+	LokiStackResourceName                = "data-science-lokistack"
 	clusterLogForwarderResourceName      = "data-science-cluster-log-forwarder"
 	Korrel8rServiceName                  = "korrel8r"
 	ClusterLogForwarderNetworkPolicyName = "data-science-cluster-log-forwarder-allow"
@@ -596,7 +598,10 @@ func deployUsageLogsCollector(
 	return nil
 }
 
-// deployLokiStack deploys LokiStack when usage logs storage or log forwarding is configured.
+// deployLokiStack deploys the usage logs LokiStack when usage logs storage is
+// configured and the log forwarding LokiStack when logs are configured. The two
+// stacks are separate CRs with independent storage, so each is rendered and
+// reported on only when its own feature is configured.
 func deployLokiStack(
 	ctx context.Context,
 	c client.Client,
@@ -604,11 +609,18 @@ func deployLokiStack(
 	cm *conditions.ConditionsManager,
 	sources *[]rendertemplate.TemplateSource,
 ) error {
-	needsLoki := monitoring.Spec.Logs != nil ||
-		(monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil)
+	needsUsageLogsLoki := monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil
+	needsLoki := monitoring.Spec.Logs != nil
+
+	if !needsUsageLogsLoki {
+		cm.MarkNotConfigured(conditions.ConditionUsageLogsLokiStackAvailable,
+			"LokiNotRequired", "Usage logs storage not configured")
+	}
 	if !needsLoki {
 		cm.MarkNotConfigured(conditions.ConditionLokiStackAvailable,
-			"LokiNotRequired", "Neither usage logs storage nor log forwarding configured")
+			"LokiNotRequired", "Log forwarding not configured")
+	}
+	if !needsUsageLogsLoki && !needsLoki {
 		return nil
 	}
 
@@ -617,31 +629,53 @@ func deployLokiStack(
 		return fmt.Errorf("checking LokiStack CRD: %w", err)
 	}
 	if !lokiExists {
-		cm.MarkFalse(conditions.ConditionLokiStackAvailable,
-			conditions.MissingOperatorReason,
-			"LokiStack operator must be installed for usage logs storage configuration")
+		if needsUsageLogsLoki {
+			cm.MarkFalse(conditions.ConditionUsageLogsLokiStackAvailable,
+				conditions.MissingOperatorReason,
+				"LokiStack operator must be installed for usage logs storage configuration")
+		}
+		if needsLoki {
+			cm.MarkFalse(conditions.ConditionLokiStackAvailable,
+				conditions.MissingOperatorReason,
+				"LokiStack operator must be installed for log forwarding configuration")
+		}
 		return nil
 	}
 
-	// Check if LokiStack is actually ready
-	lokiReady, err := isLokiStackReady(ctx, c, monitoring)
-	if err != nil {
-		return fmt.Errorf("checking LokiStack readiness: %w", err)
+	if needsUsageLogsLoki {
+		ready, err := isLokiStackReady(ctx, c, monitoring, usageLogsLokiStackResourceName)
+		if err != nil {
+			return fmt.Errorf("checking usage logs LokiStack readiness: %w", err)
+		}
+		if ready {
+			cm.MarkTrue(conditions.ConditionUsageLogsLokiStackAvailable)
+		} else {
+			cm.MarkFalse(conditions.ConditionUsageLogsLokiStackAvailable,
+				"LokiStackNotReady",
+				"Usage logs LokiStack is not ready yet")
+		}
+		*sources = append(*sources, src(UsageLogsLokiStackTemplate))
 	}
 
-	if lokiReady {
-		cm.MarkTrue(conditions.ConditionLokiStackAvailable)
-	} else {
-		cm.MarkFalse(conditions.ConditionLokiStackAvailable,
-			"LokiStackNotReady",
-			"LokiStack is not ready yet")
+	if needsLoki {
+		ready, err := isLokiStackReady(ctx, c, monitoring, LokiStackResourceName)
+		if err != nil {
+			return fmt.Errorf("checking LokiStack readiness: %w", err)
+		}
+		if ready {
+			cm.MarkTrue(conditions.ConditionLokiStackAvailable)
+		} else {
+			cm.MarkFalse(conditions.ConditionLokiStackAvailable,
+				"LokiStackNotReady",
+				"LokiStack is not ready yet")
+		}
+		*sources = append(*sources,
+			src(LokiStackTemplate),
+			src(LokiStackNetworkPolicyTemplate),
+			src(LokiStackGatewayNetworkPolicyTemplate),
+		)
 	}
 
-	*sources = append(*sources,
-		src(LokiStackTemplate),
-		src(LokiStackNetworkPolicyTemplate),
-		src(LokiStackGatewayNetworkPolicyTemplate),
-	)
 	return nil
 }
 
@@ -690,7 +724,7 @@ func deployClusterLogForwarder(
 		src(ClusterLogForwarderNetworkPolicyTemplate),
 	)
 
-	lokiReady, err := isLokiStackReady(ctx, c, monitoring)
+	lokiReady, err := isLokiStackReady(ctx, c, monitoring, LokiStackResourceName)
 	if err != nil {
 		return fmt.Errorf("checking LokiStack readiness for log forwarding: %w", err)
 	}
@@ -875,13 +909,13 @@ func hasReadyCondition(obj *unstructured.Unstructured) (bool, error) {
 	return false, nil
 }
 
-// isLokiStackReady checks if the LokiStack CR exists and is in a Ready state.
-func isLokiStackReady(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) (bool, error) {
+// isLokiStackReady checks if the named LokiStack CR exists and is in a Ready state.
+func isLokiStackReady(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring, name string) (bool, error) {
 	lokiStack := &unstructured.Unstructured{}
 	lokiStack.SetGroupVersionKind(gvk.LokiStack)
 
 	err := c.Get(ctx, types.NamespacedName{
-		Name:      lokiStackResourceName,
+		Name:      name,
 		Namespace: monitoringNamespace(monitoring),
 	}, lokiStack)
 	if err != nil {

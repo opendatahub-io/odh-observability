@@ -73,6 +73,9 @@ const (
 	// ConditionUsageLogsCollectorAvailable indicates the usage logs OpenTelemetry collector is deployed.
 	ConditionUsageLogsCollectorAvailable = "UsageLogsCollectorAvailable"
 
+	// ConditionUsageLogsLokiStackAvailable indicates the usage logs LokiStack CR is deployed.
+	ConditionUsageLogsLokiStackAvailable = "UsageLogsLokiStackAvailable"
+
 	// ConditionLokiStackAvailable indicates the LokiStack CR is deployed.
 	ConditionLokiStackAvailable = "LokiStackAvailable"
 
@@ -122,6 +125,7 @@ var featureConditionTypes = map[string]bool{
 	ConditionNodeMetricsEndpointAvailable:        true,
 	ConditionWebhookAvailable:                    true,
 	ConditionUsageLogsCollectorAvailable:         true,
+	ConditionUsageLogsLokiStackAvailable:         true,
 	ConditionLokiStackAvailable:                  true,
 	ConditionClusterLogForwarderAvailable:        true,
 	ConditionKorrel8rAvailable:                   true,

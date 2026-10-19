@@ -24,6 +24,7 @@ import (
 	"time"
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	libconditions "github.com/opendatahub-io/odh-platform-utilities/pkg/controller/conditions"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/controller/gc"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
 	odhLabels "github.com/opendatahub-io/odh-platform-utilities/pkg/metadata/labels"
@@ -320,16 +321,13 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 
 	r.syncPostDeployResources(ctx, monitoring, cm)
 
-	// Update usageLogsEndpoint in status only when LokiStack is ready
+	// Publish usageLogsEndpoint only once the usage logs LokiStack is ready.
+	// deployLokiStack already observed that readiness and recorded it in the
+	// condition, so read it back instead of re-fetching the CR. LokiStack is
+	// not watched (only core kinds are), so a not-ready stack has to be polled.
 	requeueNeeded := false
 	if monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil {
-		lokiReady, err := isLokiStackReady(ctx, r.Client, monitoring)
-		if err != nil {
-			log.Error(err, "Failed to check LokiStack readiness")
-			cm.MarkFalse(string(platformcommon.ConditionTypeReady), "LokiStackReadinessCheckFailed", err.Error())
-			return ctrl.Result{}, err
-		}
-		if lokiReady {
+		if libconditions.IsStatusConditionTrue(monitoring, conditions.ConditionUsageLogsLokiStackAvailable) {
 			endpoint, _ := data["UsageLogsEndpoint"].(string)
 			monitoring.Status.UsageLogsEndpoint = endpoint
 		} else {
