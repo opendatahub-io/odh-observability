@@ -586,6 +586,58 @@ func TestLokiStackTemplatesRenderIndependentStorage(t *testing.T) {
 	}
 }
 
+// TestLokiStackTemplatesCarryComponentLabel is the drift guard for the garbage
+// collection shield. A rejected storage configuration renders none of these
+// templates, so the only thing keeping the live resources out of the
+// collector's reach is this label on the objects already in the cluster. A
+// template added to lokiStackSources without it would be deleted the first time
+// the storage check fails, which is exactly the data loss the shield prevents.
+func TestLokiStackTemplatesCarryComponentLabel(t *testing.T) {
+	t.Parallel()
+
+	data := map[string]any{
+		"Namespace":                          testMonitoringNamespace,
+		"LokiStackName":                      lokiStackResourceName,
+		"LokiStorageSecretName":              "logs-secret",
+		"LokiStorageType":                    "s3",
+		"LokiStorageCredentialMode":          "static",
+		"LokiStorageClassName":               "logs-sc",
+		"UsageLogsLokiStackName":             usageLogsLokiStackResourceName,
+		"UsageLogsLokiStorageSecretName":     "usage-logs-secret",
+		"UsageLogsLokiStorageType":           "s3",
+		"UsageLogsLokiStorageCredentialMode": "token",
+		"UsageLogsLokiStorageClassName":      "usage-logs-sc",
+		"Korrel8rName":                       Korrel8rServiceName,
+		// The usage logs gateway policy names the collector as its only peer.
+		"UsageLogsCollectorName": "data-science-usage-logs",
+	}
+
+	// Must stay in step with lokiStackSources in actions.go.
+	for _, template := range []string{
+		UsageLogsLokiStackTemplate,
+		UsageLogsLokiStackNPTemplate,
+		LokiStackTemplate,
+		LokiStackNetworkPolicyTemplate,
+		LokiStackGatewayNetworkPolicyTemplate,
+	} {
+		t.Run(template, func(t *testing.T) {
+			t.Parallel()
+
+			// Only the component label is asserted here. part-of is the other
+			// half of the shield — it is the selector the collector lists by
+			// — but it is not a template contract: the deployer stamps it
+			// from the field owner for any object that arrives without one,
+			// which is why most operand CR templates omit it.
+			for _, resource := range renderObservabilityTemplate(t, template, data) {
+				if got := resource.GetLabels()[componentLabel]; got != componentLoki {
+					t.Errorf("%s %s: want %s=%s, got %q",
+						resource.GetKind(), resource.GetName(), componentLabel, componentLoki, got)
+				}
+			}
+		})
+	}
+}
+
 func TestClusterLogForwarderNetworkPolicyTemplateContract(t *testing.T) {
 	t.Parallel()
 

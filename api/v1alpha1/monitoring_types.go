@@ -224,6 +224,14 @@ type MonitoringStatus struct {
 	// Populated when usageLogs is configured.
 	// +optional
 	UsageLogsEndpoint string `json:"usageLogsEndpoint,omitempty"`
+
+	// LogsEndpoint is the Loki query endpoint for forwarded application logs.
+	// Populated when logs is configured and its LokiStack is ready. Unlike
+	// usageLogsEndpoint this is a read endpoint: the ClusterLogForwarder
+	// addresses the LokiStack by name rather than by URL, so there is no write
+	// endpoint to publish.
+	// +optional
+	LogsEndpoint string `json:"logsEndpoint,omitempty"`
 }
 
 //+kubebuilder:object:root=true

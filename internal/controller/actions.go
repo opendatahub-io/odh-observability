@@ -33,6 +33,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -603,7 +604,6 @@ func deployUsageLogsCollector(
 		src(UsageLogsOpenTelemetryCollectorTemplate),
 		src(UsageLogsOpenTelemetryCollectorRBACTemplate),
 		src(UsageLogsOpenTelemetryCollectorNPTemplate),
-		src(UsageLogsLokiStackNPTemplate),
 	)
 
 	return nil
@@ -614,18 +614,17 @@ func deployUsageLogsCollector(
 // stacks are separate CRs with independent storage, so each is rendered and
 // reported on only when its own feature is configured.
 //
-// When the storage isolation check rejects the configuration, the stacks go to
-// withheld rather than sources: they are not applied, but the caller still
-// feeds them to garbage collection so an already-running stack is treated as
-// desired instead of deleted. The returned error degrades Loki only; the rest
-// of the reconciliation continues without it.
+// When the storage isolation check rejects the configuration, neither stack is
+// rendered and the error is returned. The caller shields the loki component
+// from garbage collection for that round, so an already-running stack is left
+// alone rather than deleted for being absent from the desired set. The error
+// degrades Loki only; the rest of the reconciliation continues without it.
 func deployLokiStack(
 	ctx context.Context,
 	c client.Client,
 	monitoring *v1alpha1.Monitoring,
 	cm *conditions.ConditionsManager,
 	sources *[]rendertemplate.TemplateSource,
-	withheld *[]rendertemplate.TemplateSource,
 ) error {
 	needsUsageLogsLoki := monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil
 	needsLoki := monitoring.Spec.Logs != nil
@@ -642,8 +641,15 @@ func deployLokiStack(
 		return nil
 	}
 
+	// Every error return below marks its conditions before returning. The caller
+	// holds this action's error rather than returning it, so the reconcile goes
+	// on to publish endpoints and aggregate Ready from these conditions; an
+	// unmarked return would leave the previous round's True in place and report
+	// a stack healthy on the strength of a check that never completed.
 	lokiExists, err := hasCRD(ctx, c, gvk.LokiStack)
 	if err != nil {
+		markLokiUnknown(cm, needsUsageLogsLoki, needsLoki, lokiCRDCheckFailedReason,
+			fmt.Sprintf("Cannot determine whether the LokiStack CRD is installed: %v", err))
 		return fmt.Errorf("checking LokiStack CRD: %w", err)
 	}
 	if !lokiExists {
@@ -665,22 +671,38 @@ func deployLokiStack(
 	// silently corrupting log storage. Readiness is not polled: there is nothing
 	// to report readiness about while the configuration is rejected.
 	if err := checkLokiStorageIsolation(ctx, c, monitoring); err != nil {
-		// Both outcomes withhold the stacks; only the reason differs. An error
-		// that does not name one can only have come from the check itself.
-		reason := lokiStorageCheckFailedReason
+		// Both outcomes withhold the stacks; the reason and the status differ.
+		// A conflict is a determinate answer and reports False; a check that
+		// could not run establishes nothing and reports Unknown. An error that
+		// names neither can only have come from the check itself.
+		reason, status := lokiStorageCheckFailedReason, metav1.ConditionUnknown
 		var storageErr lokiStorageError
 		if errors.As(err, &storageErr) {
-			reason = storageErr.conditionReason()
+			reason, status = storageErr.conditionReason(), storageErr.conditionStatus()
 		}
-		cm.MarkFalse(conditions.ConditionUsageLogsLokiStackAvailable, reason, err.Error())
-		cm.MarkFalse(conditions.ConditionLokiStackAvailable, reason, err.Error())
-		*withheld = append(*withheld, lokiStackSources(needsUsageLogsLoki, needsLoki)...)
+		if status == metav1.ConditionUnknown {
+			markLokiUnknown(cm, true, true, reason, err.Error())
+		} else {
+			cm.MarkFalse(conditions.ConditionUsageLogsLokiStackAvailable, reason, err.Error())
+			cm.MarkFalse(conditions.ConditionLokiStackAvailable, reason, err.Error())
+		}
 		return err
 	}
 
 	if needsUsageLogsLoki {
 		ready, err := isLokiStackReady(ctx, c, monitoring, usageLogsLokiStackResourceName)
 		if err != nil {
+			cm.MarkUnknown(conditions.ConditionUsageLogsLokiStackAvailable, lokiReadinessCheckFailedReason,
+				fmt.Sprintf("Cannot determine whether the usage logs LokiStack is ready: %v", err))
+			// Returning here skips the log forwarding check below, leaving
+			// its condition describing the previous round. A condition that
+			// nothing verified this round must not keep asserting True:
+			// publishLokiEndpoints would read it and republish an endpoint
+			// on the strength of an observation that never happened.
+			if needsLoki {
+				cm.MarkUnknown(conditions.ConditionLokiStackAvailable, lokiReadinessCheckFailedReason,
+					"LokiStack readiness was not checked: the usage logs LokiStack check failed first")
+			}
 			return fmt.Errorf("checking usage logs LokiStack readiness: %w", err)
 		}
 		if ready {
@@ -695,6 +717,12 @@ func deployLokiStack(
 	if needsLoki {
 		ready, err := isLokiStackReady(ctx, c, monitoring, lokiStackResourceName)
 		if err != nil {
+			// No sibling to invalidate: this is the last check, so the usage
+			// logs condition above was either marked this round or its stack
+			// is not configured. The asymmetry with the block above is the
+			// point — only an unchecked condition goes stale.
+			cm.MarkUnknown(conditions.ConditionLokiStackAvailable, lokiReadinessCheckFailedReason,
+				fmt.Sprintf("Cannot determine whether the LokiStack is ready: %v", err))
 			return fmt.Errorf("checking LokiStack readiness: %w", err)
 		}
 		if ready {
@@ -711,14 +739,34 @@ func deployLokiStack(
 	return nil
 }
 
-// lokiStackSources lists the templates each LokiStack contributes. Both the
-// applied path and the withheld path draw from it, so a template added here is
-// also retained by garbage collection when the storage check rejects the
-// configuration.
+// markLokiUnknown reports that a LokiStack's state could not be observed, on
+// whichever of the two conditions is configured. Unknown rather than False:
+// nothing was learned about the stack, and marking it False would clear the
+// published endpoint and take the usage logs collector down with it.
+func markLokiUnknown(cm *conditions.ConditionsManager, usageLogs, logs bool, reason, message string) {
+	if usageLogs {
+		cm.MarkUnknown(conditions.ConditionUsageLogsLokiStackAvailable, reason, message)
+	}
+	if logs {
+		cm.MarkUnknown(conditions.ConditionLokiStackAvailable, reason, message)
+	}
+}
+
+// lokiStackSources lists the templates each LokiStack contributes. Every one of
+// them carries the loki component label, which is what shields the live
+// resources from garbage collection when the storage check rejects the
+// configuration and none of these are rendered.
+//
+// The gateway NetworkPolicies belong here rather than with the workloads that
+// dial through them: a policy that guards a gateway has to exist for as long as
+// the gateway does, including the window before its client is up.
 func lokiStackSources(needsUsageLogsLoki, needsLoki bool) []rendertemplate.TemplateSource {
 	var sources []rendertemplate.TemplateSource
 	if needsUsageLogsLoki {
-		sources = append(sources, src(UsageLogsLokiStackTemplate))
+		sources = append(sources,
+			src(UsageLogsLokiStackTemplate),
+			src(UsageLogsLokiStackNPTemplate),
+		)
 	}
 	if needsLoki {
 		sources = append(sources,
@@ -741,9 +789,14 @@ func lokiStackSources(needsUsageLogsLoki, needsLoki bool) []rendertemplate.Templ
 // two different Secrets can carry the same bucketnames.
 //
 // It returns a *lokiStorageConflictError when the stacks overlap and a
-// *lokiStorageCheckError when a Secret could not be read. An unreadable Secret
-// is reported as a failed check rather than treated as isolated: a guard that
-// answers "no conflict" when it could not look is no guard at all.
+// *lokiStorageCheckError when a Secret could not be resolved. An unresolvable
+// Secret is reported as a failed check rather than treated as isolated: a
+// guard that answers "no conflict" when it could not look is no guard at all.
+//
+// Only a configuration with both stacks reaches the comparison. A collision
+// needs two writers, so a single-stack install is left alone however its
+// storage is configured — including while its Secret is still missing, which
+// the Loki operator reports on the stack itself.
 func checkLokiStorageIsolation(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) error {
 	usageLogs := monitoring.Spec.UsageLogs
 	logs := monitoring.Spec.Logs
@@ -754,11 +807,11 @@ func checkLokiStorageIsolation(ctx context.Context, c client.Client, monitoring 
 	namespace := monitoringNamespace(monitoring)
 	usageLogsLocations, err := lokiStorageLocations(ctx, c, namespace, usageLogs.Storage.SecretName)
 	if err != nil {
-		return &lokiStorageCheckError{err: err}
+		return newLokiStorageCheckError(err)
 	}
 	logsLocations, err := lokiStorageLocations(ctx, c, namespace, logs.Storage.SecretName)
 	if err != nil {
-		return &lokiStorageCheckError{err: err}
+		return newLokiStorageCheckError(err)
 	}
 
 	shared := make([]string, 0, len(usageLogsLocations))
@@ -782,20 +835,20 @@ func checkLokiStorageIsolation(ctx context.Context, c client.Client, monitoring 
 // object store locations it writes to: the same bucket name on two different
 // endpoints is two different buckets.
 //
-// A Secret that does not exist yet returns no locations, since it cannot be
-// shown to conflict and the Loki operator reports the missing credentials
-// itself. Any other read failure is returned, so the caller withholds both
-// stacks instead of concluding they are isolated.
+// Every way of not arriving at a location is an error, including a Secret that
+// does not exist yet and one that names no bucket. Returning "no locations"
+// there would make two unresolvable stacks compare as isolated, and the
+// comparison is the only thing standing between them and a shared bucket. The
+// cost of failing closed is that neither stack is created until both Secrets
+// resolve; the storage Secret watch in SetupWithManager is what keeps that
+// from stalling until the next periodic requeue.
 func lokiStorageLocations(ctx context.Context, c client.Client, namespace, secretName string) ([]string, error) {
 	if secretName == "" {
-		return nil, nil
+		return nil, fmt.Errorf("LokiStack storage secret name is empty: %w", errLokiStorageSecretInvalid)
 	}
 
 	secret := &corev1.Secret{}
 	if err := c.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, secret); err != nil {
-		if k8serr.IsNotFound(err) {
-			return nil, nil
-		}
 		return nil, fmt.Errorf("reading LokiStack storage secret %s/%s: %w", namespace, secretName, err)
 	}
 
@@ -807,6 +860,10 @@ func lokiStorageLocations(ctx context.Context, c client.Client, namespace, secre
 		if bucket = strings.TrimSpace(bucket); bucket != "" {
 			locations = append(locations, lokiStorageLocation(endpoint, bucket))
 		}
+	}
+	if len(locations) == 0 {
+		return nil, fmt.Errorf("LokiStack storage secret %s/%s has no usable bucketnames entry: %w",
+			namespace, secretName, errLokiStorageSecretInvalid)
 	}
 	return locations, nil
 }

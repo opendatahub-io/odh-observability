@@ -3,6 +3,9 @@ kind: NetworkPolicy
 metadata:
   name: {{.UsageLogsLokiStackName}}-allow
   namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+    platform.opendatahub.io/component: loki
 spec:
   # Protects the loki gateway pods (the ones RECEIVING the connection).
   podSelector:

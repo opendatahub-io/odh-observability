@@ -577,6 +577,11 @@ func (tc *MonitoringTestCtx) setupUsageLogsWithStorage(t *testing.T, storageType
 // which is what deploys the log forwarding LokiStack. It does not wait for
 // Monitoring to be Ready: the ClusterLogForwarder stays unavailable until its
 // own LokiStack finishes provisioning.
+//
+// The ordering is load-bearing. With both stacks configured, the storage
+// isolation check fails closed until every referenced secret resolves, so
+// patching the CR first would withhold both stacks until the secret arrives
+// and the watch on it fires.
 func (tc *MonitoringTestCtx) setupLogsWithStorage(t *testing.T, storageType, secretName string) {
 	t.Helper()
 	tc.createLokiS3SecretForBucket(t, secretName, tc.MonitoringNamespace, logsS3Bucket)

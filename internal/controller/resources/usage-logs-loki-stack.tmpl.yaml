@@ -3,6 +3,8 @@ kind: LokiStack
 metadata:
   name: {{.UsageLogsLokiStackName}}
   namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/component: loki
 spec:
   limits:
     global:
