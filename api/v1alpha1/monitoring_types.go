@@ -130,7 +130,8 @@ type TracesTLS struct {
 // Logs defines the configuration for cluster log forwarding via the ClusterLogForwarder operator.
 type Logs struct {
 	// Storage configures the LokiStack storage backend for log forwarding.
-	// Required: the operator deploys a shared LokiStack used by both log forwarding and usage logs.
+	// Required: the operator deploys a LokiStack dedicated to log forwarding, separate from the
+	// one usageLogs.storage deploys.
 	// +kubebuilder:validation:Required
 	Storage *LokiStorageConfig `json:"storage"`
 

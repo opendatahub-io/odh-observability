@@ -1332,13 +1332,239 @@ func TestDeployLokiStack_LogsOnlyNoUsageLogs(t *testing.T) {
 	if data["UsageLogs"] != false {
 		t.Errorf("expected UsageLogs=false when usageLogs is nil, got %v", data["UsageLogs"])
 	}
+	if data["UsageLogsLokiStorageSecretName"] != "" {
+		t.Errorf("expected blank UsageLogsLokiStorageSecretName when usageLogs is nil, got %v", data["UsageLogsLokiStorageSecretName"])
+	}
+}
+
+func TestDeployLokiStack_UsageLogsOnlyNoLogs(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Logs = nil
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{
+			Type:             "s3",
+			SecretName:       "usage-logs-only-secret",
+			CredentialMode:   "static",
+			StorageClassName: "gp3-csi",
+		},
+	}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
+	err := deployLokiStack(context.Background(), cli, m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 1 {
+		t.Fatalf("expected 1 source (UsageLogsLokiStackTemplate), got %d", len(sources))
+	}
+
+	// Log forwarding is not configured, so its stack must stay out of the way.
+	c := mustFindCondition(t, m, conditions.ConditionLokiStackAvailable)
+	if c.Status != metav1.ConditionFalse || c.Reason != "LokiNotRequired" {
+		t.Errorf("LokiStackAvailable: expected False/LokiNotRequired, got %s/%s", c.Status, c.Reason)
+	}
+
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("buildTemplateData error: %v", err)
+	}
+
+	if data["UsageLogsLokiStorageSecretName"] != "usage-logs-only-secret" {
+		t.Errorf("expected UsageLogsLokiStorageSecretName=usage-logs-only-secret, got %v", data["UsageLogsLokiStorageSecretName"])
+	}
+	if data["UsageLogsLokiStorageType"] != "s3" {
+		t.Errorf("expected UsageLogsLokiStorageType=s3, got %v", data["UsageLogsLokiStorageType"])
+	}
+	if data["UsageLogsLokiStorageCredentialMode"] != "static" {
+		t.Errorf("expected UsageLogsLokiStorageCredentialMode=static, got %v", data["UsageLogsLokiStorageCredentialMode"])
+	}
+	if data["UsageLogsLokiStorageClassName"] != "gp3-csi" {
+		t.Errorf("expected UsageLogsLokiStorageClassName=gp3-csi, got %v", data["UsageLogsLokiStorageClassName"])
+	}
+	// The log forwarding stack is not rendered, so its storage keys stay blank
+	// rather than inheriting the usage logs storage.
+	if data["LokiStorageSecretName"] != "" {
+		t.Errorf("expected blank LokiStorageSecretName when logs is nil, got %v", data["LokiStorageSecretName"])
+	}
+	if data["UsageLogs"] != true {
+		t.Errorf("expected UsageLogs=true when usageLogs storage is set, got %v", data["UsageLogs"])
+	}
+}
+
+// TestDeployLokiStack_BothConfigured covers the two stacks being independent:
+// each is rendered from its own storage configuration and reported on by its
+// own condition.
+func TestDeployLokiStack_BothConfigured(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{
+			Type:             "s3",
+			SecretName:       "usage-logs-secret",
+			CredentialMode:   "static",
+			StorageClassName: "usage-logs-sc",
+		},
+	}
+	m.Spec.Logs = &v1alpha1.Logs{
+		Storage: &v1alpha1.LokiStorageConfig{
+			Type:           "s3",
+			SecretName:     "logs-secret",
+			CredentialMode: "token",
+		},
+	}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(kubernetesAPIServerEndpointSlice(),
+			readyLokiStack(usageLogsLokiStackResourceName, m.Spec.Namespace),
+			readyLokiStack(LokiStackResourceName, m.Spec.Namespace)).
+		Build()
+	err := deployLokiStack(context.Background(), cli, m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 2 {
+		t.Fatalf("expected 2 sources (usage logs + log forwarding LokiStacks), got %d", len(sources))
+	}
+
+	for _, conditionType := range []string{
+		conditions.ConditionUsageLogsLokiStackAvailable,
+		conditions.ConditionLokiStackAvailable,
+	} {
+		if c := mustFindCondition(t, m, conditionType); c.Status != metav1.ConditionTrue {
+			t.Errorf("%s: expected True once the stack is ready, got %s/%s", conditionType, c.Status, c.Reason)
+		}
+	}
+
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("buildTemplateData error: %v", err)
+	}
+
+	// Distinct CRs, so neither feature's storage may leak into the other's stack.
+	if data["UsageLogsLokiStackName"] == data["LokiStackName"] {
+		t.Errorf("the two LokiStacks must have different names, both are %v", data["LokiStackName"])
+	}
+	if data["UsageLogsLokiStorageSecretName"] != "usage-logs-secret" {
+		t.Errorf("expected UsageLogsLokiStorageSecretName=usage-logs-secret, got %v", data["UsageLogsLokiStorageSecretName"])
+	}
+	if data["LokiStorageSecretName"] != "logs-secret" {
+		t.Errorf("expected LokiStorageSecretName=logs-secret, got %v", data["LokiStorageSecretName"])
+	}
+	if data["UsageLogsLokiStorageCredentialMode"] != "static" {
+		t.Errorf("expected UsageLogsLokiStorageCredentialMode=static, got %v", data["UsageLogsLokiStorageCredentialMode"])
+	}
+	if data["LokiStorageCredentialMode"] != "token" {
+		t.Errorf("expected LokiStorageCredentialMode=token, got %v", data["LokiStorageCredentialMode"])
+	}
+	// StorageClassName is unset for log forwarding, so it falls back to the default
+	// instead of borrowing the usage logs storage class.
+	if data["LokiStorageClassName"] != defaultLokiStorageClassName {
+		t.Errorf("expected LokiStorageClassName=%s, got %v", defaultLokiStorageClassName, data["LokiStorageClassName"])
+	}
+	if data["UsageLogsLokiStorageClassName"] != "usage-logs-sc" {
+		t.Errorf("expected UsageLogsLokiStorageClassName=usage-logs-sc, got %v", data["UsageLogsLokiStorageClassName"])
+	}
+}
+
+func TestDeployLokiStack_NeitherConfigured(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = nil
+	m.Spec.Logs = nil
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	err := deployLokiStack(context.Background(), cli, m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 0 {
+		t.Fatalf("expected no sources when neither feature is configured, got %d", len(sources))
+	}
+
+	for _, conditionType := range []string{
+		conditions.ConditionUsageLogsLokiStackAvailable,
+		conditions.ConditionLokiStackAvailable,
+	} {
+		c := mustFindCondition(t, m, conditionType)
+		if c.Status != metav1.ConditionFalse || c.Severity != platformcommon.ConditionSeverityInfo {
+			t.Errorf("%s: expected False+Info when not configured, got %s/%s", conditionType, c.Status, c.Severity)
+		}
+	}
+}
+
+func TestDeployLokiStack_CRDMissing(t *testing.T) {
+	s := newActionsTestScheme(t)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: "usage-logs-secret"}}
+	m.Spec.Logs = &v1alpha1.Logs{Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: "logs-secret"}}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithInterceptorFuncs(missingCRDs(gvk.LokiStack)).Build()
+	err := deployLokiStack(context.Background(), cli, m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 0 {
+		t.Fatalf("expected no sources when the LokiStack CRD is missing, got %d", len(sources))
+	}
+
+	// Both features are configured, so both must report the missing operator.
+	for _, conditionType := range []string{
+		conditions.ConditionUsageLogsLokiStackAvailable,
+		conditions.ConditionLokiStackAvailable,
+	} {
+		c := mustFindCondition(t, m, conditionType)
+		if c.Status != metav1.ConditionFalse || c.Reason != conditions.MissingOperatorReason {
+			t.Errorf("%s: expected False/%s, got %s/%s", conditionType, conditions.MissingOperatorReason, c.Status, c.Reason)
+		}
+	}
+}
+
+// readyLokiStack builds a LokiStack CR reporting Ready=True, the state the
+// readiness check in deployLokiStack looks for.
+func readyLokiStack(name, namespace string) *unstructured.Unstructured {
+	lokiStack := &unstructured.Unstructured{}
+	lokiStack.SetGroupVersionKind(gvk.LokiStack)
+	lokiStack.SetName(name)
+	lokiStack.SetNamespace(namespace)
+	_ = unstructured.SetNestedSlice(lokiStack.Object, []any{
+		map[string]any{
+			"type":   "Ready",
+			"status": "True",
+		},
+	}, "status", "conditions")
+	return lokiStack
 }
 
 // --- deployUsageLogsCollector ---
 
-// usageLogsEndpoint is the LokiStack OTLP endpoint the reconciler publishes to
-// status once LokiStack is ready; the collector deploys only after it is set.
-const usageLogsEndpoint = "https://data-science-lokistack-gateway-http.test-ns.svc.cluster.local:8080/api/logs/v1/application/otlp"
+// usageLogsEndpoint is the usage logs LokiStack OTLP endpoint the reconciler
+// publishes to status once that stack is ready; the collector deploys only
+// after it is set.
+const usageLogsEndpoint = "https://data-science-usage-logs-lokistack-gateway-http.test-ns.svc.cluster.local:8080/api/logs/v1/application/otlp"
 
 func TestDeployUsageLogsCollector_NoUsageLogs(t *testing.T) {
 	s := newActionsTestScheme(t)
@@ -1517,7 +1743,7 @@ func TestDeployUsageLogsCollector_RendersCollectorRBACAndNetworkPolicies(t *test
 		"ClusterRole/data-science-usage-logs-processor",
 		"ClusterRoleBinding/data-science-usage-logs-processor",
 		"NetworkPolicy/data-science-usage-logs-collector-allow",
-		"NetworkPolicy/data-science-lokistack-allow",
+		"NetworkPolicy/data-science-usage-logs-lokistack-allow",
 	} {
 		if rendered[key] == nil {
 			t.Errorf("missing rendered resource %s (got %v)", key, slices.Sorted(maps.Keys(rendered)))
@@ -1533,15 +1759,15 @@ func TestDeployUsageLogsCollector_RendersCollectorRBACAndNetworkPolicies(t *test
 	if !ok {
 		t.Fatal("UsageLogsCollectorName should be a string")
 	}
-	lokiStackName, ok := data["LokiStackName"].(string)
+	lokiStackName, ok := data["UsageLogsLokiStackName"].(string)
 	if !ok {
-		t.Fatal("LokiStackName should be a string")
+		t.Fatal("UsageLogsLokiStackName should be a string")
 	}
 
 	assertUsageLogsCollectorConfig(t, rendered["OpenTelemetryCollector/data-science-usage-logs"])
 	assertUsageLogsNetworkPolicies(t, usageLogsNetworkPolicyPeers{
 		collectorPolicy:  rendered["NetworkPolicy/data-science-usage-logs-collector-allow"],
-		lokiStackPolicy:  rendered["NetworkPolicy/data-science-lokistack-allow"],
+		lokiStackPolicy:  rendered["NetworkPolicy/data-science-usage-logs-lokistack-allow"],
 		collectorPodName: collectorName + "-collector",
 		lokiStackName:    lokiStackName,
 		namespace:        m.Spec.Namespace,

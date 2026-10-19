@@ -1081,7 +1081,7 @@ func TestBuildTemplateData_UsesEffectiveMonitoringNamespace(t *testing.T) {
 	if data["Namespace"] != defaultMonitoringNamespace {
 		t.Errorf("Namespace: want %q, got %v", defaultMonitoringNamespace, data["Namespace"])
 	}
-	if data["UsageLogsEndpoint"] != "https://data-science-lokistack-gateway-http.opendatahub.svc.cluster.local:8080/api/logs/v1/application/otlp" {
+	if data["UsageLogsEndpoint"] != "https://data-science-usage-logs-lokistack-gateway-http.opendatahub.svc.cluster.local:8080/api/logs/v1/application/otlp" {
 		t.Errorf("UsageLogsEndpoint: unexpected effective namespace endpoint %v", data["UsageLogsEndpoint"])
 	}
 }

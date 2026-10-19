@@ -76,7 +76,9 @@ const (
 	// ConditionUsageLogsLokiStackAvailable indicates the usage logs LokiStack CR is deployed.
 	ConditionUsageLogsLokiStackAvailable = "UsageLogsLokiStackAvailable"
 
-	// ConditionLokiStackAvailable indicates the LokiStack CR is deployed.
+	// ConditionLokiStackAvailable indicates the log forwarding LokiStack CR is
+	// deployed. It is separate from ConditionUsageLogsLokiStackAvailable: the
+	// two stacks are independent CRs with independent storage.
 	ConditionLokiStackAvailable = "LokiStackAvailable"
 
 	// ConditionClusterLogForwarderAvailable indicates the ClusterLogForwarder CR is deployed.
