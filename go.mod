@@ -7,7 +7,7 @@ tool gotest.tools/gotestsum
 require (
 	github.com/hashicorp/go-multierror v1.1.1
 	github.com/itchyny/gojq v0.12.19
-	github.com/onsi/gomega v1.42.0
+	github.com/onsi/gomega v1.44.0
 	github.com/opendatahub-io/odh-platform-utilities v0.5.0
 	github.com/opendatahub-io/odh-platform-utilities/framework v0.2.0
 	github.com/openshift/api v0.0.0-20261002115817-f8795cdde518
@@ -92,7 +92,7 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
-	go.yaml.in/yaml/v3 v3.0.4 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/mod v0.41.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
