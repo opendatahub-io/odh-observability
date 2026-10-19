@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"slices"
 	"strings"
@@ -31,6 +32,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -1300,40 +1302,25 @@ func TestDeployLokiStack_LogsOnlyNoUsageLogs(t *testing.T) {
 	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
-	var sources []rendertemplate.TemplateSource
+	var sources, withheld []rendertemplate.TemplateSource
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
-	err := deployLokiStack(context.Background(), cli, m, cm, &sources)
+	err := deployLokiStack(context.Background(), cli, m, cm, &sources, &withheld)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 3 {
-		t.Fatalf("expected 3 sources (LokiStackTemplate + NetworkPolicies), got %d", len(sources))
-	}
+	// Log forwarding brings its own stack and the network policies guarding it,
+	// and nothing belonging to usage logs.
+	assertTemplatePaths(t, sources, []string{
+		LokiStackTemplate,
+		LokiStackNetworkPolicyTemplate,
+		LokiStackGatewayNetworkPolicyTemplate,
+	})
 
-	data, err := buildTemplateData(context.Background(), cli, m, "")
-	if err != nil {
-		t.Fatalf("buildTemplateData error: %v", err)
-	}
-
-	if data["LokiStorageSecretName"] != "logs-only-secret" {
-		t.Errorf("expected LokiStorageSecretName=logs-only-secret, got %v", data["LokiStorageSecretName"])
-	}
-	if data["LokiStorageType"] != "s3" {
-		t.Errorf("expected LokiStorageType=s3, got %v", data["LokiStorageType"])
-	}
-	if data["LokiStorageCredentialMode"] != "static" {
-		t.Errorf("expected LokiStorageCredentialMode=static, got %v", data["LokiStorageCredentialMode"])
-	}
-	if data["LokiStorageClassName"] != "gp3-csi" {
-		t.Errorf("expected LokiStorageClassName=gp3-csi, got %v", data["LokiStorageClassName"])
-	}
-	if data["UsageLogs"] != false {
-		t.Errorf("expected UsageLogs=false when usageLogs is nil, got %v", data["UsageLogs"])
-	}
-	if data["UsageLogsLokiStorageSecretName"] != "" {
-		t.Errorf("expected blank UsageLogsLokiStorageSecretName when usageLogs is nil, got %v", data["UsageLogsLokiStorageSecretName"])
+	c := mustFindCondition(t, m, conditions.ConditionUsageLogsLokiStackAvailable)
+	if c.Status != metav1.ConditionFalse || c.Reason != "LokiNotRequired" {
+		t.Errorf("UsageLogsLokiStackAvailable: expected False/LokiNotRequired, got %s/%s", c.Status, c.Reason)
 	}
 }
 
@@ -1353,54 +1340,29 @@ func TestDeployLokiStack_UsageLogsOnlyNoLogs(t *testing.T) {
 	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
-	var sources []rendertemplate.TemplateSource
+	var sources, withheld []rendertemplate.TemplateSource
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
-	err := deployLokiStack(context.Background(), cli, m, cm, &sources)
+	err := deployLokiStack(context.Background(), cli, m, cm, &sources, &withheld)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 1 {
-		t.Fatalf("expected 1 source (UsageLogsLokiStackTemplate), got %d", len(sources))
-	}
+	// Usage logs brings only its own stack; the network policy guarding it is
+	// contributed by deployUsageLogsCollector, not here.
+	assertTemplatePaths(t, sources, []string{UsageLogsLokiStackTemplate})
 
 	// Log forwarding is not configured, so its stack must stay out of the way.
 	c := mustFindCondition(t, m, conditions.ConditionLokiStackAvailable)
 	if c.Status != metav1.ConditionFalse || c.Reason != "LokiNotRequired" {
 		t.Errorf("LokiStackAvailable: expected False/LokiNotRequired, got %s/%s", c.Status, c.Reason)
 	}
-
-	data, err := buildTemplateData(context.Background(), cli, m, "")
-	if err != nil {
-		t.Fatalf("buildTemplateData error: %v", err)
-	}
-
-	if data["UsageLogsLokiStorageSecretName"] != "usage-logs-only-secret" {
-		t.Errorf("expected UsageLogsLokiStorageSecretName=usage-logs-only-secret, got %v", data["UsageLogsLokiStorageSecretName"])
-	}
-	if data["UsageLogsLokiStorageType"] != "s3" {
-		t.Errorf("expected UsageLogsLokiStorageType=s3, got %v", data["UsageLogsLokiStorageType"])
-	}
-	if data["UsageLogsLokiStorageCredentialMode"] != "static" {
-		t.Errorf("expected UsageLogsLokiStorageCredentialMode=static, got %v", data["UsageLogsLokiStorageCredentialMode"])
-	}
-	if data["UsageLogsLokiStorageClassName"] != "gp3-csi" {
-		t.Errorf("expected UsageLogsLokiStorageClassName=gp3-csi, got %v", data["UsageLogsLokiStorageClassName"])
-	}
-	// The log forwarding stack is not rendered, so its storage keys stay blank
-	// rather than inheriting the usage logs storage.
-	if data["LokiStorageSecretName"] != "" {
-		t.Errorf("expected blank LokiStorageSecretName when logs is nil, got %v", data["LokiStorageSecretName"])
-	}
-	if data["UsageLogs"] != true {
-		t.Errorf("expected UsageLogs=true when usageLogs storage is set, got %v", data["UsageLogs"])
-	}
 }
 
 // TestDeployLokiStack_BothConfigured covers the two stacks being independent:
-// each is rendered from its own storage configuration and reported on by its
-// own condition.
+// each contributes its own templates and is reported on by its own condition.
+// The storage keys that feed those templates are covered by
+// TestAddLokiStorageData and TestLokiStackTemplatesRenderIndependentStorage.
 func TestDeployLokiStack_BothConfigured(t *testing.T) {
 	s := newActionsTestScheme(t)
 	registerCRDs(s, gvk.LokiStack)
@@ -1423,21 +1385,24 @@ func TestDeployLokiStack_BothConfigured(t *testing.T) {
 	}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
-	var sources []rendertemplate.TemplateSource
+	var sources, withheld []rendertemplate.TemplateSource
 
 	cli := fake.NewClientBuilder().WithScheme(s).
 		WithObjects(kubernetesAPIServerEndpointSlice(),
 			readyLokiStack(usageLogsLokiStackResourceName, m.Spec.Namespace),
-			readyLokiStack(LokiStackResourceName, m.Spec.Namespace)).
+			readyLokiStack(lokiStackResourceName, m.Spec.Namespace)).
 		Build()
-	err := deployLokiStack(context.Background(), cli, m, cm, &sources)
+	err := deployLokiStack(context.Background(), cli, m, cm, &sources, &withheld)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 2 {
-		t.Fatalf("expected 2 sources (usage logs + log forwarding LokiStacks), got %d", len(sources))
-	}
+	assertTemplatePaths(t, sources, []string{
+		UsageLogsLokiStackTemplate,
+		LokiStackTemplate,
+		LokiStackNetworkPolicyTemplate,
+		LokiStackGatewayNetworkPolicyTemplate,
+	})
 
 	for _, conditionType := range []string{
 		conditions.ConditionUsageLogsLokiStackAvailable,
@@ -1446,36 +1411,6 @@ func TestDeployLokiStack_BothConfigured(t *testing.T) {
 		if c := mustFindCondition(t, m, conditionType); c.Status != metav1.ConditionTrue {
 			t.Errorf("%s: expected True once the stack is ready, got %s/%s", conditionType, c.Status, c.Reason)
 		}
-	}
-
-	data, err := buildTemplateData(context.Background(), cli, m, "")
-	if err != nil {
-		t.Fatalf("buildTemplateData error: %v", err)
-	}
-
-	// Distinct CRs, so neither feature's storage may leak into the other's stack.
-	if data["UsageLogsLokiStackName"] == data["LokiStackName"] {
-		t.Errorf("the two LokiStacks must have different names, both are %v", data["LokiStackName"])
-	}
-	if data["UsageLogsLokiStorageSecretName"] != "usage-logs-secret" {
-		t.Errorf("expected UsageLogsLokiStorageSecretName=usage-logs-secret, got %v", data["UsageLogsLokiStorageSecretName"])
-	}
-	if data["LokiStorageSecretName"] != "logs-secret" {
-		t.Errorf("expected LokiStorageSecretName=logs-secret, got %v", data["LokiStorageSecretName"])
-	}
-	if data["UsageLogsLokiStorageCredentialMode"] != "static" {
-		t.Errorf("expected UsageLogsLokiStorageCredentialMode=static, got %v", data["UsageLogsLokiStorageCredentialMode"])
-	}
-	if data["LokiStorageCredentialMode"] != "token" {
-		t.Errorf("expected LokiStorageCredentialMode=token, got %v", data["LokiStorageCredentialMode"])
-	}
-	// StorageClassName is unset for log forwarding, so it falls back to the default
-	// instead of borrowing the usage logs storage class.
-	if data["LokiStorageClassName"] != defaultLokiStorageClassName {
-		t.Errorf("expected LokiStorageClassName=%s, got %v", defaultLokiStorageClassName, data["LokiStorageClassName"])
-	}
-	if data["UsageLogsLokiStorageClassName"] != "usage-logs-sc" {
-		t.Errorf("expected UsageLogsLokiStorageClassName=usage-logs-sc, got %v", data["UsageLogsLokiStorageClassName"])
 	}
 }
 
@@ -1488,10 +1423,10 @@ func TestDeployLokiStack_NeitherConfigured(t *testing.T) {
 	m.Spec.Logs = nil
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
-	var sources []rendertemplate.TemplateSource
+	var sources, withheld []rendertemplate.TemplateSource
 
 	cli := fake.NewClientBuilder().WithScheme(s).Build()
-	err := deployLokiStack(context.Background(), cli, m, cm, &sources)
+	err := deployLokiStack(context.Background(), cli, m, cm, &sources, &withheld)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1519,10 +1454,10 @@ func TestDeployLokiStack_CRDMissing(t *testing.T) {
 	m.Spec.Logs = &v1alpha1.Logs{Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: "logs-secret"}}
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
-	var sources []rendertemplate.TemplateSource
+	var sources, withheld []rendertemplate.TemplateSource
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithInterceptorFuncs(missingCRDs(gvk.LokiStack)).Build()
-	err := deployLokiStack(context.Background(), cli, m, cm, &sources)
+	err := deployLokiStack(context.Background(), cli, m, cm, &sources, &withheld)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1539,6 +1474,315 @@ func TestDeployLokiStack_CRDMissing(t *testing.T) {
 		c := mustFindCondition(t, m, conditionType)
 		if c.Status != metav1.ConditionFalse || c.Reason != conditions.MissingOperatorReason {
 			t.Errorf("%s: expected False/%s, got %s/%s", conditionType, conditions.MissingOperatorReason, c.Status, c.Reason)
+		}
+	}
+}
+
+// lokiStorageSecret builds a LokiStack S3 storage Secret pointing at a bucket
+// on an endpoint.
+func lokiStorageSecret(name, namespace, endpoint, bucketnames string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Data: map[string][]byte{
+			"endpoint":    []byte(endpoint),
+			"bucketnames": []byte(bucketnames),
+		},
+	}
+}
+
+// monitoringWithBothLokiStorage configures both features against the named
+// storage Secrets.
+func monitoringWithBothLokiStorage(usageLogsSecret, logsSecret string) *v1alpha1.Monitoring {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: usageLogsSecret},
+	}
+	m.Spec.Logs = &v1alpha1.Logs{
+		Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: logsSecret},
+	}
+	return m
+}
+
+func TestCheckLokiStorageIsolation(t *testing.T) {
+	const ns = "test-ns"
+
+	tests := []struct {
+		name         string
+		secrets      []client.Object
+		monitoring   *v1alpha1.Monitoring
+		wantConflict bool
+		wantBuckets  string
+	}{
+		{
+			// Distinct Secret names are not evidence of separation.
+			name: "same bucket through different secrets conflicts",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "https://s3.example.com/shared-bucket",
+		},
+		{
+			name: "the same secret for both stacks conflicts",
+			secrets: []client.Object{
+				lokiStorageSecret("one-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("one-secret", "one-secret"),
+			wantConflict: true,
+			wantBuckets:  "https://s3.example.com/shared-bucket",
+		},
+		{
+			// bucketnames is a list, so an overlap anywhere in it conflicts.
+			name: "overlap inside a bucket list conflicts",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "usage-bucket, shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket,logs-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "https://s3.example.com/shared-bucket",
+		},
+		{
+			name: "separate buckets are accepted",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "usage-logs-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "logs-bucket"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			// The same bucket name on two backends is two different buckets.
+			name: "same bucket name on different endpoints is accepted",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "logs"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.other.example.com", "logs"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			// The operator renders LokiStacks without reading their Secrets, so a
+			// missing Secret must not block reconciliation.
+			name: "missing secret cannot be shown to conflict",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			// With one stack there is no second writer to collide with, so the
+			// check must stay out of the way however the storage is configured.
+			name: "only usage logs configured is never a conflict",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring: func() *v1alpha1.Monitoring {
+				m := monitoringWithBothLokiStorage("usage-logs-secret", "usage-logs-secret")
+				m.Spec.Logs = nil
+				return m
+			}(),
+		},
+		{
+			name: "only log forwarding configured is never a conflict",
+			secrets: []client.Object{
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring: func() *v1alpha1.Monitoring {
+				m := monitoringWithBothLokiStorage("logs-secret", "logs-secret")
+				m.Spec.UsageLogs = nil
+				return m
+			}(),
+		},
+		{
+			// Equivalent spellings of one endpoint must not look like two
+			// backends: a trailing slash, hostname case, an explicitly written
+			// default port and a doubled slash all name the same place.
+			name: "equivalent endpoint spellings still conflict",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://S3.Example.com:443//", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "https://s3.example.com/shared-bucket",
+		},
+		{
+			// Virtual-host-style addressing folds the bucket into the hostname;
+			// it still reaches the bucket the path-style spelling reaches.
+			name: "virtual-host and path-style addressing of one bucket conflict",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://shared-bucket.s3.example.com", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "https://s3.example.com/shared-bucket",
+		},
+		{
+			// A non-default port is a different backend, not a spelling variant.
+			name: "same bucket on a non-default port is accepted",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com:9000", "logs"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "logs"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			// http and https are configured as separate backends; normalizing
+			// them together would invent a conflict that does not exist.
+			name: "same bucket over http and https is accepted",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "http://s3.example.com", "logs"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "logs"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			// Gateway path prefixes are case-sensitive, so they separate buckets.
+			name: "same bucket under different gateway path prefixes is accepted",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://gateway.internal/s3", "logs"),
+				lokiStorageSecret("logs-secret", ns, "https://gateway.internal/S3", "logs"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newActionsTestScheme(t)
+			cli := fake.NewClientBuilder().WithScheme(s).WithObjects(tt.secrets...).Build()
+
+			err := checkLokiStorageIsolation(context.Background(), cli, tt.monitoring)
+			if !tt.wantConflict {
+				if err != nil {
+					t.Fatalf("expected no conflict, got %v", err)
+				}
+				return
+			}
+
+			// A rejected configuration, not a check that could not run: the
+			// two are reported under different reasons and only one of them
+			// is the user's to fix.
+			var conflict *lokiStorageConflictError
+			if !errors.As(err, &conflict) {
+				t.Fatalf("expected a *lokiStorageConflictError, got %T (%v)", err, err)
+			}
+			if !strings.Contains(err.Error(), tt.wantBuckets) {
+				t.Errorf("error should name the shared location %q, got %v", tt.wantBuckets, err)
+			}
+		})
+	}
+}
+
+// TestDeployLokiStack_SharedBucketRejected covers the conflict stopping the
+// action before anything is applied, while the stacks stay in the withheld set
+// so garbage collection does not delete a stack that is already running.
+func TestDeployLokiStack_SharedBucketRejected(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret")
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		lokiStorageSecret("usage-logs-secret", m.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+		lokiStorageSecret("logs-secret", m.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+	).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources, withheld []rendertemplate.TemplateSource
+
+	err := deployLokiStack(context.Background(), cli, m, cm, &sources, &withheld)
+	if err == nil {
+		t.Fatal("expected deployLokiStack to reject the shared bucket")
+	}
+
+	// The typed error survives the caller boundary, so the reconciler can tell
+	// a rejected configuration from a check that could not run.
+	var conflict *lokiStorageConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("expected a *lokiStorageConflictError, got %T (%v)", err, err)
+	}
+
+	if len(sources) != 0 {
+		t.Fatalf("expected nothing to be applied while the storage conflicts, got %d sources", len(sources))
+	}
+
+	// Withheld, not dropped: the reconciler feeds these to garbage collection.
+	assertTemplatePaths(t, withheld, []string{
+		UsageLogsLokiStackTemplate,
+		LokiStackTemplate,
+		LokiStackNetworkPolicyTemplate,
+		LokiStackGatewayNetworkPolicyTemplate,
+	})
+
+	for _, conditionType := range []string{
+		conditions.ConditionUsageLogsLokiStackAvailable,
+		conditions.ConditionLokiStackAvailable,
+	} {
+		c := mustFindCondition(t, m, conditionType)
+		if c.Status != metav1.ConditionFalse || c.Reason != lokiStorageConflictReason {
+			t.Errorf("%s: expected False/%s, got %s/%s", conditionType, lokiStorageConflictReason, c.Status, c.Reason)
+		}
+	}
+}
+
+// TestDeployLokiStack_StorageSecretUnreadableWithholdsBothStacks covers the
+// isolation check failing closed. An unreadable Secret leaves the overlap
+// question unanswered, and answering "no conflict" would let two stacks share a
+// bucket and overwrite each other's index and chunks.
+func TestDeployLokiStack_StorageSecretUnreadableWithholdsBothStacks(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret")
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		lokiStorageSecret("usage-logs-secret", m.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+		lokiStorageSecret("logs-secret", m.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+	).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, isSecret := obj.(*corev1.Secret); isSecret {
+				return k8serr.NewForbidden(
+					schema.GroupResource{Resource: "secrets"}, key.Name, errors.New("no permission"))
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources, withheld []rendertemplate.TemplateSource
+
+	err := deployLokiStack(context.Background(), cli, m, cm, &sources, &withheld)
+	if err == nil {
+		t.Fatal("expected deployLokiStack to fail closed when the storage secret cannot be read")
+	}
+
+	var checkErr *lokiStorageCheckError
+	if !errors.As(err, &checkErr) {
+		t.Fatalf("expected a *lokiStorageCheckError, got %T (%v)", err, err)
+	}
+	// The API error stays reachable through the wrapper, so callers can still
+	// tell a permission problem from any other reason the check did not run.
+	if !k8serr.IsForbidden(err) {
+		t.Errorf("expected the Forbidden cause to remain unwrappable, got %v", err)
+	}
+
+	if len(sources) != 0 {
+		t.Fatalf("expected neither stack to be applied while isolation is unverifiable, got %d sources", len(sources))
+	}
+	if len(withheld) == 0 {
+		t.Error("expected the stacks to be withheld rather than dropped, so garbage collection retains them")
+	}
+
+	for _, conditionType := range []string{
+		conditions.ConditionUsageLogsLokiStackAvailable,
+		conditions.ConditionLokiStackAvailable,
+	} {
+		c := mustFindCondition(t, m, conditionType)
+		if c.Status != metav1.ConditionFalse || c.Reason != lokiStorageCheckFailedReason {
+			t.Errorf("%s: expected False/%s, got %s/%s", conditionType, lokiStorageCheckFailedReason, c.Status, c.Reason)
 		}
 	}
 }

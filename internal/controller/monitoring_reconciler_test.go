@@ -25,6 +25,7 @@ import (
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
+	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
 	configv1 "github.com/openshift/api/config/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -52,6 +53,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
+	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	controllergvk "github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 )
 
@@ -1343,6 +1345,68 @@ func TestOpenTelemetryOperatorNetworkPolicyWatch(t *testing.T) {
 	}
 	if pred.Create(event.CreateEvent{Object: &corev1.ConfigMap{}}) {
 		t.Fatal("a non-NetworkPolicy event must not trigger legacy policy cleanup")
+	}
+}
+
+// TestStorageConflictRetainsLokiStacksForGarbageCollection covers the
+// resolution of a rejected storage configuration: the LokiStacks are not
+// applied, but they stay in the desired set so garbage collection leaves a
+// running stack alone. Collection itself keeps running, which is what
+// separates this from disabling GC for the whole reconcile.
+//
+// It drives the pieces the reconciler composes rather than Reconcile itself:
+// newTestReconciler's fake discovery client exposes no API resources, so a
+// reconciler-level GC test would find nothing to delete and pass vacuously.
+func TestStorageConflictRetainsLokiStacksForGarbageCollection(t *testing.T) {
+	ctx := context.Background()
+	s := newActionsTestScheme(t)
+	registerCRDs(s, controllergvk.LokiStack)
+
+	monitoring := monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret")
+	monitoring.UID = types.UID("monitoring-owner")
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		kubernetesAPIServerEndpointSlice(),
+		lokiStorageSecret("usage-logs-secret", monitoring.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+		lokiStorageSecret("logs-secret", monitoring.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+	).Build()
+
+	cm := conditions.NewConditionsManager(monitoring, monitoring.Generation)
+	var sources, withheld []rendertemplate.TemplateSource
+	if err := deployLokiStack(ctx, cli, monitoring, cm, &sources, &withheld); err == nil {
+		t.Fatal("expected the shared bucket to be rejected")
+	}
+
+	data, err := buildTemplateData(ctx, cli, monitoring, "")
+	if err != nil {
+		t.Fatalf("building template data: %v", err)
+	}
+	// The set the reconciler hands to collectGarbage. Nothing was applied, so
+	// everything in it comes from the withheld sources.
+	r := &MonitoringReconciler{Scheme: s}
+	desiredList, err := r.desiredForGarbageCollection(ctx, nil, withheld, data)
+	if err != nil {
+		t.Fatalf("building the desired set: %v", err)
+	}
+
+	desired := make(map[resourceKey]struct{}, len(desiredList))
+	for i := range desiredList {
+		obj := &desiredList[i]
+		desired[resourceKey{gvk: obj.GroupVersionKind(), namespace: obj.GetNamespace(), name: obj.GetName()}] = struct{}{}
+	}
+
+	for _, name := range []string{usageLogsLokiStackResourceName, lokiStackResourceName} {
+		liveStack := ownedGarbageCollectionTestObject(controllergvk.LokiStack, monitoring.Spec.Namespace, name, monitoring.UID)
+		if shouldCollectOwnedResource(monitoring, liveStack, desired, monitoring.Spec.Namespace) {
+			t.Errorf("%s would be deleted while its storage configuration is rejected", name)
+		}
+	}
+
+	// Unrelated resources are still collected; the conflict degrades Loki only.
+	staleConfigMap := ownedGarbageCollectionTestObject(
+		schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}, monitoring.Spec.Namespace, "stale-config", monitoring.UID)
+	if !shouldCollectOwnedResource(monitoring, staleConfigMap, desired, monitoring.Spec.Namespace) {
+		t.Error("unrelated stale resources must still be collected, the conflict must not disable garbage collection")
 	}
 }
 

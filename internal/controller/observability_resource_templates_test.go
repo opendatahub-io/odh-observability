@@ -500,6 +500,92 @@ func TestKorrel8rNetworkPolicyTemplateContract(t *testing.T) {
 	}
 }
 
+// TestLokiStackTemplatesRenderIndependentStorage renders both LokiStack
+// templates from one data map and checks each CR picks up only its own storage.
+//
+// The two templates are identical apart from the key prefix they read
+// (.LokiStorage* versus .UsageLogsLokiStorage*), so a single mis-prefixed key
+// would point one stack at the other's bucket without failing to render. Every
+// value below differs between the two families so that such a swap shows up by
+// name.
+func TestLokiStackTemplatesRenderIndependentStorage(t *testing.T) {
+	t.Parallel()
+
+	data := map[string]any{
+		"Namespace": testMonitoringNamespace,
+
+		"LokiStackName":             lokiStackResourceName,
+		"LokiStorageSecretName":     "logs-secret",
+		"LokiStorageType":           "s3",
+		"LokiStorageCredentialMode": "static",
+		"LokiStorageClassName":      "logs-sc",
+
+		"UsageLogsLokiStackName":             usageLogsLokiStackResourceName,
+		"UsageLogsLokiStorageSecretName":     "usage-logs-secret",
+		"UsageLogsLokiStorageType":           "s3",
+		"UsageLogsLokiStorageCredentialMode": "token",
+		"UsageLogsLokiStorageClassName":      "usage-logs-sc",
+	}
+
+	tests := []struct {
+		template        string
+		stackName       string
+		secretName      string
+		credentialMode  string
+		storageClass    string
+		storageTypeName string
+	}{
+		{
+			template:        LokiStackTemplate,
+			stackName:       lokiStackResourceName,
+			secretName:      "logs-secret",
+			credentialMode:  "static",
+			storageClass:    "logs-sc",
+			storageTypeName: "s3",
+		},
+		{
+			template:        UsageLogsLokiStackTemplate,
+			stackName:       usageLogsLokiStackResourceName,
+			secretName:      "usage-logs-secret",
+			credentialMode:  "token",
+			storageClass:    "usage-logs-sc",
+			storageTypeName: "s3",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.stackName, func(t *testing.T) {
+			t.Parallel()
+
+			resources := renderObservabilityTemplate(t, tt.template, data)
+			stack := findRenderedResource(t, resources, "LokiStack", tt.stackName)
+
+			for _, field := range []struct {
+				path []string
+				want string
+			}{
+				{[]string{"spec", "storage", "secret", "name"}, tt.secretName},
+				{[]string{"spec", "storage", "secret", "type"}, tt.storageTypeName},
+				{[]string{"spec", "storage", "secret", "credentialMode"}, tt.credentialMode},
+				{[]string{"spec", "storageClassName"}, tt.storageClass},
+				// Both stacks serve the same tenant, which is why they cannot
+				// share a bucket; checkLokiStorageIsolation depends on it.
+				{[]string{"spec", "tenants", "mode"}, "openshift-logging"},
+			} {
+				got, found, err := unstructured.NestedString(stack.Object, field.path...)
+				if err != nil || !found || got != field.want {
+					t.Errorf("%s %s: want %q, got %q (found=%t error=%v)",
+						tt.stackName, strings.Join(field.path, "."), field.want, got, found, err)
+				}
+			}
+
+			if namespace := stack.GetNamespace(); namespace != testMonitoringNamespace {
+				t.Errorf("%s: want namespace %q, got %q", tt.stackName, testMonitoringNamespace, namespace)
+			}
+		})
+	}
+}
+
 func TestClusterLogForwarderNetworkPolicyTemplateContract(t *testing.T) {
 	t.Parallel()
 

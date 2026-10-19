@@ -132,6 +132,10 @@ type Logs struct {
 	// Storage configures the LokiStack storage backend for log forwarding.
 	// Required: the operator deploys a LokiStack dedicated to log forwarding, separate from the
 	// one usageLogs.storage deploys.
+	// The two stacks must use different object storage buckets. Both serve the "application" tenant and
+	// Loki keys objects by tenant rather than by stack, so a shared bucket makes them overwrite each
+	// other's index and chunks. Separate secrets are not sufficient; the operator compares the resolved
+	// endpoint and bucketnames and refuses to reconcile when they overlap.
 	// +kubebuilder:validation:Required
 	Storage *LokiStorageConfig `json:"storage"`
 
@@ -169,6 +173,8 @@ type TracesStorage struct {
 type UsageLogs struct {
 	// Storage configures the LokiStack storage backend (S3).
 	// When configured, the operator deploys a LokiStack instance and auto-configures the collector endpoint.
+	// This stack is separate from the one logs.storage deploys and must use a different object storage
+	// bucket; see logs.storage for why a shared bucket is rejected.
 	// +kubebuilder:validation:Required
 	Storage *LokiStorageConfig `json:"storage"`
 }

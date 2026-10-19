@@ -252,12 +252,12 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 // neither feature's storage configuration leaks into the other's stack.
 func addLokiTemplateData(monitoring *v1alpha1.Monitoring, monitoringNamespace string, templateData map[string]any) {
 	templateData["UsageLogsLokiStackName"] = usageLogsLokiStackResourceName
-	templateData["LokiStackName"] = LokiStackResourceName
+	templateData["LokiStackName"] = lokiStackResourceName
 	// Both LokiStacks are configured in OpenShift logging mode. Their
 	// application tenant is the pinned tenant for inference logs.
 	templateData["LokiTenant"] = "application"
 	templateData["UsageLogsLokiQueryEndpoint"] = lokiGatewayURL(usageLogsLokiStackResourceName, monitoringNamespace)
-	templateData["LokiQueryEndpoint"] = lokiGatewayURL(LokiStackResourceName, monitoringNamespace)
+	templateData["LokiQueryEndpoint"] = lokiGatewayURL(lokiStackResourceName, monitoringNamespace)
 
 	var usageLogsLokiStorage, lokiStorage *v1alpha1.LokiStorageConfig
 	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil {

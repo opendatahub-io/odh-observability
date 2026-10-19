@@ -19,8 +19,13 @@ package controller
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"path"
+	"slices"
 	"strings"
 
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
@@ -103,16 +108,22 @@ const (
 	defaultMonitoringNamespace           = "opendatahub"
 	clusterLoggingNamespace              = "openshift-logging"
 	usageLogsLokiStackResourceName       = "data-science-usage-logs-lokistack"
-	LokiStackResourceName                = "data-science-lokistack"
+	lokiStackResourceName                = "data-science-lokistack"
 	clusterLogForwarderResourceName      = "data-science-cluster-log-forwarder"
 	Korrel8rServiceName                  = "korrel8r"
 	ClusterLogForwarderNetworkPolicyName = "data-science-cluster-log-forwarder-allow"
 	conditionTypeReady                   = "Ready"
 	conditionStatusTrue                  = "True"
+	schemeHTTP                           = "http"
+	schemeHTTPS                          = "https"
 )
 
 //go:embed resources monitoring
 var resourcesFS embed.FS
+
+// defaultPortForScheme maps a URL scheme to the port it implies when none is
+// written, so both spellings of one endpoint canonicalize alike.
+var defaultPortForScheme = map[string]string{schemeHTTP: "80", schemeHTTPS: "443"}
 
 func src(path string) rendertemplate.TemplateSource {
 	return rendertemplate.TemplateSource{FS: resourcesFS, Path: path}
@@ -602,12 +613,19 @@ func deployUsageLogsCollector(
 // configured and the log forwarding LokiStack when logs are configured. The two
 // stacks are separate CRs with independent storage, so each is rendered and
 // reported on only when its own feature is configured.
+//
+// When the storage isolation check rejects the configuration, the stacks go to
+// withheld rather than sources: they are not applied, but the caller still
+// feeds them to garbage collection so an already-running stack is treated as
+// desired instead of deleted. The returned error degrades Loki only; the rest
+// of the reconciliation continues without it.
 func deployLokiStack(
 	ctx context.Context,
 	c client.Client,
 	monitoring *v1alpha1.Monitoring,
 	cm *conditions.ConditionsManager,
 	sources *[]rendertemplate.TemplateSource,
+	withheld *[]rendertemplate.TemplateSource,
 ) error {
 	needsUsageLogsLoki := monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil
 	needsLoki := monitoring.Spec.Logs != nil
@@ -642,6 +660,24 @@ func deployLokiStack(
 		return nil
 	}
 
+	// Withhold both stacks when they would write to the same bucket, or when
+	// that question cannot be answered, so the conflict is reported instead of
+	// silently corrupting log storage. Readiness is not polled: there is nothing
+	// to report readiness about while the configuration is rejected.
+	if err := checkLokiStorageIsolation(ctx, c, monitoring); err != nil {
+		// Both outcomes withhold the stacks; only the reason differs. An error
+		// that does not name one can only have come from the check itself.
+		reason := lokiStorageCheckFailedReason
+		var storageErr lokiStorageError
+		if errors.As(err, &storageErr) {
+			reason = storageErr.conditionReason()
+		}
+		cm.MarkFalse(conditions.ConditionUsageLogsLokiStackAvailable, reason, err.Error())
+		cm.MarkFalse(conditions.ConditionLokiStackAvailable, reason, err.Error())
+		*withheld = append(*withheld, lokiStackSources(needsUsageLogsLoki, needsLoki)...)
+		return err
+	}
+
 	if needsUsageLogsLoki {
 		ready, err := isLokiStackReady(ctx, c, monitoring, usageLogsLokiStackResourceName)
 		if err != nil {
@@ -654,11 +690,10 @@ func deployLokiStack(
 				"LokiStackNotReady",
 				"Usage logs LokiStack is not ready yet")
 		}
-		*sources = append(*sources, src(UsageLogsLokiStackTemplate))
 	}
 
 	if needsLoki {
-		ready, err := isLokiStackReady(ctx, c, monitoring, LokiStackResourceName)
+		ready, err := isLokiStackReady(ctx, c, monitoring, lokiStackResourceName)
 		if err != nil {
 			return fmt.Errorf("checking LokiStack readiness: %w", err)
 		}
@@ -669,14 +704,165 @@ func deployLokiStack(
 				"LokiStackNotReady",
 				"LokiStack is not ready yet")
 		}
-		*sources = append(*sources,
+	}
+
+	*sources = append(*sources, lokiStackSources(needsUsageLogsLoki, needsLoki)...)
+
+	return nil
+}
+
+// lokiStackSources lists the templates each LokiStack contributes. Both the
+// applied path and the withheld path draw from it, so a template added here is
+// also retained by garbage collection when the storage check rejects the
+// configuration.
+func lokiStackSources(needsUsageLogsLoki, needsLoki bool) []rendertemplate.TemplateSource {
+	var sources []rendertemplate.TemplateSource
+	if needsUsageLogsLoki {
+		sources = append(sources, src(UsageLogsLokiStackTemplate))
+	}
+	if needsLoki {
+		sources = append(sources,
 			src(LokiStackTemplate),
 			src(LokiStackNetworkPolicyTemplate),
 			src(LokiStackGatewayNetworkPolicyTemplate),
 		)
 	}
+	return sources
+}
 
-	return nil
+// checkLokiStorageIsolation rejects a configuration that points both LokiStacks
+// at the same object store bucket.
+//
+// Both stacks serve the "application" tenant, and Loki keys its objects by
+// tenant ID rather than by LokiStack name, so two stacks sharing a bucket
+// address the same index and chunk objects and overwrite each other. The
+// LokiStack API exposes no per-stack object prefix, so separate buckets are the
+// only isolation boundary available. Comparing SecretName would not catch this:
+// two different Secrets can carry the same bucketnames.
+//
+// It returns a *lokiStorageConflictError when the stacks overlap and a
+// *lokiStorageCheckError when a Secret could not be read. An unreadable Secret
+// is reported as a failed check rather than treated as isolated: a guard that
+// answers "no conflict" when it could not look is no guard at all.
+func checkLokiStorageIsolation(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) error {
+	usageLogs := monitoring.Spec.UsageLogs
+	logs := monitoring.Spec.Logs
+	if usageLogs == nil || usageLogs.Storage == nil || logs == nil || logs.Storage == nil {
+		return nil
+	}
+
+	namespace := monitoringNamespace(monitoring)
+	usageLogsLocations, err := lokiStorageLocations(ctx, c, namespace, usageLogs.Storage.SecretName)
+	if err != nil {
+		return &lokiStorageCheckError{err: err}
+	}
+	logsLocations, err := lokiStorageLocations(ctx, c, namespace, logs.Storage.SecretName)
+	if err != nil {
+		return &lokiStorageCheckError{err: err}
+	}
+
+	shared := make([]string, 0, len(usageLogsLocations))
+	for _, location := range usageLogsLocations {
+		if slices.Contains(logsLocations, location) {
+			shared = append(shared, location)
+		}
+	}
+	if len(shared) == 0 {
+		return nil
+	}
+
+	return &lokiStorageConflictError{
+		usageLogsSecret: usageLogs.Storage.SecretName,
+		logsSecret:      logs.Storage.SecretName,
+		shared:          shared,
+	}
+}
+
+// lokiStorageLocations resolves a LokiStack storage Secret to the canonical
+// object store locations it writes to: the same bucket name on two different
+// endpoints is two different buckets.
+//
+// A Secret that does not exist yet returns no locations, since it cannot be
+// shown to conflict and the Loki operator reports the missing credentials
+// itself. Any other read failure is returned, so the caller withholds both
+// stacks instead of concluding they are isolated.
+func lokiStorageLocations(ctx context.Context, c client.Client, namespace, secretName string) ([]string, error) {
+	if secretName == "" {
+		return nil, nil
+	}
+
+	secret := &corev1.Secret{}
+	if err := c.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, secret); err != nil {
+		if k8serr.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading LokiStack storage secret %s/%s: %w", namespace, secretName, err)
+	}
+
+	// bucketnames holds a comma-separated list; the stacks conflict if any one
+	// bucket is common to both.
+	endpoint := string(secret.Data["endpoint"])
+	var locations []string
+	for bucket := range strings.SplitSeq(string(secret.Data["bucketnames"]), ",") {
+		if bucket = strings.TrimSpace(bucket); bucket != "" {
+			locations = append(locations, lokiStorageLocation(endpoint, bucket))
+		}
+	}
+	return locations, nil
+}
+
+// lokiStorageLocation canonicalizes an (endpoint, bucket) pair into a
+// comparable object store address, so that two spellings of one location
+// compare equal instead of slipping past the overlap check.
+//
+// The comparison key is (scheme, host, port, path prefix, bucket). Credentials
+// are deliberately excluded: two identities writing to one bucket still
+// collide, so comparing access keys would only mask the conflict. The scheme is
+// kept, because http and https are configured as separate backends. DNS aliases
+// pointing at one server are not detected; that needs resolution, not parsing.
+func lokiStorageLocation(endpoint, bucket string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	bucket = strings.TrimSpace(bucket)
+
+	// A bare "host" or "host:port" would parse as a scheme, so supply the
+	// authority marker that makes url.Parse read it as one.
+	toParse := endpoint
+	if !strings.Contains(toParse, "://") {
+		toParse = "//" + toParse
+	}
+	parsed, err := url.Parse(toParse)
+	if err != nil {
+		// An unparseable endpoint still has to compare equal to itself.
+		return endpoint + "/" + bucket
+	}
+
+	// Schemes and hostnames are case-insensitive (RFC 4343).
+	scheme := strings.ToLower(parsed.Scheme)
+	host := strings.ToLower(parsed.Hostname())
+
+	// An explicitly written default port names the same endpoint as none at all.
+	port := parsed.Port()
+	if port == defaultPortForScheme[scheme] {
+		port = ""
+	}
+	if port != "" {
+		host = net.JoinHostPort(host, port)
+	}
+
+	// Virtual-host-style addressing folds the bucket into the hostname; strip it
+	// so that form matches the path-style spelling of the same location.
+	if bucket != "" {
+		host = strings.TrimPrefix(host, strings.ToLower(bucket)+".")
+	}
+
+	// path.Clean collapses repeated slashes and resolves dot segments. Prefix
+	// case is significant on self-hosted gateways, so it is left alone.
+	prefix := path.Clean("/" + parsed.Path)
+	if prefix == "/" {
+		prefix = ""
+	}
+
+	return scheme + "://" + host + prefix + "/" + bucket
 }
 
 // deployClusterLogForwarder deploys the ClusterLogForwarder when logs are configured.
@@ -724,7 +910,7 @@ func deployClusterLogForwarder(
 		src(ClusterLogForwarderNetworkPolicyTemplate),
 	)
 
-	lokiReady, err := isLokiStackReady(ctx, c, monitoring, LokiStackResourceName)
+	lokiReady, err := isLokiStackReady(ctx, c, monitoring, lokiStackResourceName)
 	if err != nil {
 		return fmt.Errorf("checking LokiStack readiness for log forwarding: %w", err)
 	}
