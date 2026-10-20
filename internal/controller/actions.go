@@ -895,7 +895,19 @@ func checkStorageIsolation(ctx context.Context, c client.Client, namespace strin
 		if err != nil {
 			return newStorageCheckError(err)
 		}
+		// One claimant naming a location twice — a bucketnames list repeating a
+		// bucket, in any spelling that canonicalizes the same way — is still a
+		// single claim on it. Counting both entries would read one writer as
+		// two and report a stack as conflicting with itself. Deduping here
+		// rather than by claimant name keeps the length test below sound even
+		// if two claims ever share a description.
+		claimed := map[string]struct{}{}
 		for _, location := range locations {
+			if _, repeated := claimed[location]; repeated {
+				continue
+			}
+			claimed[location] = struct{}{}
+
 			if len(claimedBy[location]) == 0 {
 				order = append(order, location)
 			}

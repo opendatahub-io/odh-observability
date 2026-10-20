@@ -2117,6 +2117,27 @@ func TestCheckStorageIsolation_EndpointSpellings(t *testing.T) {
 			wantConflict: true,
 			wantBuckets:  "//s3.example.com/shared-bucket",
 		},
+	})
+}
+
+// TestCheckStorageIsolation_BucketLists covers bucketnames being a list rather
+// than a name: entries that resolve to nothing, and entries that resolve to
+// each other.
+//
+// A conflict is two claimants on one location, and the comparison reads that
+// off how many claimants a location collected. A claimant that names one
+// bucket twice puts two entries under one key by itself, so without a dedupe
+// the count stops meaning "writers" and a stack is reported as conflicting
+// with itself — a withhold of both LokiStacks, under a message that can only
+// name one party, for a repeated word in a Secret.
+//
+// The repetition does not have to be visible to whoever wrote the list.
+// Canonicalization folds bucket case and trims whitespace, so entries that
+// read as two buckets in the YAML can arrive as one.
+func TestCheckStorageIsolation_BucketLists(t *testing.T) {
+	const ns = "test-ns"
+
+	runStorageIsolationTests(t, ns, []storageIsolationTest{
 		{
 			// Empty entries in a bucket list are skipped rather than claimed as
 			// a location with no bucket, which every other list would overlap.
@@ -2124,6 +2145,48 @@ func TestCheckStorageIsolation_EndpointSpellings(t *testing.T) {
 			secrets: []client.Object{
 				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "logs-a, , shared-bucket"),
 				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", ",,shared-bucket,"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			// The plain form: a list repeating a bucket is one claim on it.
+			name: "a bucket repeated in one list is not a conflict with itself",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "bucket-a,bucket-a"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "bucket-b"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			// A repetition only the canonicalizer can see: these are two
+			// distinct strings in the Secret and one bucket after folding.
+			name: "a bucket repeated in one list in another case is not a conflict with itself",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "Bucket-A,bucket-a"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "bucket-b"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			// The same, folded by the trim that makes a list readable.
+			name: "a bucket repeated in one list around whitespace is not a conflict with itself",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "bucket-a, bucket-a "),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "bucket-b"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			// The row that bounds the three above. Ignoring a claimant's own
+			// repetition must not cost the bucket its claim: the second
+			// claimant reaching the repeated bucket is still two writers on
+			// it, which is the conflict the gate exists for.
+			name: "a bucket repeated in one list still conflicts with another claimant on it",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "shared-bucket,shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
 			},
 			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
 			wantConflict: true,
