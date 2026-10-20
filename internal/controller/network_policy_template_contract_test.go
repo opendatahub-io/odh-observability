@@ -74,8 +74,8 @@ func TestOperandNetworkPolicyTemplatesContract(t *testing.T) {
 			expectedPorts: []networkPolicyPort{{protocol: "TCP", port: 8080}},
 		},
 		{
-			// The usage logs gateway, guarded by deployLokiStack alongside the
-			// stack it fronts. Its only peer is the collector, so unlike the
+			// The usage logs gateway, guarded by the usage logs LokiStack deployment
+			// alongside the stack it fronts. Its only peer is the collector, so unlike the
 			// general-logs gateway it admits no Korrel8r and no Prometheus.
 			name:       "usage logs loki stack gateway",
 			template:   "resources/usage-logs-lokistack-network-policy.tmpl.yaml",

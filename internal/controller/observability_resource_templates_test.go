@@ -569,7 +569,7 @@ func TestLokiStackTemplatesRenderIndependentStorage(t *testing.T) {
 				{[]string{"spec", "storage", "secret", "credentialMode"}, tt.credentialMode},
 				{[]string{"spec", "storageClassName"}, tt.storageClass},
 				// Both stacks serve the same tenant, which is why they cannot
-				// share a bucket; checkLokiStorageIsolation depends on it.
+				// share a bucket; checkStorageIsolation depends on it.
 				{[]string{"spec", "tenants", "mode"}, "openshift-logging"},
 			} {
 				got, found, err := unstructured.NestedString(stack.Object, field.path...)
@@ -590,8 +590,13 @@ func TestLokiStackTemplatesRenderIndependentStorage(t *testing.T) {
 // collection shield. A rejected storage configuration renders none of these
 // templates, so the only thing keeping the live resources out of the
 // collector's reach is this label on the objects already in the cluster. A
-// template added to lokiStackSources without it would be deleted the first time
+// template added to a stack action without it would be deleted the first time
 // the storage check fails, which is exactly the data loss the shield prevents.
+//
+// Which value it carries is as much the contract as that it carries one. The
+// two stacks are shielded independently, so a usage logs template labelled for
+// log forwarding would be spared by the wrong claimant's failure and collected
+// on its own.
 func TestLokiStackTemplatesCarryComponentLabel(t *testing.T) {
 	t.Parallel()
 
@@ -612,13 +617,14 @@ func TestLokiStackTemplatesCarryComponentLabel(t *testing.T) {
 		"UsageLogsCollectorName": "data-science-usage-logs",
 	}
 
-	// Must stay in step with lokiStackSources in actions.go.
-	for _, template := range []string{
-		UsageLogsLokiStackTemplate,
-		UsageLogsLokiStackNPTemplate,
-		LokiStackTemplate,
-		LokiStackNetworkPolicyTemplate,
-		LokiStackGatewayNetworkPolicyTemplate,
+	// Must stay in step with the two stack actions' templates in actions.go,
+	// grouped the same way they are grouped there.
+	for template, wantComponent := range map[string]string{
+		UsageLogsLokiStackTemplate:            componentLokiUsageLogs,
+		UsageLogsLokiStackNPTemplate:          componentLokiUsageLogs,
+		LokiStackTemplate:                     componentLokiLogs,
+		LokiStackNetworkPolicyTemplate:        componentLokiLogs,
+		LokiStackGatewayNetworkPolicyTemplate: componentLokiLogs,
 	} {
 		t.Run(template, func(t *testing.T) {
 			t.Parallel()
@@ -629,9 +635,9 @@ func TestLokiStackTemplatesCarryComponentLabel(t *testing.T) {
 			// from the field owner for any object that arrives without one,
 			// which is why most operand CR templates omit it.
 			for _, resource := range renderObservabilityTemplate(t, template, data) {
-				if got := resource.GetLabels()[componentLabel]; got != componentLoki {
+				if got := resource.GetLabels()[componentLabel]; got != wantComponent {
 					t.Errorf("%s %s: want %s=%s, got %q",
-						resource.GetKind(), resource.GetName(), componentLabel, componentLoki, got)
+						resource.GetKind(), resource.GetName(), componentLabel, wantComponent, got)
 				}
 			}
 		})

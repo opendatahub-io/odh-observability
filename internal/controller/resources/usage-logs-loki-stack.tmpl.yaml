@@ -4,7 +4,7 @@ metadata:
   name: {{.UsageLogsLokiStackName}}
   namespace: {{.Namespace}}
   labels:
-    platform.opendatahub.io/component: loki
+    platform.opendatahub.io/component: loki-usage-logs
 spec:
   limits:
     global:

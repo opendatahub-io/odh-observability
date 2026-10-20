@@ -26,9 +26,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// TestLokiStorageError_ConditionStatus pins the distinction the two storage
-// errors exist to carry. Both withhold the stacks, so the error alone says
-// nothing about how to report them; the status is what deployLokiStack reads
+// TestStorageError_ConditionStatus pins the distinction the two storage errors
+// exist to carry. Both withhold the claimants, so the error alone says nothing
+// about how to report them; the status is what validateStorageIsolation reads
 // to choose between MarkFalse and MarkUnknown.
 //
 // Getting this backwards is silent and costly in both directions. Reporting a
@@ -36,12 +36,12 @@ import (
 // collection remove the usage logs collector over one unreadable Secret.
 // Reporting a real conflict as Unknown hides a configuration the user has to
 // fix behind a status that reads like a transient blip.
-func TestLokiStorageError_ConditionStatus(t *testing.T) {
+func TestStorageError_ConditionStatus(t *testing.T) {
 	t.Parallel()
 
 	for _, test := range []struct {
 		name       string
-		err        lokiStorageError
+		err        storageError
 		wantStatus metav1.ConditionStatus
 		wantReason string
 	}{
@@ -49,36 +49,35 @@ func TestLokiStorageError_ConditionStatus(t *testing.T) {
 			// The buckets were compared and found to overlap. A determinate
 			// answer, and the user's to fix.
 			name: "conflict is a determinate answer",
-			err: &lokiStorageConflictError{
-				usageLogsSecret: "usage-logs-secret",
-				logsSecret:      "logs-secret",
-				shared:          []string{"https://s3.example.com/shared-bucket"},
+			err: &storageConflictError{
+				claimants: []string{`usageLogs.storage (secret "usage-logs-secret")`, `logs.storage (secret "logs-secret")`},
+				shared:    []string{"https://s3.example.com/shared-bucket"},
 			},
 			wantStatus: metav1.ConditionFalse,
-			wantReason: lokiStorageConflictReason,
+			wantReason: storageConflictReason,
 		},
 		{
 			// The comparison never ran, so nothing is known either way. Built
 			// bare rather than through the constructor, which pins the
 			// zero-reason fallback.
 			name:       "failed check establishes nothing",
-			err:        &lokiStorageCheckError{err: errors.New("secrets is forbidden")},
+			err:        &storageCheckError{err: errors.New("secrets is forbidden")},
 			wantStatus: metav1.ConditionUnknown,
-			wantReason: lokiStorageCheckFailedReason,
+			wantReason: storageCheckFailedReason,
 		},
 		{
 			// A Secret that has not been applied yet is an ordering race, not
 			// a fault, but it leaves the comparison just as unanswered.
 			name:       "missing secret establishes nothing",
-			err:        newLokiStorageCheckError(k8serr.NewNotFound(schema.GroupResource{Resource: "secrets"}, "logs-secret")),
+			err:        newStorageCheckError(k8serr.NewNotFound(schema.GroupResource{Resource: "secrets"}, "logs-secret")),
 			wantStatus: metav1.ConditionUnknown,
-			wantReason: lokiStorageSecretMissingReason,
+			wantReason: storageSecretMissingReason,
 		},
 		{
 			name:       "unusable secret establishes nothing",
-			err:        newLokiStorageCheckError(fmt.Errorf("no bucket: %w", errLokiStorageSecretInvalid)),
+			err:        newStorageCheckError(fmt.Errorf("no bucket: %w", errStorageSecretInvalid)),
 			wantStatus: metav1.ConditionUnknown,
-			wantReason: lokiStorageSecretInvalidReason,
+			wantReason: storageSecretInvalidReason,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -97,14 +96,14 @@ func TestLokiStorageError_ConditionStatus(t *testing.T) {
 	}
 }
 
-// TestNewLokiStorageCheckError_ClassifiesCause covers the classification
+// TestNewStorageCheckError_ClassifiesCause covers the classification
 // itself rather than the reasons it produces.
 //
 // The three cases ask different things of the user — create the Secret, fix
 // its contents, fix access and wait — and only the last is a malfunction.
 // Collapsing them would put an ordinary install-ordering race under a reason
 // that reads as an operator bug, which is what this guards against.
-func TestNewLokiStorageCheckError_ClassifiesCause(t *testing.T) {
+func TestNewStorageCheckError_ClassifiesCause(t *testing.T) {
 	t.Parallel()
 
 	for _, test := range []struct {
@@ -115,14 +114,14 @@ func TestNewLokiStorageCheckError_ClassifiesCause(t *testing.T) {
 		{
 			name:       "not found is a missing secret",
 			cause:      k8serr.NewNotFound(schema.GroupResource{Resource: "secrets"}, "logs-secret"),
-			wantReason: lokiStorageSecretMissingReason,
+			wantReason: storageSecretMissingReason,
 		},
 		{
 			// Matched on the sentinel, not on the message, so rewording the
 			// wrapper text cannot silently reclassify it.
 			name:       "the sentinel is an unusable secret",
-			cause:      fmt.Errorf("secret test-ns/logs-secret has no usable bucketnames entry: %w", errLokiStorageSecretInvalid),
-			wantReason: lokiStorageSecretInvalidReason,
+			cause:      fmt.Errorf("secret test-ns/logs-secret has no usable bucketnames entry: %w", errStorageSecretInvalid),
+			wantReason: storageSecretInvalidReason,
 		},
 		{
 			// Anything else is the cluster, not the configuration. This is
@@ -130,18 +129,18 @@ func TestNewLokiStorageCheckError_ClassifiesCause(t *testing.T) {
 			// something the user fixes by editing the Secret.
 			name:       "forbidden stays a failed check",
 			cause:      k8serr.NewForbidden(schema.GroupResource{Resource: "secrets"}, "logs-secret", errors.New("no permission")),
-			wantReason: lokiStorageCheckFailedReason,
+			wantReason: storageCheckFailedReason,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := newLokiStorageCheckError(test.cause)
+			err := newStorageCheckError(test.cause)
 			if got := err.conditionReason(); got != test.wantReason {
 				t.Errorf("conditionReason: want %s, got %s", test.wantReason, got)
 			}
-			// Classification must not consume the cause: deployLokiStack and
-			// its tests still reach through for k8serr.IsForbidden.
+			// Classification must not consume the cause: the gate and its
+			// tests still reach through for k8serr.IsForbidden.
 			if !errors.Is(err, test.cause) {
 				t.Error("the cause must stay reachable after classification")
 			}
@@ -149,23 +148,23 @@ func TestNewLokiStorageCheckError_ClassifiesCause(t *testing.T) {
 	}
 }
 
-// TestLokiStorageCheckError_UnwrapsCause keeps the API error underneath
-// reachable. deployLokiStack wraps the cause rather than replacing it so that
+// TestStorageCheckError_UnwrapsCause keeps the API error underneath reachable.
+// checkStorageIsolation wraps the cause rather than replacing it so that
 // helpers like k8serr.IsForbidden still work on the result, which is how a
 // permission problem is told apart from any other reason the check did not run.
-func TestLokiStorageCheckError_UnwrapsCause(t *testing.T) {
+func TestStorageCheckError_UnwrapsCause(t *testing.T) {
 	t.Parallel()
 
 	cause := errors.New("connection refused")
-	wrapped := &lokiStorageCheckError{err: cause}
+	wrapped := &storageCheckError{err: cause}
 
 	if !errors.Is(wrapped, cause) {
 		t.Error("the cause must stay reachable through errors.Is")
 	}
 
-	var asStorageErr lokiStorageError
+	var asStorageErr storageError
 	if !errors.As(error(wrapped), &asStorageErr) {
-		t.Fatal("a *lokiStorageCheckError must satisfy lokiStorageError, which is how the action recovers the status")
+		t.Fatal("a *storageCheckError must satisfy storageError, which is how the action recovers the status")
 	}
 	if got := asStorageErr.conditionStatus(); got != metav1.ConditionUnknown {
 		t.Errorf("status recovered through the interface: want Unknown, got %s", got)
