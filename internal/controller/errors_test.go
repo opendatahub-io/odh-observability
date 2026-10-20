@@ -51,7 +51,7 @@ func TestStorageError_ConditionStatus(t *testing.T) {
 			name: "conflict is a determinate answer",
 			err: &storageConflictError{
 				claimants: []string{`usageLogs.storage (secret "usage-logs-secret")`, `logs.storage (secret "logs-secret")`},
-				shared:    []string{"https://s3.example.com/shared-bucket"},
+				shared:    []string{"//s3.example.com/shared-bucket"},
 			},
 			wantStatus: metav1.ConditionFalse,
 			wantReason: storageConflictReason,

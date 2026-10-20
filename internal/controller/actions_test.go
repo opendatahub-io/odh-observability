@@ -1577,58 +1577,70 @@ func TestCanonicalStorageLocation(t *testing.T) {
 			name:     "path-style endpoint",
 			endpoint: "https://s3.example.com",
 			bucket:   "logs",
-			want:     "https://s3.example.com/logs",
+			want:     "//s3.example.com/logs",
 		},
 		{
-			// Scheme and host are case-insensitive (RFC 4343).
-			name:     "scheme and host are lowercased",
+			// http and https are transports to one gateway, not separate
+			// backends: every S3-compatible store serves the same buckets over
+			// both. Keeping the scheme in the key would let two claimants reach
+			// one bucket under two spellings and pass the comparison.
+			name:     "the scheme is not part of the location",
+			endpoint: "http://s3.example.com",
+			bucket:   "logs",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			// Hosts are case-insensitive (RFC 4343).
+			name:     "the host is lowercased",
 			endpoint: "HTTPS://S3.Example.COM",
 			bucket:   "logs",
-			want:     "https://s3.example.com/logs",
+			want:     "//s3.example.com/logs",
 		},
 		{
 			name:     "an explicitly written default https port is dropped",
 			endpoint: "https://s3.example.com:443",
 			bucket:   "logs",
-			want:     "https://s3.example.com/logs",
+			want:     "//s3.example.com/logs",
 		},
 		{
 			name:     "an explicitly written default http port is dropped",
 			endpoint: "http://s3.example.com:80",
 			bucket:   "logs",
-			want:     "http://s3.example.com/logs",
+			want:     "//s3.example.com/logs",
 		},
 		{
-			// The port is dropped only when it is the default *for that
-			// scheme*; :80 under https is a real, distinguishing port.
-			name:     "the http default port under https is kept",
+			// The port rule cannot key off the scheme when the scheme is not in
+			// the key: were :80 kept here and dropped under http, the two
+			// spellings of one gateway would still land on different locations
+			// and the scheme would go on separating them by proxy.
+			name:     "a default web port is dropped whichever scheme carried it",
 			endpoint: "https://s3.example.com:80",
 			bucket:   "logs",
-			want:     "https://s3.example.com:80/logs",
+			want:     "//s3.example.com/logs",
 		},
 		{
 			name:     "a non-default port is kept",
 			endpoint: "https://s3.example.com:9000",
 			bucket:   "logs",
-			want:     "https://s3.example.com:9000/logs",
+			want:     "//s3.example.com:9000/logs",
 		},
 		{
 			name:     "a trailing slash is not a path prefix",
 			endpoint: "https://s3.example.com/",
 			bucket:   "logs",
-			want:     "https://s3.example.com/logs",
+			want:     "//s3.example.com/logs",
 		},
 		{
 			name:     "repeated slashes collapse",
 			endpoint: "https://s3.example.com//",
 			bucket:   "logs",
-			want:     "https://s3.example.com/logs",
+			want:     "//s3.example.com/logs",
 		},
 		{
 			name:     "dot segments resolve",
 			endpoint: "https://gateway.internal/s3/../s3/",
 			bucket:   "logs",
-			want:     "https://gateway.internal/s3/logs",
+			want:     "//gateway.internal/s3/logs",
 		},
 		{
 			// Self-hosted gateways route on the prefix and are free to treat
@@ -1636,7 +1648,7 @@ func TestCanonicalStorageLocation(t *testing.T) {
 			name:     "path prefix case is preserved",
 			endpoint: "https://gateway.internal/S3",
 			bucket:   "logs",
-			want:     "https://gateway.internal/S3/logs",
+			want:     "//gateway.internal/S3/logs",
 		},
 		{
 			// Virtual-host-style addressing folds the bucket into the
@@ -1645,13 +1657,32 @@ func TestCanonicalStorageLocation(t *testing.T) {
 			name:     "a virtual-host bucket is folded out of the hostname",
 			endpoint: "https://logs.s3.example.com",
 			bucket:   "logs",
-			want:     "https://s3.example.com/logs",
+			want:     "//s3.example.com/logs",
 		},
 		{
 			name:     "the virtual-host fold ignores bucket case",
 			endpoint: "https://LOGS.s3.example.com",
 			bucket:   "logs",
-			want:     "https://s3.example.com/logs",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			// The fold and the key read the same lowercased bucket, so an
+			// uppercase bucketnames entry has to survive both. One lowercasing
+			// site serves them; this is the row that notices if it stops.
+			name:     "the virtual-host fold ignores bucket case written the other way",
+			endpoint: "https://logs.s3.example.com",
+			bucket:   "LOGS",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			// The fold reads the hostname only; a gateway path prefix is not
+			// part of what it strips, so it survives the virtual-host spelling
+			// and keeps that form comparable to the path-style one under the
+			// same prefix.
+			name:     "the virtual-host fold leaves a gateway path prefix alone",
+			endpoint: "https://logs.s3.example.com/custom/prefix",
+			bucket:   "logs",
+			want:     "//s3.example.com/custom/prefix/logs",
 		},
 		{
 			// The fold matches on a whole leading label, so a host that merely
@@ -1661,34 +1692,76 @@ func TestCanonicalStorageLocation(t *testing.T) {
 			name:     "a hostname that only starts with the bucket name is untouched",
 			endpoint: "https://logs-archive.s3.example.com",
 			bucket:   "logs",
-			want:     "https://logs-archive.s3.example.com/logs",
+			want:     "//logs-archive.s3.example.com/logs",
+		},
+		{
+			// An S3 bucket name is a DNS label, so a store that distinguishes
+			// these two is out of spec. Folding the case costs a conflict that
+			// could only be invented by an out-of-spec backend and buys one
+			// that would otherwise be silent.
+			name:     "bucket case is folded",
+			endpoint: "https://s3.example.com",
+			bucket:   "LOGS",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			// url.Parse keeps the DNS root dot, and the fully qualified
+			// spelling is the ordinary one for an in-cluster Service.
+			name:     "the DNS root dot is stripped",
+			endpoint: "https://minio.odh.svc.cluster.local.",
+			bucket:   "logs",
+			want:     "//minio.odh.svc.cluster.local/logs",
+		},
+		{
+			// url.Parse strips the brackets from an IPv6 literal and
+			// JoinHostPort only restores them when a port survives, so the two
+			// spellings below differ in more than the port. Nothing reparses a
+			// key, so a bracketless literal is only ever compared, and the two
+			// forms of one address still agree with themselves.
+			name:     "an IPv6 literal keeps its brackets only alongside a port",
+			endpoint: "http://[::1]:9000",
+			bucket:   "logs",
+			want:     "//[::1]:9000/logs",
+		},
+		{
+			name:     "an IPv6 literal on a default port loses its brackets",
+			endpoint: "http://[::1]:80",
+			bucket:   "logs",
+			want:     "//::1/logs",
 		},
 		{
 			name:     "surrounding whitespace is ignored",
 			endpoint: "  https://s3.example.com  ",
 			bucket:   "  logs  ",
-			want:     "https://s3.example.com/logs",
+			want:     "//s3.example.com/logs",
 		},
 		{
 			// An endpoint url.Parse rejects cannot be normalized, but it still
 			// has to compare equal to itself: the fallback is what keeps two
-			// identically misspelled endpoints detectable as one location.
+			// identically misspelled endpoints detectable as one location. It
+			// cannot collide with a normalized key, which always opens "//".
 			name:     "an unparseable endpoint falls back to itself",
 			endpoint: "https://exa\x7fmple.com",
 			bucket:   "logs",
 			want:     "https://exa\x7fmple.com/logs",
 		},
 		{
-			// An absent scheme is left absent rather than guessed at. What an
-			// endpoint with no scheme means is a question about the storage
-			// API and not about string handling, so it is answered one level
-			// up: lokiStorageLocations claims such an endpoint under both
-			// schemes. This function only has to keep the spelling it was
-			// given comparable to itself.
-			name:     "a scheme-less endpoint keeps an empty scheme",
+			// The spelling the Loki operator takes for an in-cluster gateway.
+			// With no scheme in the key it needs no special handling: it is
+			// already the same location as either spelling that names it, which
+			// is what the first two rows above assert from the other side.
+			name:     "a scheme-less endpoint is the same location as either spelling of it",
 			endpoint: "s3.example.com",
 			bucket:   "logs",
-			want:     "://s3.example.com/logs",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			// A bare host with a standard port, which is only equal to the
+			// scheme-ful spellings because the port rule ignores the scheme.
+			name:     "a scheme-less endpoint on a default web port drops it",
+			endpoint: "s3.example.com:443",
+			bucket:   "logs",
+			want:     "//s3.example.com/logs",
 		},
 	}
 
@@ -1732,7 +1805,7 @@ func TestCheckStorageIsolation(t *testing.T) {
 			},
 			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
 			wantConflict: true,
-			wantBuckets:  "https://s3.example.com/shared-bucket",
+			wantBuckets:  "//s3.example.com/shared-bucket",
 		},
 		{
 			name: "the same secret for both stacks conflicts",
@@ -1741,7 +1814,7 @@ func TestCheckStorageIsolation(t *testing.T) {
 			},
 			monitoring:   monitoringWithBothLokiStorage("one-secret", "one-secret"),
 			wantConflict: true,
-			wantBuckets:  "https://s3.example.com/shared-bucket",
+			wantBuckets:  "//s3.example.com/shared-bucket",
 		},
 		{
 			// bucketnames is a list, so an overlap anywhere in it conflicts.
@@ -1752,7 +1825,7 @@ func TestCheckStorageIsolation(t *testing.T) {
 			},
 			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
 			wantConflict: true,
-			wantBuckets:  "https://s3.example.com/shared-bucket",
+			wantBuckets:  "//s3.example.com/shared-bucket",
 		},
 		{
 			name: "separate buckets are accepted",
@@ -1859,11 +1932,11 @@ func TestCheckStorageIsolation(t *testing.T) {
 // endpoints that are written differently and mean the same thing, or written
 // alike and mean different things.
 //
-// TestCanonicalStorageLocation pins most of these rules directly, as string in
-// and string out. They are driven through the Secret here as well because that
-// is the path the gate actually takes, and because one of the rules — claiming
-// a scheme-less endpoint under both schemes — lives in lokiStorageLocations
-// rather than in the canonicalizer, so this is its only coverage.
+// TestCanonicalStorageLocation pins these rules directly, as string in and
+// string out. They are driven through the Secret here as well because that is
+// the path the gate actually takes: these rows are what says a rule survives
+// two Secrets, a bucket list and a fake client, and they are written as pairs
+// of real spellings rather than as keys.
 func TestCheckStorageIsolation_EndpointSpellings(t *testing.T) {
 	const ns = "test-ns"
 
@@ -1879,7 +1952,7 @@ func TestCheckStorageIsolation_EndpointSpellings(t *testing.T) {
 			},
 			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
 			wantConflict: true,
-			wantBuckets:  "https://s3.example.com/shared-bucket",
+			wantBuckets:  "//s3.example.com/shared-bucket",
 		},
 		{
 			// Virtual-host-style addressing folds the bucket into the hostname;
@@ -1891,7 +1964,7 @@ func TestCheckStorageIsolation_EndpointSpellings(t *testing.T) {
 			},
 			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
 			wantConflict: true,
-			wantBuckets:  "https://s3.example.com/shared-bucket",
+			wantBuckets:  "//s3.example.com/shared-bucket",
 		},
 		{
 			// A non-default port is a different backend, not a spelling variant.
@@ -1903,14 +1976,31 @@ func TestCheckStorageIsolation_EndpointSpellings(t *testing.T) {
 			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
 		},
 		{
-			// http and https are configured as separate backends; normalizing
-			// them together would invent a conflict that does not exist.
-			name: "same bucket over http and https is accepted",
+			// The case this gate was reopened for. http and https are transports
+			// to one gateway, not separate backends — MinIO, Ceph RGW, ODF and
+			// S3 all serve the same buckets over both — so two claimants written
+			// this way are two writers on one bucket.
+			name: "same bucket over http and https conflicts",
 			secrets: []client.Object{
-				lokiStorageSecret("usage-logs-secret", ns, "http://s3.example.com", "logs"),
-				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "logs"),
+				lokiStorageSecret("usage-logs-secret", ns, "http://s3.example.com", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
 			},
-			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			// The same thing on a port the scheme does not imply, where no
+			// default-port rule can be doing the work: only ignoring the scheme
+			// brings these together.
+			name: "same bucket over http and https on one non-default port conflicts",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "http://minio.odh.svc:9000", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://minio.odh.svc:9000", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//minio.odh.svc:9000/shared-bucket",
 		},
 		{
 			// Gateway path prefixes are case-sensitive, so they separate buckets.
@@ -1923,9 +2013,9 @@ func TestCheckStorageIsolation_EndpointSpellings(t *testing.T) {
 		},
 		{
 			// Writing the scheme is optional, so one claimant can name the
-			// endpoint bare and the other name it in full. They are the same
-			// endpoint, and were compared as two until the scheme-less form
-			// started claiming both spellings.
+			// endpoint bare and the other name it in full. Both reach the same
+			// gateway, and with no scheme in the key they say so without the
+			// gate having to decide which scheme the bare one meant.
 			name: "a scheme-less endpoint conflicts with the https spelling of it",
 			secrets: []client.Object{
 				lokiStorageSecret("usage-logs-secret", ns, "s3.example.com", "shared-bucket"),
@@ -1933,12 +2023,11 @@ func TestCheckStorageIsolation_EndpointSpellings(t *testing.T) {
 			},
 			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
 			wantConflict: true,
-			wantBuckets:  "https://s3.example.com/shared-bucket",
+			wantBuckets:  "//s3.example.com/shared-bucket",
 		},
 		{
-			// The other half of claiming both: http is as likely as https for
-			// a bare in-cluster endpoint, so guessing one scheme would close
-			// this case and leave the other open.
+			// The other half of it: http is as likely as https for a bare
+			// in-cluster endpoint, and neither spelling is privileged.
 			name: "a scheme-less endpoint conflicts with the http spelling of it",
 			secrets: []client.Object{
 				lokiStorageSecret("usage-logs-secret", ns, "s3.example.com", "shared-bucket"),
@@ -1946,12 +2035,9 @@ func TestCheckStorageIsolation_EndpointSpellings(t *testing.T) {
 			},
 			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
 			wantConflict: true,
-			wantBuckets:  "http://s3.example.com/shared-bucket",
+			wantBuckets:  "//s3.example.com/shared-bucket",
 		},
 		{
-			// Two bare spellings of one endpoint overlap on both candidates,
-			// so the message names the location twice. That is the accepted
-			// cost of not knowing which scheme is the real one.
 			name: "two scheme-less spellings of one endpoint conflict",
 			secrets: []client.Object{
 				lokiStorageSecret("usage-logs-secret", ns, "s3.example.com", "shared-bucket"),
@@ -1959,13 +2045,25 @@ func TestCheckStorageIsolation_EndpointSpellings(t *testing.T) {
 			},
 			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
 			wantConflict: true,
-			wantBuckets:  "https://s3.example.com/shared-bucket, http://s3.example.com/shared-bucket",
+			wantBuckets:  "//s3.example.com/shared-bucket",
 		},
 		{
-			// The row that bounds the one above it. Claiming two locations for
-			// one endpoint must not make claimants overlap that never did: a
-			// collision needs the bucket to match too, and a bucket is named
-			// the same way whichever scheme reaches it.
+			// A bare host with a standard port is only equal to the scheme-ful
+			// spelling because the port rule stopped keying off the scheme.
+			name: "a scheme-less endpoint on a default web port conflicts with the https spelling",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "s3.example.com:443", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			// The row that bounds all of the above. Folding spellings together
+			// must not make claimants overlap that never did: a collision needs
+			// the bucket to match too, and a bucket is named the same way
+			// whichever scheme reaches it.
 			name: "a scheme-less endpoint on a different bucket is accepted",
 			secrets: []client.Object{
 				lokiStorageSecret("usage-logs-secret", ns, "s3.example.com", "usage-logs-bucket"),
@@ -1974,11 +2072,6 @@ func TestCheckStorageIsolation_EndpointSpellings(t *testing.T) {
 			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
 		},
 		{
-			// Whitespace has to come off before the scheme goes on, not after.
-			// canonicalStorageLocation trims what it is handed, but by then
-			// the scheme has already been concatenated onto a value with a
-			// space in it, which parses as nothing and falls back to comparing
-			// the misspelling against itself.
 			name: "a padded scheme-less endpoint conflicts with the spelling of it",
 			secrets: []client.Object{
 				lokiStorageSecret("usage-logs-secret", ns, "  s3.example.com  ", "shared-bucket"),
@@ -1986,7 +2079,7 @@ func TestCheckStorageIsolation_EndpointSpellings(t *testing.T) {
 			},
 			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
 			wantConflict: true,
-			wantBuckets:  "https://s3.example.com/shared-bucket",
+			wantBuckets:  "//s3.example.com/shared-bucket",
 		},
 		{
 			// The spelling this is actually about: an in-cluster gateway
@@ -1998,9 +2091,101 @@ func TestCheckStorageIsolation_EndpointSpellings(t *testing.T) {
 			},
 			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
 			wantConflict: true,
-			wantBuckets:  "http://minio.odh.svc:9000/shared-bucket",
+			wantBuckets:  "//minio.odh.svc:9000/shared-bucket",
+		},
+		{
+			// The fully qualified spelling of an in-cluster Service carries a
+			// DNS root dot that url.Parse keeps and the two forms are one host.
+			name: "an FQDN with a root dot conflicts with the spelling without one",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "http://minio.odh.svc.cluster.local.:9000", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "http://minio.odh.svc.cluster.local:9000", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//minio.odh.svc.cluster.local:9000/shared-bucket",
+		},
+		{
+			// An S3 bucket name is a DNS label, so these name one bucket on any
+			// backend that accepts both at all.
+			name: "the same bucket spelled in different cases conflicts",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "SHARED-BUCKET"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			// Empty entries in a bucket list are skipped rather than claimed as
+			// a location with no bucket, which every other list would overlap.
+			name: "empty entries in a bucket list are ignored",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "logs-a, , shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", ",,shared-bucket,"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
 		},
 	})
+}
+
+// TestCheckStorageIsolation_ThreeClaimants covers the comparison being
+// all-against-all rather than neighbour-against-neighbour.
+//
+// checkStorageIsolation keeps a claimedBy map so a third claimant is detected
+// against both of the first two, and nothing else reaches that: storageClaims
+// yields at most two claims today, so the tables above cannot produce a third
+// however their Secrets are written. This calls the comparison directly with
+// claims a future component would supply, which is also what says the map is
+// keyed on the location rather than on the claimant.
+//
+// The claimants that do not overlap have to stay out of the error as well as
+// out of the verdict. validateStorageIsolation withholds every claim it was
+// given once any of them conflict — that is deliberate, since the gate cannot
+// tell which writer to prefer — but the message is what the user reads to find
+// the two buckets to separate, and naming an innocent third sends them to the
+// wrong Secret.
+func TestCheckStorageIsolation_ThreeClaimants(t *testing.T) {
+	const ns = "test-ns"
+
+	s := newActionsTestScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		lokiStorageSecret("first-secret", ns, "https://s3.example.com", "shared-bucket"),
+		lokiStorageSecret("second-secret", ns, "https://s3.example.com", "its-own-bucket"),
+		// Spelled differently from the first on purpose: the third claimant
+		// has to be compared against the first through canonicalization, not
+		// by matching the Secret or the literal endpoint.
+		lokiStorageSecret("third-secret", ns, "shared-bucket.s3.example.com:443", "shared-bucket"),
+	).Build()
+
+	claims := []storageClaim{
+		{description: "first", secretName: "first-secret"},
+		{description: "second", secretName: "second-secret"},
+		{description: "third", secretName: "third-secret"},
+	}
+
+	err := checkStorageIsolation(context.Background(), cli, ns, claims)
+
+	var conflict *storageConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("expected a *storageConflictError, got %T (%v)", err, err)
+	}
+
+	// The first and third overlap across the second, which is the ordering the
+	// claimedBy map exists for: a comparison that only looked at the preceding
+	// claimant would find nothing here.
+	if want := []string{"first", "third"}; !slices.Equal(conflict.claimants, want) {
+		t.Errorf("claimants: want %v, got %v", want, conflict.claimants)
+	}
+	if want := []string{"//s3.example.com/shared-bucket"}; !slices.Equal(conflict.shared, want) {
+		t.Errorf("shared locations: want %v, got %v", want, conflict.shared)
+	}
+	if strings.Contains(err.Error(), "second") {
+		t.Errorf("the isolated claimant should not be named in the conflict, got %v", err)
+	}
 }
 
 // runStorageIsolationTests drives the cases of both tables above. The three

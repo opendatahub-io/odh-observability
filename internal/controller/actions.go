@@ -115,16 +115,15 @@ const (
 	ClusterLogForwarderNetworkPolicyName = "data-science-cluster-log-forwarder-allow"
 	conditionTypeReady                   = "Ready"
 	conditionStatusTrue                  = "True"
-	schemeHTTP                           = "http"
-	schemeHTTPS                          = "https"
 )
 
 //go:embed resources monitoring
 var resourcesFS embed.FS
 
-// defaultPortForScheme maps a URL scheme to the port it implies when none is
-// written, so both spellings of one endpoint canonicalize alike.
-var defaultPortForScheme = map[string]string{schemeHTTP: "80", schemeHTTPS: "443"}
+// defaultWebPorts are the ports http and https imply when none is written. The
+// storage comparison key carries no scheme, so either one names the same
+// endpoint as no port at all.
+var defaultWebPorts = map[string]struct{}{"80": {}, "443": {}}
 
 func src(path string) rendertemplate.TemplateSource {
 	return rendertemplate.TemplateSource{FS: resourcesFS, Path: path}
@@ -935,16 +934,6 @@ func checkStorageIsolation(ctx context.Context, c client.Client, namespace strin
 // cost of failing closed is that neither stack is created until both Secrets
 // resolve; the storage Secret watch in SetupWithManager is what keeps that
 // from stalling until the next periodic requeue.
-//
-// An endpoint written without a scheme — the spelling the Loki operator takes
-// for an in-cluster gateway, "minio.odh.svc:9000" — resolves to one location
-// per scheme rather than to one scheme-less location. Which of the two it
-// really is cannot be read off the Secret, and a single scheme-less location
-// compares unequal to both spellings that name it, so one claimant written
-// bare and another written "https://" would pass the comparison and share a
-// bucket. Claiming both is what closes that: an overlap on either spelling is
-// an overlap. It cannot invent one, because claimants collide only when the
-// bucket matches too, and a bucket is named the same way however it is reached.
 func lokiStorageLocations(ctx context.Context, c client.Client, namespace, secretName string) ([]string, error) {
 	if secretName == "" {
 		return nil, fmt.Errorf("LokiStack storage secret name is empty: %w", errStorageSecretInvalid)
@@ -955,23 +944,15 @@ func lokiStorageLocations(ctx context.Context, c client.Client, namespace, secre
 		return nil, fmt.Errorf("reading LokiStack storage secret %s/%s: %w", namespace, secretName, err)
 	}
 
-	// A scheme-less endpoint is claimed under both schemes, per the note above.
-	endpoint := strings.TrimSpace(string(secret.Data["endpoint"]))
-	endpoints := []string{endpoint}
-	if !strings.Contains(endpoint, "://") {
-		endpoints = []string{schemeHTTPS + "://" + endpoint, schemeHTTP + "://" + endpoint}
-	}
-
 	// bucketnames holds a comma-separated list; the stacks conflict if any one
 	// bucket is common to both.
+	endpoint := string(secret.Data["endpoint"])
 	var locations []string
 	for bucket := range strings.SplitSeq(string(secret.Data["bucketnames"]), ",") {
 		if bucket = strings.TrimSpace(bucket); bucket == "" {
 			continue
 		}
-		for _, endpoint := range endpoints {
-			locations = append(locations, canonicalStorageLocation(endpoint, bucket))
-		}
+		locations = append(locations, canonicalStorageLocation(endpoint, bucket))
 	}
 	if len(locations) == 0 {
 		return nil, fmt.Errorf("LokiStack storage secret %s/%s has no usable bucketnames entry: %w",
@@ -988,14 +969,29 @@ func lokiStorageLocations(ctx context.Context, c client.Client, namespace, secre
 // over an object store address, which is what lets a non-Loki claimant join
 // storageClaims without the comparison growing a case for it.
 //
-// The comparison key is (scheme, host, port, path prefix, bucket). Credentials
-// are deliberately excluded: two identities writing to one bucket still
-// collide, so comparing access keys would only mask the conflict. The scheme is
-// kept, because http and https are configured as separate backends. DNS aliases
-// pointing at one server are not detected; that needs resolution, not parsing.
+// The comparison key is (host, port, path prefix, bucket).
+//
+// The scheme is excluded. http and https are transports to one gateway rather
+// than separate backends — MinIO, Ceph RGW, ODF and S3 all serve the same
+// buckets over both — so keeping it in the key would let two claimants reach
+// one bucket under two spellings and pass the comparison. Excluding it is also
+// what lets an endpoint written bare, the spelling the Loki operator takes for
+// an in-cluster gateway, compare equal to either spelling that names it.
+//
+// Bucket case and the DNS root dot are folded for the same reason. An S3
+// bucket name is a DNS label, so a backend that distinguishes "my-bucket" from
+// "MY-BUCKET" is out of spec, and "minio.odh.svc.cluster.local." is an
+// ordinary in-cluster spelling of the host without the dot. Where a spelling
+// is ambiguous the gate fails closed, because a conflict it invents is loud
+// and the user can rename a bucket, while one it misses is silent corruption.
+//
+// Credentials are deliberately excluded: two identities writing to one bucket
+// still collide, so comparing access keys would only mask the conflict. DNS
+// aliases pointing at one server are not detected; that needs resolution, not
+// parsing.
 func canonicalStorageLocation(endpoint, bucket string) string {
 	endpoint = strings.TrimSpace(endpoint)
-	bucket = strings.TrimSpace(bucket)
+	bucket = strings.ToLower(strings.TrimSpace(bucket))
 
 	// A bare "host" or "host:port" would parse as a scheme, so supply the
 	// authority marker that makes url.Parse read it as one.
@@ -1005,27 +1001,33 @@ func canonicalStorageLocation(endpoint, bucket string) string {
 	}
 	parsed, err := url.Parse(toParse)
 	if err != nil {
-		// An unparseable endpoint still has to compare equal to itself.
+		// An unparseable endpoint still has to compare equal to itself. It
+		// cannot collide with a parsed one by accident: every key below opens
+		// with the authority marker and this one does not.
 		return endpoint + "/" + bucket
 	}
 
-	// Schemes and hostnames are case-insensitive (RFC 4343).
-	scheme := strings.ToLower(parsed.Scheme)
-	host := strings.ToLower(parsed.Hostname())
+	// Hostnames are case-insensitive (RFC 4343) and the DNS root dot names the
+	// same host as its absence.
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
 
-	// An explicitly written default port names the same endpoint as none at all.
+	// An explicitly written default port names the same endpoint as none at
+	// all, whichever scheme carried it, since the scheme is not in the key.
 	port := parsed.Port()
-	if port == defaultPortForScheme[scheme] {
+	if _, isDefault := defaultWebPorts[port]; isDefault {
 		port = ""
 	}
 	if port != "" {
+		// JoinHostPort restores the brackets url.Parse stripped from an IPv6
+		// literal. A bracketless literal survives the portless path instead,
+		// which is only ever compared against another key, never reparsed.
 		host = net.JoinHostPort(host, port)
 	}
 
 	// Virtual-host-style addressing folds the bucket into the hostname; strip it
 	// so that form matches the path-style spelling of the same location.
 	if bucket != "" {
-		host = strings.TrimPrefix(host, strings.ToLower(bucket)+".")
+		host = strings.TrimPrefix(host, bucket+".")
 	}
 
 	// path.Clean collapses repeated slashes and resolves dot segments. Prefix
@@ -1035,7 +1037,7 @@ func canonicalStorageLocation(endpoint, bucket string) string {
 		prefix = ""
 	}
 
-	return scheme + "://" + host + prefix + "/" + bucket
+	return "//" + host + prefix + "/" + bucket
 }
 
 // deployClusterLogForwarder deploys the ClusterLogForwarder when logs are configured.
