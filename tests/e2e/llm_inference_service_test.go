@@ -912,7 +912,7 @@ func requireNamespacesMatchExistingDSCI(t *testing.T, tc *TestContext) {
 // operator builds a namespace-scoped cache when its pod starts, so a namespace created later
 // fails every module deploy with "unknown namespace for the cache" -- which surfaces only as
 // odh-observability never appearing, several minutes into the run.
-func warnIfOperatorPredatesNamespace(t *testing.T, tc *TestContext, namespace string) {
+func warnIfOperatorPredatesNamespace(t *testing.T, tc *TestContext, platformOp platformOperator, namespace string) {
 	t.Helper()
 
 	ns, err := tc.fetchResource(t, gvk.Namespace, types.NamespacedName{Name: namespace})
@@ -921,7 +921,7 @@ func warnIfOperatorPredatesNamespace(t *testing.T, tc *TestContext, namespace st
 	}
 	pods := &unstructured.UnstructuredList{}
 	pods.SetGroupVersionKind(gvk.Pod.GroupVersion().WithKind(gvk.Pod.Kind + "List"))
-	if err := tc.Client().List(tc.Context(), pods, client.InNamespace(odhOperatorNamespace)); err != nil {
+	if err := tc.Client().List(tc.Context(), pods, client.InNamespace(platformOp.Namespace)); err != nil {
 		return
 	}
 
@@ -937,8 +937,8 @@ func warnIfOperatorPredatesNamespace(t *testing.T, tc *TestContext, namespace st
 		t.Logf("WARNING: namespace %s was created at %s but %s/%s started at %s; the operator's "+
 			"namespace cache predates it and module deploys will fail with \"unknown namespace "+
 			"for the cache\". Run: oc rollout restart deploy/%s -n %s",
-			namespace, ns.GetCreationTimestamp().Format(time.RFC3339), odhOperatorNamespace,
-			pod.GetName(), started, odhOperatorDeployment, odhOperatorNamespace)
+			namespace, ns.GetCreationTimestamp().Format(time.RFC3339), platformOp.Namespace,
+			pod.GetName(), started, platformOp.Deployment, platformOp.Namespace)
 		return
 	}
 }
@@ -1433,11 +1433,11 @@ func installInferenceOperators(t *testing.T, tc *TestContext) {
 // pointed at the same namespaces the prerequisites used. It can only run after dsci.yaml: the
 // ODH operator deploys odh-observability in response to the DSCI monitoring stanza, and the
 // applications namespace is the operator's to create.
-func requireObservabilityAgreesOnNamespaces(t *testing.T, tc *TestContext) {
+func requireObservabilityAgreesOnNamespaces(t *testing.T, tc *TestContext, platformOp platformOperator) {
 	t.Helper()
 
 	for _, namespace := range []string{inferenceApplicationsNamespace(), inferenceMonitoringNamespace()} {
-		warnIfOperatorPredatesNamespace(t, tc, namespace)
+		warnIfOperatorPredatesNamespace(t, tc, platformOp, namespace)
 	}
 
 	// Nothing else reconciles the Monitoring CR, so without this the waits that follow spend
@@ -1466,6 +1466,11 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	t.Logf("Inference prerequisites use applicationsNamespace=%s, monitoring.namespace=%s, storageClassName=%s",
 		inferenceApplicationsNamespace(), inferenceMonitoringNamespace(), inferenceStorageClassName)
 	requireNamespacesMatchExistingDSCI(t, tc)
+
+	platformOp, err := detectPlatformOperator(tc.Context(), tc.Client())
+	require.NoError(t, err, "platform operator must be installed before inference prerequisites")
+	t.Logf("Using platform operator deployment %s/%s (webhook Service %s/%s)",
+		platformOp.Namespace, platformOp.Deployment, platformOp.Namespace, platformOp.WebhookService)
 
 	waitFor := func(description string, gvk schema.GroupVersionKind, nn types.NamespacedName, condition string, timeout ...time.Duration) {
 		wait := 5 * time.Minute
@@ -1532,7 +1537,7 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	// usage logs is the difference between reading a run's log and guessing.
 	logUsageLogsPropagation(t, tc)
 
-	requireObservabilityAgreesOnNamespaces(t, tc)
+	requireObservabilityAgreesOnNamespaces(t, tc, platformOp)
 
 	if testOpts.applyMonitoringManifest {
 		applyMonitoringManifest(t, tc, dir)
@@ -1633,9 +1638,9 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	}
 	applyPrerequisite("lgtm.yaml")
 	waitFor(
-		"opendatahub-operator should be Available",
+		fmt.Sprintf("platform operator %s/%s should be Available", platformOp.Namespace, platformOp.Deployment),
 		schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"},
-		types.NamespacedName{Name: odhOperatorDeployment, Namespace: odhOperatorNamespace},
+		types.NamespacedName{Name: platformOp.Deployment, Namespace: platformOp.Namespace},
 		"Available",
 	)
 	waitFor(
@@ -1645,7 +1650,7 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 		"Available",
 	)
 	for _, endpoint := range []struct{ service, namespace string }{
-		{odhOperatorWebhookService, odhOperatorNamespace},
+		{platformOp.WebhookService, platformOp.Namespace},
 		{"kserve-webhook-server-service", inferenceApplicationsNamespace()},
 		{"llmisvc-webhook-server-service", inferenceApplicationsNamespace()},
 		{"lgtm", inferenceMonitoringNamespace()},

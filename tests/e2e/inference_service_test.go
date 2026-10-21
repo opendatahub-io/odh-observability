@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -153,11 +154,12 @@ func TestInferenceServiceTracing(t *testing.T) {
 	requestURL, err := url.JoinPath(routeURL, "v1", "completions")
 	require.NoError(t, err, "failed to construct the OpenAI-compatible completions endpoint")
 	t.Logf("Sending completion requests to InferenceService OAuth Route %s", requestURL)
+	routeCAs := ingressCAPool(t, tc.Context(), tc.Client())
 	g.Eventually(func() error {
-		return sendInferenceServiceCompletion(tc.Context(), requestURL, ocToken, "")
+		return sendInferenceServiceCompletion(tc.Context(), requestURL, ocToken, "", routeCAs)
 	}, 5*time.Minute, 5*time.Second).Should(gomega.Succeed(), "completion request without traceparent should succeed through the OAuth proxy")
 	g.Eventually(func() error {
-		return sendInferenceServiceCompletion(tc.Context(), requestURL, ocToken, inferenceServiceTraceparent)
+		return sendInferenceServiceCompletion(tc.Context(), requestURL, ocToken, inferenceServiceTraceparent, routeCAs)
 	}, 5*time.Minute, 5*time.Second).Should(gomega.Succeed(), "completion request with traceparent should succeed through the OAuth proxy")
 
 	t.Logf("Running OATS case with dedicated tag %q", inferenceServiceOATSCase)
@@ -347,7 +349,7 @@ func createInferenceServiceOAuthProxy(
 	return "https://" + routeHost
 }
 
-func sendInferenceServiceCompletion(ctx context.Context, endpoint, ocToken, traceparent string) error {
+func sendInferenceServiceCompletion(ctx context.Context, endpoint, ocToken, traceparent string, rootCAs *x509.CertPool) error {
 	payload := map[string]any{
 		"model":       inferenceServiceModel,
 		"prompt":      "San Francisco is a",
@@ -370,8 +372,11 @@ func sendInferenceServiceCompletion(ctx context.Context, endpoint, ocToken, trac
 	}
 
 	httpClient := &http.Client{
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}},
-		Timeout:   2 * time.Minute,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    rootCAs,
+		}},
+		Timeout: 2 * time.Minute,
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
