@@ -2,6 +2,7 @@ package e2e_test
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,6 +29,10 @@ const (
 	seaweedFSSecretKey   = "seaweedfs-test-secret"
 	tempoS3Bucket        = "tempo-traces"
 	lokiS3Bucket         = "loki-logs"
+	// logsS3Bucket backs the log forwarding LokiStack. It is deliberately not
+	// lokiS3Bucket: the two stacks are separate Loki clusters, and pointing both
+	// at one bucket would have them interleave index and chunk objects.
+	logsS3Bucket = "loki-general-logs"
 
 	fakeGCSPodName     = "fake-gcs-server"
 	fakeGCSServiceName = "fake-gcs-server"
@@ -97,9 +102,16 @@ func (tc *TestContext) cleanupSeaweedFS() {
 	)
 }
 
-func (tc *TestContext) startSeaweedFS(t *testing.T, bucket string) {
+// startSeaweedFS brings up the S3 fixture and creates every requested bucket.
+// Callers that need two isolated backends (one per LokiStack) pass both here
+// rather than starting the fixture twice: the second start would tear the first
+// one down.
+func (tc *TestContext) startSeaweedFS(t *testing.T, buckets ...string) {
 	t.Helper()
-	require.Regexp(t, `^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`, bucket)
+	require.NotEmpty(t, buckets, "startSeaweedFS requires at least one bucket")
+	for _, bucket := range buckets {
+		require.Regexp(t, `^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`, bucket)
+	}
 	tc.cleanupSeaweedFS()
 
 	tc.createFixtureResource(t, gvk.Pod, &corev1.Pod{
@@ -148,9 +160,12 @@ func (tc *TestContext) startSeaweedFS(t *testing.T, bucket string) {
 	})
 
 	tc.waitForFixturePod(seaweedFSPodName, jq.Match(`.status.phase == "Running" and any(.status.conditions[]; .type == "Ready" and .status == "True")`))
-	endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/%s", seaweedFSServiceName, tc.MonitoringNamespace, seaweedFSS3Port, bucket)
-	script := fmt.Sprintf(`i=0; until curl -fsS -X PUT %q; do i=$((i+1)); [ "$i" -lt 60 ] || exit 1; sleep 2; done`, endpoint)
-	tc.createBucketPod(t, seaweedFSBucketPod, seaweedFSImage, script)
+	var script strings.Builder
+	for _, bucket := range buckets {
+		endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/%s", seaweedFSServiceName, tc.MonitoringNamespace, seaweedFSS3Port, bucket)
+		fmt.Fprintf(&script, `i=0; until curl -fsS -X PUT %q; do i=$((i+1)); [ "$i" -lt 60 ] || exit 1; sleep 2; done`+"\n", endpoint)
+	}
+	tc.createBucketPod(t, seaweedFSBucketPod, seaweedFSImage, script.String())
 }
 
 func (tc *TestContext) cleanupFakeGCS() {

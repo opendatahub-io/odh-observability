@@ -50,9 +50,10 @@ const (
 	UsageLogsCollectorName               = "data-science-usage-logs"
 	UsageLogsCollectorServiceAccount     = "data-science-usage-logs-collector"
 	LokiStackName                        = "data-science-lokistack"
+	UsageLogsLokiStackName               = "data-science-usage-logs-lokistack"
 
 	UsageLogsCollectorNetworkPolicyName = UsageLogsCollectorName + "-collector-allow"
-	UsageLogsLokiStackNetworkPolicyName = LokiStackName + "-allow"
+	UsageLogsLokiStackNetworkPolicyName = UsageLogsLokiStackName + "-allow"
 )
 
 func cooOperatorChannel() string {
@@ -434,12 +435,15 @@ func (tc *MonitoringTestCtx) resetMonitoringConfigToManaged() {
 			Name: UsageLogsCollectorName, Namespace: tc.MonitoringNamespace,
 		}),
 	)
-	tc.EnsureResourceGone(
-		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
-			Name: LokiStackName, Namespace: tc.MonitoringNamespace,
-		}),
-		WithEventuallyTimeout(15*time.Minute),
-	)
+	// Both usageLogs and logs were deleted above, so neither LokiStack remains.
+	for _, name := range []string{UsageLogsLokiStackName, LokiStackName} {
+		tc.EnsureResourceGone(
+			WithMinimalObject(gvk.LokiStack, types.NamespacedName{
+				Name: name, Namespace: tc.MonitoringNamespace,
+			}),
+			WithEventuallyTimeout(15*time.Minute),
+		)
+	}
 }
 
 // resetMonitoringConfigToRemoved deletes optional config fields and sets managementState=Removed.
@@ -569,6 +573,24 @@ func (tc *MonitoringTestCtx) setupUsageLogsWithStorage(t *testing.T, storageType
 	)
 }
 
+// setupLogsWithStorage creates a secret and configures log forwarding storage,
+// which is what deploys the log forwarding LokiStack. It does not wait for
+// Monitoring to be Ready: the ClusterLogForwarder stays unavailable until its
+// own LokiStack finishes provisioning.
+//
+// The ordering is load-bearing. With both stacks configured, the storage
+// isolation check fails closed until every referenced secret resolves, so
+// patching the CR first would withhold both stacks until the secret arrives
+// and the watch on it fires.
+func (tc *MonitoringTestCtx) setupLogsWithStorage(t *testing.T, storageType, secretName string) {
+	t.Helper()
+	tc.createLokiS3SecretForBucket(t, secretName, tc.MonitoringNamespace, logsS3Bucket)
+	tc.updateMonitoringConfigWithoutReady(
+		withManagementState(common.Managed),
+		withLogsStorage(storageType, secretName, tc.DefaultStorageClass),
+	)
+}
+
 // cleanupTracesConfiguration resets traces configuration.
 func (tc *MonitoringTestCtx) cleanupTracesConfiguration() {
 	tc.updateMonitoringConfig(withManagementState(common.Managed), withNoTraces())
@@ -690,8 +712,17 @@ func (tc *TestContext) createTempoGCSSecret(t *testing.T, secretName, namespace 
 	)
 }
 
-// createLokiS3Secret creates an S3 secret compatible with LokiStack operator.
+// createLokiS3Secret creates an S3 secret compatible with LokiStack operator,
+// backed by the usage logs bucket.
 func (tc *TestContext) createLokiS3Secret(t *testing.T, secretName, namespace string) {
+	t.Helper()
+	tc.createLokiS3SecretForBucket(t, secretName, namespace, lokiS3Bucket)
+}
+
+// createLokiS3SecretForBucket creates a LokiStack S3 secret for a specific
+// bucket. The two LokiStacks use separate buckets, so the bucket is part of the
+// caller's choice rather than fixed.
+func (tc *TestContext) createLokiS3SecretForBucket(t *testing.T, secretName, namespace, bucket string) {
 	t.Helper()
 
 	secret := &corev1.Secret{
@@ -703,7 +734,7 @@ func (tc *TestContext) createLokiS3Secret(t *testing.T, secretName, namespace st
 		Data: map[string][]byte{
 			"access_key_id":     []byte(seaweedFSAccessKey),
 			"access_key_secret": []byte(seaweedFSSecretKey),
-			"bucketnames":       []byte(lokiS3Bucket),
+			"bucketnames":       []byte(bucket),
 			"endpoint":          fmt.Appendf(nil, "http://%s.%s.svc.cluster.local:%d", seaweedFSServiceName, namespace, seaweedFSS3Port),
 			"region":            []byte("us-east-1"),
 			"insecure":          []byte("true"),

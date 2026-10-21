@@ -204,6 +204,43 @@ func TestAggregateReady_MixedNotConfiguredAndFailing(t *testing.T) {
 	}
 }
 
+// TestMarkUnknown_CarriesReasonAndMessage: an Unknown condition has to say why
+// it could not be observed. Callers distinguish "the readiness check failed"
+// from "still starting up" by reason, and an Unknown that reported neither
+// would be indistinguishable from an unset condition in the status.
+func TestMarkUnknown_CarriesReasonAndMessage(t *testing.T) {
+	cm, acc := newTestCM()
+
+	cm.MarkUnknown(ConditionLokiStackAvailable, "ReadinessCheckFailed", "apiserver timed out")
+
+	c := libconditions.FindStatusCondition(acc, ConditionLokiStackAvailable)
+	if c == nil {
+		t.Fatalf("condition %s not set", ConditionLokiStackAvailable)
+	}
+	if c.Status != metav1.ConditionUnknown {
+		t.Errorf("Status: want Unknown, got %s", c.Status)
+	}
+	if c.Reason != "ReadinessCheckFailed" {
+		t.Errorf("Reason: want ReadinessCheckFailed, got %q", c.Reason)
+	}
+	if c.Message != "apiserver timed out" {
+		t.Errorf("Message: want %q, got %q", "apiserver timed out", c.Message)
+	}
+	// Severity Info would exclude the condition from Degraded aggregation,
+	// which is only correct for features the user turned off.
+	if c.Severity != "" {
+		t.Errorf("Severity: want empty, got %q", c.Severity)
+	}
+	// Stamped so the status says when the stack was last observable, not when
+	// it was last looked at.
+	if c.LastTransitionTime.IsZero() {
+		t.Error("LastTransitionTime must be stamped")
+	}
+	if c.ObservedGeneration != 1 {
+		t.Errorf("ObservedGeneration: want 1, got %d", c.ObservedGeneration)
+	}
+}
+
 // TestAggregateReady_ConfiguredFeatureInitializing: a configured feature still
 // in Unknown state should produce Ready=Unknown, Degraded=False.
 func TestAggregateReady_ConfiguredFeatureInitializing(t *testing.T) {
@@ -211,7 +248,7 @@ func TestAggregateReady_ConfiguredFeatureInitializing(t *testing.T) {
 	cm.MarkTrue(ConditionMonitoringDependenciesReady)
 
 	// Simulate a configured feature that hasn't finished initializing.
-	cm.MarkUnknown(ConditionMonitoringStackAvailable)
+	cm.MarkUnknown(ConditionMonitoringStackAvailable, "Progressing", "")
 
 	// Mark everything else as not configured.
 	cm.MarkNotConfigured(ConditionThanosQuerierAvailable, MetricsNotConfiguredReason, MetricsNotConfiguredMessage)
@@ -231,6 +268,12 @@ func TestAggregateReady_ConfiguredFeatureInitializing(t *testing.T) {
 	}
 	if got := degraded(acc); got != metav1.ConditionFalse {
 		t.Errorf("Degraded: want False, got %s", got)
+	}
+	// The aggregated reason stays Progressing whatever the feature's own
+	// reason was: Ready summarises, the feature condition carries the detail.
+	if c := libconditions.FindStatusCondition(acc, string(platformcommon.ConditionTypeReady)); c == nil ||
+		c.Reason != "Progressing" {
+		t.Errorf("Ready reason: want Progressing, got %v", c)
 	}
 }
 

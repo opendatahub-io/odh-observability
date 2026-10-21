@@ -497,6 +497,144 @@ func TestKorrel8rNetworkPolicyTemplateContract(t *testing.T) {
 	}
 }
 
+// TestLokiStackTemplatesRenderIndependentStorage renders both LokiStack
+// templates from one data map and checks each CR picks up only its own storage.
+//
+// The two templates are identical apart from the key prefix they read
+// (.LokiStorage* versus .UsageLogsLokiStorage*), so a single mis-prefixed key
+// would point one stack at the other's bucket without failing to render. Every
+// value below differs between the two families so that such a swap shows up by
+// name.
+func TestLokiStackTemplatesRenderIndependentStorage(t *testing.T) {
+	t.Parallel()
+
+	data := map[string]any{
+		"Namespace": testMonitoringNamespace,
+
+		"LokiStackName":             lokiStackResourceName,
+		"LokiStorageSecretName":     "logs-secret",
+		"LokiStorageType":           "s3",
+		"LokiStorageCredentialMode": "static",
+		"LokiStorageClassName":      "logs-sc",
+
+		"UsageLogsLokiStackName":             usageLogsLokiStackResourceName,
+		"UsageLogsLokiStorageSecretName":     "usage-logs-secret",
+		"UsageLogsLokiStorageType":           "s3",
+		"UsageLogsLokiStorageCredentialMode": "token",
+		"UsageLogsLokiStorageClassName":      "usage-logs-sc",
+	}
+
+	tests := []struct {
+		template        string
+		stackName       string
+		secretName      string
+		credentialMode  string
+		storageClass    string
+		storageTypeName string
+	}{
+		{
+			template:        LokiStackTemplate,
+			stackName:       lokiStackResourceName,
+			secretName:      "logs-secret",
+			credentialMode:  "static",
+			storageClass:    "logs-sc",
+			storageTypeName: "s3",
+		},
+		{
+			template:        UsageLogsLokiStackTemplate,
+			stackName:       usageLogsLokiStackResourceName,
+			secretName:      "usage-logs-secret",
+			credentialMode:  "token",
+			storageClass:    "usage-logs-sc",
+			storageTypeName: "s3",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.stackName, func(t *testing.T) {
+			t.Parallel()
+
+			resources := renderObservabilityTemplate(t, tt.template, data)
+			stack := findRenderedResource(t, resources, "LokiStack", tt.stackName)
+
+			for _, field := range []struct {
+				path []string
+				want string
+			}{
+				{[]string{"spec", "storage", "secret", "name"}, tt.secretName},
+				{[]string{"spec", "storage", "secret", "type"}, tt.storageTypeName},
+				{[]string{"spec", "storage", "secret", "credentialMode"}, tt.credentialMode},
+				{[]string{"spec", "storageClassName"}, tt.storageClass},
+				// Both stacks serve the same tenant, which is why they cannot
+				// share a bucket; checkLokiStorageIsolation depends on it.
+				{[]string{"spec", "tenants", "mode"}, "openshift-logging"},
+			} {
+				got, found, err := unstructured.NestedString(stack.Object, field.path...)
+				if err != nil || !found || got != field.want {
+					t.Errorf("%s %s: want %q, got %q (found=%t error=%v)",
+						tt.stackName, strings.Join(field.path, "."), field.want, got, found, err)
+				}
+			}
+
+			if namespace := stack.GetNamespace(); namespace != testMonitoringNamespace {
+				t.Errorf("%s: want namespace %q, got %q", tt.stackName, testMonitoringNamespace, namespace)
+			}
+		})
+	}
+}
+
+// TestLokiStackTemplatesCarryComponentLabel is the drift guard for the garbage
+// collection shield. A rejected storage configuration renders none of these
+// templates, so the only thing keeping the live resources out of the
+// collector's reach is this label on the objects already in the cluster. A
+// template added to lokiStackSources without it would be deleted the first time
+// the storage check fails, which is exactly the data loss the shield prevents.
+func TestLokiStackTemplatesCarryComponentLabel(t *testing.T) {
+	t.Parallel()
+
+	data := map[string]any{
+		"Namespace":                          testMonitoringNamespace,
+		"LokiStackName":                      lokiStackResourceName,
+		"LokiStorageSecretName":              "logs-secret",
+		"LokiStorageType":                    "s3",
+		"LokiStorageCredentialMode":          "static",
+		"LokiStorageClassName":               "logs-sc",
+		"UsageLogsLokiStackName":             usageLogsLokiStackResourceName,
+		"UsageLogsLokiStorageSecretName":     "usage-logs-secret",
+		"UsageLogsLokiStorageType":           "s3",
+		"UsageLogsLokiStorageCredentialMode": "token",
+		"UsageLogsLokiStorageClassName":      "usage-logs-sc",
+		"Korrel8rName":                       Korrel8rServiceName,
+		// The usage logs gateway policy names the collector as its only peer.
+		"UsageLogsCollectorName": "data-science-usage-logs",
+	}
+
+	// Must stay in step with lokiStackSources in actions.go.
+	for _, template := range []string{
+		UsageLogsLokiStackTemplate,
+		UsageLogsLokiStackNPTemplate,
+		LokiStackTemplate,
+		LokiStackNetworkPolicyTemplate,
+		LokiStackGatewayNetworkPolicyTemplate,
+	} {
+		t.Run(template, func(t *testing.T) {
+			t.Parallel()
+
+			// Only the component label is asserted here. part-of is the other
+			// half of the shield — it is the selector the collector lists by
+			// — but it is not a template contract: the deployer stamps it
+			// from the field owner for any object that arrives without one,
+			// which is why most operand CR templates omit it.
+			for _, resource := range renderObservabilityTemplate(t, template, data) {
+				if got := resource.GetLabels()[componentLabel]; got != componentLoki {
+					t.Errorf("%s %s: want %s=%s, got %q",
+						resource.GetKind(), resource.GetName(), componentLabel, componentLoki, got)
+				}
+			}
+		})
+	}
+}
+
 func TestClusterLogForwarderNetworkPolicyTemplateContract(t *testing.T) {
 	t.Parallel()
 

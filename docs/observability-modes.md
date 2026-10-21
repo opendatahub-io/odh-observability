@@ -280,6 +280,14 @@ spec:
 Metrics, traces, and `dsci.logs` can be set from Helm / `DSCInitialization`. Log forwarding still needs object storage, the Loki secret, and CLO.
 
 1. Provide S3-compatible object storage and a bucket for Loki.
+
+   > **`logs.storage` and `usageLogs.storage` must use different buckets.** They deploy two separate LokiStacks
+   > (`data-science-lokistack` and `data-science-usage-logs-lokistack`). Both serve the `application` tenant, and Loki
+   > keys its objects by tenant rather than by stack, so two stacks sharing a bucket overwrite each other's index and
+   > chunks. Using two secrets is not enough — the operator compares the resolved `endpoint` and `bucketnames`, and
+   > refuses to reconcile with `LokiStorageConflict` on `LokiStackAvailable` and `UsageLogsLokiStackAvailable` when they
+   > overlap.
+
 2. Create a secret in the monitoring namespace (`redhat-ods-monitoring`) with **all** of these keys (required by the Monitoring API):
 
    | Key | Purpose |

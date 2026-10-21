@@ -19,11 +19,13 @@ package controller
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
+	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
 	configv1 "github.com/openshift/api/config/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -48,8 +50,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
+	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	controllergvk "github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 )
 
@@ -844,7 +848,8 @@ func TestGarbageCollectionOwnershipAndNamespaceScope(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := shouldCollectOwnedResource(monitoring, test.obj, test.desired, monitoring.Spec.Namespace); got != test.wantMainGC {
+			if got := shouldCollectOwnedResource(
+				monitoring, test.obj, test.desired, monitoring.Spec.Namespace, nil); got != test.wantMainGC {
 				t.Errorf("main GC eligibility: want %t, got %t", test.wantMainGC, got)
 			}
 			if got := shouldCollectTargetAllocatorRBAC(monitoring, test.obj, test.desired); got != test.wantTargetGC {
@@ -951,6 +956,199 @@ func TestOpenTelemetryOperatorNetworkPolicyWatch(t *testing.T) {
 	}
 }
 
+// TestStorageSecretRequests covers the watch that makes failing closed on an
+// unresolved storage Secret survivable.
+//
+// The storage Secrets belong to the user, carry no part-of label, and so are
+// invisible to the managed-resource predicate the other Secret watch uses.
+// Without this mapping a Secret applied after the Monitoring CR is not noticed
+// until the periodic requeue, and both LokiStacks stay withheld for that whole
+// window. The mapping runs on every Secret event in the cluster, so what it
+// declines to enqueue matters as much as what it enqueues.
+func TestStorageSecretRequests(t *testing.T) {
+	const ns = "test-ns"
+
+	configured := func() *v1alpha1.Monitoring {
+		return monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret")
+	}
+
+	for _, test := range []struct {
+		name        string
+		monitoring  *v1alpha1.Monitoring
+		secret      *corev1.Secret
+		wantEnqueue bool
+	}{
+		{
+			name:        "the usage logs storage secret enqueues",
+			monitoring:  configured(),
+			secret:      &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "usage-logs-secret", Namespace: ns}},
+			wantEnqueue: true,
+		},
+		{
+			// Both names have to be matched: covering only the first would
+			// leave log forwarding waiting on the requeue it was the point
+			// of this watch to avoid.
+			name:        "the log forwarding storage secret enqueues",
+			monitoring:  configured(),
+			secret:      &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "logs-secret", Namespace: ns}},
+			wantEnqueue: true,
+		},
+		{
+			name:        "an unrelated secret in the monitoring namespace does not",
+			monitoring:  configured(),
+			secret:      &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "some-other-secret", Namespace: ns}},
+			wantEnqueue: false,
+		},
+		{
+			// Secret names are not unique across the cluster, and this sees
+			// every namespace. Matching on name alone would have any tenant's
+			// "logs-secret" drive reconciliation of the platform's Monitoring.
+			name:        "the same name in another namespace does not",
+			monitoring:  configured(),
+			secret:      &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "logs-secret", Namespace: "other-ns"}},
+			wantEnqueue: false,
+		},
+		{
+			// Teardown: the CR is gone, so there is nothing to enqueue and
+			// nothing worth logging about it either.
+			name:        "no Monitoring CR does not",
+			monitoring:  nil,
+			secret:      &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "logs-secret", Namespace: ns}},
+			wantEnqueue: false,
+		},
+		{
+			// Storage is required within UsageLogs and Logs, but both of
+			// those are optional, so the nil checks are reachable.
+			name: "a secret named by an unconfigured feature does not",
+			monitoring: func() *v1alpha1.Monitoring {
+				m := configured()
+				m.Spec.Logs = nil
+				return m
+			}(),
+			secret:      &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "logs-secret", Namespace: ns}},
+			wantEnqueue: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := newActionsTestScheme(t)
+
+			builder := fake.NewClientBuilder().WithScheme(s)
+			if test.monitoring != nil {
+				builder = builder.WithObjects(test.monitoring)
+			}
+			r := newTestReconciler(t, s, builder.Build())
+
+			got := r.storageSecretRequests(context.Background(), test.secret)
+
+			if !test.wantEnqueue {
+				if len(got) != 0 {
+					t.Fatalf("expected no requests, got %v", got)
+				}
+				return
+			}
+			want := []reconcile.Request{
+				{NamespacedName: types.NamespacedName{Name: v1alpha1.MonitoringInstanceName}},
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("requests: want %v, got %v", want, got)
+			}
+		})
+	}
+}
+
+// TestStorageConflictShieldsLokiFromGarbageCollection covers the resolution of
+// a rejected storage configuration: deployLokiStack renders neither stack, and
+// the loki component is shielded so the collector does not read that absence as
+// "the user removed log storage". Collection itself keeps running, which is
+// what separates this from disabling GC for the whole reconcile.
+//
+// It drives the pieces the reconciler composes rather than Reconcile itself:
+// newTestReconciler's fake discovery client exposes no API resources, so a
+// reconciler-level GC test would find nothing to delete and pass vacuously.
+func TestStorageConflictShieldsLokiFromGarbageCollection(t *testing.T) {
+	ctx := context.Background()
+	s := newActionsTestScheme(t)
+	registerCRDs(s, controllergvk.LokiStack)
+
+	monitoring := monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret")
+	monitoring.UID = types.UID("monitoring-owner")
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		kubernetesAPIServerEndpointSlice(),
+		lokiStorageSecret("usage-logs-secret", monitoring.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+		lokiStorageSecret("logs-secret", monitoring.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+	).Build()
+
+	cm := conditions.NewConditionsManager(monitoring, monitoring.Generation)
+	var sources []rendertemplate.TemplateSource
+	lokiErr := deployLokiStack(ctx, cli, monitoring, cm, &sources)
+	if lokiErr == nil {
+		t.Fatal("expected the shared bucket to be rejected")
+	}
+	if len(sources) != 0 {
+		t.Fatalf("expected nothing to be rendered for a rejected configuration, got %d sources", len(sources))
+	}
+
+	// What the reconciler builds from a non-nil lokiErr. Nothing was rendered,
+	// so the desired set is empty and only the shield can save the live stacks.
+	withheld := map[string]struct{}{componentLoki: {}}
+	desired := map[resourceKey]struct{}{}
+
+	ns := monitoring.Spec.Namespace
+	labelled := func(gvk schema.GroupVersionKind, name string) unstructured.Unstructured {
+		obj := ownedGarbageCollectionTestObject(gvk, ns, name, monitoring.UID)
+		obj.SetLabels(map[string]string{componentLabel: componentLoki})
+		return obj
+	}
+
+	// Every resource lokiStackSources renders, by the label its template carries.
+	for _, live := range []unstructured.Unstructured{
+		labelled(controllergvk.LokiStack, usageLogsLokiStackResourceName),
+		labelled(controllergvk.LokiStack, lokiStackResourceName),
+		labelled(controllergvk.NetworkPolicy, "data-science-lokistack-ingress"),
+		labelled(controllergvk.NetworkPolicy, "data-science-lokistack-gateway-ingress"),
+		labelled(controllergvk.NetworkPolicy, usageLogsLokiStackResourceName+"-allow"),
+	} {
+		if shouldCollectOwnedResource(monitoring, live, desired, ns, withheld) {
+			t.Errorf("%s %s would be deleted while its storage configuration is rejected",
+				live.GetKind(), live.GetName())
+		}
+	}
+
+	// Upgrade case: a stack created before componentLabel existed carries no
+	// label, so only the GVK fallback stands between it and deletion.
+	unlabelled := ownedGarbageCollectionTestObject(controllergvk.LokiStack, ns, lokiStackResourceName, monitoring.UID)
+	if shouldCollectOwnedResource(monitoring, unlabelled, desired, ns, withheld) {
+		t.Error("an unlabelled LokiStack from an older release must still be shielded")
+	}
+
+	// Unrelated resources are still collected; the conflict degrades Loki only.
+	staleConfigMap := ownedGarbageCollectionTestObject(
+		schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}, ns, "stale-config", monitoring.UID)
+	if !shouldCollectOwnedResource(monitoring, staleConfigMap, desired, ns, withheld) {
+		t.Error("unrelated stale resources must still be collected, the conflict must not disable garbage collection")
+	}
+
+	// Without the conflict the shield lifts, so removing log storage from the
+	// spec still prunes. A shield that never lifts would strand them forever.
+	//
+	// The LokiStack is checked alongside the policy because it is the one
+	// resource with a second, GVK-based shield. That fallback has to be gated
+	// on loki actually being withheld: ungated, it would make a LokiStack
+	// uncollectable, and a stack the user has removed from the spec would
+	// outlive its configuration indefinitely.
+	for _, live := range []unstructured.Unstructured{
+		labelled(controllergvk.NetworkPolicy, "data-science-lokistack-ingress"),
+		labelled(controllergvk.NetworkPolicy, usageLogsLokiStackResourceName+"-allow"),
+		labelled(controllergvk.LokiStack, lokiStackResourceName),
+	} {
+		if !shouldCollectOwnedResource(monitoring, live, desired, ns, nil) {
+			t.Errorf("%s %s: loki resources absent from the desired set must be collected when loki is not withheld",
+				live.GetKind(), live.GetName())
+		}
+	}
+}
+
 func ownedGarbageCollectionTestObject(gvk schema.GroupVersionKind, namespace, name string, ownerUID types.UID) unstructured.Unstructured {
 	controller := true
 	obj := unstructured.Unstructured{Object: map[string]any{}}
@@ -965,6 +1163,180 @@ func ownedGarbageCollectionTestObject(gvk schema.GroupVersionKind, namespace, na
 		Controller: &controller,
 	}})
 	return obj
+}
+
+// TestPublishLokiEndpoints is the status contract for the two LokiStacks: an
+// endpoint is published only while its own stack reports ready, cleared when
+// the stack is confirmed not ready so nothing dials an address the stack behind
+// it has outlived, and held when readiness could not be observed at all.
+//
+// That last case is the one with teeth. Clearing UsageLogsEndpoint makes
+// deployUsageLogsCollector return early, so garbage collection removes the
+// collector and its policies — a response far too destructive for one failed
+// API call. Unknown therefore keeps the previous value.
+//
+// The table deliberately crosses each pipeline's configuration with the other
+// pipeline's readiness. The two stacks are independent and each reads its own
+// condition, so the failure worth catching is one of them answering for the
+// other — which a table that only ever moves both together cannot see.
+func TestPublishLokiEndpoints(t *testing.T) {
+	t.Parallel()
+
+	const (
+		usageLogsEndpoint = "http://data-science-usage-logs-lokistack-gateway-http.test-ns.svc:8080/otlp"
+		logsEndpoint      = "https://data-science-lokistack-gateway-http.test-ns.svc:8080"
+
+		// Values from an earlier round where both stacks were up. Every case
+		// that does not publish has to overwrite these, not skip them.
+		staleUsageLogs = "http://stale-usage-logs"
+		staleLogs      = "http://stale-logs"
+	)
+	data := map[string]any{
+		"UsageLogsEndpoint": usageLogsEndpoint,
+		"LokiQueryEndpoint": logsEndpoint,
+	}
+
+	for _, test := range []struct {
+		name                string
+		usageLogsConfigured bool
+		logsConfigured      bool
+		usageLogsStatus     metav1.ConditionStatus
+		logsStatus          metav1.ConditionStatus
+		// firstReconcile starts from empty endpoints rather than the stale
+		// pair, so "hold what you had" can be told apart from "hold a value".
+		firstReconcile bool
+		wantUsageLogs  string
+		wantLogs       string
+		wantRequeue    bool
+	}{
+		{
+			name: "neither configured clears both",
+			// Readiness is true for both: a condition left over from a
+			// configuration the user has since removed must not publish.
+			usageLogsStatus: metav1.ConditionTrue,
+			logsStatus:      metav1.ConditionTrue,
+		},
+		{
+			name:                "both configured and ready",
+			usageLogsConfigured: true, logsConfigured: true,
+			usageLogsStatus: metav1.ConditionTrue, logsStatus: metav1.ConditionTrue,
+			wantUsageLogs: usageLogsEndpoint, wantLogs: logsEndpoint,
+		},
+		{
+			name:                "both configured, only usage logs ready",
+			usageLogsConfigured: true, logsConfigured: true,
+			usageLogsStatus: metav1.ConditionTrue, logsStatus: metav1.ConditionFalse,
+			wantUsageLogs: usageLogsEndpoint,
+			wantRequeue:   true,
+		},
+		{
+			name:                "both configured, only logs ready",
+			usageLogsConfigured: true, logsConfigured: true,
+			usageLogsStatus: metav1.ConditionFalse, logsStatus: metav1.ConditionTrue,
+			wantLogs:    logsEndpoint,
+			wantRequeue: true,
+		},
+		{
+			name:                "both configured, neither ready",
+			usageLogsConfigured: true, logsConfigured: true,
+			usageLogsStatus: metav1.ConditionFalse, logsStatus: metav1.ConditionFalse,
+			wantRequeue: true,
+		},
+		{
+			name:            "only logs configured, its stack ready",
+			logsConfigured:  true,
+			usageLogsStatus: metav1.ConditionTrue, logsStatus: metav1.ConditionTrue,
+			wantLogs: logsEndpoint,
+		},
+		{
+			name:                "only usage logs configured, its stack ready",
+			usageLogsConfigured: true,
+			usageLogsStatus:     metav1.ConditionTrue, logsStatus: metav1.ConditionTrue,
+			wantUsageLogs: usageLogsEndpoint,
+		},
+		{
+			// The readiness check failed. Nothing is known about either stack,
+			// so both keep the endpoint they were last published with.
+			name:                "unobservable readiness holds published endpoints",
+			usageLogsConfigured: true, logsConfigured: true,
+			usageLogsStatus: metav1.ConditionUnknown, logsStatus: metav1.ConditionUnknown,
+			wantUsageLogs: staleUsageLogs, wantLogs: staleLogs,
+			wantRequeue: true,
+		},
+		{
+			// Holding on Unknown must not invent an endpoint: a stack that has
+			// never been ready has nothing to hold.
+			name:                "unobservable readiness on first reconcile stays empty",
+			usageLogsConfigured: true, logsConfigured: true,
+			usageLogsStatus: metav1.ConditionUnknown, logsStatus: metav1.ConditionUnknown,
+			firstReconcile: true,
+			wantRequeue:    true,
+		},
+		{
+			// One stack unobservable, the other confirmed down. Hold and clear
+			// have to be decided per stack, not once for both.
+			name:                "unobservable usage logs holds while confirmed-down logs clears",
+			usageLogsConfigured: true, logsConfigured: true,
+			usageLogsStatus: metav1.ConditionUnknown, logsStatus: metav1.ConditionFalse,
+			wantUsageLogs: staleUsageLogs,
+			wantRequeue:   true,
+		},
+		{
+			// Unknown does not override the user turning the feature off.
+			// Whatever the stack is doing, nothing should be dialling it.
+			name:            "unobservable but unconfigured still clears",
+			logsConfigured:  true,
+			usageLogsStatus: metav1.ConditionUnknown, logsStatus: metav1.ConditionTrue,
+			wantLogs: logsEndpoint,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			if test.usageLogsConfigured {
+				m.Spec.UsageLogs = &v1alpha1.UsageLogs{Storage: &v1alpha1.LokiStorageConfig{
+					Type: v1alpha1.StorageBackendS3, SecretName: "usage-logs-secret",
+				}}
+			}
+			if test.logsConfigured {
+				m.Spec.Logs = &v1alpha1.Logs{Storage: &v1alpha1.LokiStorageConfig{
+					Type: v1alpha1.StorageBackendS3, SecretName: "logs-secret",
+				}}
+			}
+
+			if !test.firstReconcile {
+				m.Status.UsageLogsEndpoint = staleUsageLogs
+				m.Status.LogsEndpoint = staleLogs
+			}
+
+			cm := conditions.NewConditionsManager(m, m.Generation)
+			mark := func(condType string, status metav1.ConditionStatus) {
+				switch status {
+				case metav1.ConditionTrue:
+					cm.MarkTrue(condType)
+				case metav1.ConditionFalse:
+					cm.MarkFalse(condType, "LokiStackNotReady", "LokiStack is not ready yet")
+				case metav1.ConditionUnknown:
+					cm.MarkUnknown(condType, "ReadinessCheckFailed", "Cannot determine whether the LokiStack is ready")
+				}
+			}
+			mark(conditions.ConditionUsageLogsLokiStackAvailable, test.usageLogsStatus)
+			mark(conditions.ConditionLokiStackAvailable, test.logsStatus)
+
+			gotRequeue := publishLokiEndpoints(m, data)
+
+			if got := m.Status.UsageLogsEndpoint; got != test.wantUsageLogs {
+				t.Errorf("UsageLogsEndpoint: want %q, got %q", test.wantUsageLogs, got)
+			}
+			if got := m.Status.LogsEndpoint; got != test.wantLogs {
+				t.Errorf("LogsEndpoint: want %q, got %q", test.wantLogs, got)
+			}
+			if gotRequeue != test.wantRequeue {
+				t.Errorf("requeue: want %t, got %t", test.wantRequeue, gotRequeue)
+			}
+		})
+	}
 }
 
 func TestKorrel8rEndpointSliceWatch_EnqueuesForKorrel8rAndKubernetesAPI(t *testing.T) {

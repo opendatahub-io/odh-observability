@@ -24,6 +24,7 @@ import (
 	"time"
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	libconditions "github.com/opendatahub-io/odh-platform-utilities/pkg/controller/conditions"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/controller/gc"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
 	odhLabels "github.com/opendatahub-io/odh-platform-utilities/pkg/metadata/labels"
@@ -72,6 +73,16 @@ const (
 	openTelemetryPartOf                   = "opentelemetry"
 	collectorOperatorNetworkPolicyName    = "data-science-collector-collector-networkpolicy"
 	targetAllocatorOperatorPolicyName     = "data-science-collector-targetallocator-networkpolicy"
+
+	// componentLabel names the subsystem a rendered resource belongs to, so
+	// garbage collection can shield one subsystem's resources without having to
+	// skip the sweep for everything else. It is deliberately not
+	// app.kubernetes.io/component: that key is already used by these templates
+	// as a pod selector for operand workloads (alertmanager, lokistack-gateway)
+	// and as a workload role on Korrel8r and the querier, neither of which is a
+	// subsystem boundary.
+	componentLabel = "platform.opendatahub.io/component"
+	componentLoki  = "loki"
 )
 
 func operatorVersion() string {
@@ -277,7 +288,6 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		deployTracingStack,
 		deployOpenTelemetryCollector,
 		deployUsageLogsCollector,
-		deployLokiStack,
 		deployAlerting,
 		deployNodeMetricsEndpoint,
 		deployClusterLogForwarder,
@@ -286,6 +296,17 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		if err := action(ctx, r.Client, monitoring, cm, &sources); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+
+	// A rejected LokiStack storage configuration must not stall metrics, traces
+	// or anything else, so the error is held until the end of the reconcile
+	// instead of aborting here. deployLokiStack reports it on both LokiStack
+	// conditions and renders neither stack, which would read as "deleted by the
+	// user" to garbage collection — hence the shield below.
+	withheldComponents := map[string]struct{}{}
+	lokiErr := deployLokiStack(ctx, r.Client, monitoring, cm, &sources)
+	if lokiErr != nil {
+		withheldComponents[componentLoki] = struct{}{}
 	}
 
 	// Perses actions share the pre-resolved API version.
@@ -319,33 +340,22 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	}
 
 	// Garbage-collect stale owned resources via API discovery.
-	if err := r.collectGarbage(ctx, monitoring, desired); err != nil {
+	if err := r.collectGarbage(ctx, monitoring, desired, withheldComponents); err != nil {
 		log.Error(err, "Garbage collection encountered errors")
 	}
 
 	r.syncPostDeployResources(ctx, monitoring, cm)
 
-	// Update usageLogsEndpoint in status only when LokiStack is ready
-	requeueNeeded := false
-	if monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil {
-		lokiReady, err := isLokiStackReady(ctx, r.Client, monitoring)
-		if err != nil {
-			log.Error(err, "Failed to check LokiStack readiness")
-			cm.MarkFalse(string(platformcommon.ConditionTypeReady), "LokiStackReadinessCheckFailed", err.Error())
-			return ctrl.Result{}, err
-		}
-		if lokiReady {
-			endpoint, _ := data["UsageLogsEndpoint"].(string)
-			monitoring.Status.UsageLogsEndpoint = endpoint
-		} else {
-			monitoring.Status.UsageLogsEndpoint = ""
-			requeueNeeded = true // Requeue to check again when LokiStack becomes ready
-		}
-	} else {
-		monitoring.Status.UsageLogsEndpoint = ""
-	}
+	requeueNeeded := publishLokiEndpoints(monitoring, data)
 
 	cm.AggregateReady()
+
+	// Surface a withheld LokiStack configuration now that every other feature
+	// has been reconciled. Storage Secrets are not watched, so the retry this
+	// triggers is the only way a corrected configuration gets noticed.
+	if lokiErr != nil {
+		return ctrl.Result{}, lokiErr
+	}
 
 	// Stamp the platform version only after reconciliation has applied
 	// desired state without returning an error. Early exits (Removed,
@@ -426,6 +436,72 @@ func isOpenTelemetryOperatorNetworkPolicyEvent(obj client.Object) bool {
 	}
 }
 
+// publishLokiEndpoints records the endpoint of each LokiStack on the status,
+// and reports whether a short requeue is needed to pick up one that is not
+// ready yet.
+//
+// An endpoint is published only once its stack reports ready. deployLokiStack
+// already observed that readiness and recorded it on the condition, so this
+// reads the condition back instead of re-fetching either CR. LokiStack is not
+// watched (only core kinds are), hence the requeue: nothing else would bring
+// the reconciler back when a stack finishes coming up.
+//
+// Clearing the endpoint of a stack that is confirmed not ready is deliberate.
+// These fields are what other components dial, and a stale address outlives the
+// stack it pointed at.
+//
+// A stack whose readiness could not be observed is the one case that holds its
+// endpoint instead. The condition is Unknown there, meaning nothing was learned
+// about the stack — and the published endpoint is load-bearing: clearing
+// Status.UsageLogsEndpoint makes deployUsageLogsCollector return early, which
+// drops the collector and its policies from the desired set and has garbage
+// collection delete them. A single apiserver timeout should not tear down a
+// healthy pipeline.
+func publishLokiEndpoints(monitoring *v1alpha1.Monitoring, data map[string]any) bool {
+	requeueNeeded := false
+
+	publish := func(configured bool, condition, dataKey string, endpoint *string) {
+		switch {
+		case !configured:
+			// The user turned the feature off: clear regardless of condition.
+			*endpoint = ""
+		case libconditions.IsStatusConditionTrue(monitoring, condition):
+			*endpoint, _ = data[dataKey].(string)
+		case libconditions.IsStatusConditionPresentAndEqual(monitoring, condition, metav1.ConditionUnknown):
+			// Could not observe: hold the last known endpoint. On a first
+			// reconcile that holds "", which is what it already was.
+			//
+			// Unknown currently always accompanies a held lokiErr, which
+			// returns before the requeue check and gets controller-runtime
+			// backoff instead. Set it anyway so an Unknown that arrives
+			// without an error still gets polled.
+			requeueNeeded = true
+		default:
+			*endpoint = ""
+			requeueNeeded = true
+		}
+	}
+
+	// The usage logs collector writes to its stack, so it needs the OTLP
+	// ingestion endpoint. Nothing writes to the log forwarding stack by URL —
+	// the ClusterLogForwarder addresses it by name — so that one publishes the
+	// gateway query endpoint instead.
+	publish(
+		monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil,
+		conditions.ConditionUsageLogsLokiStackAvailable,
+		"UsageLogsEndpoint",
+		&monitoring.Status.UsageLogsEndpoint,
+	)
+	publish(
+		monitoring.Spec.Logs != nil,
+		conditions.ConditionLokiStackAvailable,
+		"LokiQueryEndpoint",
+		&monitoring.Status.LogsEndpoint,
+	)
+
+	return requeueNeeded
+}
+
 func (r *MonitoringReconciler) syncPostDeployResources(
 	ctx context.Context,
 	monitoring *v1alpha1.Monitoring,
@@ -460,8 +536,16 @@ type resourceKey struct {
 	name      string
 }
 
-// collectGarbage deletes owned resources not in the desired set using API discovery.
-func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v1alpha1.Monitoring, desired []unstructured.Unstructured) error {
+// collectGarbage deletes owned resources not in the desired set using API
+// discovery. Resources belonging to a withheld component are left alone: their
+// subsystem did not get to contribute to the desired set this round, so their
+// absence from it says nothing about whether they are still wanted.
+func (r *MonitoringReconciler) collectGarbage(
+	ctx context.Context,
+	monitoring *v1alpha1.Monitoring,
+	desired []unstructured.Unstructured,
+	withheldComponents map[string]struct{},
+) error {
 	if monitoring.Spec.Namespace == "" {
 		return errors.New("monitoring.Spec.Namespace is empty, cannot safely perform garbage collection")
 	}
@@ -481,7 +565,8 @@ func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v
 		gc.InNamespace(monitoring.Spec.Namespace),
 		gc.WithDeletePropagationPolicy(metav1.DeletePropagationBackground),
 		gc.WithObjectPredicate(func(_ gc.RunParams, obj unstructured.Unstructured) (bool, error) {
-			return shouldCollectOwnedResource(monitoring, obj, desiredSet, monitoring.Spec.Namespace), nil
+			return shouldCollectOwnedResource(
+				monitoring, obj, desiredSet, monitoring.Spec.Namespace, withheldComponents), nil
 		}),
 	)
 
@@ -558,8 +643,24 @@ func shouldCollectOwnedResource(
 	obj unstructured.Unstructured,
 	desiredSet map[resourceKey]struct{},
 	namespace string,
+	withheldComponents map[string]struct{},
 ) bool {
 	if !isOwnedByMonitoring(monitoring, &obj) || !isInMonitoringScope(&obj, namespace) {
+		return false
+	}
+
+	if _, isWithheld := withheldComponents[obj.GetLabels()[componentLabel]]; isWithheld {
+		return false
+	}
+
+	// A LokiStack created before componentLabel existed does not carry it, so an
+	// upgrade landing straight into a storage conflict would not be shielded by
+	// the label alone. LokiStack is the one resource here that cannot be
+	// recreated without losing logs, and its GVK belongs to no other component,
+	// so shield it by kind as well. The sibling NetworkPolicies are stateless
+	// and come back with the next clean apply, so they get no such fallback.
+	if _, lokiWithheld := withheldComponents[componentLoki]; lokiWithheld &&
+		obj.GroupVersionKind() == controllergvk.LokiStack {
 		return false
 	}
 
@@ -653,6 +754,44 @@ func singletonRequests(_ context.Context, _ client.Object) []reconcile.Request {
 	}
 }
 
+// storageSecretRequests enqueues Monitoring when one of the LokiStack storage
+// Secrets named in its spec changes.
+//
+// Those Secrets belong to the user, so they carry no part-of label and the
+// managed-resource predicate never matches them. Without this, a Secret
+// arriving after the Monitoring CR — the ordinary case for GitOps, where apply
+// order is not guaranteed — is not noticed until the periodic requeue, and the
+// storage isolation check fails closed for that whole window.
+//
+// The names come from the spec rather than a label, so this has to be a map
+// function: a predicate sees only the Secret.
+func (r *MonitoringReconciler) storageSecretRequests(ctx context.Context, obj client.Object) []reconcile.Request {
+	monitoring := &v1alpha1.Monitoring{}
+	if err := r.Get(ctx, types.NamespacedName{Name: v1alpha1.MonitoringInstanceName}, monitoring); err != nil {
+		// Including NotFound: the CR is gone or not yet cached, so there is
+		// nothing to enqueue and nothing worth logging on an event stream that
+		// carries every Secret in the cluster.
+		return nil
+	}
+
+	if obj.GetNamespace() != monitoringNamespace(monitoring) {
+		return nil
+	}
+
+	// UsageLogs and Logs are each optional; Storage is required only within
+	// whichever of them is present.
+	name := obj.GetName()
+	usageLogs := monitoring.Spec.UsageLogs
+	logs := monitoring.Spec.Logs
+	matches := (usageLogs != nil && usageLogs.Storage != nil && usageLogs.Storage.SecretName == name) ||
+		(logs != nil && logs.Storage != nil && logs.Storage.SecretName == name)
+	if !matches {
+		return nil
+	}
+
+	return singletonRequests(ctx, obj)
+}
+
 // isPlatformConfigMap matches the platform-written handshake ConfigMap by name
 // and operator namespace. That ConfigMap is labeled part-of=platform (or
 // unlabeled), so it is not covered by the managed-resource predicate. The
@@ -724,6 +863,15 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(platformConfigPredicate)).
 		Watches(&corev1.Secret{}, toSingleton, builder.WithPredicates(managedPredicate)).
+		// The LokiStack storage Secrets are the user's, so they carry no
+		// part-of label and the predicate above skips them. They gate the
+		// storage isolation check, which fails closed until both resolve.
+		// Delete events matter as much as creates for that reason. The Secret
+		// informer already exists for the watch above, so this costs an event
+		// handler rather than a second cache.
+		Watches(&corev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.storageSecretRequests),
+			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{})).
 		Watches(&corev1.Service{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&discoveryv1.EndpointSlice{}, toSingleton, builder.WithPredicates(predicate.NewPredicateFuncs(isKorrel8rEndpointSlice))).
 		Watches(&corev1.ServiceAccount{}, toSingleton, builder.WithPredicates(managedPredicate)).

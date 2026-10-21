@@ -130,7 +130,12 @@ type TracesTLS struct {
 // Logs defines the configuration for cluster log forwarding via the ClusterLogForwarder operator.
 type Logs struct {
 	// Storage configures the LokiStack storage backend for log forwarding.
-	// Required: the operator deploys a shared LokiStack used by both log forwarding and usage logs.
+	// Required: the operator deploys a LokiStack dedicated to log forwarding, separate from the
+	// one usageLogs.storage deploys.
+	// The two stacks must use different object storage buckets. Both serve the "application" tenant and
+	// Loki keys objects by tenant rather than by stack, so a shared bucket makes them overwrite each
+	// other's index and chunks. Separate secrets are not sufficient; the operator compares the resolved
+	// endpoint and bucketnames and refuses to reconcile when they overlap.
 	// +kubebuilder:validation:Required
 	Storage *LokiStorageConfig `json:"storage"`
 
@@ -168,6 +173,8 @@ type TracesStorage struct {
 type UsageLogs struct {
 	// Storage configures the LokiStack storage backend (S3).
 	// When configured, the operator deploys a LokiStack instance and auto-configures the collector endpoint.
+	// This stack is separate from the one logs.storage deploys and must use a different object storage
+	// bucket; see logs.storage for why a shared bucket is rejected.
 	// +kubebuilder:validation:Required
 	Storage *LokiStorageConfig `json:"storage"`
 }
@@ -217,6 +224,14 @@ type MonitoringStatus struct {
 	// Populated when usageLogs is configured.
 	// +optional
 	UsageLogsEndpoint string `json:"usageLogsEndpoint,omitempty"`
+
+	// LogsEndpoint is the Loki query endpoint for forwarded application logs.
+	// Populated when logs is configured and its LokiStack is ready. Unlike
+	// usageLogsEndpoint this is a read endpoint: the ClusterLogForwarder
+	// addresses the LokiStack by name rather than by URL, so there is no write
+	// endpoint to publish.
+	// +optional
+	LogsEndpoint string `json:"logsEndpoint,omitempty"`
 }
 
 //+kubebuilder:object:root=true
