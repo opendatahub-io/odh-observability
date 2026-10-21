@@ -54,6 +54,8 @@ const (
 
 	UsageLogsCollectorNetworkPolicyName = UsageLogsCollectorName + "-collector-allow"
 	UsageLogsLokiStackNetworkPolicyName = UsageLogsLokiStackName + "-allow"
+	LokiStackNetworkPolicyName          = LokiStackName + "-ingress"
+	LokiStackGatewayNetworkPolicyName   = LokiStackName + "-gateway-ingress"
 )
 
 func cooOperatorChannel() string {

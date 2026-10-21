@@ -86,6 +86,47 @@ func (tc *MonitoringTestCtx) ValidateLogsLokiStackDeployment(t *testing.T) {
 		),
 		WithCustomErrorMsg("LokiStackAvailable condition should be True when the log forwarding LokiStack is deployed"),
 	)
+
+	// These two policies ride with the log forwarding stack, so they are only
+	// rendered while spec.logs is set. They are asserted here rather than
+	// alongside the usage logs policies because nothing in a usage-logs-only
+	// install creates them.
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+			Name:      LokiStackNetworkPolicyName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/name" == "lokistack"`),
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, LokiStackName),
+			jq.Match(`.spec.policyTypes == ["Ingress"]`),
+			jq.Match(`[.spec.ingress[] | select((.from // []) | length == 0)] | length == 0`),
+			jq.Match(`[.spec.ingress[].ports[].port] | unique | sort == [3100, 7946, 9095]`),
+		)),
+		WithCustomErrorMsg("LokiStack NetworkPolicy should restrict component ingress to declared peers"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+			Name:      LokiStackGatewayNetworkPolicyName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/component" == "lokistack-gateway"`),
+			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, LokiStackName),
+			jq.Match(`.spec.policyTypes == ["Ingress"]`),
+			jq.Match(`[.spec.ingress[] | select((.from // []) | length == 0)] | length == 0`),
+			jq.Match(`[.spec.ingress[].from[] | .namespaceSelector.matchLabels."kubernetes.io/metadata.name"] | map(select(. == "openshift-logging")) | length == 1`),
+			jq.Match(`
+				[.spec.ingress[].from[] | .podSelector.matchLabels |
+					select(."app.kubernetes.io/name" == "korrel8r" and
+						."app.kubernetes.io/component" == "correlation" and
+						."app.kubernetes.io/part-of" == "monitoring")] | length == 1
+			`),
+			jq.Match(`[.spec.ingress[].ports[].port] | unique == [8080]`),
+		)),
+		WithCustomErrorMsg("LokiStack gateway NetworkPolicy should admit only declared in-namespace and CLO traffic"),
+	)
 }
 
 // ValidateLogsLokiStackConfiguration tests the log forwarding LokiStack OTLP
@@ -136,12 +177,31 @@ func (tc *MonitoringTestCtx) ValidateLogsLokiStackRemoved(t *testing.T) {
 		WithEventuallyTimeout(lokiStackReadyTimeout),
 	)
 
+	// The stack's policies are rendered by the same action, so they go with it.
+	// The usage logs policies are driven by spec.usageLogs and must not.
+	for _, name := range []string{LokiStackNetworkPolicyName, LokiStackGatewayNetworkPolicyName} {
+		tc.EnsureResourceGone(
+			WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+				Name:      name,
+				Namespace: tc.MonitoringNamespace,
+			}),
+		)
+	}
+
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.LokiStack, types.NamespacedName{
 			Name:      UsageLogsLokiStackName,
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithCustomErrorMsg("Usage logs LokiStack must survive the removal of spec.logs"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
+			Name:      UsageLogsLokiStackNetworkPolicyName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCustomErrorMsg("Usage logs LokiStack NetworkPolicy must survive the removal of spec.logs"),
 	)
 
 	tc.EnsureResourceExists(
