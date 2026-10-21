@@ -73,6 +73,20 @@ func TestOperandNetworkPolicyTemplatesContract(t *testing.T) {
 			policyTypes:   []any{"Ingress"},
 			expectedPorts: []networkPolicyPort{{protocol: "TCP", port: 8080}},
 		},
+		{
+			// The usage logs gateway, guarded by the usage logs LokiStack deployment
+			// alongside the stack it fronts. Its only peer is the collector, so unlike the
+			// general-logs gateway it admits no Korrel8r and no Prometheus.
+			name:       "usage logs loki stack gateway",
+			template:   "resources/usage-logs-lokistack-network-policy.tmpl.yaml",
+			policyName: "data-science-usage-logs-lokistack-allow",
+			selector: map[string]string{
+				"app.kubernetes.io/component": "lokistack-gateway",
+				"app.kubernetes.io/instance":  "data-science-usage-logs-lokistack",
+			},
+			policyTypes:   []any{"Ingress"},
+			expectedPorts: []networkPolicyPort{{protocol: "TCP", port: 8080}},
+		},
 	}
 
 	for _, tt := range tests {
@@ -82,6 +96,7 @@ func TestOperandNetworkPolicyTemplatesContract(t *testing.T) {
 			resources := renderObservabilityTemplate(t, tt.template, map[string]any{
 				"Namespace":              testMonitoringNamespace,
 				"LokiStackName":          "data-science-lokistack",
+				"UsageLogsLokiStackName": "data-science-usage-logs-lokistack",
 				"UsageLogsCollectorName": "data-science-usage-logs",
 			})
 			policy := findRenderedResource(t, resources, "NetworkPolicy", tt.policyName)

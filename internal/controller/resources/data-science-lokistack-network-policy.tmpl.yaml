@@ -5,6 +5,7 @@ metadata:
   namespace: {{.Namespace}}
   labels:
     platform.opendatahub.io/part-of: monitoring
+    platform.opendatahub.io/component: loki-logs
 spec:
   podSelector:
     matchLabels:

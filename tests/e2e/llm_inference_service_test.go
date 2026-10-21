@@ -1507,10 +1507,12 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 		applyMonitoringManifest(t, tc, dir)
 	}
 
+	// This scenario configures usageLogs storage, so it is the usage logs
+	// LokiStack that must come up; the log forwarding one is never requested.
 	waitFor(
-		"LokiStack "+LokiStackName+" should be Ready",
+		"LokiStack "+UsageLogsLokiStackName+" should be Ready",
 		gvk.LokiStack,
-		types.NamespacedName{Name: LokiStackName, Namespace: inferenceMonitoringNamespace()},
+		types.NamespacedName{Name: UsageLogsLokiStackName, Namespace: inferenceMonitoringNamespace()},
 		"Ready",
 		20*time.Minute,
 	)

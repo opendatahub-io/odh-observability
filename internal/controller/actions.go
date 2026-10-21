@@ -19,8 +19,13 @@ package controller
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
+	"path"
+	"slices"
 	"strings"
 
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
@@ -28,6 +33,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -85,6 +91,7 @@ const (
 	UsageLogsOpenTelemetryCollectorRBACTemplate      = "resources/usage-logs-opentelemetry-collector-rbac.tmpl.yaml"
 	UsageLogsOpenTelemetryCollectorNPTemplate        = "resources/usage-logs-opentelemetry-collector-network-policy.tmpl.yaml"
 	UsageLogsLokiStackNPTemplate                     = "resources/usage-logs-lokistack-network-policy.tmpl.yaml"
+	UsageLogsLokiStackTemplate                       = "resources/usage-logs-loki-stack.tmpl.yaml"
 	LokiStackNetworkPolicyTemplate                   = "resources/data-science-lokistack-network-policy.tmpl.yaml"
 	LokiStackGatewayNetworkPolicyTemplate            = "resources/data-science-lokistack-gateway-network-policy.tmpl.yaml"
 	LokiStackTemplate                                = "resources/loki-stack.tmpl.yaml"
@@ -101,6 +108,7 @@ const (
 
 	defaultMonitoringNamespace           = "opendatahub"
 	clusterLoggingNamespace              = "openshift-logging"
+	usageLogsLokiStackResourceName       = "data-science-usage-logs-lokistack"
 	lokiStackResourceName                = "data-science-lokistack"
 	clusterLogForwarderResourceName      = "data-science-cluster-log-forwarder"
 	Korrel8rServiceName                  = "korrel8r"
@@ -111,6 +119,11 @@ const (
 
 //go:embed resources monitoring
 var resourcesFS embed.FS
+
+// defaultWebPorts are the ports http and https imply when none is written. The
+// storage comparison key carries no scheme, so either one names the same
+// endpoint as no port at all.
+var defaultWebPorts = map[string]struct{}{"80": {}, "443": {}}
 
 func src(path string) rendertemplate.TemplateSource {
 	return rendertemplate.TemplateSource{FS: resourcesFS, Path: path}
@@ -566,59 +579,490 @@ func deployUsageLogsCollector(
 		src(UsageLogsOpenTelemetryCollectorTemplate),
 		src(UsageLogsOpenTelemetryCollectorRBACTemplate),
 		src(UsageLogsOpenTelemetryCollectorNPTemplate),
-		src(UsageLogsLokiStackNPTemplate),
 	)
 
 	return nil
 }
 
-// deployLokiStack deploys LokiStack when usage logs storage or log forwarding is configured.
-func deployLokiStack(
+// deployUsageLogsLokiStack renders the LokiStack that backs usage logs.
+//
+// The reconciler runs it only when validateStorageIsolation has not withheld
+// componentLokiUsageLogs, so by the time it is called its storage has either
+// been proven disjoint from every other claimant's or was never contested.
+func deployUsageLogsLokiStack(
 	ctx context.Context,
 	c client.Client,
 	monitoring *v1alpha1.Monitoring,
 	cm *conditions.ConditionsManager,
 	sources *[]rendertemplate.TemplateSource,
 ) error {
-	needsLoki := monitoring.Spec.Logs != nil ||
-		(monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil)
-	if !needsLoki {
-		cm.MarkNotConfigured(conditions.ConditionLokiStackAvailable,
-			"LokiNotRequired", "Neither usage logs storage nor log forwarding configured")
+	return deployLokiStack(ctx, c, monitoring, cm, sources, lokiStackDeployment{
+		configured:   monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil,
+		resourceName: usageLogsLokiStackResourceName,
+		condition:    conditions.ConditionUsageLogsLokiStackAvailable,
+		description:  "usage logs LokiStack",
+		feature:      "usage logs storage",
+		templates: []string{
+			UsageLogsLokiStackTemplate,
+			UsageLogsLokiStackNPTemplate,
+		},
+	})
+}
+
+// deployRHOAILogsLokiStack renders the LokiStack that backs log forwarding.
+//
+// It is gated on Spec.Logs alone rather than on Spec.Logs.Storage, because the
+// CRD marks Storage required within Logs; the nil check in storageClaims is
+// there for the isolation comparison, which must not read through a nil.
+//
+// Like its counterpart above, the reconciler runs it only when
+// validateStorageIsolation has not withheld componentLokiLogs.
+func deployRHOAILogsLokiStack(
+	ctx context.Context,
+	c client.Client,
+	monitoring *v1alpha1.Monitoring,
+	cm *conditions.ConditionsManager,
+	sources *[]rendertemplate.TemplateSource,
+) error {
+	return deployLokiStack(ctx, c, monitoring, cm, sources, lokiStackDeployment{
+		configured:   monitoring.Spec.Logs != nil,
+		resourceName: lokiStackResourceName,
+		condition:    conditions.ConditionLokiStackAvailable,
+		description:  "LokiStack",
+		feature:      "log forwarding",
+		templates: []string{
+			LokiStackTemplate,
+			LokiStackNetworkPolicyTemplate,
+			LokiStackGatewayNetworkPolicyTemplate,
+		},
+	})
+}
+
+// deployLokiStacks renders each LokiStack whose component the storage gate
+// left standing.
+//
+// The withheld check is the only thing separating these from the other deploy
+// actions: past it they are ordinary actions whose errors abort the round,
+// which is what keeps them free of any shield of their own. It walks
+// lokiComponents rather than calling the two in sequence so that the set of
+// components the gate can withhold and the set the reconcile deploys cannot
+// drift apart.
+func deployLokiStacks(
+	ctx context.Context,
+	c client.Client,
+	monitoring *v1alpha1.Monitoring,
+	cm *conditions.ConditionsManager,
+	sources *[]rendertemplate.TemplateSource,
+	withheldComponents map[string]struct{},
+) error {
+	for _, component := range lokiComponents {
+		if _, withheld := withheldComponents[component]; withheld {
+			continue
+		}
+
+		var err error
+		switch component {
+		case componentLokiUsageLogs:
+			err = deployUsageLogsLokiStack(ctx, c, monitoring, cm, sources)
+		case componentLokiLogs:
+			err = deployRHOAILogsLokiStack(ctx, c, monitoring, cm, sources)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// lokiStackDeployment is everything that differs between the two stacks, so
+// the deploy path below can be written once.
+//
+// The gateway NetworkPolicy belongs in templates rather than with the workload
+// that dials through it: a policy that guards a gateway has to exist for as
+// long as the gateway does, including the window before its client is up.
+type lokiStackDeployment struct {
+	configured   bool
+	resourceName string
+	condition    string
+	description  string // names the stack in condition messages
+	feature      string // names the spec field that asks for it
+	templates    []string
+}
+
+// deployLokiStack renders one LokiStack and reports on it. The two stacks are
+// independent of one another — separate CRs whose storage
+// validateStorageIsolation has already proven disjoint — so nothing here reads
+// the other stack's state.
+//
+// Rendering comes before the readiness observation on purpose. The templates
+// are a function of the spec, which the gate already accepted, so a failed
+// readiness Get must not withhold them — withholding is for gates, and a stack
+// that is never applied is a stack that never becomes ready. The same
+// reasoning is why an absent stack renders: NotFound is a determinate "not
+// ready", not a failure to look.
+//
+// This is an ordinary action. Every state it can report on — not configured,
+// operator absent, stack not ready — marks its condition and returns nil, the
+// way the ten actions ahead of it do. It returns an error only when the
+// apiserver failed to answer, and that aborts the round from the call site,
+// which is also the contract those ten keep.
+//
+// The two aborts cost different things, and only one of them needs the abort
+// to be safe. A failed readiness check has already appended its templates, so
+// the round it costs is just a round. A failed CRD check has appended nothing,
+// and a template missing from the desired set is indistinguishable, to the
+// collector, from one the user deleted — the abort is what keeps that branch
+// from needing a garbage collection shield, by reaching neither Deploy nor
+// collectGarbage.
+//
+// Both error returns mark the condition before returning, which the other
+// hasCRD call sites do not. The deferred patch in Reconcile writes status on
+// error paths too, so the mark lands; without it the previous round's True
+// would stand and report a stack healthy on a check that never completed.
+func deployLokiStack(
+	ctx context.Context,
+	c client.Client,
+	monitoring *v1alpha1.Monitoring,
+	cm *conditions.ConditionsManager,
+	sources *[]rendertemplate.TemplateSource,
+	stack lokiStackDeployment,
+) error {
+	// Configured is tested before the CRD, so a stack nobody asked for reports
+	// LokiNotRequired at Info severity whether or not the operator happens to
+	// be installed. The reverse order would call a cluster without Loki
+	// degraded for declining to run a feature it was never asked to run.
+	if !stack.configured {
+		cm.MarkNotConfigured(stack.condition, "LokiNotRequired",
+			fmt.Sprintf("%s not configured", capitalizeFirst(stack.feature)))
 		return nil
 	}
 
-	lokiExists, err := hasCRD(ctx, c, gvk.LokiStack)
+	lokiCRDExists, err := hasCRD(ctx, c, gvk.LokiStack)
 	if err != nil {
+		cm.MarkUnknown(stack.condition, lokiCRDCheckFailedReason,
+			fmt.Sprintf("Cannot determine whether the LokiStack CRD is installed: %v", err))
 		return fmt.Errorf("checking LokiStack CRD: %w", err)
 	}
-	if !lokiExists {
-		cm.MarkFalse(conditions.ConditionLokiStackAvailable,
-			conditions.MissingOperatorReason,
-			"LokiStack operator must be installed for usage logs storage configuration")
+	if !lokiCRDExists {
+		cm.MarkFalse(stack.condition, conditions.MissingOperatorReason,
+			fmt.Sprintf("LokiStack operator must be installed for %s configuration", stack.feature))
 		return nil
 	}
 
-	// Check if LokiStack is actually ready
-	lokiReady, err := isLokiStackReady(ctx, c, monitoring)
+	for _, template := range stack.templates {
+		*sources = append(*sources, src(template))
+	}
+
+	ready, err := isLokiStackReady(ctx, c, monitoring, stack.resourceName)
 	if err != nil {
-		return fmt.Errorf("checking LokiStack readiness: %w", err)
+		cm.MarkUnknown(stack.condition, lokiReadinessCheckFailedReason,
+			fmt.Sprintf("Cannot determine whether the %s is ready: %v", stack.description, err))
+		return fmt.Errorf("checking %s readiness: %w", stack.description, err)
 	}
-
-	if lokiReady {
-		cm.MarkTrue(conditions.ConditionLokiStackAvailable)
+	if ready {
+		cm.MarkTrue(stack.condition)
 	} else {
-		cm.MarkFalse(conditions.ConditionLokiStackAvailable,
-			"LokiStackNotReady",
-			"LokiStack is not ready yet")
+		cm.MarkFalse(stack.condition, "LokiStackNotReady",
+			fmt.Sprintf("%s is not ready yet", capitalizeFirst(stack.description)))
+	}
+	return nil
+}
+
+// capitalizeFirst uppercases the leading byte of a condition message built
+// from a stack description. The descriptions read as nouns mid-sentence
+// ("Cannot determine whether the usage logs LokiStack…") and as sentence
+// openers elsewhere.
+func capitalizeFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+// storageClaim is one component's claim on an object store location: who wants
+// it, which Secret resolves it, and which condition reports on it. Adding a
+// claimant to the isolation check is adding an entry.
+type storageClaim struct {
+	description string
+	secretName  string
+	condition   string
+
+	// component is the garbage collection shield this claimant's resources
+	// carry, in the componentLabel on its templates. The gate withholds it
+	// when the claimant's storage cannot be accepted, which is what keeps a
+	// configuration the operator refused to render from reading to the
+	// collector as a deletion. A future claimant joins by labelling its
+	// templates and naming the value here.
+	component string
+}
+
+// storageClaims lists every component that writes to object storage. Both
+// entries are LokiStacks today; the shape is what lets a third consumer join
+// without the check growing a special case for it.
+func storageClaims(monitoring *v1alpha1.Monitoring) []storageClaim {
+	var claims []storageClaim
+	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
+		claims = append(claims, storageClaim{
+			description: fmt.Sprintf("usageLogs.storage (secret %q)", usageLogs.Storage.SecretName),
+			secretName:  usageLogs.Storage.SecretName,
+			condition:   conditions.ConditionUsageLogsLokiStackAvailable,
+			component:   componentLokiUsageLogs,
+		})
+	}
+	if logs := monitoring.Spec.Logs; logs != nil && logs.Storage != nil {
+		claims = append(claims, storageClaim{
+			description: fmt.Sprintf("logs.storage (secret %q)", logs.Storage.SecretName),
+			secretName:  logs.Storage.SecretName,
+			condition:   conditions.ConditionLokiStackAvailable,
+			component:   componentLokiLogs,
+		})
+	}
+	return claims
+}
+
+// validateStorageIsolation is the gate in front of every component that writes to
+// object storage. A rejected configuration withholds all of them, because the
+// comparison is the only thing standing between two writers and a shared
+// bucket, and a stack that is never created cannot corrupt anything.
+//
+// It is the only step in the Loki path that refuses to render something the
+// spec asked for, and therefore the only one that owns a garbage collection
+// shield. On failure it hands back the component of every claimant it just
+// refused, because resources missing from the desired set otherwise read to
+// the collector as "the user deleted these".
+//
+// The set is built from the claims, which are built from the spec, so a stack
+// the user removed is not a claimant, is not withheld, and is collected on
+// schedule even while a surviving claimant is in conflict.
+//
+// It reports on each claimant's own condition, with the reason and status
+// carried by the error: a conflict is a determinate answer and reports False,
+// a check that could not run establishes nothing and reports Unknown. Unknown
+// matters because publishLokiEndpoints holds the published endpoint there
+// instead of clearing it, and clearing it takes the usage logs collector and
+// its policies down with it over one failed API call.
+func validateStorageIsolation(
+	ctx context.Context,
+	c client.Client,
+	monitoring *v1alpha1.Monitoring,
+	cm *conditions.ConditionsManager,
+) (map[string]struct{}, error) {
+	claims := storageClaims(monitoring)
+	err := checkStorageIsolation(ctx, c, monitoringNamespace(monitoring), claims)
+	if err == nil {
+		return nil, nil
 	}
 
-	*sources = append(*sources,
-		src(LokiStackTemplate),
-		src(LokiStackNetworkPolicyTemplate),
-		src(LokiStackGatewayNetworkPolicyTemplate),
-	)
-	return nil
+	// An error that names neither reason nor status can only have come from
+	// the check itself, so fall back to the generic unobservable reporting.
+	reason, status := storageCheckFailedReason, metav1.ConditionUnknown
+	var storageErr storageError
+	if errors.As(err, &storageErr) {
+		reason, status = storageErr.conditionReason(), storageErr.conditionStatus()
+	}
+
+	withheld := make(map[string]struct{}, len(claims))
+	for _, claim := range claims {
+		if status == metav1.ConditionUnknown {
+			cm.MarkUnknown(claim.condition, reason, err.Error())
+		} else {
+			cm.MarkFalse(claim.condition, reason, err.Error())
+		}
+		withheld[claim.component] = struct{}{}
+	}
+	return withheld, err
+}
+
+// checkStorageIsolation rejects a configuration that points two claimants at
+// the same object store bucket.
+//
+// Both LokiStacks serve the "application" tenant, and Loki keys its objects by
+// tenant ID rather than by LokiStack name, so two stacks sharing a bucket
+// address the same index and chunk objects and overwrite each other. The
+// LokiStack API exposes no per-stack object prefix, so separate buckets are the
+// only isolation boundary available. Comparing SecretName would not catch this:
+// two different Secrets can carry the same bucketnames.
+//
+// It returns a *storageConflictError when claimants overlap and a
+// *storageCheckError when a Secret could not be resolved. An unresolvable
+// Secret is reported as a failed check rather than treated as isolated: a
+// guard that answers "no conflict" when it could not look is no guard at all.
+//
+// Fewer than two claimants returns nil without reading anything. A collision
+// needs two writers, so a single-stack install is left alone however its
+// storage is configured — including while its Secret is still missing, which
+// the Loki operator reports on the stack itself.
+func checkStorageIsolation(ctx context.Context, c client.Client, namespace string, claims []storageClaim) error {
+	if len(claims) < 2 {
+		return nil
+	}
+
+	// claimedBy maps a canonical location to the claimants that resolve to it,
+	// so a third claimant is detected against both of the first two rather
+	// than only against its immediate predecessor.
+	claimedBy := map[string][]string{}
+	var order []string
+	for _, claim := range claims {
+		locations, err := lokiStorageLocations(ctx, c, namespace, claim.secretName)
+		if err != nil {
+			return newStorageCheckError(err)
+		}
+		// One claimant naming a location twice — a bucketnames list repeating a
+		// bucket, in any spelling that canonicalizes the same way — is still a
+		// single claim on it. Counting both entries would read one writer as
+		// two and report a stack as conflicting with itself. Deduping here
+		// rather than by claimant name keeps the length test below sound even
+		// if two claims ever share a description.
+		claimed := map[string]struct{}{}
+		for _, location := range locations {
+			if _, repeated := claimed[location]; repeated {
+				continue
+			}
+			claimed[location] = struct{}{}
+
+			if len(claimedBy[location]) == 0 {
+				order = append(order, location)
+			}
+			claimedBy[location] = append(claimedBy[location], claim.description)
+		}
+	}
+
+	var shared []string
+	claimants := make([]string, 0, len(claims))
+	for _, location := range order {
+		if len(claimedBy[location]) < 2 {
+			continue
+		}
+		shared = append(shared, location)
+		for _, claimant := range claimedBy[location] {
+			if !slices.Contains(claimants, claimant) {
+				claimants = append(claimants, claimant)
+			}
+		}
+	}
+	if len(shared) == 0 {
+		return nil
+	}
+
+	return &storageConflictError{claimants: claimants, shared: shared}
+}
+
+// lokiStorageLocations resolves a LokiStack storage Secret to the canonical
+// object store locations it writes to: the same bucket name on two different
+// endpoints is two different buckets.
+//
+// Every way of not arriving at a location is an error, including a Secret that
+// does not exist yet and one that names no bucket. Returning "no locations"
+// there would make two unresolvable stacks compare as isolated, and the
+// comparison is the only thing standing between them and a shared bucket. The
+// cost of failing closed is that neither stack is created until both Secrets
+// resolve; the storage Secret watch in SetupWithManager is what keeps that
+// from stalling until the next periodic requeue.
+func lokiStorageLocations(ctx context.Context, c client.Client, namespace, secretName string) ([]string, error) {
+	if secretName == "" {
+		return nil, fmt.Errorf("LokiStack storage secret name is empty: %w", errStorageSecretInvalid)
+	}
+
+	secret := &corev1.Secret{}
+	if err := c.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, secret); err != nil {
+		return nil, fmt.Errorf("reading LokiStack storage secret %s/%s: %w", namespace, secretName, err)
+	}
+
+	// bucketnames holds a comma-separated list; the stacks conflict if any one
+	// bucket is common to both.
+	endpoint := string(secret.Data["endpoint"])
+	var locations []string
+	for bucket := range strings.SplitSeq(string(secret.Data["bucketnames"]), ",") {
+		if bucket = strings.TrimSpace(bucket); bucket == "" {
+			continue
+		}
+		locations = append(locations, canonicalStorageLocation(endpoint, bucket))
+	}
+	if len(locations) == 0 {
+		return nil, fmt.Errorf("LokiStack storage secret %s/%s has no usable bucketnames entry: %w",
+			namespace, secretName, errStorageSecretInvalid)
+	}
+	return locations, nil
+}
+
+// canonicalStorageLocation canonicalizes an (endpoint, bucket) pair into a
+// comparable object store address, so that two spellings of one location
+// compare equal instead of slipping past the overlap check.
+//
+// Nothing here is Loki-specific, and the name says so: it is string handling
+// over an object store address, which is what lets a non-Loki claimant join
+// storageClaims without the comparison growing a case for it.
+//
+// The comparison key is (host, port, path prefix, bucket).
+//
+// The scheme is excluded. http and https are transports to one gateway rather
+// than separate backends — MinIO, Ceph RGW, ODF and S3 all serve the same
+// buckets over both — so keeping it in the key would let two claimants reach
+// one bucket under two spellings and pass the comparison. Excluding it is also
+// what lets an endpoint written bare, the spelling the Loki operator takes for
+// an in-cluster gateway, compare equal to either spelling that names it.
+//
+// Bucket case and the DNS root dot are folded for the same reason. An S3
+// bucket name is a DNS label, so a backend that distinguishes "my-bucket" from
+// "MY-BUCKET" is out of spec, and "minio.odh.svc.cluster.local." is an
+// ordinary in-cluster spelling of the host without the dot. Where a spelling
+// is ambiguous the gate fails closed, because a conflict it invents is loud
+// and the user can rename a bucket, while one it misses is silent corruption.
+//
+// Credentials are deliberately excluded: two identities writing to one bucket
+// still collide, so comparing access keys would only mask the conflict. DNS
+// aliases pointing at one server are not detected; that needs resolution, not
+// parsing.
+func canonicalStorageLocation(endpoint, bucket string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	bucket = strings.ToLower(strings.TrimSpace(bucket))
+
+	// A bare "host" or "host:port" would parse as a scheme, so supply the
+	// authority marker that makes url.Parse read it as one.
+	toParse := endpoint
+	if !strings.Contains(toParse, "://") {
+		toParse = "//" + toParse
+	}
+	parsed, err := url.Parse(toParse)
+	if err != nil {
+		// An unparseable endpoint still has to compare equal to itself. It
+		// cannot collide with a parsed one by accident: every key below opens
+		// with the authority marker and this one does not.
+		return endpoint + "/" + bucket
+	}
+
+	// Hostnames are case-insensitive (RFC 4343) and the DNS root dot names the
+	// same host as its absence.
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+
+	// An explicitly written default port names the same endpoint as none at
+	// all, whichever scheme carried it, since the scheme is not in the key.
+	port := parsed.Port()
+	if _, isDefault := defaultWebPorts[port]; isDefault {
+		port = ""
+	}
+	if port != "" {
+		// JoinHostPort restores the brackets url.Parse stripped from an IPv6
+		// literal. A bracketless literal survives the portless path instead,
+		// which is only ever compared against another key, never reparsed.
+		host = net.JoinHostPort(host, port)
+	}
+
+	// Virtual-host-style addressing folds the bucket into the hostname; strip it
+	// so that form matches the path-style spelling of the same location.
+	if bucket != "" {
+		host = strings.TrimPrefix(host, bucket+".")
+	}
+
+	// path.Clean collapses repeated slashes and resolves dot segments. Prefix
+	// case is significant on self-hosted gateways, so it is left alone.
+	prefix := path.Clean("/" + parsed.Path)
+	if prefix == "/" {
+		prefix = ""
+	}
+
+	return "//" + host + prefix + "/" + bucket
 }
 
 // deployClusterLogForwarder deploys the ClusterLogForwarder when logs are configured.
@@ -666,7 +1110,7 @@ func deployClusterLogForwarder(
 		src(ClusterLogForwarderNetworkPolicyTemplate),
 	)
 
-	lokiReady, err := isLokiStackReady(ctx, c, monitoring)
+	lokiReady, err := isLokiStackReady(ctx, c, monitoring, lokiStackResourceName)
 	if err != nil {
 		return fmt.Errorf("checking LokiStack readiness for log forwarding: %w", err)
 	}
@@ -848,13 +1292,13 @@ func hasReadyCondition(obj *unstructured.Unstructured) (bool, error) {
 	return false, nil
 }
 
-// isLokiStackReady checks if the LokiStack CR exists and is in a Ready state.
-func isLokiStackReady(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) (bool, error) {
+// isLokiStackReady checks if the named LokiStack CR exists and is in a Ready state.
+func isLokiStackReady(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring, name string) (bool, error) {
 	lokiStack := &unstructured.Unstructured{}
 	lokiStack.SetGroupVersionKind(gvk.LokiStack)
 
 	err := c.Get(ctx, types.NamespacedName{
-		Name:      lokiStackResourceName,
+		Name:      name,
 		Namespace: monitoringNamespace(monitoring),
 	}, lokiStack)
 	if err != nil {

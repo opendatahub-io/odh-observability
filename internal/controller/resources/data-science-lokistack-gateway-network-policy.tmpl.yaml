@@ -5,6 +5,7 @@ metadata:
   namespace: {{.Namespace}}
   labels:
     platform.opendatahub.io/part-of: monitoring
+    platform.opendatahub.io/component: loki-logs
 spec:
   podSelector:
     matchLabels:
@@ -14,14 +15,6 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # Usage logs are sent by the operator-owned collector.
-    - from:
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: {{.UsageLogsCollectorName}}-collector
-      ports:
-        - protocol: TCP
-          port: 8080
     # ClusterLogForwarder is owned by this module but its Vector pods are
     # created by CLO in the dedicated openshift-logging namespace.
     - from:
