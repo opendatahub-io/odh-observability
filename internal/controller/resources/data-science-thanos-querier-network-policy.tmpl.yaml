@@ -20,10 +20,8 @@ spec:
             matchLabels:
               app.kubernetes.io/name: prometheus
               app.kubernetes.io/instance: data-science-monitoringstack
-        - podSelector:
-            matchLabels:
-              instance: data-science-perses
-              app.kubernetes.io/name: data-science-perses
+        # Perses must not reach :10902 directly — force queries through
+        # data-science-thanos-querier-proxy:8443 (namespace gate lives there).
         - podSelector:
             matchLabels:
               app: data-science-thanos-querier-proxy

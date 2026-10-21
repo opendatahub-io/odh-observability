@@ -44,6 +44,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierIngressConnectivity(t *testing
 		name      string
 		podPrefix string
 		selector  map[string]string
+		allowed   bool
 	}{
 		{
 			name:      "prometheus",
@@ -52,7 +53,10 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierIngressConnectivity(t *testing
 				"app.kubernetes.io/name":     "prometheus",
 				"app.kubernetes.io/instance": MonitoringStackName,
 			},
+			allowed: true,
 		},
+		// Perses must not reach Thanos :10902 directly; queries go through
+		// data-science-thanos-querier-proxy so data-science-metrics-view applies.
 		{
 			name:      "perses",
 			podPrefix: persesPodName,
@@ -60,6 +64,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierIngressConnectivity(t *testing
 				"instance":               PersesName,
 				"app.kubernetes.io/name": PersesName,
 			},
+			allowed: false,
 		},
 		{
 			name:      "korrel8r",
@@ -69,6 +74,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierIngressConnectivity(t *testing
 				"app.kubernetes.io/component": "correlation",
 				"app.kubernetes.io/part-of":   "monitoring",
 			},
+			allowed: true,
 		},
 		{
 			name:      "authenticated-proxy",
@@ -76,6 +82,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierIngressConnectivity(t *testing
 			selector: map[string]string{
 				"app": ThanosQuerierProxyName,
 			},
+			allowed: true,
 		},
 	}
 
@@ -83,7 +90,7 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierIngressConnectivity(t *testing
 		t.Run(source.name, func(t *testing.T) {
 			tc := tc.WithT(t)
 			tc.assertReadyPodLabels(t, source.name, source.podPrefix, source.selector)
-			tc.runThanosIngressProbe(t, source.name, tc.MonitoringNamespace, source.selector, endpoint, true)
+			tc.runThanosIngressProbe(t, source.name, tc.MonitoringNamespace, source.selector, endpoint, source.allowed)
 		})
 	}
 

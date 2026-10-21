@@ -1,29 +1,5 @@
-# Cluster Prometheus Datasource for Perses
-#
-# This is a short-term workaround to provide access to cluster-wide metrics
-# via the OpenShift Monitoring stack's Thanos Querier.
-#
-# This datasource points to the cluster's Thanos Querier (in openshift-monitoring)
-# which aggregates metrics from all Prometheus instances in the cluster.
-#
-# This will be replaced/updated once decentralized metrics collection is implemented.
-#
-# The configuration uses:
-# - ConfigMap-based TLS CA (prometheus-web-tls-ca with OpenShift service CA)
-# - A secret for bearer token authentication to Thanos Querier
-#
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: cluster-prometheus-datasource-secret
-  namespace: {{.Namespace}}
-  labels:
-    platform.opendatahub.io/part-of: monitoring
-  annotations:
-    kubernetes.io/service-account.name: data-science-prometheus-cluster-proxy
-type: kubernetes.io/service-account-token
----
+# OCP admin / cluster-wide Prometheus (:9091). Not the 99814 DS scoping lane.
+# Caller token, no shared SA. default:false so DS proxy remains default.
 apiVersion: perses.dev/{{.PersesAPIVersion}}
 kind: PersesDatasource
 metadata:
@@ -32,7 +8,7 @@ metadata:
   labels:
     platform.opendatahub.io/part-of: monitoring
   annotations:
-    platform.opendatahub.io/description: "Cluster-wide Prometheus metrics via OpenShift Monitoring Thanos Querier"
+    platform.opendatahub.io/description: "Cluster-wide Prometheus metrics via OpenShift Monitoring Thanos Querier (caller token)"
 spec:
   client:
     tls:
@@ -43,16 +19,15 @@ spec:
         name: prometheus-web-tls-ca
         certPath: service-ca.crt
   config:
-    default: true
+    default: false
     display:
       name: "Cluster Prometheus"
-      description: "OpenShift Monitoring Thanos Querier - provides cluster-wide metrics"
+      description: "OpenShift Monitoring Thanos Querier - cluster-wide metrics (caller token, no shared SA)"
     plugin:
       kind: "PrometheusDatasource"
       spec:
         proxy:
           kind: HTTPProxy
           spec:
-            # Secret contains bearer token for Thanos Querier authentication
             secret: cluster-prometheus-datasource-secret
             url: https://thanos-querier.openshift-monitoring.svc:9091
