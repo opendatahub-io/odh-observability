@@ -15,6 +15,8 @@ import (
 	gTypes "github.com/onsi/gomega/types"
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -1017,6 +1019,7 @@ func (tc *MonitoringTestCtx) runThanosQuerierTests(t *testing.T) {
 		})
 
 		t.Run("Integration — Thanos ⇄ Perses datasource wiring", tc.ValidateThanosPersesDatasourceIntegration)
+		t.Run("Integration — Perses datasource proxy namespace scoping", tc.ValidatePersesDatasourceProxyNamespaceScoping)
 	})
 }
 
@@ -1127,6 +1130,8 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteAuthorizationBoundary(t *
 			jq.Match(`.status.readyReplicas == 1`),
 			jq.Match(`.spec.template.spec.serviceAccountName == "%s"`, ThanosQuerierProxyName),
 			jq.Match(`.spec.template.spec.containers | map(.name) | contains(["kube-rbac-proxy", "prom-label-proxy"])`),
+			// Perses Project=All sends namespace=a&namespace=b; --regex-match rejects that.
+			jq.Match(`[.spec.template.spec.containers[]? | select(.name == "prom-label-proxy") | select(.args | index("--regex-match"))] | length == 0`),
 		)),
 		WithCustomErrorMsg("Thanos Querier proxy deployment should be ready with both authorization containers"),
 	)
@@ -1192,6 +1197,9 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteAuthorizationBoundary(t *
 			jq.Match(`.spec.podSelector.matchLabels.app == "%s"`, ThanosQuerierProxyName),
 			jq.Match(`.spec.ingress[0].from[0].namespaceSelector.matchLabels["policy-group.network.openshift.io/ingress"] == ""`),
 			jq.Match(`.spec.ingress[0].ports[0].port == 8443`),
+			jq.Match(`.spec.ingress[1].from[0].podSelector.matchLabels.instance == "%s"`, PersesName),
+			jq.Match(`.spec.ingress[1].from[0].podSelector.matchLabels["app.kubernetes.io/name"] == "%s"`, PersesName),
+			jq.Match(`.spec.ingress[1].ports[0].port == 8443`),
 		)),
 	)
 }
@@ -1404,22 +1412,25 @@ func (tc *MonitoringTestCtx) ValidateThanosPersesDatasourceIntegration(t *testin
 
 	tc.ensureMetricsManaged()
 
-	expectedThanosURL := fmt.Sprintf("http://%s.%s.svc.cluster.local:10902", thanosQuerierDeploymentName, tc.MonitoringNamespace)
+	expectedProxyURL := fmt.Sprintf("https://%s.%s.svc.cluster.local:8443", ThanosQuerierProxyName, tc.MonitoringNamespace)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: PersesDatasourceName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
 			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
-			jq.Match(`.spec.config.plugin.spec.proxy.spec.url == "%s"`, expectedThanosURL),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url == "%s"`, expectedProxyURL),
+			jq.Match(`.spec.config.plugin.spec.queryParams.namespace == "${namespace:queryparam}"`),
+			jq.Match(`.spec.client.tls.enable == true`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.secret == "data-science-prometheus-datasource-secret"`),
 		)),
 		WithCustomErrorMsg("Integration=Thanos⇄Perses Assertion=dependent-dashboards: "+
-			"PersesDatasource %s does not route through HTTPProxy to Thanos Querier at %s", PersesDatasourceName, expectedThanosURL),
+			"PersesDatasource %s does not route through HTTPProxy to Thanos namespace proxy at %s", PersesDatasourceName, expectedProxyURL),
 	)
 
 	t.Logf(
 		"✓ THANOS ⇄ PERSES DATASOURCE WIRING OK\n"+
-			"  • Dependent dashboards: PersesDatasource %s → HTTPProxy → %s\n",
-		PersesDatasourceName, expectedThanosURL)
+			"  • Dependent dashboards: PersesDatasource %s → HTTPProxy → %s (namespace-enforcing)\n",
+		PersesDatasourceName, expectedProxyURL)
 }
 
 func (tc *MonitoringTestCtx) ValidateThanosComponentVersionBoundaryUnsupported(t *testing.T) {
@@ -2162,6 +2173,7 @@ func (tc *MonitoringTestCtx) ValidatePersesCRConfiguration(t *testing.T) {
 		WithMinimalObject(gvk.Perses, types.NamespacedName{Name: PersesName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
 			jq.Match(`.spec.containerPort == 8080`),
+			jq.Match(`.spec.config.security == null`),
 			jq.Match(`.spec.config.database.file != null`),
 			jq.Match(`(.apiVersion | contains("v1alpha1") | not) or .spec.storage.size == "1Gi"`),
 			jq.Match(`.metadata.labels["platform.opendatahub.io/part-of"] == "monitoring"`),
@@ -2414,13 +2426,18 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceWithPrometheus(t *testing.T
 		WithCondition(And(
 			tc.monitoringOwnerReferencesCondition(),
 			jq.Match(`.status.conditions[] | select(.type == "Available") | .status == "True"`),
-			jq.Match(`.spec.config.default == false`),
+			jq.Match(`.spec.config.default == true`),
 			jq.Match(`.spec.config.plugin.kind == "PrometheusDatasource"`),
 			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
-			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains("thanos-querier-data-science-thanos-querier")`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains("data-science-thanos-querier-proxy")`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains(":8443")`),
 			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains("%s")`, tc.MonitoringNamespace),
+			jq.Match(`(.spec.config.plugin.spec.proxy.spec.url | contains(":10902")) | not`),
+			jq.Match(`.spec.config.plugin.spec.queryParams.namespace == "${namespace:queryparam}"`),
+			jq.Match(`.spec.client.tls.enable == true`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.secret == "data-science-prometheus-datasource-secret"`),
 		)),
-		WithCustomErrorMsg("Data Science PersesDatasource CR should be created with correct Thanos Querier proxy configuration"),
+		WithCustomErrorMsg("Data Science PersesDatasource CR should route through the namespace-enforcing Thanos proxy"),
 	)
 
 	tc.EnsureResourceExists(
@@ -2428,14 +2445,49 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceWithPrometheus(t *testing.T
 		WithCondition(And(
 			tc.monitoringOwnerReferencesCondition(),
 			jq.Match(`.status.conditions[] | select(.type == "Available") | .status == "True"`),
-			jq.Match(`.spec.config.default == true`),
+			jq.Match(`.spec.config.default == false`),
 			jq.Match(`.spec.config.plugin.kind == "PrometheusDatasource"`),
 			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
 			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains("thanos-querier.openshift-monitoring")`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains(":9091")`),
+			jq.Match(`(.spec.config.plugin.spec.queryParams // {}) | length == 0`),
 			jq.Match(`.spec.client.tls.enable == true`),
-			jq.Match(`.spec.config.plugin.spec.proxy.spec.secret == "%s"`, ClusterPrometheusDatasourceSecret),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.secret == "cluster-prometheus-datasource-secret"`),
 		)),
-		WithCustomErrorMsg("Cluster Prometheus PersesDatasource CR should be created with correct openshift-monitoring Thanos Querier configuration"),
+		WithCustomErrorMsg("Cluster PersesDatasource should use caller token on :9091 (no shared SA, not default)"),
+	)
+
+	// If a K8s Secret still exists under the shared name, it must not be an SA token.
+	var clusterDSSecret corev1.Secret
+	err := tc.Client().Get(tc.Context(), types.NamespacedName{
+		Name:      "cluster-prometheus-datasource-secret",
+		Namespace: tc.MonitoringNamespace,
+	}, &clusterDSSecret)
+	if err == nil {
+		if clusterDSSecret.Type == corev1.SecretTypeServiceAccountToken {
+			t.Fatal("cluster-prometheus-datasource-secret must not be a shared service-account token")
+		}
+		if clusterDSSecret.Annotations["kubernetes.io/service-account.name"] == "data-science-prometheus-cluster-proxy" {
+			t.Fatal("cluster-prometheus-datasource-secret must not reference the cluster-proxy SA")
+		}
+	} else if !k8serr.IsNotFound(err) {
+		t.Fatalf("reading cluster-prometheus-datasource-secret: %v", err)
+	}
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusTenancyDatasourceName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(And(
+			tc.monitoringOwnerReferencesCondition(),
+			jq.Match(`.spec.config.default == false`),
+			jq.Match(`.spec.config.plugin.kind == "PrometheusDatasource"`),
+			jq.Match(`.spec.config.plugin.spec.proxy.kind == "HTTPProxy"`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains("thanos-querier.openshift-monitoring")`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.url | contains(":9092")`),
+			jq.Match(`.spec.config.plugin.spec.queryParams.namespace == "${namespace:queryparam}"`),
+			jq.Match(`.spec.client.tls.enable == true`),
+			jq.Match(`.spec.config.plugin.spec.proxy.spec.secret == "cluster-prometheus-tenancy-datasource-secret"`),
+		)),
+		WithCustomErrorMsg("Cluster tenancy PersesDatasource should use caller token on :9092 with namespace="),
 	)
 }
 
@@ -2458,7 +2510,13 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceLifecycle(t *testing.T) {
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusDatasourceName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(jq.Match(`.metadata.name == "%s"`, ClusterPrometheusDatasourceName)),
-		WithCustomErrorMsg("Cluster Prometheus PersesDatasource should exist when metrics are configured"),
+		WithCustomErrorMsg("Cluster PersesDatasource should exist when metrics are configured"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusTenancyDatasourceName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(jq.Match(`.metadata.name == "%s"`, ClusterPrometheusTenancyDatasourceName)),
+		WithCustomErrorMsg("Cluster tenancy PersesDatasource should exist when metrics are configured"),
 	)
 
 	tc.updateMonitoringConfig(
@@ -2481,6 +2539,10 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceLifecycle(t *testing.T) {
 	tc.EnsureResourceGone(
 		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusDatasourceName, Namespace: tc.MonitoringNamespace}),
 	)
+
+	tc.EnsureResourceGone(
+		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusTenancyDatasourceName, Namespace: tc.MonitoringNamespace}),
+	)
 	tc.waitForPrometheusPodsGone(t)
 
 	tc.updateMonitoringConfig(
@@ -2497,7 +2559,13 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceLifecycle(t *testing.T) {
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusDatasourceName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(jq.Match(`.metadata.name == "%s"`, ClusterPrometheusDatasourceName)),
-		WithCustomErrorMsg("Cluster Prometheus PersesDatasource should be recreated when metrics are re-enabled"),
+		WithCustomErrorMsg("Cluster PersesDatasource should be recreated when metrics are re-enabled"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.PersesDatasource, types.NamespacedName{Name: ClusterPrometheusTenancyDatasourceName, Namespace: tc.MonitoringNamespace}),
+		WithCondition(jq.Match(`.metadata.name == "%s"`, ClusterPrometheusTenancyDatasourceName)),
+		WithCustomErrorMsg("Cluster tenancy PersesDatasource should be recreated when metrics are re-enabled"),
 	)
 }
 
@@ -2922,6 +2990,7 @@ func (tc *MonitoringTestCtx) ValidateMonitoringServiceDisabled(t *testing.T) {
 		{gvk: gvk.Perses, name: PersesName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.PersesDatasource, name: PersesDatasourceName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.PersesDatasource, name: ClusterPrometheusDatasourceName, namespace: tc.MonitoringNamespace},
+		{gvk: gvk.PersesDatasource, name: ClusterPrometheusTenancyDatasourceName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.NetworkPolicy, name: UsageLogsCollectorNetworkPolicyName, namespace: tc.MonitoringNamespace},
 		{gvk: gvk.NetworkPolicy, name: UsageLogsLokiStackNetworkPolicyName, namespace: tc.MonitoringNamespace},
 	} {

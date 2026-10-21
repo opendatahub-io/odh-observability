@@ -1,3 +1,6 @@
+# Data Science Prometheus datasource (DEFAULT).
+# Perses → data-science-thanos-querier-proxy:8443 with namespace= (caller token).
+# BREAKING: default:true; panels needing OCP metrics must pin those datasources.
 apiVersion: perses.dev/{{.PersesAPIVersion}}
 kind: PersesDatasource
 metadata:
@@ -6,18 +9,30 @@ metadata:
   labels:
     platform.opendatahub.io/part-of: monitoring
   annotations:
-    platform.opendatahub.io/description: "Data Science specific metrics from the local MonitoringStack"
+    platform.opendatahub.io/description: "Data Science metrics via namespace-enforcing Thanos proxy"
 spec:
+  client:
+    tls:
+      enable: true
+      caCert:
+        type: configmap
+        namespace: {{.Namespace}}
+        name: prometheus-web-tls-ca
+        certPath: service-ca.crt
   config:
-    # default: false - Cluster Prometheus is the default until decentralized collection is implemented
-    default: false
+    default: true
     display:
       name: "Data Science Prometheus"
-      description: "Data Science MonitoringStack Thanos Querier - provides DS workload metrics"
+      description: "Data Science Thanos Querier via namespace-enforcing proxy (requires data-science-metrics-view)"
     plugin:
       kind: "PrometheusDatasource"
       spec:
         proxy:
           kind: HTTPProxy
           spec:
-            url: http://thanos-querier-data-science-thanos-querier.{{.Namespace}}.svc.cluster.local:10902
+            # TLS CA only — Perses operator creates this Secret from client.tls.
+            # No bearer token: Perses forwards the caller's Authorization header.
+            secret: data-science-prometheus-datasource-secret
+            url: https://data-science-thanos-querier-proxy.{{.Namespace}}.svc.cluster.local:8443
+        queryParams:
+          namespace: "${namespace:queryparam}"

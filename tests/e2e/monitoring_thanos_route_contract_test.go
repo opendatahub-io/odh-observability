@@ -165,6 +165,20 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 		t.Fatalf("restricted Thanos route request must be forbidden for an unauthorized namespace, got %d", restricted.HTTPStatus)
 	}
 
+	// Datasource contract: Perses injects namespace= via queryParams. Missing it
+	// must fail closed (not fall through to unscoped Thanos).
+	missingNamespace, err := probeThanosRouteWithError(rootCAs, routeHost, authorizedToken, "", thanosRouteProbeQuery)
+	if err != nil {
+		t.Fatalf("missing-namespace Thanos route probe failed: %v", err)
+	}
+	logThanosRouteEvidence(t, "authorized-missing-namespace", missingNamespace)
+	if missingNamespace.HTTPStatus == http.StatusOK {
+		t.Fatalf("authorized query without namespace= must not succeed, got %d", missingNamespace.HTTPStatus)
+	}
+	if missingNamespace.HTTPStatus != http.StatusBadRequest && missingNamespace.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("authorized query without namespace= must be 400 or 403, got %d", missingNamespace.HTTPStatus)
+	}
+
 	var authorized thanosRouteProbe
 	t.Log("Waiting for the authorized Thanos route to return namespace-scoped Prometheus data")
 	tc.g.Eventually(func() error {
@@ -465,7 +479,9 @@ func probeThanosRouteWithError(rootCAs *x509.CertPool, routeHost, token, namespa
 		Path:   "/api/v1/query",
 	}
 	query := endpoint.Query()
-	query.Set("namespace", namespace)
+	if namespace != "" {
+		query.Set("namespace", namespace)
+	}
 	query.Set("query", promQL)
 	endpoint.RawQuery = query.Encode()
 
