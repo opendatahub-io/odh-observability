@@ -662,6 +662,43 @@ func deployRHOAILogsLokiStack(
 	})
 }
 
+// deployLokiStacks renders each LokiStack whose component the storage gate
+// left standing.
+//
+// The withheld check is the only thing separating these from the other deploy
+// actions: past it they are ordinary actions whose errors abort the round,
+// which is what keeps them free of any shield of their own. It walks
+// lokiComponents rather than calling the two in sequence so that the set of
+// components the gate can withhold and the set the reconcile deploys cannot
+// drift apart.
+func deployLokiStacks(
+	ctx context.Context,
+	c client.Client,
+	monitoring *v1alpha1.Monitoring,
+	cm *conditions.ConditionsManager,
+	sources *[]rendertemplate.TemplateSource,
+	withheldComponents map[string]struct{},
+) error {
+	for _, component := range lokiComponents {
+		if _, withheld := withheldComponents[component]; withheld {
+			continue
+		}
+
+		var err error
+		switch component {
+		case componentLokiUsageLogs:
+			err = deployUsageLogsLokiStack(ctx, c, monitoring, cm, sources)
+		case componentLokiLogs:
+			err = deployRHOAILogsLokiStack(ctx, c, monitoring, cm, sources)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // lokiStackDeployment is everything that differs between the two stacks, so
 // the deploy path below can be written once.
 //
