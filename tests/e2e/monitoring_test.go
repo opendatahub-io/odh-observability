@@ -14,7 +14,13 @@ import (
 
 	gTypes "github.com/onsi/gomega/types"
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	configv1 "github.com/openshift/api/config/v1"
+	ocpcrypto "github.com/openshift/library-go/pkg/crypto"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
+	corev1 "k8s.io/api/core/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -2514,6 +2520,7 @@ func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 
 		t.Run("Prometheus restricted resource configuration", tc.ValidatePrometheusRestrictedResourceConfiguration)
 		t.Run("Prometheus secure proxy authentication", tc.ValidatePrometheusSecureProxyAuthentication)
+		t.Run("Monitoring proxy TLS profile rollout", tc.ValidateMonitoringProxyTLSProfileRollout)
 		t.Run("Tenant workload metrics namespace restriction", tc.ValidateTenantWorkloadMetricsNamespaceRestriction)
 		t.Run("OTLP metric identity cannot be spoofed", tc.ValidateOTLPMetricIdentityCannotBeSpoofed)
 		t.Run("Node metrics endpoint deployment", tc.ValidateNodeMetricsEndpointDeployment)
@@ -2687,6 +2694,233 @@ func (tc *MonitoringTestCtx) ValidatePrometheusSecureProxyAuthentication(t *test
 		)),
 		WithCustomErrorMsg("ClusterRoleBinding should reference system:auth-delegator for authentication and authorization"),
 	)
+}
+
+func (tc *MonitoringTestCtx) ValidateMonitoringProxyTLSProfileRollout(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+	tc.setupMetrics(t)
+
+	proxyDeployments := []string{
+		"data-science-prometheus-namespace-proxy",
+		"data-science-prometheus-cluster-proxy",
+		ThanosQuerierProxyName,
+	}
+
+	for _, deploymentName := range proxyDeployments {
+		deploymentKey := types.NamespacedName{
+			Name:      deploymentName,
+			Namespace: tc.MonitoringNamespace,
+		}
+		tc.EnsureDeploymentReady(WithMinimalObject(gvk.Deployment, deploymentKey))
+
+		deployment := tc.FetchResource(WithMinimalObject(gvk.Deployment, deploymentKey))
+		containers, found, err := unstructured.NestedSlice(
+			deployment.Object, "spec", "template", "spec", "containers",
+		)
+		require.NoError(t, err)
+		require.True(t, found)
+
+		var proxyContainer map[string]any
+		for _, rawContainer := range containers {
+			container, ok := rawContainer.(map[string]any)
+			require.True(t, ok)
+			if container["name"] == "kube-rbac-proxy" {
+				proxyContainer = container
+				break
+			}
+		}
+		require.NotNil(t, proxyContainer, "kube-rbac-proxy container not found in %s", deploymentName)
+
+		args, found, err := unstructured.NestedStringSlice(proxyContainer, "args")
+		require.NoError(t, err)
+		require.True(t, found)
+
+		expected := tc.expectedKubeRBACProxyTLSArgs(t)
+
+		minVersion, found := findProxyArg(args, "--tls-min-version=")
+		require.True(t, found, "%s must set --tls-min-version", deploymentName)
+		require.Equal(t, expected.minVersion, minVersion)
+
+		cipherSuites, found := findProxyArg(args, "--tls-cipher-suites=")
+		if expected.cipherSuites == "" {
+			require.False(t, found, "TLS 1.3 must not restrict cipher suites in %s", deploymentName)
+		} else {
+			require.True(t, found, "TLS 1.2 must set cipher suites in %s", deploymentName)
+			require.Equal(t, expected.cipherSuites, cipherSuites)
+		}
+
+		curvePreferences, found := findProxyArg(args, "--tls-curve-preferences=")
+		if expected.curvePreferences == "" {
+			require.False(t, found, "%s must omit curve preferences when no usable groups are configured", deploymentName)
+		} else {
+			require.True(t, found, "%s must set curve preferences", deploymentName)
+			require.Equal(t, expected.curvePreferences, curvePreferences)
+		}
+
+		_, found = findProxyArg(args, "--tls-cipher-suite=")
+		require.False(t, found, "%s uses kube-rbac-proxy and must use the plural cipher flag", deploymentName)
+	}
+}
+
+type expectedProxyTLSArgs struct {
+	minVersion       string
+	cipherSuites     string
+	curvePreferences string
+}
+
+func (tc *MonitoringTestCtx) expectedKubeRBACProxyTLSArgs(t *testing.T) expectedProxyTLSArgs {
+	t.Helper()
+
+	profile := tc.expectedClusterTLSProfile(t)
+	spec := expectedProxyTLSProfileSpec(t, profile)
+	minVersion := expectedProxyTLSMinVersion(t, spec.MinTLSVersion)
+
+	cipherSuites := ""
+	if minVersion == "VersionTLS12" {
+		cipherSuites = expectedProxyTLSCipherSuites(spec.Ciphers)
+	}
+
+	return expectedProxyTLSArgs{
+		minVersion:       minVersion,
+		cipherSuites:     cipherSuites,
+		curvePreferences: tc.expectedProxyTLSCurvePreferences(t, spec.Groups),
+	}
+}
+
+func (tc *MonitoringTestCtx) expectedClusterTLSProfile(t *testing.T) *configv1.TLSSecurityProfile {
+	t.Helper()
+
+	apiServer := &configv1.APIServer{}
+	err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: "cluster"}, apiServer)
+	if k8serr.IsNotFound(err) || meta.IsNoMatchError(err) {
+		return nil
+	}
+	require.NoError(t, err, "failed to get cluster APIServer configuration")
+
+	switch apiServer.Spec.TLSAdherence {
+	case configv1.TLSAdherencePolicyNoOpinion, configv1.TLSAdherencePolicyLegacyAdheringComponentsOnly:
+		return nil
+	default:
+		return apiServer.Spec.TLSSecurityProfile
+	}
+}
+
+func expectedProxyTLSProfileSpec(t *testing.T, profile *configv1.TLSSecurityProfile) configv1.TLSProfileSpec {
+	t.Helper()
+
+	if profile == nil || profile.Type == "" {
+		return *configv1.TLSProfiles[configv1.TLSProfileIntermediateType]
+	}
+	if profile.Type == configv1.TLSProfileCustomType {
+		require.NotNil(t, profile.Custom, "strict custom TLS profile must define a specification")
+		return profile.Custom.TLSProfileSpec
+	}
+
+	spec, ok := configv1.TLSProfiles[profile.Type]
+	require.True(t, ok, "unsupported strict TLS profile type %q", profile.Type)
+	return *spec
+}
+
+func expectedProxyTLSMinVersion(t *testing.T, minVersion configv1.TLSProtocolVersion) string {
+	t.Helper()
+
+	switch minVersion {
+	case configv1.VersionTLS12:
+		return "VersionTLS12"
+	case configv1.VersionTLS13:
+		return "VersionTLS13"
+	default:
+		t.Fatalf("kube-rbac-proxy cannot represent minimum TLS version %q", minVersion)
+		return ""
+	}
+}
+
+func expectedProxyTLSCipherSuites(ciphers []string) string {
+	ianaCiphers := ocpcrypto.OpenSSLToIANACipherSuites(ciphers)
+	filtered := make([]string, 0, len(ianaCiphers))
+	for _, cipher := range ianaCiphers {
+		code, err := ocpcrypto.CipherSuite(cipher)
+		if err != nil || code&0xff00 == 0x1300 {
+			continue
+		}
+		filtered = append(filtered, cipher)
+	}
+	if len(filtered) == 0 {
+		filtered = ocpcrypto.OpenSSLToIANACipherSuites(
+			configv1.TLSProfiles[configv1.TLSProfileIntermediateType].Ciphers,
+		)
+	}
+	return strings.Join(filtered, ",")
+}
+
+func (tc *MonitoringTestCtx) expectedProxyTLSCurvePreferences(t *testing.T, groups []configv1.TLSGroup) string {
+	t.Helper()
+
+	if len(groups) == 0 {
+		return ""
+	}
+
+	curves, _ := ocpcrypto.TLSGroupsToCurveIDs(groups)
+	fipsEnabled := tc.expectedClusterFIPSEnabled(t)
+	allowedCurves := map[int]struct{}{
+		23: {}, 24: {}, 25: {}, 29: {}, 4588: {},
+	}
+	if fipsEnabled {
+		allowedCurves = map[int]struct{}{23: {}, 24: {}, 25: {}}
+	}
+
+	seen := make(map[int]struct{}, len(curves))
+	curveIDs := make([]string, 0, len(curves))
+	for _, curve := range curves {
+		if _, ok := allowedCurves[int(curve)]; !ok {
+			continue
+		}
+		if _, ok := seen[int(curve)]; ok {
+			continue
+		}
+		seen[int(curve)] = struct{}{}
+		curveIDs = append(curveIDs, strconv.Itoa(int(curve)))
+	}
+
+	require.NotEmpty(t, curveIDs, "strict TLS profile groups contain no kube-rbac-proxy-supported curves")
+	return strings.Join(curveIDs, ",")
+}
+
+func (tc *MonitoringTestCtx) expectedClusterFIPSEnabled(t *testing.T) bool {
+	t.Helper()
+
+	configMap := &corev1.ConfigMap{}
+	err := tc.Client().Get(tc.Context(), types.NamespacedName{
+		Namespace: "kube-system",
+		Name:      "cluster-config-v1",
+	}, configMap)
+	if k8serr.IsNotFound(err) {
+		return false
+	}
+	require.NoError(t, err, "failed to get cluster install configuration")
+
+	installConfig := configMap.Data["install-config"]
+	if installConfig == "" {
+		return false
+	}
+
+	var parsedInstallConfig struct {
+		FIPS bool `yaml:"fips"`
+	}
+	if err := yaml.Unmarshal([]byte(installConfig), &parsedInstallConfig); err != nil {
+		return strings.Contains(strings.ToLower(installConfig), "fips: true")
+	}
+	return parsedInstallConfig.FIPS
+}
+
+func findProxyArg(args []string, prefix string) (string, bool) {
+	for _, arg := range args {
+		if value, found := strings.CutPrefix(arg, prefix); found {
+			return value, true
+		}
+	}
+	return "", false
 }
 
 func (tc *MonitoringTestCtx) ValidateNodeMetricsEndpointDeployment(t *testing.T) {

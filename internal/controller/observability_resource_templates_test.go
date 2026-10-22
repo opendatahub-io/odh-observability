@@ -228,7 +228,9 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		"--config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml",
 		"--tls-cert-file=/etc/tls/private/tls.crt",
 		"--tls-private-key-file=/etc/tls/private/tls.key",
-		"--tls-min-version=VersionTLS12",
+		"--tls-min-version="+proxyTLSVersion12,
+		"--tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		"--tls-curve-preferences=29,25",
 	)
 	assertContainerArgs(t, findContainer(t, containers, "prom-label-proxy"),
 		"--insecure-listen-address=127.0.0.1:9091",
@@ -763,7 +765,9 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		"--config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml",
 		"--tls-cert-file=/etc/tls/private/tls.crt",
 		"--tls-private-key-file=/etc/tls/private/tls.key",
-		"--tls-min-version=VersionTLS12",
+		"--tls-min-version="+proxyTLSVersion12,
+		"--tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		"--tls-curve-preferences=29,25",
 	)
 	assertContainerArgs(t, findContainer(t, containers, "prom-label-proxy"),
 		"--insecure-listen-address=127.0.0.1:9091",
@@ -803,18 +807,23 @@ func TestPrometheusClusterProxyTemplateContract(t *testing.T) {
 	if len(containers) != 1 {
 		t.Fatalf("cluster proxy must have one kube-rbac-proxy container, got %d", len(containers))
 	}
-	assertContainerArgs(t, findContainer(t, containers, "kube-rbac-proxy"),
+	proxyContainer := findContainer(t, containers, "kube-rbac-proxy")
+	assertContainerArgs(t, proxyContainer,
 		"--secure-listen-address=0.0.0.0:8443",
 		"--upstream=https://prometheus-operated."+testMonitoringNamespace+".svc:9090",
 		"--config-file=/etc/kube-rbac-proxy/config.yaml",
 		"--tls-cert-file=/etc/tls/private/tls.crt",
 		"--tls-private-key-file=/etc/tls/private/tls.key",
-		"--tls-min-version=VersionTLS12",
+		"--tls-min-version="+proxyTLSVersion12,
+		"--tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		"--tls-curve-preferences=29,25",
 		"--upstream-ca-file=/etc/prometheus-ca/service-ca.crt",
 		"--upstream-client-cert-file=/etc/prometheus-client/tls.crt",
 		"--upstream-client-key-file=/etc/prometheus-client/tls.key",
 		"--allow-paths=/metrics",
 	)
+	assertTCPSocketProbe(t, proxyContainer, "livenessProbe")
+	assertTCPSocketProbe(t, proxyContainer, "readinessProbe")
 
 	service := findRenderedResource(t, resources, "Service", "data-science-prometheus-cluster-proxy")
 	ports := nestedSlice(t, service, "spec", "ports")
@@ -1059,8 +1068,39 @@ func proxyTemplateData() map[string]any {
 		"GatewayNamespace":    "",
 		"KubeRBACProxyImage":  "example.invalid/kube-rbac-proxy:test",
 		"PromLabelProxyImage": "example.invalid/prom-label-proxy:test",
-		"TLSMinVersion":       "VersionTLS12",
-		"TLSCipherSuites":     "",
+		"TLSMinVersion":       proxyTLSVersion12,
+		"TLSCipherSuites":     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		"TLSCurvePreferences": "29,25",
+	}
+}
+
+func TestProxyTemplatesTLS13OmitCipherRestriction(t *testing.T) {
+	proxyTemplates := []struct {
+		template       string
+		deploymentName string
+	}{
+		{template: PrometheusNamespaceProxyTemplate, deploymentName: "data-science-prometheus-namespace-proxy"},
+		{template: PrometheusClusterProxyTemplate, deploymentName: "data-science-prometheus-cluster-proxy"},
+		{template: ThanosQuerierProxyTemplate, deploymentName: "data-science-thanos-querier-proxy"},
+	}
+
+	for _, proxy := range proxyTemplates {
+		t.Run(proxy.deploymentName, func(t *testing.T) {
+			data := proxyTemplateData()
+			data["TLSMinVersion"] = proxyTLSVersion13
+			data["TLSCipherSuites"] = ""
+			data["TLSCurvePreferences"] = "23,29"
+
+			resources := renderObservabilityTemplate(t, proxy.template, data)
+			deployment := findRenderedResource(t, resources, "Deployment", proxy.deploymentName)
+			containers := nestedSliceAt(t, deployment, "spec", "template", "spec", "containers")
+			container := findContainer(t, containers, "kube-rbac-proxy")
+			assertContainerArgs(t, container,
+				"--tls-min-version="+proxyTLSVersion13,
+				"--tls-curve-preferences=23,29",
+			)
+			assertContainerArgAbsent(t, container, "--tls-cipher-suites=")
+		})
 	}
 }
 
@@ -1195,5 +1235,28 @@ func assertContainerArgs(t *testing.T, container map[string]any, expected ...str
 		if !containsString(args, want) {
 			t.Errorf("container %q args do not contain %q: %#v", container["name"], want, args)
 		}
+	}
+}
+
+func assertContainerArgAbsent(t *testing.T, container map[string]any, unexpected string) {
+	t.Helper()
+	args, ok := container["args"].([]any)
+	if !ok {
+		t.Fatalf("container %q args have unexpected type %T", container["name"], container["args"])
+	}
+	if containsString(args, unexpected) {
+		t.Errorf("container %q args must not contain %q: %#v", container["name"], unexpected, args)
+	}
+}
+
+func assertTCPSocketProbe(t *testing.T, container map[string]any, probeName string) {
+	t.Helper()
+	probe, ok := container[probeName].(map[string]any)
+	if !ok {
+		t.Fatalf("container %q is missing %s", container["name"], probeName)
+	}
+	tcpSocket, ok := probe["tcpSocket"].(map[string]any)
+	if !ok || tcpSocket["port"] != int64(8443) {
+		t.Fatalf("container %q %s must probe TCP port 8443, got: %#v", container["name"], probeName, probe)
 	}
 }

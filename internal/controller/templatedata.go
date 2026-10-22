@@ -32,7 +32,6 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-multierror"
-	pkgtls "github.com/opendatahub-io/odh-platform-utilities/framework/tls"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/olm"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/openshift"
 	"gopkg.in/yaml.v3"
@@ -606,7 +605,7 @@ func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces,
 func addImageURLs(templateData map[string]any) {
 	templateData["KubeRBACProxyImage"] = getEnvOrDefault(
 		"RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE",
-		"quay.io/opendatahub/odh-kube-rbac-proxy@sha256:f9cad8a1389ba747f412620525328ccebda1409eab55ea80e4818349b37cbdeb",
+		"quay.io/opendatahub/odh-kube-rbac-proxy@sha256:69c4b767117b9dab040070ca3cd6a4d08f87c197f92c2e9d7637101a39018a7d",
 	)
 	templateData["PromLabelProxyImage"] = getEnvOrDefault(
 		"RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE",
@@ -621,16 +620,6 @@ func getKorrel8rImage() string {
 	// image. This build enforces the traversal limits in the Monitoring config.
 	const defaultImage = "registry.redhat.io/cluster-observability-operator/korrel8r-rhel9@sha256:e3ebab37597e15fc58b989e7f3cf70f5561e96723f4f409333e8b99540386c8a"
 	return getEnvOrDefault("RELATED_IMAGE_KORREL8R_IMAGE", defaultImage)
-}
-
-func addTLSData(ctx context.Context, c client.Client, templateData map[string]any) error {
-	minVersion, cipherSuites, err := pkgtls.FromAPIServerWithAdherence(ctx, c, pkgtls.FormatGo)
-	if err != nil {
-		return err
-	}
-	templateData["TLSMinVersion"] = minVersion
-	templateData["TLSCipherSuites"] = cipherSuites
-	return nil
 }
 
 func getEnvOrDefault(envVar, defaultVal string) string {

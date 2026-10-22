@@ -151,13 +151,15 @@ func listAllNamespaces(ctx context.Context, c client.Client, fallback string) ([
 // TargetAllocator's per-namespace Secret read Role. Kubernetes does not have a
 // portable system-namespace marker, so account for the built-in namespaces and
 // the system markers used by OpenShift, HyperShift, and OLM.
+const kubeSystemNamespace = "kube-system"
+
 func isSystemNamespace(namespace *corev1.Namespace) bool {
 	if namespace == nil {
 		return true
 	}
 
 	switch namespace.Name {
-	case "", "default", "kube-system", "kube-public", "kube-node-lease", "openshift", "openshift-infra", "openshift-node":
+	case "", "default", kubeSystemNamespace, "kube-public", "kube-node-lease", "openshift", "openshift-infra", "openshift-node":
 		return true
 	}
 

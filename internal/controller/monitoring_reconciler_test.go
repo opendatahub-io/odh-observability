@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -403,6 +404,243 @@ func TestReconcile_PreconditionLookupFailureReturnsError(t *testing.T) {
 		if condition.Reason == "MissingOperator" {
 			t.Errorf("lookup failure was incorrectly reported as a missing operator: %#v", condition)
 		}
+	}
+}
+
+func TestReconcileInvalidTLSProfilePreservesExistingWorkload(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorConditionTypes(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.UID = "monitoring-test-uid"
+	apiServer := strictAPIServer(configv1.VersionTLS10)
+	existingDeployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-science-prometheus-cluster-proxy",
+			Namespace: m.Spec.Namespace,
+			Labels: map[string]string{
+				"platform.opendatahub.io/part-of": monitoringPartOf,
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "data-science-prometheus-cluster-proxy"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": "data-science-prometheus-cluster-proxy"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name: "kube-rbac-proxy",
+						Args: []string{"--tls-min-version=" + proxyTLSVersion12},
+					}},
+				},
+			},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(m, apiServer, existingDeployment).
+		WithStatusSubresource(m).
+		Build()
+	r := newTestReconciler(t, s, cli)
+
+	_, err := r.reconcile(context.Background(), m)
+	if err != nil {
+		t.Fatalf("invalid proxy TLS profile should be a configuration error, got: %v", err)
+	}
+	ready := mustFindCondition(t, m, string(platformcommon.ConditionTypeReady))
+	if ready.Status != metav1.ConditionFalse || ready.Reason != "ConfigurationError" {
+		t.Errorf("Ready: want False/ConfigurationError, got %s/%s", ready.Status, ready.Reason)
+	}
+	provisioning := mustFindCondition(t, m, string(platformcommon.ConditionTypeProvisioningSucceeded))
+	if provisioning.Status != metav1.ConditionFalse || provisioning.Reason != "ConfigurationError" {
+		t.Errorf("ProvisioningSucceeded: want False/ConfigurationError, got %s/%s", provisioning.Status, provisioning.Reason)
+	}
+	degraded := mustFindCondition(t, m, string(platformcommon.ConditionTypeDegraded))
+	if degraded.Status != metav1.ConditionFalse || degraded.Reason != "NotDegraded" {
+		t.Errorf("Degraded: want False/NotDegraded, got %s/%s", degraded.Status, degraded.Reason)
+	}
+
+	var unchanged appsv1.Deployment
+	if err := cli.Get(context.Background(),
+		client.ObjectKey{Namespace: existingDeployment.Namespace, Name: existingDeployment.Name},
+		&unchanged); err != nil {
+		t.Fatalf("failed to get existing Deployment: %v", err)
+	}
+	gotArgs := unchanged.Spec.Template.Spec.Containers[0].Args
+	if len(gotArgs) != 1 || gotArgs[0] != "--tls-min-version="+proxyTLSVersion12 {
+		t.Fatalf("invalid TLS profile must preserve existing workload args, got: %#v", gotArgs)
+	}
+}
+
+func TestReconcileProxyTLSResolutionFailureReturnsError(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.UID = "monitoring-test-uid"
+	apiServer := &configv1.APIServer{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(m, apiServer).
+		WithStatusSubresource(m).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if key.Name == "cluster" {
+					return k8serr.NewForbidden(
+						schema.GroupResource{Group: "config.openshift.io", Resource: "apiservers"},
+						key.Name,
+						errors.New("not allowed"),
+					)
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+	r := newTestReconciler(t, s, cli)
+
+	_, err := r.reconcile(context.Background(), m)
+	if !errors.Is(err, errProxyTLSResolutionFailed) {
+		t.Fatalf("expected proxy TLS resolution failure, got: %v", err)
+	}
+	ready := mustFindCondition(t, m, string(platformcommon.ConditionTypeReady))
+	if ready.Status != metav1.ConditionFalse || ready.Reason != "ReconcileFailed" {
+		t.Errorf("Ready: want False/ReconcileFailed, got %s/%s", ready.Status, ready.Reason)
+	}
+	degraded := mustFindCondition(t, m, string(platformcommon.ConditionTypeDegraded))
+	if degraded.Status != metav1.ConditionTrue {
+		t.Errorf("Degraded: want True, got %s", degraded.Status)
+	}
+}
+
+func TestTLSProfileChangeUpdatesProxyDeploymentPodTemplate(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.UID = "monitoring-test-uid"
+	m.Spec.Namespace = testMonitoringNamespace
+
+	apiServer := strictAPIServer(configv1.VersionTLS12)
+	legacyDeployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "data-science-prometheus-cluster-proxy",
+			Namespace: m.Spec.Namespace,
+			Labels: map[string]string{
+				"platform.opendatahub.io/part-of": monitoringPartOf,
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"app": "data-science-prometheus-cluster-proxy"},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": "data-science-prometheus-cluster-proxy"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name: "kube-rbac-proxy",
+						Args: []string{
+							"--tls-min-version=" + proxyTLSVersion12,
+							"--tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+						},
+					}},
+				},
+			},
+		},
+	}
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(m, apiServer, legacyDeployment).
+		WithStatusSubresource(m).
+		Build()
+	r := newTestReconciler(t, s, cli)
+
+	deployTLSProfile := func() appsv1.Deployment {
+		data := proxyTemplateData()
+		if err := addTLSData(context.Background(), cli, data); err != nil {
+			t.Fatalf("failed to resolve TLS profile: %v", err)
+		}
+		resources := renderObservabilityTemplate(t, PrometheusClusterProxyTemplate, data)
+		desired := findRenderedResource(t, resources, "Deployment", "data-science-prometheus-cluster-proxy")
+		if err := r.Deployer.Deploy(context.Background(), deploy.DeployInput{
+			Client:    cli,
+			Owner:     m,
+			Release:   deploy.ReleaseInfo{Type: platformType, Version: "test"},
+			Resources: []unstructured.Unstructured{desired},
+		}); err != nil {
+			t.Fatalf("failed to deploy proxy: %v", err)
+		}
+
+		var deployment appsv1.Deployment
+		if err := cli.Get(context.Background(),
+			client.ObjectKey{Namespace: m.Spec.Namespace, Name: "data-science-prometheus-cluster-proxy"},
+			&deployment); err != nil {
+			t.Fatalf("failed to get proxy Deployment: %v", err)
+		}
+		return deployment
+	}
+
+	deployment := deployTLSProfile()
+	if deployment.ResourceVersion == legacyDeployment.ResourceVersion {
+		t.Fatal("upgrading a legacy proxy Deployment must update its resource version")
+	}
+	args := deployment.Spec.Template.Spec.Containers[0].Args
+	if !slices.Contains(args, "--tls-min-version="+proxyTLSVersion12) ||
+		!slices.Contains(args, "--tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256") ||
+		!slices.Contains(args, "--tls-curve-preferences=29,25") {
+		t.Fatalf("initial proxy args missing TLS settings: %#v", args)
+	}
+
+	apiServer.Spec.TLSSecurityProfile = &configv1.TLSSecurityProfile{
+		Type: configv1.TLSProfileCustomType,
+		Custom: &configv1.CustomTLSProfile{
+			TLSProfileSpec: configv1.TLSProfileSpec{
+				MinTLSVersion: configv1.VersionTLS13,
+				Ciphers:       []string{"TLS_AES_128_GCM_SHA256"},
+				Groups: []configv1.TLSGroup{
+					configv1.TLSGroupSecP256r1,
+					configv1.TLSGroupX25519,
+				},
+			},
+		},
+	}
+	if err := cli.Update(context.Background(), apiServer); err != nil {
+		t.Fatalf("failed to update APIServer TLS profile: %v", err)
+	}
+
+	deployment = deployTLSProfile()
+	args = deployment.Spec.Template.Spec.Containers[0].Args
+	if !slices.Contains(args, "--tls-min-version="+proxyTLSVersion13) ||
+		!slices.Contains(args, "--tls-curve-preferences=23,29") {
+		t.Fatalf("updated proxy args missing TLS settings: %#v", args)
+	}
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--tls-cipher-suites=") {
+			t.Fatalf("TLS 1.3 proxy args must not restrict cipher suites: %#v", args)
+		}
+	}
+}
+
+func strictAPIServer(minVersion configv1.TLSProtocolVersion) *configv1.APIServer {
+	return &configv1.APIServer{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+		Spec: configv1.APIServerSpec{
+			TLSAdherence: configv1.TLSAdherencePolicyStrictAllComponents,
+			TLSSecurityProfile: &configv1.TLSSecurityProfile{
+				Type: configv1.TLSProfileCustomType,
+				Custom: &configv1.CustomTLSProfile{
+					TLSProfileSpec: configv1.TLSProfileSpec{
+						MinTLSVersion: minVersion,
+						Ciphers:       []string{"ECDHE-RSA-AES128-GCM-SHA256"},
+						Groups: []configv1.TLSGroup{
+							configv1.TLSGroupX25519,
+							configv1.TLSGroupSecP521r1,
+						},
+					},
+				},
+			},
+		},
 	}
 }
 

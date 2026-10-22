@@ -18,39 +18,326 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
 	configv1 "github.com/openshift/api/config/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func rawExt(yaml string) runtime.RawExtension {
 	return runtime.RawExtension{Raw: []byte(yaml)}
 }
 
-func TestAddTLSDataHonorsStrictAPIServerProfile(t *testing.T) {
+func TestAddTLSDataResolvesEffectiveProxyProfile(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		apiServer  *configv1.APIServer
+		wantMin    string
+		wantCipher string
+		wantCurves string
+		wantErr    string
+	}{
+		{
+			name:       "missing APIServer uses Intermediate defaults",
+			apiServer:  nil,
+			wantMin:    proxyTLSVersion12,
+			wantCipher: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+			wantCurves: "4588,29,23,24",
+		},
+		{
+			name: "NoOpinion uses Intermediate defaults",
+			apiServer: &configv1.APIServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+				Spec: configv1.APIServerSpec{
+					TLSAdherence:       configv1.TLSAdherencePolicyNoOpinion,
+					TLSSecurityProfile: &configv1.TLSSecurityProfile{Type: configv1.TLSProfileModernType},
+				},
+			},
+			wantMin:    proxyTLSVersion12,
+			wantCipher: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+			wantCurves: "4588,29,23,24",
+		},
+		{
+			name: "LegacyAdheringComponentsOnly uses Intermediate defaults",
+			apiServer: &configv1.APIServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+				Spec: configv1.APIServerSpec{
+					TLSAdherence:       configv1.TLSAdherencePolicyLegacyAdheringComponentsOnly,
+					TLSSecurityProfile: &configv1.TLSSecurityProfile{Type: configv1.TLSProfileModernType},
+				},
+			},
+			wantMin:    proxyTLSVersion12,
+			wantCipher: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+			wantCurves: "4588,29,23,24",
+		},
+		{
+			name: "strict Modern uses TLS 1.3 without a cipher restriction",
+			apiServer: &configv1.APIServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+				Spec: configv1.APIServerSpec{
+					TLSAdherence:       configv1.TLSAdherencePolicyStrictAllComponents,
+					TLSSecurityProfile: &configv1.TLSSecurityProfile{Type: configv1.TLSProfileModernType},
+				},
+			},
+			wantMin:    proxyTLSVersion13,
+			wantCipher: "",
+			wantCurves: "4588,29,23,24",
+		},
+		{
+			name: "unknown adherence is treated as strict",
+			apiServer: &configv1.APIServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+				Spec: configv1.APIServerSpec{
+					TLSAdherence: "Unknown",
+					TLSSecurityProfile: &configv1.TLSSecurityProfile{
+						Type: configv1.TLSProfileCustomType,
+						Custom: &configv1.CustomTLSProfile{
+							TLSProfileSpec: configv1.TLSProfileSpec{
+								MinTLSVersion: configv1.VersionTLS12,
+								Ciphers:       []string{"ECDHE-RSA-AES128-GCM-SHA256"},
+								Groups: []configv1.TLSGroup{
+									configv1.TLSGroupX25519,
+									configv1.TLSGroupSecP521r1,
+								},
+							},
+						},
+					},
+				},
+			},
+			wantMin:    proxyTLSVersion12,
+			wantCipher: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+			wantCurves: "29,25",
+		},
+		{
+			name: "strict TLS 1.0 is not representable by the proxy",
+			apiServer: &configv1.APIServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+				Spec: configv1.APIServerSpec{
+					TLSAdherence: configv1.TLSAdherencePolicyStrictAllComponents,
+					TLSSecurityProfile: &configv1.TLSSecurityProfile{
+						Type: configv1.TLSProfileCustomType,
+						Custom: &configv1.CustomTLSProfile{
+							TLSProfileSpec: configv1.TLSProfileSpec{
+								MinTLSVersion: configv1.VersionTLS10,
+								Ciphers:       []string{"ECDHE-RSA-AES128-GCM-SHA256"},
+								Groups:        []configv1.TLSGroup{configv1.TLSGroupX25519},
+							},
+						},
+					},
+				},
+			},
+			wantErr: "unsupported minimum TLS version",
+		},
+		{
+			name: "strict groups with no proxy-supported curves fail",
+			apiServer: &configv1.APIServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+				Spec: configv1.APIServerSpec{
+					TLSAdherence: configv1.TLSAdherencePolicyStrictAllComponents,
+					TLSSecurityProfile: &configv1.TLSSecurityProfile{
+						Type: configv1.TLSProfileCustomType,
+						Custom: &configv1.CustomTLSProfile{
+							TLSProfileSpec: configv1.TLSProfileSpec{
+								MinTLSVersion: configv1.VersionTLS12,
+								Ciphers:       []string{"ECDHE-RSA-AES128-GCM-SHA256"},
+								Groups:        []configv1.TLSGroup{configv1.TLSGroupSecP256r1MLKEM768},
+							},
+						},
+					},
+				},
+			},
+			wantErr: "no usable proxy curve preferences",
+		},
+		{
+			name: "strict TLS 1.2 without cipher suites fails",
+			apiServer: &configv1.APIServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+				Spec: configv1.APIServerSpec{
+					TLSAdherence: configv1.TLSAdherencePolicyStrictAllComponents,
+					TLSSecurityProfile: &configv1.TLSSecurityProfile{
+						Type: configv1.TLSProfileCustomType,
+						Custom: &configv1.CustomTLSProfile{
+							TLSProfileSpec: configv1.TLSProfileSpec{
+								MinTLSVersion: configv1.VersionTLS12,
+							},
+						},
+					},
+				},
+			},
+			wantErr: "TLS profile contains no cipher suites",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			scheme := runtime.NewScheme()
+			require.NoError(t, configv1.Install(scheme))
+			builder := fake.NewClientBuilder().WithScheme(scheme)
+			if test.apiServer != nil {
+				builder = builder.WithObjects(test.apiServer)
+			}
+
+			templateData := map[string]any{}
+			err := addTLSData(context.Background(), builder.Build(), templateData)
+			if test.wantErr != "" {
+				require.ErrorContains(t, err, test.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, test.wantMin, templateData["TLSMinVersion"])
+			if test.wantCipher == "" {
+				assert.Empty(t, templateData["TLSCipherSuites"])
+			} else {
+				assert.Contains(t, templateData["TLSCipherSuites"], test.wantCipher)
+			}
+			assert.Equal(t, test.wantCurves, templateData["TLSCurvePreferences"])
+		})
+	}
+}
+
+func TestFilterProxyCurvePreferencesFIPSMode(t *testing.T) {
+	t.Parallel()
+
+	got, err := filterProxyCurvePreferences("4588,29,23,24,4589", true)
+	require.NoError(t, err)
+	assert.Equal(t, "23,24", got)
+}
+
+func TestAddTLSDataDropsNonFIPSApprovedCurvesOnFIPSCluster(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, configv1.Install(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	installConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cluster-config-v1",
+			Namespace: "kube-system",
+		},
+		Data: map[string]string{
+			"install-config": "fips: true",
+		},
+	}
+	apiServer := &configv1.APIServer{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+		Spec: configv1.APIServerSpec{
+			TLSAdherence: configv1.TLSAdherencePolicyStrictAllComponents,
+			TLSSecurityProfile: &configv1.TLSSecurityProfile{
+				Type: configv1.TLSProfileCustomType,
+				Custom: &configv1.CustomTLSProfile{
+					TLSProfileSpec: configv1.TLSProfileSpec{
+						MinTLSVersion: configv1.VersionTLS12,
+						Ciphers:       []string{"ECDHE-RSA-AES128-GCM-SHA256"},
+						Groups: []configv1.TLSGroup{
+							configv1.TLSGroupX25519,
+							configv1.TLSGroupSecP256r1,
+						},
+					},
+				},
+			},
+		},
+	}
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(installConfig, apiServer).
+		Build()
+
+	templateData := map[string]any{}
+	require.NoError(t, addTLSData(context.Background(), cli, templateData))
+	assert.Equal(t, "23", templateData["TLSCurvePreferences"])
+}
+
+func TestAddTLSDataFailsClosedWhenClusterConfigIsMalformed(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, configv1.Install(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	installConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cluster-config-v1",
+			Namespace: "kube-system",
+		},
+		Data: map[string]string{"install-config": "{ invalid"},
+	}
+	apiServer := &configv1.APIServer{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+		Spec: configv1.APIServerSpec{
+			TLSAdherence: configv1.TLSAdherencePolicyStrictAllComponents,
+			TLSSecurityProfile: &configv1.TLSSecurityProfile{
+				Type: configv1.TLSProfileCustomType,
+				Custom: &configv1.CustomTLSProfile{
+					TLSProfileSpec: configv1.TLSProfileSpec{
+						MinTLSVersion: configv1.VersionTLS12,
+						Ciphers:       []string{"ECDHE-RSA-AES128-GCM-SHA256"},
+						Groups: []configv1.TLSGroup{
+							configv1.TLSGroupX25519,
+							configv1.TLSGroupSecP256r1,
+						},
+					},
+				},
+			},
+		},
+	}
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(installConfig, apiServer).
+		Build()
+
+	templateData := map[string]any{}
+	err := addTLSData(context.Background(), cli, templateData)
+	require.ErrorIs(t, err, errProxyTLSResolutionFailed)
+	require.NotErrorIs(t, err, errInvalidProxyTLSProfile)
+	assert.Empty(t, templateData)
+}
+
+func TestAddTLSDataDistinguishesOperationalResolutionFailure(t *testing.T) {
 	t.Parallel()
 
 	scheme := runtime.NewScheme()
 	require.NoError(t, configv1.Install(scheme))
 	apiServer := &configv1.APIServer{
 		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
-		Spec: configv1.APIServerSpec{
-			TLSAdherence:       configv1.TLSAdherencePolicyStrictAllComponents,
-			TLSSecurityProfile: &configv1.TLSSecurityProfile{Type: configv1.TLSProfileModernType},
-		},
 	}
-	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(apiServer).Build()
-	templateData := map[string]any{}
+	cli := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(apiServer).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if key.Name == "cluster" {
+					return k8serr.NewForbidden(
+						schema.GroupResource{Group: "config.openshift.io", Resource: "apiservers"},
+						key.Name,
+						errors.New("not allowed"),
+					)
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
 
-	require.NoError(t, addTLSData(context.Background(), cli, templateData))
-	assert.Equal(t, "VersionTLS13", templateData["TLSMinVersion"])
-	assert.NotEmpty(t, templateData["TLSCipherSuites"])
+	templateData := map[string]any{}
+	err := addTLSData(context.Background(), cli, templateData)
+	require.ErrorIs(t, err, errProxyTLSResolutionFailed)
+	require.NotErrorIs(t, err, errInvalidProxyTLSProfile)
+	assert.Empty(t, templateData)
 }
 
 func TestValidateExporters_ValidOTLP(t *testing.T) {

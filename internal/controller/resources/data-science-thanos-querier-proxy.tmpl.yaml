@@ -96,6 +96,9 @@ spec:
             {{- if .TLSCipherSuites}}
             - --tls-cipher-suites={{.TLSCipherSuites}}
             {{- end}}
+            {{- if .TLSCurvePreferences}}
+            - --tls-curve-preferences={{.TLSCurvePreferences}}
+            {{- end}}
             - --logtostderr=true
             - --v=2
           ports:
