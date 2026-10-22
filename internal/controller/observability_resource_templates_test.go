@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -219,12 +220,12 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		t.Fatalf("Thanos proxy must use its service account: found=%t value=%q error=%v", found, serviceAccount, err)
 	}
 	containers := nestedSliceAt(t, deployment, "spec", "template", "spec", "containers")
-	if len(containers) != 2 {
+	if len(containers) != 3 {
 		t.Fatalf("Thanos proxy must have kube-rbac-proxy and prom-label-proxy containers, got %d", len(containers))
 	}
 	assertContainerArgs(t, findContainer(t, containers, "kube-rbac-proxy"),
 		"--secure-listen-address=0.0.0.0:8443",
-		"--upstream=http://127.0.0.1:9091/",
+		"--upstream=http://127.0.0.1:9092/",
 		"--config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml",
 		"--tls-cert-file=/etc/tls/private/tls.crt",
 		"--tls-private-key-file=/etc/tls/private/tls.key",
@@ -237,7 +238,10 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		"--enable-label-apis",
 		"--regex-match",
 	)
-
+	assertContainerArgs(t, findContainer(t, containers, "method-gate"),
+		"--listen=127.0.0.1:9092",
+		"--upstream=http://127.0.0.1:9091",
+	)
 	service := findRenderedResource(t, resources, "Service", "data-science-thanos-querier-proxy")
 	ports := nestedSlice(t, service, "spec", "ports")
 	if len(ports) != 1 || asMap(t, ports[0])["port"] != int64(8443) || asMap(t, ports[0])["targetPort"] != "https" {
@@ -695,24 +699,16 @@ func TestThanosQuerierRouteUsesAuthorizedProxy(t *testing.T) {
 func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 	resources := renderObservabilityTemplate(t, PrometheusNamespaceProxyTemplate, proxyTemplateData())
 
-	clusterRole := findRenderedResource(t, resources, "ClusterRole", "data-science-metrics-view")
-	if labels := clusterRole.GetLabels(); len(labels) != 4 || labels["rbac.authorization.k8s.io/aggregate-to-view"] != "true" ||
-		labels["rbac.authorization.k8s.io/aggregate-to-edit"] != "true" ||
-		labels["rbac.authorization.k8s.io/aggregate-to-admin"] != "true" ||
-		labels["platform.opendatahub.io/part-of"] != "monitoring" {
-		t.Fatalf("metrics ClusterRole must aggregate to view/edit/admin: %#v", labels)
+	// The template must NOT grant users "create" on metrics.k8s.io/pods. kube-rbac-proxy
+	// maps POST -> "create", so any such grant would authorize POST requests, and
+	// prom-label-proxy's --query-param (ParseForm) would then merge a POST-body
+	// "namespace" into the enforced matcher, bypassing tenant isolation. The proxy is
+	// GET-only; POST is rejected at the authorization layer.
+	for _, resource := range resources {
+		if resource.GetKind() == "ClusterRole" && resource.GetName() == "data-science-metrics-view" {
+			t.Fatalf("template must not render the data-science-metrics-view ClusterRole: granting create on metrics.k8s.io/pods authorizes POST and enables a POST-body namespace bypass")
+		}
 	}
-	rules := nestedSlice(t, clusterRole, "rules")
-	if len(rules) != 1 {
-		t.Fatalf("expected one metrics ClusterRole rule, got %d", len(rules))
-	}
-	rule := asMap(t, rules[0])
-	if len(rule) != 3 {
-		t.Fatalf("metrics ClusterRole rule must not contain extra permissions: %#v", rule)
-	}
-	assertStringSet(t, rule, "apiGroups", []string{"metrics.k8s.io"})
-	assertStringSet(t, rule, "resources", []string{"pods"})
-	assertStringSet(t, rule, "verbs", []string{"create"})
 
 	assertClusterRoleBinding(
 		t,
@@ -754,12 +750,14 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		t.Fatalf("namespace proxy must use its service account: found=%t value=%q error=%v", found, serviceAccount, err)
 	}
 	containers := nestedSliceAt(t, deployment, "spec", "template", "spec", "containers")
-	if len(containers) != 2 {
-		t.Fatalf("namespace proxy must have kube-rbac-proxy and prom-label-proxy containers, got %d", len(containers))
+	if len(containers) != 3 {
+		t.Fatalf("namespace proxy must have kube-rbac-proxy, method-gate and prom-label-proxy containers, got %d", len(containers))
 	}
+	// kube-rbac-proxy must forward to the method gate (:9092), not directly to
+	// prom-label-proxy (:9091), so GET/HEAD enforcement runs before label proxying.
 	assertContainerArgs(t, asMap(t, containers[0]),
 		"--secure-listen-address=0.0.0.0:8443",
-		"--upstream=http://127.0.0.1:9091/",
+		"--upstream=http://127.0.0.1:9092/",
 		"--config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml",
 		"--tls-cert-file=/etc/tls/private/tls.crt",
 		"--tls-private-key-file=/etc/tls/private/tls.key",
@@ -772,6 +770,34 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		"--enable-label-apis",
 		"--regex-match",
 	)
+
+	// The method gate must be present (findContainer fails the test otherwise) and
+	// run the operator binary's "method-gate" subcommand, listening on :9092 and
+	// forwarding to prom-label-proxy on :9091. GET/HEAD enforcement is implemented
+	// in that subcommand, independent of RBAC.
+	gate := findContainer(t, containers, "method-gate")
+	gateCommand, ok := gate["command"].([]any)
+	if !ok {
+		t.Fatalf("method-gate command has unexpected type %T", gate["command"])
+	}
+	gateCommandStrs := make([]string, 0, len(gateCommand))
+	for _, c := range gateCommand {
+		s, ok := c.(string)
+		if !ok {
+			t.Fatalf("method-gate command element has unexpected type %T", c)
+		}
+		gateCommandStrs = append(gateCommandStrs, s)
+	}
+	for _, expected := range []string{
+		"/manager",
+		"method-gate",
+		"--listen=127.0.0.1:9092",
+		"--upstream=http://127.0.0.1:9091",
+	} {
+		if !slices.Contains(gateCommandStrs, expected) {
+			t.Errorf("method-gate command must contain %q, got %v", expected, gateCommandStrs)
+		}
+	}
 
 	service := findRenderedResource(t, resources, "Service", "data-science-prometheus-namespace-proxy")
 	ports := nestedSlice(t, service, "spec", "ports")
@@ -1059,6 +1085,7 @@ func proxyTemplateData() map[string]any {
 		"GatewayNamespace":    "",
 		"KubeRBACProxyImage":  "example.invalid/kube-rbac-proxy:test",
 		"PromLabelProxyImage": "example.invalid/prom-label-proxy:test",
+		"HTTPMethodGateImage": "example.invalid/method-gate:test",
 		"TLSMinVersion":       "VersionTLS12",
 		"TLSCipherSuites":     "",
 	}
@@ -1127,30 +1154,6 @@ func asMap(t *testing.T, value any) map[string]any {
 		t.Fatalf("expected map[string]any, got %T", value)
 	}
 	return result
-}
-
-func assertStringSet(t *testing.T, object map[string]any, field string, want []string) {
-	t.Helper()
-	got, found, err := unstructured.NestedStringSlice(object, field)
-	if err != nil || !found {
-		t.Fatalf("field %q is missing: found=%t error=%v", field, found, err)
-	}
-	wantSet := make(map[string]struct{}, len(want))
-	for _, value := range want {
-		wantSet[value] = struct{}{}
-	}
-	gotSet := make(map[string]struct{}, len(got))
-	for _, value := range got {
-		gotSet[value] = struct{}{}
-	}
-	if len(got) != len(gotSet) || len(gotSet) != len(wantSet) {
-		t.Fatalf("field %q: got %v, want exactly %v", field, got, want)
-	}
-	for value := range wantSet {
-		if _, found := gotSet[value]; !found {
-			t.Fatalf("field %q: got %v, want exactly %v", field, got, want)
-		}
-	}
 }
 
 func assertClusterRoleBinding(t *testing.T, binding unstructured.Unstructured, roleName, subjectName, subjectNamespace string) {

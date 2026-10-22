@@ -295,6 +295,9 @@ kube-rbac-proxy (port 8443)
     |-- Extracts 'namespace' query parameter
     |-- Performs SubjectAccessReview for metrics.k8s.io/pods
     |
+method-gate (port 9092)
+    |-- Allows only GET and HEAD; returns 403 for any other method
+    |
 prom-label-proxy (port 9091)
     |-- Validates namespace parameter is present
     |-- Rejects multiple namespace values, including URL/form duplicates
@@ -305,7 +308,9 @@ Prometheus (port 9090)
 
 **Authentication**: kube-rbac-proxy validates bearer tokens via Kubernetes TokenReview API.
 
-**Authorization**: SubjectAccessReview checks that the user has permissions for `metrics.k8s.io/pods` in the requested namespace. The verb is derived from the HTTP method (GET -> `get`, POST -> `create`).
+**Authorization**: SubjectAccessReview checks that the user has `get` on `metrics.k8s.io/pods` in the requested (URL-query) namespace. The verb is derived from the HTTP method, and only `GET` (verb `get`) is authorized. `POST` maps to the `create` verb, which no role grants on `metrics.k8s.io/pods`, so POST requests are also rejected with 403 at this layer.
+
+**Method enforcement (independent of RBAC)**: a method-gate sidecar sits between kube-rbac-proxy and prom-label-proxy and returns 403 for any method other than `GET`/`HEAD`, regardless of RBAC grants. The gate runs the operator's own image (the `method-gate` subcommand of the `/manager` binary), so no additional container image has to be built, shipped, or mirrored for disconnected installs. This is the primary control that closes a tenant-isolation bypass: prom-label-proxy's `--query-param` extraction merges the URL query and the POST body (via `ParseForm`), so a POST-body `namespace` value could otherwise be OR'd into the enforced label matcher even though kube-rbac-proxy only authorized the URL-query namespace. Dropping non-`GET`/`HEAD` methods at the gate removes that vector even if a role were ever to grant `create`; the RBAC verb mapping above remains as defense in depth. Clients must send `GET /api/v1/query?query=<promql>&namespace=<namespace-name>`.
 
 **Query isolation**: prom-label-proxy rewrites PromQL queries to inject `{namespace="<value>"}`, ensuring users only see metrics from namespaces they are authorized for, regardless of how they craft their queries. Its single-value regex mode rejects duplicate namespace values supplied across URL and POST form parameters instead of widening the enforced matcher.
 

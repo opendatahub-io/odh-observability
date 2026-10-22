@@ -204,11 +204,16 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 		}
 	}
 
-	// Exercise the successful POST form separately from the conflicting-value
-	// rejection below. A GET-only contract would not prove that the proxy keeps
-	// the same namespace boundary when PromQL is submitted as form data.
-	assertAuthorizedThanosPost(t, rootCAs, routeHost, authorizedToken, tc.MonitoringNamespace)
+	// The Thanos proxy fronts prom-label-proxy with the read-only method gate, so
+	// every POST is rejected with 403 before prom-label-proxy can ParseForm and
+	// merge a body "namespace" into the enforced label matcher. Prove the gate
+	// closes the POST-body bypass regardless of the caller's RBAC: the authorized
+	// token here is granted "create" on pods.metrics.k8s.io (see postRole above),
+	// so only the gate — not kube-rbac-proxy — can be rejecting the request.
+	assertThanosPostRejectedByMethodGate(t, rootCAs, routeHost, authorizedToken, tc.MonitoringNamespace)
 
+	// A POST that also tries to smuggle a second namespace in the form body must
+	// be rejected by the same gate (403), never reaching prom-label-proxy.
 	duplicateNamespace, err := probeThanosRoutePostWithError(
 		rootCAs,
 		routeHost,
@@ -221,28 +226,22 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 		t.Fatalf("duplicate namespace POST probe failed: %v", err)
 	}
 	logThanosRouteEvidence(t, "authorized-duplicate-namespace-post", duplicateNamespace)
-	if duplicateNamespace.HTTPStatus != http.StatusBadRequest {
-		t.Fatalf("POST with conflicting URL and form namespace values must be rejected, got %d", duplicateNamespace.HTTPStatus)
+	if duplicateNamespace.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("POST with conflicting URL and form namespace values must be rejected with 403 by the method gate, got %d", duplicateNamespace.HTTPStatus)
 	}
 }
 
-func assertAuthorizedThanosPost(t *testing.T, rootCAs *x509.CertPool, routeHost, token, namespace string) {
+func assertThanosPostRejectedByMethodGate(t *testing.T, rootCAs *x509.CertPool, routeHost, token, namespace string) {
 	t.Helper()
 	probe, err := probeThanosRoutePostWithError(rootCAs, routeHost, token, namespace, "", thanosRouteProbeQuery)
 	if err != nil {
-		t.Fatalf("authorized POST probe failed: %v", err)
+		t.Fatalf("method-gate POST probe failed: %v", err)
 	}
-	logThanosRouteEvidence(t, "authorized-post", probe)
-	if probe.HTTPStatus != http.StatusOK || probe.PrometheusStatus != "success" {
-		t.Fatalf("authorized POST query should be a successful Prometheus request, got http_status=%d prometheus_status=%q", probe.HTTPStatus, probe.PrometheusStatus)
-	}
-	if len(probe.Labels) == 0 {
-		t.Fatalf("authorized POST query returned no metric series")
-	}
-	for _, labels := range probe.Labels {
-		if labels["namespace"] != namespace {
-			t.Fatalf("authorized POST response escaped the namespace boundary: namespace=%q", labels["namespace"])
-		}
+	logThanosRouteEvidence(t, "post-method-gate", probe)
+	// The method gate rejects non-GET/HEAD with 403 before prom-label-proxy, even
+	// for a caller whose RBAC would otherwise authorize the POST.
+	if probe.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("POST query must be rejected with 403 by the method gate, got http_status=%d prometheus_status=%q", probe.HTTPStatus, probe.PrometheusStatus)
 	}
 }
 
