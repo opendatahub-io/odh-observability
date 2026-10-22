@@ -181,7 +181,7 @@ func (tc *MonitoringTestCtx) ValidateOTLPMetricIdentityCannotBeSpoofed(t *testin
 	// Run an inference-labeled probe from the enrolled namespace. Keep it
 	// alive for warm-up and repeated attack submissions.
 	tc.createOTLPIdentityProbe(t, otlpIdentityProbeNamespace)
-	probe := tc.readyOTLPIdentityProbe(t, otlpIdentityProbeNamespace)
+	probe := tc.readyOTLPIdentityProbe(t)
 	sender = podIdentity(probe)
 	require.NotEmpty(t, sender.IP, "OTLP identity probe must have a pod IP")
 
@@ -539,14 +539,14 @@ func (tc *MonitoringTestCtx) createOTLPIdentityProbe(t *testing.T, namespace str
 	})
 }
 
-func (tc *MonitoringTestCtx) readyOTLPIdentityProbe(t *testing.T, namespace string) corev1.Pod {
+func (tc *MonitoringTestCtx) readyOTLPIdentityProbe(t *testing.T) corev1.Pod {
 	t.Helper()
 	tc = tc.WithT(t)
 
 	var probe corev1.Pod
 	tc.g.Eventually(func() error {
 		if err := tc.Client().Get(tc.Context(), types.NamespacedName{
-			Name: otlpIdentitySpoofPodName, Namespace: namespace,
+			Name: otlpIdentitySpoofPodName, Namespace: otlpIdentityProbeNamespace,
 		}, &probe); err != nil {
 			return err
 		}

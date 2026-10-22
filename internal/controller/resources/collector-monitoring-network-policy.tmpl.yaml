@@ -20,6 +20,7 @@ spec:
   policyTypes:
     - Ingress
   ingress:
+    # Prometheus scrapes collector metrics endpoints
     - from:
         - podSelector:
             matchLabels:
@@ -30,6 +31,7 @@ spec:
           port: 8889
         - protocol: TCP
           port: 8890
+    # LLM inference workloads send OTLP metrics
     - from:
         - namespaceSelector:
             matchLabels:
@@ -48,6 +50,15 @@ spec:
                   - llminferenceservice-workload-worker-prefill
                   - llminferenceservice-workload-leader-prefill
                   - llminferenceservice-router-scheduler
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              monitoring.opendatahub.io/scrape: "true"
       ports:
         - protocol: TCP
           port: 4317

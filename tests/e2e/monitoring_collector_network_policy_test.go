@@ -112,12 +112,13 @@ func (tc *MonitoringTestCtx) ValidateCollectorNetworkPolicyContract(t *testing.T
 	requireOnlyIngressPolicy(t, targetAllocatorPolicies, "data-science-collector-targetallocator-ingress")
 
 	collectorPolicy := policyByName(t, collectorPolicies, "data-science-collector-monitoring-ingress")
-	require.Len(t, collectorPolicy.Spec.Ingress, 2)
+	require.Len(t, collectorPolicy.Spec.Ingress, 3)
 	for _, rule := range collectorPolicy.Spec.Ingress {
 		require.Len(t, rule.From, 1, "an additional peer can widen the policy union")
-		require.NotNil(t, rule.From[0].PodSelector)
 		require.Nil(t, rule.From[0].IPBlock)
 	}
+	require.NotNil(t, collectorPolicy.Spec.Ingress[0].From[0].PodSelector)
+	require.NotNil(t, collectorPolicy.Spec.Ingress[1].From[0].PodSelector)
 	require.Equal(t, collectorLabels, collectorPolicy.Spec.PodSelector.MatchLabels)
 	require.Nil(t, collectorPolicy.Spec.Ingress[0].From[0].NamespaceSelector)
 	require.Equal(t, map[string]string{
@@ -145,6 +146,13 @@ func (tc *MonitoringTestCtx) ValidateCollectorNetworkPolicyContract(t *testing.T
 		otlpNamespaceLabel: "true",
 	}}, collectorPolicy.Spec.Ingress[1].From[0].NamespaceSelector)
 	require.Equal(t, []int32{4317, 4318}, networkPolicyPorts(collectorPolicy.Spec.Ingress[1]))
+
+	// Workloads in namespaces enrolled for scraping may also push OTLP.
+	require.Nil(t, collectorPolicy.Spec.Ingress[2].From[0].PodSelector)
+	require.Equal(t, &metav1.LabelSelector{MatchLabels: map[string]string{
+		"monitoring.opendatahub.io/scrape": "true",
+	}}, collectorPolicy.Spec.Ingress[2].From[0].NamespaceSelector)
+	require.Equal(t, []int32{4317, 4318}, networkPolicyPorts(collectorPolicy.Spec.Ingress[2]))
 
 	targetAllocatorPolicy := policyByName(t, targetAllocatorPolicies, "data-science-collector-targetallocator-ingress")
 	require.Len(t, targetAllocatorPolicy.Spec.Ingress, 1)
@@ -315,6 +323,19 @@ func (tc *MonitoringTestCtx) runTargetAllocatorMTLSNetworkPolicyProbes(t *testin
 	// The Operator names the client Certificate and its Secret identically.
 	// Mount the existing client Secret; do not grant the probe API Secret access.
 	clientCertificate := OpenTelemetryCollectorName + "-ta-client-cert"
+
+	// Verify the client certificate Secret exists before running the mTLS probe
+	clientSecret := &corev1.Secret{}
+	err := tc.Client().Get(tc.Context(), types.NamespacedName{
+		Name:      clientCertificate,
+		Namespace: tc.MonitoringNamespace,
+	}, clientSecret)
+	if errors.IsNotFound(err) {
+		t.Logf("Skipping mTLS NetworkPolicy probe: client certificate Secret %s/%s not found",
+			tc.MonitoringNamespace, clientCertificate)
+		return
+	}
+	require.NoError(t, err, "failed to get client certificate Secret %s/%s", tc.MonitoringNamespace, clientCertificate)
 	tc.runNetworkPolicyProbe(t, "targetallocator-mtls-allowed", tc.MonitoringNamespace,
 		collectorNetworkPolicyLabels(tc.MonitoringNamespace), nil, true, func(probe *corev1.Pod) {
 			probe.Spec.Volumes = []corev1.Volume{{

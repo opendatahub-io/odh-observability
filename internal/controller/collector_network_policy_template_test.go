@@ -29,7 +29,7 @@ func TestCollectorNetworkPolicyTemplateRestrictsIngress(t *testing.T) {
 		"app.kubernetes.io/part-of":    "opentelemetry",
 	}, collector.Spec.PodSelector.MatchLabels)
 	require.Equal(t, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}, collector.Spec.PolicyTypes)
-	require.Len(t, collector.Spec.Ingress, 2)
+	require.Len(t, collector.Spec.Ingress, 3)
 
 	scrapeRule := collector.Spec.Ingress[0]
 	require.Equal(t, []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
@@ -110,6 +110,24 @@ func TestCollectorNetworkPolicyTemplateRestrictsIngress(t *testing.T) {
 	require.False(t, selector.Matches(labels.Set{
 		"app.kubernetes.io/component": "llminferenceservice-workload",
 	}))
+
+	// Third rule: test/monitored namespaces (monitoring.opendatahub.io/scrape: "true")
+	testRule := collector.Spec.Ingress[2]
+	require.Equal(t, []networkingv1.NetworkPolicyPeer{{
+		NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+			"monitoring.opendatahub.io/scrape": "true",
+		}},
+	}}, testRule.From)
+	require.Equal(t, []networkingv1.NetworkPolicyPort{
+		tcpNetworkPolicyPort(4317),
+		tcpNetworkPolicyPort(4318),
+	}, testRule.Ports)
+
+	testNamespaceSelector, err := metav1.LabelSelectorAsSelector(testRule.From[0].NamespaceSelector)
+	require.NoError(t, err)
+	require.True(t, testNamespaceSelector.Matches(labels.Set{"monitoring.opendatahub.io/scrape": "true"}))
+	require.False(t, testNamespaceSelector.Matches(labels.Set{"monitoring.opendatahub.io/scrape": "false"}))
+	require.False(t, testNamespaceSelector.Matches(labels.Set{}))
 }
 
 func TestCollectorTargetAllocatorNetworkPolicyTemplateRestrictsIngressAndAPIConfig(t *testing.T) {
