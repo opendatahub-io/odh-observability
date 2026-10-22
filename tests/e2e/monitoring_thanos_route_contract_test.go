@@ -54,6 +54,7 @@ type prometheusQueryResponse struct {
 	Data   struct {
 		Result []struct {
 			Metric map[string]string `json:"metric"`
+			Value  []any             `json:"value"`
 		} `json:"result"`
 	} `json:"data"`
 }

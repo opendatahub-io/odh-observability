@@ -536,7 +536,7 @@ func addExportersData(metrics *v1alpha1.Metrics, templateData map[string]any) er
 }
 
 func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces, namespace string) error {
-	templateData["OtlpEndpoint"] = fmt.Sprintf("http://data-science-collector-collector.%s.svc.cluster.local:4317", namespace)
+	templateData["OtlpEndpoint"] = fmt.Sprintf("https://data-science-collector-collector-headless.%s.svc.cluster.local:4317", namespace)
 	templateData["SampleRatio"] = getStringValueOrDefault(traces.SampleRatio, defaultTracesSampleRatio)
 
 	validatedExporters := make(map[string]string)

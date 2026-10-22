@@ -409,9 +409,102 @@ func (tc *MonitoringTestCtx) runCollectorTests(t *testing.T) {
 		tc.setupMetrics(t)
 		t.Run("Test signal-specific collector contract", tc.ValidateSignalSpecificCollectorContract)
 		t.Run("Test OpenTelemetry Collector replicas", tc.ValidateMonitoringCRCollectorReplicas)
+		t.Run("Test OTLP receiver TLS is always enabled", tc.ValidateOTLPTLSAlwaysEnabled)
 		t.Run("Test Metrics TLS is always enabled for Prometheus exporter", tc.ValidateMetricsTLSAlwaysEnabled)
 		t.Run("Test Monitoring TLS is always enabled for internal telemetry exporter", tc.ValidateMonitoringTLSAlwaysEnabled)
 	})
+}
+
+// ValidateOTLPTLSAlwaysEnabled validates the TLS contract for the main OTLP receiver.
+func (tc *MonitoringTestCtx) ValidateOTLPTLSAlwaysEnabled(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.ensureOpenTelemetryCollectorReady(t)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      OpenTelemetryCollectorServiceName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`[.spec.ports[] | select(.port == 4317 or .port == 4318)] | length == 2`),
+		)),
+		WithCustomErrorMsg("OTLP Service should expose gRPC and HTTP"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      OpenTelemetryCollectorServiceName + "-headless",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == "data-science-collector-collector-headless-tls"`)),
+		WithCustomErrorMsg("OTLP headless Service should own the service-ca serving certificate"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Secret, types.NamespacedName{
+			Name:      "data-science-collector-collector-headless-tls",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.type == "kubernetes.io/tls"`),
+			jq.Match(`.data."tls.crt" != null`),
+			jq.Match(`.data."tls.key" != null`),
+		)),
+		WithCustomErrorMsg("service-ca should issue the OTLP headless Service certificate and key"),
+	)
+	tc.assertServiceCACertificateOriginMatchesService(
+		t,
+		OpenTelemetryCollectorServiceName+"-headless",
+		"data-science-collector-collector-headless-tls",
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+			Name:      OpenTelemetryCollectorName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == null`),
+			jq.Match(`.spec.volumeMounts[] | select(.name == "otlp-tls-certs" and .mountPath == "/etc/otel-collector/otlp-tls" and .readOnly == true)`),
+			jq.Match(`.spec.volumes[] | select(.name == "otlp-tls-certs") | .secret.secretName == "data-science-collector-collector-headless-tls"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.grpc.tls.cert_file == "/etc/otel-collector/otlp-tls/tls.crt"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.grpc.tls.key_file == "/etc/otel-collector/otlp-tls/tls.key"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.http.tls.cert_file == "/etc/otel-collector/otlp-tls/tls.crt"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.http.tls.key_file == "/etc/otel-collector/otlp-tls/tls.key"`),
+		)),
+		WithCustomErrorMsg("OpenTelemetryCollector should mount the service-ca certificate and enable TLS on both OTLP receivers"),
+	)
+}
+
+func (tc *MonitoringTestCtx) assertServiceCACertificateOriginMatchesService(t *testing.T, serviceName, secretName string) {
+	t.Helper()
+
+	service, err := tc.fetchResource(t, gvk.Service, types.NamespacedName{
+		Name: serviceName, Namespace: tc.MonitoringNamespace,
+	})
+	require.NoError(t, err, "failed to fetch serving-certificate Service %s", serviceName)
+
+	secret, err := tc.fetchResource(t, gvk.Secret, types.NamespacedName{
+		Name: secretName, Namespace: tc.MonitoringNamespace,
+	})
+	require.NoError(t, err, "failed to fetch serving-certificate Secret %s", secretName)
+
+	originServiceName, found, err := unstructured.NestedString(secret.Object, "metadata", "annotations", "service.beta.openshift.io/originating-service-name")
+	require.NoError(t, err)
+	require.True(t, found, "service-ca Secret must identify its originating Service")
+	require.Equal(t, serviceName, originServiceName)
+
+	originServiceUID, found, err := unstructured.NestedString(secret.Object, "metadata", "annotations", "service.beta.openshift.io/originating-service-uid")
+	require.NoError(t, err)
+	require.True(t, found, "service-ca Secret must identify its originating Service UID")
+	require.Equal(t, string(service.GetUID()), originServiceUID)
 }
 
 // ValidateOpenTelemetryCollectorConfigurations consolidates all OpenTelemetry Collector configuration tests.
@@ -1881,7 +1974,7 @@ func (tc *MonitoringTestCtx) ValidateInstrumentationCRTracesLifecycle(t *testing
 		WithCustomErrorMsg("Monitoring resource should be updated with traces configuration"),
 	)
 
-	expectedEndpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:4317", OpenTelemetryCollectorServiceName, tc.MonitoringNamespace)
+	expectedEndpoint := fmt.Sprintf("https://%s-headless.%s.svc.cluster.local:4317", OpenTelemetryCollectorServiceName, tc.MonitoringNamespace)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Instrumentation, types.NamespacedName{Name: InstrumentationName, Namespace: tc.MonitoringNamespace}),
@@ -1890,6 +1983,7 @@ func (tc *MonitoringTestCtx) ValidateInstrumentationCRTracesLifecycle(t *testing
 			jq.Match(`.metadata.generation >= 1`),
 			jq.Match(`
 				(.spec.exporter.endpoint == "%s") and
+				(.spec.exporter.tls.ca_file == "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt") and
 				(.spec.sampler.type == "traceidratio") and
 				(.spec.sampler.argument == "0.1")
 			`, expectedEndpoint),

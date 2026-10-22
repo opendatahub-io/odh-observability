@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -511,16 +512,18 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 			"name": "facebook/opt-125m",
 		},
 		"tracing": map[string]any{
-			"exporterEndpoint": fmt.Sprintf("http://%s.%s.svc.cluster.local:4317", OpenTelemetryCollectorServiceName, inferenceMonitoringNamespace()),
+			"exporterEndpoint": fmt.Sprintf("https://%s-headless.%s.svc.cluster.local:4317", OpenTelemetryCollectorServiceName, inferenceMonitoringNamespace()),
 			"sampler":          "always_on",
 		},
 		"replicas": int64(1),
 		"template": map[string]any{
+			"volumes": serviceCAVolumes(),
 			"containers": []map[string]any{
 				{
-					"name":  "main",
-					"image": "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
-					"env":   []map[string]any{{"name": "VLLM_CPU_KVCACHE_SPACE", "value": "1"}},
+					"name":         "main",
+					"image":        "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
+					"env":          inferenceContainerEnv(),
+					"volumeMounts": serviceCAVolumeMounts(),
 					"resources": map[string]any{
 						"requests": map[string]any{"memory": memory},
 						"limits":   map[string]any{"memory": memory},
@@ -539,11 +542,13 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		// it does not contain a nested template. Unknown fields are pruned by
 		// the API server, so keep the containers directly under worker.
 		spec["worker"] = map[string]any{
+			"volumes": serviceCAVolumes(),
 			"containers": []map[string]any{
 				{
-					"name":  "main",
-					"image": "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
-					"env":   []map[string]any{{"name": "VLLM_CPU_KVCACHE_SPACE", "value": "1"}},
+					"name":         "main",
+					"image":        "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
+					"env":          inferenceContainerEnv(),
+					"volumeMounts": serviceCAVolumeMounts(),
 					"resources": map[string]any{
 						"requests": map[string]any{"memory": memory},
 						"limits":   map[string]any{"memory": memory},
@@ -554,11 +559,13 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	case "disaggregated":
 		spec["prefill"] = map[string]any{
 			"template": map[string]any{
+				"volumes": serviceCAVolumes(),
 				"containers": []map[string]any{
 					{
-						"name":  "main",
-						"image": "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
-						"env":   []map[string]any{{"name": "VLLM_CPU_KVCACHE_SPACE", "value": "1"}},
+						"name":         "main",
+						"image":        "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
+						"env":          inferenceContainerEnv(),
+						"volumeMounts": serviceCAVolumeMounts(),
 						"resources": map[string]any{
 							"requests": map[string]any{"memory": memory},
 							"limits":   map[string]any{"memory": memory},
@@ -732,9 +739,30 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		metav1.ConditionTrue,
 		WithEventuallyTimeout(10*time.Minute),
 	)
+	monitoringTC := &MonitoringTestCtx{TestContext: tc}
+	metricsRouteHost := monitoringTC.fetchPrometheusRouteHost(t)
+	traceViewerToken := monitoringTC.metricsViewerToken(t, "llmisvc-trace-reader-"+topology, tc.MonitoringNamespace)
+	metricsRootCAs := clusterIngressCAPool(t, monitoringTC)
+	baselineAcceptedSpans, err := queryOTLPReceiverAcceptedSpans(
+		tc.Context(), metricsRootCAs, metricsRouteHost, traceViewerToken, tc.MonitoringNamespace,
+	)
+	require.NoError(t, err, "should read the OTLP receiver's accepted-span counter before inference")
+
 	t.Logf("[%s] LLMInferenceService is Ready; sending authenticated completion request", topology)
 	send := func() error { return sendCompletion(tc.Context(), routeHost, ocToken) }
 	g.Eventually(send, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Should successfully send completion request through OAuth proxy")
+	g.Eventually(func() error {
+		acceptedSpans, queryErr := queryOTLPReceiverAcceptedSpans(
+			tc.Context(), metricsRootCAs, metricsRouteHost, traceViewerToken, tc.MonitoringNamespace,
+		)
+		if queryErr != nil {
+			return queryErr
+		}
+		if acceptedSpans <= baselineAcceptedSpans {
+			return fmt.Errorf("OTLP receiver accepted-span count did not increase after inference: before=%v after=%v", baselineAcceptedSpans, acceptedSpans)
+		}
+		return nil
+	}, 3*time.Minute, 5*time.Second).Should(gomega.Succeed(), "LLMInferenceService should deliver a real trace to the TLS OTLP receiver")
 
 	// 3. Verification via OATS
 	t.Logf("[%s] Running OATS verification", topology)
@@ -776,6 +804,60 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		}
 		return true
 	}, 1*time.Minute, 2*time.Second).Should(gomega.BeTrue(), "Associated PodMonitor should be deleted within 1 reconciliation cycle of LLMInferenceService deletion")
+}
+
+func inferenceContainerEnv() []map[string]any {
+	return []map[string]any{
+		{"name": "VLLM_CPU_KVCACHE_SPACE", "value": "1"},
+		{"name": "OTEL_EXPORTER_OTLP_CERTIFICATE", "value": "/var/run/secrets/service-ca/service-ca.crt"},
+	}
+}
+
+func serviceCAVolumeMounts() []map[string]any {
+	return []map[string]any{{
+		"name":      "service-ca",
+		"mountPath": "/var/run/secrets/service-ca",
+		"readOnly":  true,
+	}}
+}
+
+func serviceCAVolumes() []map[string]any {
+	return []map[string]any{{
+		"name": "service-ca",
+		"configMap": map[string]any{
+			"name":  "openshift-service-ca.crt",
+			"items": []map[string]any{{"key": "service-ca.crt", "path": "service-ca.crt"}},
+		},
+	}}
+}
+
+func queryOTLPReceiverAcceptedSpans(ctx context.Context, rootCAs *x509.CertPool, routeHost, token, namespace string) (float64, error) {
+	status, response, err := queryMetricsViaNamespaceProxy(
+		ctx, rootCAs, routeHost, token, namespace,
+		`sum(otelcol_receiver_accepted_spans{receiver=~"otlp.*"}) or sum(otelcol_receiver_accepted_spans_total{receiver=~"otlp.*"})`,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if status != http.StatusOK || response.Status != "success" {
+		return 0, fmt.Errorf("query for accepted OTLP spans returned HTTP %d and Prometheus status %q", status, response.Status)
+	}
+	if len(response.Data.Result) == 0 {
+		return 0, nil
+	}
+	value := response.Data.Result[0].Value
+	if len(value) != 2 {
+		return 0, fmt.Errorf("accepted OTLP span query returned malformed sample %v", value)
+	}
+	textValue, ok := value[1].(string)
+	if !ok {
+		return 0, fmt.Errorf("accepted OTLP span query returned non-string sample %v", value[1])
+	}
+	count, err := strconv.ParseFloat(textValue, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse accepted OTLP span count %q: %w", textValue, err)
+	}
+	return count, nil
 }
 
 func logManualCleanupCommands(t *testing.T, topology, llmSvcName, proxyName, tlsSecretName, cookieSecretName, bindingName, saName string) {

@@ -172,6 +172,42 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorDeployment(t *testing.T) 
 			Namespace: tc.MonitoringNamespace,
 		}),
 	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      UsageLogsCollectorName + "-collector",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`[.spec.ports[] | select(.port == 4317 or .port == 4318)] | length == 2`)),
+		WithCustomErrorMsg("Usage Logs OTLP Service should expose gRPC and HTTP"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      UsageLogsCollectorName + "-collector-headless",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == "%s-collector-headless-tls"`, UsageLogsCollectorName)),
+		WithCustomErrorMsg("Usage Logs OTLP headless Service should own an OpenShift serving certificate"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Secret, types.NamespacedName{
+			Name:      UsageLogsCollectorName + "-collector-headless-tls",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.type == "kubernetes.io/tls"`),
+			jq.Match(`.data."tls.crt" != null`),
+			jq.Match(`.data."tls.key" != null`),
+		)),
+		WithCustomErrorMsg("service-ca should issue the Usage Logs OTLP headless Service certificate and key"),
+	)
+	tc.assertServiceCACertificateOriginMatchesService(
+		t,
+		UsageLogsCollectorName+"-collector-headless",
+		UsageLogsCollectorName+"-collector-headless-tls",
+	)
 }
 
 // ValidateUsageLogsCollectorConfiguration validates the logs collector configuration details.
@@ -188,10 +224,17 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorConfiguration(t *testing.
 			// The operator-managed NetworkPolicy is disabled; ingress is governed by
 			// the NetworkPolicies this operator renders (see ValidateUsageLogsCollectorNetworkPolicies).
 			jq.Match(`.spec.networkPolicy.enabled == false`),
+			jq.Match(`.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == null`),
+			jq.Match(`.spec.volumeMounts[] | select(.name == "otlp-tls-certs" and .mountPath == "/etc/otel-collector/otlp-tls" and .readOnly == true)`),
+			jq.Match(`.spec.volumes[] | select(.name == "otlp-tls-certs") | .secret.secretName == "%s-collector-headless-tls"`, UsageLogsCollectorName),
 
 			// Verify receivers
 			jq.Match(`.spec.config.receivers.otlp.protocols.grpc.endpoint == "0.0.0.0:4317"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.grpc.tls.cert_file == "/etc/otel-collector/otlp-tls/tls.crt"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.grpc.tls.key_file == "/etc/otel-collector/otlp-tls/tls.key"`),
 			jq.Match(`.spec.config.receivers.otlp.protocols.http.endpoint == "0.0.0.0:4318"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.http.tls.cert_file == "/etc/otel-collector/otlp-tls/tls.crt"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.http.tls.key_file == "/etc/otel-collector/otlp-tls/tls.key"`),
 
 			// Verify processors
 			jq.Match(`.spec.config.processors.k8sattributes != null`),

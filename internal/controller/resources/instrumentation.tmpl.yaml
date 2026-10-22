@@ -6,6 +6,8 @@ metadata:
 spec:
   exporter:
     endpoint: {{.OtlpEndpoint}}
+    tls:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
   sampler:
     type: traceidratio
     argument: "{{.SampleRatio}}"
