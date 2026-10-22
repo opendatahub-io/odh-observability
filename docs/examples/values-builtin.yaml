@@ -1,6 +1,9 @@
 # All built-in observability (metrics, traces, dashboards, logs).
 # CLO (Red Hat OpenShift Logging) is still installed from OperatorHub.
 # Create the S3 secret in redhat-ods-monitoring before enabling logs.
+metrics:
+  serviceMonitor:
+    enabled: true
 components:
   dashboard:
     dsc:
