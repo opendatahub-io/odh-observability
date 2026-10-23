@@ -765,7 +765,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 
 	g.Eventually(func() bool {
 		pmList := &unstructured.UnstructuredList{}
-		pmList.SetGroupVersionKind(gvk.CoreosPodMonitor)
+		pmList.SetGroupVersionKind(gvk.PodMonitorCoreos)
 		if err := tc.Client().List(tc.Context(), pmList, client.InNamespace("default")); err != nil {
 			return true
 		}
@@ -1386,10 +1386,10 @@ func waitForCondition(tc *TestContext, g schema.GroupVersionKind, nn types.Names
 func installInferenceOperators(t *testing.T, tc *TestContext) {
 	t.Helper()
 
-	t.Log("Installing Cluster Observability, cert-manager, Tempo, OpenTelemetry, LeaderWorkerSet, " +
-		"Loki, and Red Hat Connectivity Link operators")
+	t.Log("Installing Cluster Observability, Tempo, OpenTelemetry, LeaderWorkerSet, Loki, and Red Hat Connectivity Link operators")
 	tc.EnsureOperatorInstalled(observabilityOpNamespace, observabilityOpName, observabilityOpChannel)
-	tc.EnsureOperatorInstalled(certManagerOpNamespace, certManagerOpName, certManagerOpChannel)
+	// cert-manager is preinstalled by the CI pipeline from a different catalog
+	// source than redhat-operators, so EnsureOperatorInstalled cannot match it.
 	tc.EnsureOperatorInstalled(tempoOpNamespace, tempoOpName, tempoOpChannel)
 	tc.EnsureOperatorInstalled(opentelemetryOpNamespace, opentelemetryOpName, opentelemetryOpChannel)
 	tc.EnsureOperatorInstalledInOwnNamespace(leaderWorkerSetOpNamespace, leaderWorkerSetOpName, leaderWorkerSetOpChannel)

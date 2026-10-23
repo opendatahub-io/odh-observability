@@ -106,15 +106,22 @@ var (
 		Kind:    "ServiceMonitor",
 	}
 
-	// CoreosServiceMonitor (monitoring.coreos.com/v1) — webhook target.
-	CoreosServiceMonitor = schema.GroupVersionKind{
+	// ServiceMonitorCoreos (monitoring.coreos.com/v1) for upstream Prometheus Operator.
+	ServiceMonitorCoreos = schema.GroupVersionKind{
 		Group:   "monitoring.coreos.com",
 		Version: "v1",
 		Kind:    "ServiceMonitor",
 	}
 
-	// CoreosPodMonitor (monitoring.coreos.com/v1) — webhook target.
-	CoreosPodMonitor = schema.GroupVersionKind{
+	// PodMonitor (monitoring.rhobs/v1) for RHOBS stack.
+	PodMonitor = schema.GroupVersionKind{
+		Group:   "monitoring.rhobs",
+		Version: "v1",
+		Kind:    "PodMonitor",
+	}
+
+	// PodMonitorCoreos (monitoring.coreos.com/v1) for upstream Prometheus Operator.
+	PodMonitorCoreos = schema.GroupVersionKind{
 		Group:   "monitoring.coreos.com",
 		Version: "v1",
 		Kind:    "PodMonitor",

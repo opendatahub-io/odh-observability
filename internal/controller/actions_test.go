@@ -518,13 +518,32 @@ func TestDeployAlerting_CRDPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 1 {
-		t.Errorf("expected 1 source for alerting, got %d", len(sources))
+	if len(sources) != 0 {
+		t.Errorf("expected 0 sources for alerting, got %d", len(sources))
 	}
 
 	alertC := findCondition(m, conditions.ConditionAlertingAvailable)
 	if alertC == nil || alertC.Status != metav1.ConditionTrue {
 		t.Error("AlertingAvailable should be True")
+	}
+}
+
+func TestDeployOperatorMonitoring_CRDPresent(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.PrometheusRule)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployOperatorMonitoring(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 1 {
+		t.Errorf("expected 1 source for operator monitoring, got %d", len(sources))
 	}
 }
 
@@ -890,7 +909,12 @@ func TestDeployClusterLogForwarder_CRDMissing(t *testing.T) {
 		t.Errorf("expected no sources when CLF CRD is missing, got %d", len(sources))
 	}
 
-	c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable)
+	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
+	if c == nil {
+		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
+		return
+	}
+	c = mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable)
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
 	}
@@ -930,7 +954,12 @@ func TestDeployClusterLogForwarder_LokiStackNotReady(t *testing.T) {
 		t.Errorf("expected 3 sources (CLF + RBAC + NetworkPolicy) when LokiStack is not ready, got %d", len(sources))
 	}
 
-	c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable)
+	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
+	if c == nil {
+		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
+		return
+	}
+	c = mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable)
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
 	}
@@ -985,7 +1014,12 @@ func TestDeployClusterLogForwarder_CLFExistsButNotReady(t *testing.T) {
 		t.Errorf("expected 3 sources (CLF + RBAC + NetworkPolicy) even when CLF is not ready, got %d", len(sources))
 	}
 
-	c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable)
+	c := findCondition(m, conditions.ConditionClusterLogForwarderAvailable)
+	if c == nil {
+		t.Fatal("expected ClusterLogForwarderAvailable condition to be set")
+		return
+	}
+	c = mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable)
 	if c.Status != metav1.ConditionFalse {
 		t.Errorf("expected status False, got %s", c.Status)
 	}

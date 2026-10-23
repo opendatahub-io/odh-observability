@@ -963,8 +963,10 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 		gvk.LokiStack,
 		gvk.Perses,
 		gvk.ThanosQuerier,
-		gvk.CoreosPodMonitor,
-		gvk.CoreosServiceMonitor,
+		gvk.PodMonitor,
+		gvk.ServiceMonitor,
+		gvk.PodMonitorCoreos,
+		gvk.ServiceMonitorCoreos,
 	} {
 		tc.ensureCRDExists(t, required)
 	}
@@ -1042,6 +1044,8 @@ func (tc *TestContext) installDependentOperators(t *testing.T) {
 		{observabilityOpNamespace, observabilityOpName, cooOperatorChannel()},
 		{tempoOpNamespace, tempoOpName, tempoOpChannel},
 		{opentelemetryOpNamespace, opentelemetryOpName, opentelemetryOpChannel},
+		// cert-manager is preinstalled by the CI pipeline from a different catalog
+		// source than redhat-operators, so EnsureOperatorInstalled cannot match it.
 	}
 
 	t.Run("install-dependent-operators", func(t *testing.T) {

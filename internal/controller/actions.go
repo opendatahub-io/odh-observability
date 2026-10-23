@@ -309,6 +309,30 @@ func deployOpenTelemetryCollector(
 	return nil
 }
 
+// deployOperatorMonitoring deploys PrometheusRules for operator self-monitoring
+// (webhook health, pod availability). These rules are internal monitoring for the
+// operator itself and are deployed regardless of user alerting config.
+func deployOperatorMonitoring(
+	ctx context.Context,
+	c client.Client,
+	_ *v1alpha1.Monitoring,
+	_ *conditions.ConditionsManager,
+	sources *[]rendertemplate.TemplateSource,
+) error {
+	// Check if PrometheusRule CRD exists (installed by RHOBS/Prometheus Operator)
+	exists, err := hasCRD(ctx, c, gvk.PrometheusRule)
+	if err != nil {
+		return fmt.Errorf("checking PrometheusRule CRD: %w", err)
+	}
+	if !exists {
+		// Silently skip if CRD not found - operator monitoring is best-effort
+		return nil
+	}
+
+	*sources = append(*sources, src(OperatorPrometheusRulesTemplate))
+	return nil
+}
+
 // deployAlerting deploys operator-level PrometheusRules when alerting is configured.
 // Per-component rules are intentionally dropped in the standalone module.
 func deployAlerting(
@@ -335,7 +359,6 @@ func deployAlerting(
 	}
 
 	cm.MarkTrue(conditions.ConditionAlertingAvailable)
-	*sources = append(*sources, src(OperatorPrometheusRulesTemplate))
 	return nil
 }
 

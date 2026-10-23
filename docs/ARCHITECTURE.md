@@ -61,17 +61,18 @@ Action functions run sequentially in a fixed order. Each function checks whether
 
 | Order | Function | Spec Trigger | CRDs Checked | Condition | Templates |
 |-------|----------|-------------|--------------|-----------|-----------|
-| 1 | `deployWebhookInfrastructure` | Always | `Issuer` (cert-manager) | `WebhookAvailable` | webhook-service, webhook-cert-manager, webhook-configuration |
-| 2 | `deployMonitoringAdmissionPolicies` | Always | None | None | monitoring-admission-policies |
-| 3 | `deployMonitoringStackWithQuerierAndRestrictions` | `spec.metrics` | `MonitoringStack`, `ThanosQuerier` | `MonitoringStackAvailable`, `ThanosQuerierAvailable` | 14 templates (see inventory) |
-| 4 | `deployTracingStack` | `spec.traces` | `TempoMonolithic`/`TempoStack`, `Instrumentation` | `TempoAvailable`, `InstrumentationAvailable` | Tempo template + instrumentation |
-| 5 | `deployOpenTelemetryCollector` | `spec.metrics` or `spec.traces` | `OpenTelemetryCollector` | `OpenTelemetryCollectorAvailable` | collector, RBAC, ServiceMonitors, Prometheus service |
-| 6 | `deployAlerting` | `spec.alerting` | `PrometheusRule` | `AlertingAvailable` | operator-prometheusrules |
-| 7 | `deployNodeMetricsEndpoint` | `spec.metrics` | None | `NodeMetricsEndpointAvailable` | prometheus-cluster-proxy |
-| 8 | `deployKorrel8r` | `spec.metrics` or `spec.traces` or `spec.logs` | None | `Korrel8rAvailable` | ConfigMap, Deployment, Service, RBAC, NetworkPolicy |
-| 9 | `deployPerses` | `spec.metrics` or `spec.traces` | `Perses` | `PersesAvailable` | perses, network-policy |
-| 10 | `deployPersesTempoIntegration` | `spec.traces` | `PersesDatasource`, `PersesDashboard` | `PersesTempoDataSourceAvailable` | datasource, CA ConfigMap, dashboard |
-| 11 | `deployPersesPrometheusIntegration` | `spec.metrics` | `PersesDatasource` | `PersesPrometheusDataSourceAvailable` | 2 datasource templates |
+| 1 | `deployWebhookInfrastructure` | Always | None | `WebhookAvailable` | None -- verifies the cert-manager TLS secret exists; webhook resources are deployed by the Helm chart |
+| 2 | `deployOperatorMonitoring` | Always | `PrometheusRule` | None | operator-prometheusrules |
+| 3 | `deployMonitoringAdmissionPolicies` | Always | None | None | monitoring-admission-policies |
+| 4 | `deployMonitoringStackWithQuerierAndRestrictions` | `spec.metrics` | `MonitoringStack`, `ThanosQuerier` | `MonitoringStackAvailable`, `ThanosQuerierAvailable` | 14 templates (see inventory) |
+| 5 | `deployTracingStack` | `spec.traces` | `TempoMonolithic`/`TempoStack`, `Instrumentation` | `TempoAvailable`, `InstrumentationAvailable` | Tempo template + instrumentation |
+| 6 | `deployOpenTelemetryCollector` | `spec.metrics` or `spec.traces` | `OpenTelemetryCollector` | `OpenTelemetryCollectorAvailable` | collector, RBAC, ServiceMonitors, Prometheus service |
+| 7 | `deployAlerting` | `spec.alerting` | `PrometheusRule` | `AlertingAvailable` | None -- condition-only check |
+| 8 | `deployNodeMetricsEndpoint` | `spec.metrics` | None | `NodeMetricsEndpointAvailable` | prometheus-cluster-proxy |
+| 9 | `deployKorrel8r` | `spec.metrics` or `spec.traces` or `spec.logs` | None | `Korrel8rAvailable` | ConfigMap, Deployment, Service, RBAC, NetworkPolicy |
+| 10 | `deployPerses` | `spec.metrics` or `spec.traces` | `Perses` | `PersesAvailable` | perses, network-policy |
+| 11 | `deployPersesTempoIntegration` | `spec.traces` | `PersesDatasource`, `PersesDashboard` | `PersesTempoDataSourceAvailable` | datasource, CA ConfigMap, dashboard |
+| 12 | `deployPersesPrometheusIntegration` | `spec.metrics` | `PersesDatasource` | `PersesPrometheusDataSourceAvailable` | 2 datasource templates |
 
 When a feature is not configured, the action calls `MarkNotConfigured` (Info severity) which prevents it from contributing to Degraded status. When a required CRD is missing, `MarkFalse` is used, which does contribute to Degraded.
 
@@ -150,11 +151,13 @@ All templates are embedded via `//go:embed` and rendered with Go's `text/templat
 
 ### Webhook Infrastructure
 
-| Template | Resources Created |
-|----------|-------------------|
-| `webhook-service.tmpl.yaml` | Service for webhook endpoint |
-| `webhook-cert-manager.tmpl.yaml` | cert-manager Certificate + Issuer |
-| `webhook-configuration.tmpl.yaml` | MutatingWebhookConfiguration |
+The webhook resources are **not** rendered by the operator. They are deployed by the Helm chart at install time in [`charts/odh-observability/templates/webhook.yaml`](../charts/odh-observability/templates/webhook.yaml).
+
+| Resource | Deployed By |
+|----------|-------------|
+| Service for webhook endpoint | Helm chart |
+| cert-manager Certificate + Issuer | Helm chart |
+| MutatingWebhookConfiguration | Helm chart |
 
 ### Admission Policies
 
@@ -250,27 +253,34 @@ Custom OTel exporters (`spec.metrics.exporters`, `spec.traces.exporters`) go thr
 
 ## Mutating Admission Webhook
 
-The operator includes a mutating admission webhook that injects the `opendatahub.io/monitoring=true` label onto `ServiceMonitor` and `PodMonitor` resources (both `monitoring.coreos.com/v1`).
+The operator includes a mutating admission webhook that injects the `monitoring.opendatahub.io/scrape=true` label onto `ServiceMonitor` and `PodMonitor` resources in both the `monitoring.coreos.com/v1` and `monitoring.rhobs/v1` API groups.
 
 ### How It Works
 
-1. A namespace opts in by having the label `opendatahub.io/monitoring=true`.
+1. A namespace opts in by having the label `monitoring.opendatahub.io/scrape=true`.
 2. When a ServiceMonitor or PodMonitor is created/updated in an opted-in namespace, the webhook intercepts the request.
 3. The webhook verifies the `default-monitoring` CR exists (monitoring is active).
-4. If the object does not already have the label, the webhook injects `opendatahub.io/monitoring: "true"` via JSON patch.
+4. If the object does not already have the label, the webhook injects `monitoring.opendatahub.io/scrape: "true"` via JSON patch.
 
 This label is what makes the MonitoringStack's Prometheus instance discover and scrape the monitor.
 
+### Admission Probe
+
+Because the webhook uses `failurePolicy: Ignore`, an outage admits monitors without the scrape label and no client sees an error. The operator runs an in-process probe every 5 minutes that writes a canary PodMonitor and checks that the webhook labeled it; the result is exported as `webhook_admission_probe_*` metrics and drives the `MonitoringWebhookAdmissionPathDown` alert.
+
+The canary lives in a dedicated namespace (`webhook.probe.namespace`, default `<fullname>-webhook-probe`) that the Helm chart creates with `monitoring.opendatahub.io/scrape=true`, so the webhook `namespaceSelector` matches it without opting real monitors in the monitoring namespace into scraping. The operator reads the namespace from `WEBHOOK_PROBE_NAMESPACE`; the probe is disabled when it is unset and counts a failure when the namespace lacks the label.
+
 ### Self-Bootstrapping
 
-The webhook is self-bootstrapping -- the operator provisions its own TLS infrastructure:
+The webhook resources (Service, Certificate, Issuer, and MutatingWebhookConfiguration) are deployed by the Helm chart at install time, not by the operator.
 
-1. The reconciler checks for cert-manager's `Issuer` CRD on the cluster.
-2. If present, it deploys a cert-manager Certificate and self-signed Issuer to generate TLS certs.
-3. Once the TLS secret is provisioned, the operator patches its own Deployment to add `--enable-webhook=true`, the webhook port (9443), and the cert volume mount.
-4. The MutatingWebhookConfiguration is deployed, pointing at the operator's Service.
+The operator's role is limited to:
 
-During bootstrapping, the `WebhookAvailable` condition uses Info severity (`MarkNotConfigured`) so the operator does not appear degraded while waiting for cert-manager to provision certificates.
+1. Verify that the TLS secret (generated by cert-manager from the Helm-deployed Certificate) exists and is ready.
+2. During bootstrapping (before cert-manager provisions the secret), the `WebhookAvailable` condition uses Info severity (`MarkNotConfigured`) so the operator does not appear degraded while waiting for the secret to be provisioned.
+
+This design decouples webhook infrastructure provisioning (Helm) from webhook readiness verification (operator), ensuring the operator can safely verify certificate readiness without managing the resources that create the certificates.
+
 
 ## Garbage Collection
 

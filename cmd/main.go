@@ -19,6 +19,7 @@ package main
 import (
 	"flag"
 	"os"
+	"time"
 
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
 	configv1 "github.com/openshift/api/config/v1"
@@ -136,6 +137,18 @@ func main() {
 		if err := injector.SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Unable to register monitoring webhook")
 			os.Exit(1)
+		}
+
+		// The probe namespace must carry monitoring.opendatahub.io/scrape=true for the
+		// webhook namespaceSelector to match the canary; the Helm chart provisions it.
+		if probeNamespace := os.Getenv("WEBHOOK_PROBE_NAMESPACE"); probeNamespace != "" {
+			probe := monwebhook.NewAdmissionProbe(mgr.GetClient(), probeNamespace, 5*time.Minute)
+			if err := mgr.Add(probe); err != nil {
+				setupLog.Error(err, "Unable to register webhook admission probe")
+				os.Exit(1)
+			}
+		} else {
+			setupLog.Info("Webhook admission probe disabled: WEBHOOK_PROBE_NAMESPACE not set")
 		}
 	}
 

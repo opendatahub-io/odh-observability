@@ -8,7 +8,7 @@ spec:
   failurePolicy: Fail
   matchConstraints:
     resourceRules:
-      - apiGroups: ["monitoring.coreos.com"]
+      - apiGroups: ["monitoring.rhobs", "monitoring.coreos.com"]
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE"]
         resources: ["podmonitors", "servicemonitors"]
