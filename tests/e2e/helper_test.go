@@ -2,7 +2,10 @@ package e2e_test
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -107,14 +110,19 @@ const (
 	defaultInferenceMonitoringNamespace   = "redhat-ods-monitoring"
 	defaultInferenceApplicationsNamespace = "redhat-ods-applications"
 
-	// The opendatahub-operator owns the DSCI and DSC and provisions the monitoring module, so
-	// the inference prerequisites cannot make progress until it is Available and serving its
-	// webhook. These are not part of the namespace switch above: which operator is installed is
-	// independent of the namespaces its DSCI points at. An RHOAI install names them
-	// rhods-operator / redhat-ods-operator instead.
-	odhOperatorNamespace      = "opendatahub-operator-system"
-	odhOperatorDeployment     = "opendatahub-operator-controller-manager"
-	odhOperatorWebhookService = "opendatahub-operator-webhook-service"
+	clusterIngressCANamespace = "openshift-config-managed"
+	clusterIngressCAConfigMap = "default-ingress-cert"
+	clusterIngressCAKey       = "ca-bundle.crt"
+
+	// platformOperatorRHOAI and platformOperatorODH name the platform operator Deployment and
+	// webhook Service for inference prerequisite waits. detectPlatformOperator picks whichever
+	// layout is installed.
+	platformOperatorRHOAINamespace      = "redhat-ods-operator"
+	platformOperatorRHOAIDeployment     = "rhods-operator"
+	platformOperatorRHOAIWebhookService = "rhods-operator-service"
+	platformOperatorODHNamespace        = "opendatahub-operator-system"
+	platformOperatorODHDeployment       = "opendatahub-operator-controller-manager"
+	platformOperatorODHWebhookService   = "opendatahub-operator-webhook-service"
 	// lokiStorageType mirrors spec.monitoring.usageLogs.storage.type there.
 	lokiStorageType = "s3"
 	// lokiS3SecretName mirrors spec.monitoring.usageLogs.storage.secretName there. The test-
@@ -572,6 +580,92 @@ func (tc *MonitoringTestCtx) setupUsageLogsWithStorage(t *testing.T, storageType
 // cleanupTracesConfiguration resets traces configuration.
 func (tc *MonitoringTestCtx) cleanupTracesConfiguration() {
 	tc.updateMonitoringConfig(withManagementState(common.Managed), withNoTraces())
+}
+
+// platformOperator identifies the ODH or RHOAI platform operator Deployment and webhook Service.
+type platformOperator struct {
+	Namespace      string
+	Deployment     string
+	WebhookService string
+}
+
+// clusterIngressCAPEM returns the PEM bundle used to verify OpenShift Route certificates.
+func clusterIngressCAPEM(t *testing.T, ctx context.Context, c client.Client) string {
+	t.Helper()
+
+	configMap := &corev1.ConfigMap{}
+	if err := c.Get(ctx, types.NamespacedName{
+		Name:      clusterIngressCAConfigMap,
+		Namespace: clusterIngressCANamespace,
+	}, configMap); err != nil {
+		t.Fatalf("failed to read the cluster ingress CA ConfigMap: %v", err)
+	}
+	caBundle := configMap.Data[clusterIngressCAKey]
+	if caBundle == "" {
+		t.Fatalf("cluster ingress CA ConfigMap %q is missing %q", clusterIngressCAConfigMap, clusterIngressCAKey)
+	}
+	return caBundle
+}
+
+// ingressCAPool returns a cert pool for HTTPS clients calling OpenShift Routes (system CAs plus
+// the cluster ingress certificate bundle).
+func ingressCAPool(t *testing.T, ctx context.Context, c client.Client) *x509.CertPool {
+	t.Helper()
+
+	rootCAs, err := x509.SystemCertPool()
+	if err != nil {
+		rootCAs = x509.NewCertPool()
+	}
+
+	caBundle := clusterIngressCAPEM(t, ctx, c)
+	if !rootCAs.AppendCertsFromPEM([]byte(caBundle)) {
+		t.Fatalf("cluster ingress CA ConfigMap %q does not contain a valid PEM certificate bundle", clusterIngressCAConfigMap)
+	}
+	return rootCAs
+}
+
+// writeClusterIngressCAFile writes the cluster ingress CA bundle for tools (for example gcx)
+// that read trust via GRAFANA_TLS_CA_FILE.
+func writeClusterIngressCAFile(t *testing.T, ctx context.Context, c client.Client) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "openshift-ingress-ca.pem")
+	if err := os.WriteFile(path, []byte(clusterIngressCAPEM(t, ctx, c)), 0o600); err != nil {
+		t.Fatalf("failed to write cluster ingress CA bundle for OATS/gcx: %v", err)
+	}
+	return path
+}
+
+func detectPlatformOperator(ctx context.Context, c client.Client) (platformOperator, error) {
+	layouts := []platformOperator{
+		{
+			Namespace:      platformOperatorRHOAINamespace,
+			Deployment:     platformOperatorRHOAIDeployment,
+			WebhookService: platformOperatorRHOAIWebhookService,
+		},
+		{
+			Namespace:      platformOperatorODHNamespace,
+			Deployment:     platformOperatorODHDeployment,
+			WebhookService: platformOperatorODHWebhookService,
+		},
+	}
+	for _, layout := range layouts {
+		deployment := &unstructured.Unstructured{}
+		deployment.SetGroupVersionKind(schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"})
+		err := c.Get(ctx, types.NamespacedName{Namespace: layout.Namespace, Name: layout.Deployment}, deployment)
+		if k8serr.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return platformOperator{}, fmt.Errorf("checking platform operator %s/%s: %w", layout.Namespace, layout.Deployment, err)
+		}
+		return layout, nil
+	}
+	return platformOperator{}, fmt.Errorf(
+		"platform operator deployment not found (tried %s/%s and %s/%s)",
+		platformOperatorRHOAINamespace, platformOperatorRHOAIDeployment,
+		platformOperatorODHNamespace, platformOperatorODHDeployment,
+	)
 }
 
 // detectExpectedReplicas queries the cluster node count to determine expected Prometheus replicas.
