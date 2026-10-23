@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/x509"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -587,15 +589,9 @@ type platformOperator struct {
 	WebhookService string
 }
 
-// ingressCAPool returns a cert pool for HTTPS clients calling OpenShift Routes (system CAs plus
-// the cluster ingress certificate bundle).
-func ingressCAPool(t *testing.T, ctx context.Context, c client.Client) *x509.CertPool {
+// clusterIngressCAPEM returns the PEM bundle used to verify OpenShift Route certificates.
+func clusterIngressCAPEM(t *testing.T, ctx context.Context, c client.Client) string {
 	t.Helper()
-
-	rootCAs, err := x509.SystemCertPool()
-	if err != nil {
-		rootCAs = x509.NewCertPool()
-	}
 
 	configMap := &corev1.ConfigMap{}
 	if err := c.Get(ctx, types.NamespacedName{
@@ -608,10 +604,36 @@ func ingressCAPool(t *testing.T, ctx context.Context, c client.Client) *x509.Cer
 	if caBundle == "" {
 		t.Fatalf("cluster ingress CA ConfigMap %q is missing %q", clusterIngressCAConfigMap, clusterIngressCAKey)
 	}
+	return caBundle
+}
+
+// ingressCAPool returns a cert pool for HTTPS clients calling OpenShift Routes (system CAs plus
+// the cluster ingress certificate bundle).
+func ingressCAPool(t *testing.T, ctx context.Context, c client.Client) *x509.CertPool {
+	t.Helper()
+
+	rootCAs, err := x509.SystemCertPool()
+	if err != nil {
+		rootCAs = x509.NewCertPool()
+	}
+
+	caBundle := clusterIngressCAPEM(t, ctx, c)
 	if !rootCAs.AppendCertsFromPEM([]byte(caBundle)) {
 		t.Fatalf("cluster ingress CA ConfigMap %q does not contain a valid PEM certificate bundle", clusterIngressCAConfigMap)
 	}
 	return rootCAs
+}
+
+// writeClusterIngressCAFile writes the cluster ingress CA bundle for tools (for example gcx)
+// that read trust via GRAFANA_TLS_CA_FILE.
+func writeClusterIngressCAFile(t *testing.T, ctx context.Context, c client.Client) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "openshift-ingress-ca.pem")
+	if err := os.WriteFile(path, []byte(clusterIngressCAPEM(t, ctx, c)), 0o644); err != nil {
+		t.Fatalf("failed to write cluster ingress CA bundle for OATS/gcx: %v", err)
+	}
+	return path
 }
 
 func detectPlatformOperator(ctx context.Context, c client.Client) (platformOperator, error) {
