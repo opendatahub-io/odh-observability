@@ -6,8 +6,16 @@
 
 `TestCOOVersionCompatibility` is the RHOAI 3.6 / COO 1.5 release gate. It validates fixed operator CSV lines (`cluster-observability-operator.v1.5`, `rhods-operator.3.6`), the RHOAI-pinned Perses image, Perses operand health, and mandatory dashboard paths after metrics are enabled: Prometheus dashboard Route host, namespace-proxy PromQL (`up` with `namespace=`), Perses health and projects APIs, and the Dashboards UIPlugin when installed. COO and RHOAI CSV prefixes and dashboard probes cannot be overridden through flags or `E2E_TEST_*` environment variables. It restores monitoring configuration like `TestMonitoring` but does not run the full regression matrix.
 
+`TestOLMUpgradeSurvivability` exercises in-place OLM upgrades for Cluster Observability Operator and Tempo Operator on a cluster with metrics enabled. It records a baseline, patches subscription channels when `-upgrade-coo-channel` / `-upgrade-tempo-channel` are set (skipped when the subscription is already on that channel), waits for CSV `Succeeded` without stuck Replacing/Deleting phases, flags COO operands stuck deleting with finalizers, and reruns the Perses plus Prometheus dashboard checks from the COO compatibility gate. Opt-in via `-upgrade-enabled=true` (`make e2e-test-olm-upgrade-survivability` sets this). The make target uses `-count=1`.
+
 ```bash
 make e2e-test-coo-compatibility
+```
+
+```bash
+E2E_TEST_API_MODE=dsc E2E_TEST_INSTALL_OPERATORS=false \
+  E2E_TEST_UPGRADE_COO_CHANNEL=<target> E2E_TEST_UPGRADE_TEMPO_CHANNEL=<target> \
+  make e2e-test-olm-upgrade-survivability
 ```
 
 DSC mode on a cluster with RHOAI already installed:
@@ -80,6 +88,11 @@ Pass test flags through `E2E_TEST_FLAGS` for local Make targets. The container r
 | `-consistently-poll-interval` | `2s` | Default consistency polling interval |
 | `-coo-channel` | `stable` | OLM channel for Cluster Observability Operator when `-install-operators=true` |
 | `-compatibility-report` | _(empty)_ | Optional JSON diagnostics filename or relative path under `ARTIFACTS` / `E2E_ARTIFACTS` / `e2e-artifacts` (report is always logged when the test fails) |
+| `-upgrade-enabled` | `false` | Enable `TestOLMUpgradeSurvivability` (required for the upgrade survivability make target) |
+| `-upgrade-operators` | `coo,tempo` | Comma-separated operators to upgrade (`coo`, `tempo`) |
+| `-upgrade-coo-channel` | _(empty)_ | Target OLM channel for COO; empty skips the COO upgrade step |
+| `-upgrade-tempo-channel` | _(empty)_ | Target OLM channel for Tempo Operator; empty skips the Tempo upgrade step |
+| `-upgrade-report` | _(empty)_ | Optional JSON report path under `ARTIFACTS` / `E2E_ARTIFACTS` / `e2e-artifacts` (always logged when the test finishes) |
 
 `TestCOOVersionCompatibility` always requires COO CSV prefix `cluster-observability-operator.v1.5`, RHOAI CSV prefix `rhods-operator.3.6`, the RHOAI-pinned Perses image digest, and Perses plus Prometheus dashboard proxy checks. Those requirements are not configurable.
 
