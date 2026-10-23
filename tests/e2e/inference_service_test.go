@@ -29,19 +29,23 @@ import (
 )
 
 const (
-	inferenceServiceName            = "facebook-opt-125m-isvc"
-	inferenceServiceNamespace       = "default"
-	inferenceServiceRuntime         = "csr-kserve-vllm-cpu-x86"
-	inferenceServiceModel           = inferenceServiceName
-	inferenceServiceTracingEndpoint = "http://data-science-collector-collector.redhat-ods-monitoring.svc.cluster.local:4317"
-	inferenceServiceTraceparent     = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-	inferenceServiceOATSCase        = "isvc"
+	inferenceServiceName                  = "facebook-opt-125m-isvc"
+	inferenceServiceNamespace             = "default"
+	inferenceServiceRuntime               = "csr-kserve-vllm-cpu-x86"
+	inferenceServiceModel                 = inferenceServiceName
+	inferenceServiceTraceparent           = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	inferenceServiceOATSCase              = "isvc"
+	maxInferenceServiceHTTPErrorBodyBytes = 1 << 20
 )
 
 var clusterServingRuntimeGVK = schema.GroupVersionKind{
 	Group:   "serving.kserve.io",
 	Version: "v1alpha1",
 	Kind:    "ClusterServingRuntime",
+}
+
+func inferenceServiceTracingEndpoint() string {
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local:4317", OpenTelemetryCollectorServiceName, inferenceMonitoringNamespace())
 }
 
 func TestInferenceServiceTracing(t *testing.T) {
@@ -117,7 +121,7 @@ func TestInferenceServiceTracing(t *testing.T) {
 					},
 				},
 				"tracing": map[string]any{
-					"exporterEndpoint": inferenceServiceTracingEndpoint,
+					"exporterEndpoint": inferenceServiceTracingEndpoint(),
 					"sampler":          "always_on",
 				},
 			}
@@ -131,7 +135,7 @@ func TestInferenceServiceTracing(t *testing.T) {
 	require.True(t, tracingEndpointFound,
 		"KServe admission dropped spec.tracing.exporterEndpoint even though the CRD schema exposes it; "+
 			"the installed KServe webhook/controller must include InferenceService tracing support")
-	require.Equal(t, inferenceServiceTracingEndpoint, tracingEndpoint, "KServe must preserve the configured tracing exporter endpoint")
+	require.Equal(t, inferenceServiceTracingEndpoint(), tracingEndpoint, "KServe must preserve the configured tracing exporter endpoint")
 	tracingSampler, tracingSamplerFound, err := unstructured.NestedString(persistedService.Object, "spec", "tracing", "sampler")
 	require.NoError(t, err, "failed to read persisted InferenceService tracing sampler")
 	require.True(t, tracingSamplerFound, "the KServe InferenceService CRD must preserve spec.tracing.sampler")
@@ -384,7 +388,7 @@ func sendInferenceServiceCompletion(ctx context.Context, endpoint, ocToken, trac
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		responseBody, readErr := io.ReadAll(resp.Body)
+		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxInferenceServiceHTTPErrorBodyBytes))
 		if readErr != nil {
 			return fmt.Errorf("completion request to %s failed with status %d (read response body: %w)", req.URL, resp.StatusCode, readErr)
 		}
