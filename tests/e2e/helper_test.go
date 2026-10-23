@@ -630,7 +630,7 @@ func writeClusterIngressCAFile(t *testing.T, ctx context.Context, c client.Clien
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "openshift-ingress-ca.pem")
-	if err := os.WriteFile(path, []byte(clusterIngressCAPEM(t, ctx, c)), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(clusterIngressCAPEM(t, ctx, c)), 0o600); err != nil {
 		t.Fatalf("failed to write cluster ingress CA bundle for OATS/gcx: %v", err)
 	}
 	return path

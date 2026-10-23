@@ -304,11 +304,11 @@ func runOatsCase(ctx context.Context, t *testing.T, oatsBin, topology string, oa
 
 func formatOatsCommand(env []string, args []string) string {
 	wanted := map[string]bool{
-		"GCX_TELEMETRY":        true,
-		"GRAFANA_SERVER":       true,
-		"GRAFANA_ORG_ID":       true,
-		"GRAFANA_TOKEN":        true,
-		"GRAFANA_TLS_CA_FILE":  true,
+		"GCX_TELEMETRY":       true,
+		"GRAFANA_ORG_ID":      true,
+		"GRAFANA_SERVER":      true,
+		"GRAFANA_TLS_CA_FILE": true,
+		"GRAFANA_TOKEN":       true,
 	}
 	assignments := make([]string, 0, len(wanted))
 	for _, entry := range env {
