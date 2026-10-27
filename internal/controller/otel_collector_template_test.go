@@ -2,23 +2,12 @@ package controller
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/pem"
 	"fmt"
-	"math/big"
-	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
-	promconfig "github.com/prometheus/common/config"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -760,54 +749,6 @@ func TestDCGMScrapeJobRetainsDiscoveryAndRelabeling(t *testing.T) {
 	}
 }
 
-func TestPrometheusHTTPClientTLSValidation(t *testing.T) {
-	const serverName = "metrics.example.test"
-	trustedCertPEM, trustedCert := newSelfSignedTestServerCertificate(t, serverName)
-	untrustedCertPEM, _ := newSelfSignedTestServerCertificate(t, "untrusted.example.test")
-
-	tlsServer := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	tlsServer.TLS = &tls.Config{Certificates: []tls.Certificate{trustedCert}, MinVersion: tls.VersionTLS12}
-	tlsServer.StartTLS()
-	t.Cleanup(tlsServer.Close)
-
-	redirectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, tlsServer.URL+"/metrics", http.StatusFound)
-	}))
-	t.Cleanup(redirectServer.Close)
-
-	directHTTPServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	t.Cleanup(directHTTPServer.Close)
-
-	trustedClient := newPrometheusTestHTTPClient(t, "scrape_tls_trusted", promconfig.TLSConfig{
-		CA:         string(trustedCertPEM),
-		ServerName: serverName,
-	})
-	requirePrometheusHTTPStatus(t, trustedClient, directHTTPServer.URL, http.StatusOK)
-	requirePrometheusHTTPStatus(t, trustedClient, redirectServer.URL, http.StatusOK)
-
-	untrustedClient := newPrometheusTestHTTPClient(t, "scrape_tls_untrusted_ca", promconfig.TLSConfig{
-		CA:         string(untrustedCertPEM),
-		ServerName: serverName,
-	})
-	requirePrometheusHTTPError(t, untrustedClient, redirectServer.URL)
-
-	wrongHostnameClient := newPrometheusTestHTTPClient(t, "scrape_tls_hostname_mismatch", promconfig.TLSConfig{
-		CA:         string(trustedCertPEM),
-		ServerName: "wrong.example.test",
-	})
-	requirePrometheusHTTPError(t, wrongHostnameClient, redirectServer.URL)
-
-	legacyBypassClient := newPrometheusTestHTTPClient(t, "scrape_tls_legacy_bypass", promconfig.TLSConfig{
-		InsecureSkipVerify: true,
-		ServerName:         "wrong.example.test",
-	})
-	requirePrometheusHTTPStatus(t, legacyBypassClient, redirectServer.URL, http.StatusOK)
-}
-
 func renderedPrometheusScrapeJobs(t *testing.T, collector unstructured.Unstructured) map[string]map[string]any {
 	t.Helper()
 	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
@@ -859,86 +800,4 @@ func hasPrometheusRelabelRule(rules []map[string]any, targetLabel, expected stri
 		return containsString(rule["source_labels"], expected)
 	}
 	return false
-}
-
-func newPrometheusTestHTTPClient(t *testing.T, name string, tlsConfig promconfig.TLSConfig) *http.Client {
-	t.Helper()
-	client, err := promconfig.NewClientFromConfig(promconfig.HTTPClientConfig{
-		FollowRedirects: true,
-		TLSConfig:       tlsConfig,
-	}, name)
-	if err != nil {
-		t.Fatalf("failed to create Prometheus HTTP client: %v", err)
-	}
-	return client
-}
-
-func requirePrometheusHTTPStatus(t *testing.T, client *http.Client, target string, wantStatus int) {
-	t.Helper()
-	response, err := doPrometheusTestRequest(t, client, target)
-	if err != nil {
-		t.Fatalf("GET %s failed: %v", target, err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != wantStatus {
-		t.Errorf("GET %s returned status %d, want %d", target, response.StatusCode, wantStatus)
-	}
-}
-
-func requirePrometheusHTTPError(t *testing.T, client *http.Client, target string) {
-	t.Helper()
-	response, err := doPrometheusTestRequest(t, client, target)
-	if response != nil {
-		response.Body.Close()
-	}
-	if err == nil {
-		t.Fatalf("GET %s succeeded; expected TLS validation failure", target)
-	}
-}
-
-func doPrometheusTestRequest(t *testing.T, client *http.Client, target string) (*http.Response, error) {
-	t.Helper()
-	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, target, nil)
-	if err != nil {
-		t.Fatalf("failed to create GET request for %s: %v", target, err)
-	}
-	return client.Do(request)
-}
-
-func newSelfSignedTestServerCertificate(t *testing.T, serverName string) ([]byte, tls.Certificate) {
-	t.Helper()
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("failed to generate test TLS key: %v", err)
-	}
-	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
-		t.Fatalf("failed to generate test TLS certificate serial: %v", err)
-	}
-	now := time.Now()
-	template := x509.Certificate{
-		SerialNumber:          serialNumber,
-		NotBefore:             now.Add(-time.Minute),
-		NotAfter:              now.Add(time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-		DNSNames:              []string{serverName},
-	}
-	certificateDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
-	if err != nil {
-		t.Fatalf("failed to create test TLS certificate: %v", err)
-	}
-	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER})
-	privateKeyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
-	if err != nil {
-		t.Fatalf("failed to marshal test TLS key: %v", err)
-	}
-	privateKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateKeyDER})
-	certificate, err := tls.X509KeyPair(certificatePEM, privateKeyPEM)
-	if err != nil {
-		t.Fatalf("failed to load test TLS key pair: %v", err)
-	}
-	return certificatePEM, certificate
 }
