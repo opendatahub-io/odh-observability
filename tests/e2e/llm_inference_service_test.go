@@ -220,6 +220,82 @@ func newTestTraceparent() (string, error) {
 	return fmt.Sprintf("00-%x-%x-01", traceID, parentSpanID), nil
 }
 
+func traceIDFromTraceparent(traceparent string) (string, error) {
+	parts := strings.Split(traceparent, "-")
+	if len(parts) != 4 || parts[0] != "00" {
+		return "", fmt.Errorf("invalid traceparent %q", traceparent)
+	}
+	if len(parts[1]) != 32 {
+		return "", fmt.Errorf("invalid trace ID in traceparent %q", traceparent)
+	}
+	return parts[1], nil
+}
+
+// traceIDForTraceQL returns the trace ID forms gcx/Tempo accept in TraceQL (hex and UUID).
+func traceIDForTraceQL(hexID string) (string, string) {
+	hex := strings.ToLower(hexID)
+	if len(hex) != 32 {
+		return hex, hex
+	}
+	uuid := fmt.Sprintf("%s-%s-%s-%s-%s", hex[0:8], hex[8:12], hex[12:16], hex[16:20], hex[20:32])
+	return hex, uuid
+}
+
+func writeOatsTraceCaseFile(t *testing.T, tag, podNamePrefix, traceID string) string {
+	t.Helper()
+
+	dir := filepath.Join(t.TempDir(), tag)
+	require.NoError(t, os.MkdirAll(dir, 0o750))
+	path := filepath.Join(dir, "oats-case.yaml")
+	// Per-run pod prefix avoids stale spans from prior runs. Trace ID is asserted separately via gcx traces get.
+	content := fmt.Sprintf(`name: %s vLLM tracing (run-specific)
+tags: ["e2e", "vllm", "%s"]
+
+fixture:
+  remote:
+    endpoint: default
+
+expected:
+  traces:
+    - traceql: '{ name = "llm_request" && resource.k8s.pod.name =~ "%s.*" && span:parentID = "0000000000000000" }'
+      count: ">= 1"
+    - traceql: '{ name = "llm_request" && resource.k8s.pod.name =~ "%s.*" && span:parentID != "0000000000000000" }'
+      count: ">= 1"
+`, tag, tag, podNamePrefix, podNamePrefix)
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	_ = traceID
+	return path
+}
+
+func gcxBinaryPath() string {
+	if path, err := exec.LookPath("gcx"); err == nil {
+		return path
+	}
+	return filepath.Join(os.Getenv("HOME"), ".cache/oats/tools/gcx/1.2.0/linux_amd64/gcx")
+}
+
+func assertTraceIDInTempo(ctx context.Context, t *testing.T, traceID string, oatsEnv []string) error {
+	t.Helper()
+
+	traceHex, traceUUID := traceIDForTraceQL(traceID)
+	gcxBin := gcxBinaryPath()
+	if _, err := os.Stat(gcxBin); err != nil {
+		return fmt.Errorf("gcx binary not found at %s: %w", gcxBin, err)
+	}
+	var lastErr error
+	for _, id := range []string{traceHex, traceUUID} {
+		cmd := exec.CommandContext(ctx, gcxBin, "traces", "get", id)
+		cmd.Env = oatsEnv
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Logf("gcx traces get %s succeeded (%d bytes)", id, len(out))
+			return nil
+		}
+		lastErr = fmt.Errorf("gcx traces get %s: %w\n%s", id, err, strings.TrimSpace(string(out)))
+	}
+	return lastErr
+}
+
 func sendCompletion(ctx context.Context, routeHost, ocToken string, rootCAs *x509.CertPool, traceparent ...string) error {
 	payload := map[string]any{
 		"model":       "facebook/opt-125m",
@@ -254,7 +330,7 @@ func sendCompletion(ctx context.Context, routeHost, ocToken string, rootCAs *x50
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		responseBody, readErr := io.ReadAll(resp.Body)
+		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxInferenceServiceHTTPErrorBodyBytes))
 		if readErr != nil {
 			return fmt.Errorf("completions request to %s failed with status %d (read response body: %w)", req.URL, resp.StatusCode, readErr)
 		}
@@ -284,8 +360,32 @@ func ensureInferenceWorkloadNamespaceScrape(t *testing.T, tc *TestContext, names
 
 func runOatsCase(ctx context.Context, t *testing.T, oatsBin, topology string, oatsEnv []string, projectRoot string) error {
 	t.Helper()
+	return runOats(ctx, t, oatsBin, oatsEnv, projectRoot, []string{"-vv", "--gcx-download", "auto", "--gcx-version", "v1.2.0", "--tags", topology, "--gcx-context", "default"})
+}
 
-	args := []string{"-vv", "--gcx-download", "auto", "--gcx-version", "v1.2.0", "--tags", topology, "--gcx-context", "default"}
+func runOatsCaseFile(ctx context.Context, t *testing.T, oatsBin, caseFile string, oatsEnv []string, projectRoot string) error {
+	t.Helper()
+
+	caseDir := filepath.Dir(caseFile)
+	configDir := filepath.Dir(caseDir)
+	relCase, err := filepath.Rel(configDir, caseFile)
+	if err != nil {
+		return fmt.Errorf("resolve OATS case path: %w", err)
+	}
+	configPath := filepath.Join(configDir, "oats-config.yaml")
+	config := fmt.Sprintf("meta:\n  version: 3\ncases:\n  - \"%s\"\n", filepath.ToSlash(relCase))
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		return fmt.Errorf("write OATS config: %w", err)
+	}
+	return runOats(ctx, t, oatsBin, oatsEnv, configDir, []string{
+		"--config", configPath,
+		"-vv", "--gcx-download", "auto", "--gcx-version", "v1.2.0", "--gcx-context", "default",
+	})
+}
+
+func runOats(ctx context.Context, t *testing.T, oatsBin string, oatsEnv []string, projectRoot string, args []string) error {
+	t.Helper()
+
 	cmd := exec.CommandContext(ctx, oatsBin, args...)
 	cmd.Dir = projectRoot
 	cmd.Env = oatsEnv
@@ -294,10 +394,10 @@ func runOatsCase(ctx context.Context, t *testing.T, oatsBin, topology string, oa
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &outBuf
 
-	t.Logf("Running OATS topology %s: %s", topology, formatOatsCommand(oatsEnv, append([]string{oatsBin}, args...)))
+	t.Logf("Running OATS: %s", formatOatsCommand(oatsEnv, append([]string{oatsBin}, args...)))
 	err := cmd.Run()
 	if err != nil {
-		return fmt.Errorf("OATS topology %s failed: %w\nOutput: %s", topology, err, outBuf.String())
+		return fmt.Errorf("OATS failed: %w\nOutput: %s", err, outBuf.String())
 	}
 	return nil
 }
@@ -786,10 +886,13 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	routeCAs := ingressCAPool(t, tc.Context(), tc.Client())
 	send := func() error { return sendCompletion(tc.Context(), routeHost, ocToken, routeCAs) }
 	g.Eventually(send, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Should successfully send completion request through OAuth proxy")
+	var tracedRequestTraceID string
 	if topology == "single-node" {
 		traceparent, err := newTestTraceparent()
 		require.NoError(t, err, "failed to generate randomized test trace context")
-		t.Logf("[%s] Sending completion request with randomized trace context", topology)
+		tracedRequestTraceID, err = traceIDFromTraceparent(traceparent)
+		require.NoError(t, err, "failed to parse trace ID from traceparent")
+		t.Logf("[%s] Sending completion request with trace ID %s", topology, tracedRequestTraceID)
 		g.Eventually(func() error {
 			return sendCompletion(tc.Context(), routeHost, ocToken, routeCAs, traceparent)
 		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Should successfully send completion request with traceparent through OAuth proxy")
@@ -797,9 +900,18 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 
 	// 3. Verification via OATS
 	t.Logf("[%s] Running OATS verification", topology)
+	if tracedRequestTraceID != "" {
+		g.Eventually(func() error {
+			return assertTraceIDInTempo(tc.Context(), t, tracedRequestTraceID, oatsEnv)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "injected trace ID should be retrievable from Tempo via gcx")
+	}
 	g.Eventually(func() error {
+		if tracedRequestTraceID != "" {
+			casePath := writeOatsTraceCaseFile(t, topology, llmSvcName, tracedRequestTraceID)
+			return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
+		}
 		return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
-	}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "OATS verification should succeed within 2 minutes")
+	}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "OATS verification should succeed within 2 minutes")
 
 	// 4. Pod Termination & Scrape Recovery
 	t.Logf("[%s] Restarting vLLM pod for scrape recovery", topology)

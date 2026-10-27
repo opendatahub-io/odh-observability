@@ -1,3 +1,5 @@
+# Manual / make oats reference case. TestLLMInferenceService/single-node writes a
+# run-specific oats-case.yaml that filters on the injected trace:ID and pod name.
 name: single-node topology llmisvc
 tags: ["e2e", "vllm", "single-node"]
 

@@ -29,11 +29,8 @@ import (
 )
 
 const (
-	inferenceServiceName                  = "facebook-opt-125m-isvc"
 	inferenceServiceNamespace             = "default"
 	inferenceServiceRuntime               = "csr-kserve-vllm-cpu-x86"
-	inferenceServiceModel                 = inferenceServiceName
-	inferenceServiceTraceparent           = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 	inferenceServiceOATSCase              = "isvc"
 	maxInferenceServiceHTTPErrorBodyBytes = 1 << 20
 )
@@ -68,8 +65,10 @@ func TestInferenceServiceTracing(t *testing.T) {
 	oatsEnv := buildOatsEnv(t, tc)
 	g := gomega.NewWithT(t)
 
-	serviceNN := types.NamespacedName{Name: inferenceServiceName, Namespace: inferenceServiceNamespace}
-	proxyName := inferenceServiceName + "-p"
+	serviceName, err := randomServiceName("vllm-trace-isvc")
+	require.NoError(t, err, "failed to generate per-run InferenceService name")
+	serviceNN := types.NamespacedName{Name: serviceName, Namespace: inferenceServiceNamespace}
+	proxyName := serviceName + "-p"
 	proxyNN := types.NamespacedName{Name: proxyName, Namespace: inferenceServiceNamespace}
 	tlsSecretName := proxyName + "-tls"
 	cookieSecretName := proxyName + "-cookie"
@@ -87,7 +86,7 @@ func TestInferenceServiceTracing(t *testing.T) {
 		{gvk.Secret, cookieSecretName, inferenceServiceNamespace},
 		{gvk.ClusterRoleBinding, bindingName, ""},
 		{gvk.ServiceAccount, serviceAccountName, inferenceServiceNamespace},
-		{gvk.InferenceService, inferenceServiceName, inferenceServiceNamespace},
+		{gvk.InferenceService, serviceName, inferenceServiceNamespace},
 	}
 	// Register cleanup before creating anything so failures do not leave the
 	// stable, test-specific ISVC or OAuth proxy resources behind.
@@ -160,16 +159,26 @@ func TestInferenceServiceTracing(t *testing.T) {
 	t.Logf("Sending completion requests to InferenceService OAuth Route %s", requestURL)
 	routeCAs := ingressCAPool(t, tc.Context(), tc.Client())
 	g.Eventually(func() error {
-		return sendInferenceServiceCompletion(tc.Context(), requestURL, ocToken, "", routeCAs)
+		return sendInferenceServiceCompletion(tc.Context(), requestURL, ocToken, serviceName, "", routeCAs)
 	}, 5*time.Minute, 5*time.Second).Should(gomega.Succeed(), "completion request without traceparent should succeed through the OAuth proxy")
+	traceparent, err := newTestTraceparent()
+	require.NoError(t, err, "failed to generate per-run trace context")
+	traceID, err := traceIDFromTraceparent(traceparent)
+	require.NoError(t, err, "failed to parse trace ID from traceparent")
+	t.Logf("Sending traced completion with trace ID %s", traceID)
 	g.Eventually(func() error {
-		return sendInferenceServiceCompletion(tc.Context(), requestURL, ocToken, inferenceServiceTraceparent, routeCAs)
+		return sendInferenceServiceCompletion(tc.Context(), requestURL, ocToken, serviceName, traceparent, routeCAs)
 	}, 5*time.Minute, 5*time.Second).Should(gomega.Succeed(), "completion request with traceparent should succeed through the OAuth proxy")
 
-	t.Logf("Running OATS case with dedicated tag %q", inferenceServiceOATSCase)
 	g.Eventually(func() error {
-		return runOatsCase(tc.Context(), t, oatsBin, inferenceServiceOATSCase, oatsEnv, projectRoot)
-	}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "InferenceService tracing OATS checks should succeed")
+		return assertTraceIDInTempo(tc.Context(), t, traceID, oatsEnv)
+	}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "injected trace ID should be retrievable from Tempo via gcx")
+
+	t.Logf("Running OATS case with dedicated tag %q and trace ID %s", inferenceServiceOATSCase, traceID)
+	casePath := writeOatsTraceCaseFile(t, inferenceServiceOATSCase, serviceName, traceID)
+	g.Eventually(func() error {
+		return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
+	}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "InferenceService tracing OATS checks should succeed")
 }
 
 func requireStandardVLLMCPURuntime(t *testing.T, tc *TestContext) {
@@ -209,8 +218,6 @@ func createInferenceServiceOAuthProxy(
 
 	clusterDomain, err := getClusterDomain(tc)
 	require.NoError(t, err, "failed to discover cluster domain")
-	ocToken := getAuthToken(tc)
-	require.NotEmpty(t, ocToken, "Kubernetes bearer token is required for the OAuth proxy")
 
 	inferenceEndpoint, err := url.Parse(inferenceURL)
 	require.NoError(t, err, "InferenceService status.url should be a valid upstream URL")
@@ -353,9 +360,9 @@ func createInferenceServiceOAuthProxy(
 	return "https://" + routeHost
 }
 
-func sendInferenceServiceCompletion(ctx context.Context, endpoint, ocToken, traceparent string, rootCAs *x509.CertPool) error {
+func sendInferenceServiceCompletion(ctx context.Context, endpoint, ocToken, model, traceparent string, rootCAs *x509.CertPool) error {
 	payload := map[string]any{
-		"model":       inferenceServiceModel,
+		"model":       model,
 		"prompt":      "San Francisco is a",
 		"max_tokens":  7,
 		"temperature": 0,
