@@ -977,12 +977,13 @@ func checkStorageIsolation(ctx context.Context, c client.Client, namespace strin
 // endpoints is two different buckets.
 //
 // Every way of not arriving at a location is an error, including a Secret that
-// does not exist yet and one that names no bucket. Returning "no locations"
-// there would make two unresolvable stacks compare as isolated, and the
-// comparison is the only thing standing between them and a shared bucket. The
-// cost of failing closed is that neither stack is created until both Secrets
-// resolve; the storage Secret watch in SetupWithManager is what keeps that
-// from stalling until the next periodic requeue.
+// does not exist yet, one that names no bucket, and one whose endpoint is
+// empty, hostless, or unparseable. Returning "no locations" there would make
+// two unresolvable stacks compare as isolated, and the comparison is the only
+// thing standing between them and a shared bucket. The cost of failing closed
+// is that neither stack is created until both Secrets resolve; the storage
+// Secret watch in SetupWithManager is what keeps that from stalling until the
+// next periodic requeue.
 func lokiStorageLocations(ctx context.Context, c client.Client, namespace, secretName string) ([]string, error) {
 	if secretName == "" {
 		return nil, fmt.Errorf("LokiStack storage secret name is empty: %w", errStorageSecretInvalid)
@@ -993,15 +994,35 @@ func lokiStorageLocations(ctx context.Context, c client.Client, namespace, secre
 		return nil, fmt.Errorf("reading LokiStack storage secret %s/%s: %w", namespace, secretName, err)
 	}
 
+	// The endpoint names the backend; without it a location cannot be named
+	// either. An empty one once canonicalized to "///bucket", a key no valid
+	// endpoint produces, and compared as isolated from the real endpoint
+	// beside it — the same fail-closed rule as a bucketnames list with nothing
+	// usable in it.
+	endpoint := strings.TrimSpace(string(secret.Data["endpoint"]))
+	if endpoint == "" {
+		return nil, fmt.Errorf("LokiStack storage secret %s/%s has an empty endpoint: %w",
+			namespace, secretName, errStorageSecretInvalid)
+	}
+
 	// bucketnames holds a comma-separated list; the stacks conflict if any one
 	// bucket is common to both.
-	endpoint := string(secret.Data["endpoint"])
 	var locations []string
 	for bucket := range strings.SplitSeq(string(secret.Data["bucketnames"]), ",") {
 		if bucket = strings.TrimSpace(bucket); bucket == "" {
 			continue
 		}
-		locations = append(locations, canonicalStorageLocation(endpoint, bucket))
+		location, err := canonicalStorageLocation(endpoint, bucket)
+		if err != nil {
+			// The sentinel is wrapped here rather than inside the canonicalizer
+			// so the classification reports a Secret the user must fix rather
+			// than a check that happened to fail. The cause stays wrapped
+			// alongside it, so what was wrong with the endpoint remains
+			// readable in the condition message.
+			return nil, fmt.Errorf("LokiStack storage secret %s/%s: %w: %w",
+				namespace, secretName, err, errStorageSecretInvalid)
+		}
+		locations = append(locations, location)
 	}
 	if len(locations) == 0 {
 		return nil, fmt.Errorf("LokiStack storage secret %s/%s has no usable bucketnames entry: %w",
@@ -1019,6 +1040,13 @@ func lokiStorageLocations(ctx context.Context, c client.Client, namespace, secre
 // storageClaims without the comparison growing a case for it.
 //
 // The comparison key is (host, port, path prefix, bucket).
+//
+// An endpoint that is empty, hostless, or unparseable is an error rather than
+// a key. Each of those canonicalizes — or fails to canonicalize — to an
+// address no valid endpoint can equal: the empty one to "///bucket", which
+// compares as isolated from any real endpoint beside it and would let a
+// claimant that names no backend past the gate. A malformed address fails
+// closed, the same way a Secret that names no bucket does.
 //
 // The scheme is excluded. http and https are transports to one gateway rather
 // than separate backends — MinIO, Ceph RGW, ODF and S3 all serve the same
@@ -1038,8 +1066,11 @@ func lokiStorageLocations(ctx context.Context, c client.Client, namespace, secre
 // still collide, so comparing access keys would only mask the conflict. DNS
 // aliases pointing at one server are not detected; that needs resolution, not
 // parsing.
-func canonicalStorageLocation(endpoint, bucket string) string {
+func canonicalStorageLocation(endpoint, bucket string) (string, error) {
 	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return "", errors.New("storage endpoint is empty")
+	}
 	bucket = strings.ToLower(strings.TrimSpace(bucket))
 
 	// A bare "host" or "host:port" would parse as a scheme, so supply the
@@ -1050,15 +1081,23 @@ func canonicalStorageLocation(endpoint, bucket string) string {
 	}
 	parsed, err := url.Parse(toParse)
 	if err != nil {
-		// An unparseable endpoint still has to compare equal to itself. It
-		// cannot collide with a parsed one by accident: every key below opens
-		// with the authority marker and this one does not.
-		return endpoint + "/" + bucket
+		return "", fmt.Errorf("parsing storage endpoint %q: %w", endpoint, err)
 	}
 
 	// Hostnames are case-insensitive (RFC 4343) and the DNS root dot names the
 	// same host as its absence.
 	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if host == "" {
+		return "", fmt.Errorf("storage endpoint %q names no host", endpoint)
+	}
+
+	// Virtual-host-style addressing folds the bucket into the hostname; strip it
+	// so that form matches the path-style spelling of the same location. The
+	// fold runs on the bare hostname, before the port goes back on, so it does
+	// not depend on how the ported spelling of the host is written.
+	if bucket != "" {
+		host = strings.TrimPrefix(host, bucket+".")
+	}
 
 	// An explicitly written default port names the same endpoint as none at
 	// all, whichever scheme carried it, since the scheme is not in the key.
@@ -1073,12 +1112,6 @@ func canonicalStorageLocation(endpoint, bucket string) string {
 		host = net.JoinHostPort(host, port)
 	}
 
-	// Virtual-host-style addressing folds the bucket into the hostname; strip it
-	// so that form matches the path-style spelling of the same location.
-	if bucket != "" {
-		host = strings.TrimPrefix(host, bucket+".")
-	}
-
 	// path.Clean collapses repeated slashes and resolves dot segments. Prefix
 	// case is significant on self-hosted gateways, so it is left alone.
 	prefix := path.Clean("/" + parsed.Path)
@@ -1086,7 +1119,7 @@ func canonicalStorageLocation(endpoint, bucket string) string {
 		prefix = ""
 	}
 
-	return "//" + host + prefix + "/" + bucket
+	return "//" + host + prefix + "/" + bucket, nil
 }
 
 // deployClusterLogForwarder deploys the ClusterLogForwarder when logs are configured.

@@ -1553,7 +1553,7 @@ func monitoringWithBothLokiStorage(usageLogsSecret, logsSecret string) *v1alpha1
 }
 
 // TestCanonicalStorageLocation pins the canonicalization rules directly, as
-// string in and string out.
+// an endpoint and bucket in and a key or an error out.
 //
 // They are the subtlest code in the gate and decide every verdict it reaches:
 // a rule that normalizes too little misses a conflict and lets two writers
@@ -1572,6 +1572,10 @@ func TestCanonicalStorageLocation(t *testing.T) {
 		endpoint string
 		bucket   string
 		want     string
+		// wantErr asserts the pair is rejected rather than keyed: an address
+		// that cannot name a location must not become one that compares as
+		// isolated from the locations that do.
+		wantErr bool
 	}{
 		{
 			name:     "path-style endpoint",
@@ -1621,6 +1625,17 @@ func TestCanonicalStorageLocation(t *testing.T) {
 		{
 			name:     "a non-default port is kept",
 			endpoint: "https://s3.example.com:9000",
+			bucket:   "logs",
+			want:     "//s3.example.com:9000/logs",
+		},
+		{
+			// The fold and the port have to agree on one spelling of the host:
+			// the bucket label comes off the bare hostname, and the port goes
+			// back on after it. This row pins that the two spellings of one
+			// ported endpoint still meet in a single key, whichever order those
+			// two steps run in.
+			name:     "a virtual-host bucket on a non-default port is still folded out",
+			endpoint: "https://logs.s3.example.com:9000",
 			bucket:   "logs",
 			want:     "//s3.example.com:9000/logs",
 		},
@@ -1736,14 +1751,41 @@ func TestCanonicalStorageLocation(t *testing.T) {
 			want:     "//s3.example.com/logs",
 		},
 		{
-			// An endpoint url.Parse rejects cannot be normalized, but it still
-			// has to compare equal to itself: the fallback is what keeps two
-			// identically misspelled endpoints detectable as one location. It
-			// cannot collide with a normalized key, which always opens "//".
-			name:     "an unparseable endpoint falls back to itself",
+			// An endpoint url.Parse rejects cannot be normalized, and a key
+			// built from the raw string cannot be checked against anything.
+			// Rejecting it is the fail-closed answer: two identically
+			// misspelled endpoints used to conflict through the fallback key;
+			// now the Secret is reported as invalid instead, which names the
+			// thing the user actually has to fix.
+			name:     "an unparseable endpoint is rejected",
 			endpoint: "https://exa\x7fmple.com",
 			bucket:   "logs",
-			want:     "https://exa\x7fmple.com/logs",
+			wantErr:  true,
+		},
+		{
+			// The regression this row guards: an empty endpoint once parsed as
+			// an empty authority and keyed to "///logs", which no valid
+			// endpoint produces, so it compared as isolated from every real
+			// one beside it.
+			name:     "an empty endpoint is rejected",
+			endpoint: "",
+			bucket:   "logs",
+			wantErr:  true,
+		},
+		{
+			name:     "a whitespace-only endpoint is rejected",
+			endpoint: "   ",
+			bucket:   "logs",
+			wantErr:  true,
+		},
+		{
+			// Parses, and to a path — but a location without a host is the
+			// same "///" key an empty endpoint produced, reached by another
+			// spelling.
+			name:     "a hostless endpoint is rejected",
+			endpoint: "/just-a-path",
+			bucket:   "logs",
+			wantErr:  true,
 		},
 		{
 			// The spelling the Loki operator takes for an in-cluster gateway.
@@ -1767,7 +1809,19 @@ func TestCanonicalStorageLocation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := canonicalStorageLocation(tt.endpoint, tt.bucket); got != tt.want {
+			got, err := canonicalStorageLocation(tt.endpoint, tt.bucket)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("canonicalStorageLocation(%q, %q): expected an error, got key %q",
+						tt.endpoint, tt.bucket, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("canonicalStorageLocation(%q, %q): unexpected error: %v",
+					tt.endpoint, tt.bucket, err)
+			}
+			if got != tt.want {
 				t.Errorf("canonicalStorageLocation(%q, %q):\n want %q\n  got %q",
 					tt.endpoint, tt.bucket, tt.want, got)
 			}
@@ -1891,6 +1945,46 @@ func TestCheckStorageIsolation(t *testing.T) {
 			wantCheckReason: storageSecretInvalidReason,
 		},
 		{
+			// The regression this row guards: an endpoint that is empty — here
+			// because the Secret never carried the key — once keyed to
+			// "///bucket", which no valid endpoint produces, so it compared as
+			// isolated from the real endpoint beside it and both stacks passed
+			// the gate on one bucket. It fails closed now, under the reason
+			// that names the Secret as the thing to fix.
+			name: "secret without an endpoint key withholds both stacks",
+			secrets: []client.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: "usage-logs-secret", Namespace: ns},
+					Data:       map[string][]byte{"bucketnames": []byte("shared-bucket")},
+				},
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:      monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantCheckReason: storageSecretInvalidReason,
+		},
+		{
+			name: "secret with a whitespace-only endpoint withholds both stacks",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "   ", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:      monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantCheckReason: storageSecretInvalidReason,
+		},
+		{
+			// An endpoint url.Parse rejects is the same question unanswered: it
+			// can be shown to be neither conflicting nor isolated, so it
+			// withholds rather than vouches. The reason says the Secret, not
+			// the cluster, is what to fix.
+			name: "secret with an unparseable endpoint withholds both stacks",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://exa\x7fmple.com", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:      monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantCheckReason: storageSecretInvalidReason,
+		},
+		{
 			// Failing closed is scoped to the comparison. With one stack
 			// there is no second writer, so a missing Secret is the Loki
 			// operator's to report and this check stays out of the way.
@@ -1965,6 +2059,21 @@ func TestCheckStorageIsolation_EndpointSpellings(t *testing.T) {
 			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
 			wantConflict: true,
 			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			// The same fold with a port in play. The bucket label comes off the
+			// bare hostname and the port goes back on after it; this row pins
+			// that the ported spellings of one endpoint still meet in a single
+			// key, so the fold cannot come to depend on how the ported host is
+			// written.
+			name: "virtual-host and path-style addressing on a non-default port conflict",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://shared-bucket.s3.example.com:9000", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com:9000", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com:9000/shared-bucket",
 		},
 		{
 			// A non-default port is a different backend, not a spelling variant.
@@ -2469,6 +2578,62 @@ func TestValidateStorageIsolation_MissingStorageSecretsWithholdBothStacks(t *tes
 		if c.Status != metav1.ConditionUnknown || c.Reason != storageSecretMissingReason {
 			t.Errorf("%s: expected Unknown/%s, got %s/%s",
 				conditionType, storageSecretMissingReason, c.Status, c.Reason)
+		}
+	}
+}
+
+// TestValidateStorageIsolation_EmptyEndpointWithholdsBothStacks is the
+// endpoint half of the fail-closed rule the test above covers for missing
+// Secrets: a Secret that exists but carries no endpoint.
+//
+// The empty endpoint once canonicalized to "///bucket" — a key no valid
+// endpoint produces — so it compared as isolated from the real endpoint beside
+// it and both stacks were created on one bucket. The reason the conditions
+// carry is the point of the assertions: StorageSecretInvalid, not
+// StorageCheckFailed, because the user fixes this by editing the Secret, not
+// by fixing cluster access.
+func TestValidateStorageIsolation_EmptyEndpointWithholdsBothStacks(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret")
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "usage-logs-secret", Namespace: m.Spec.Namespace},
+			Data:       map[string][]byte{"bucketnames": []byte("shared-bucket")},
+		},
+		lokiStorageSecret("logs-secret", m.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+	).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	withheld, err := validateStorageIsolation(context.Background(), cli, m, cm)
+	if err == nil {
+		t.Fatal("expected validateStorageIsolation to fail closed on a Secret with no endpoint")
+	}
+
+	var checkErr *storageCheckError
+	if !errors.As(err, &checkErr) {
+		t.Fatalf("expected a *storageCheckError, got %T (%v)", err, err)
+	}
+	if got := checkErr.conditionReason(); got != storageSecretInvalidReason {
+		t.Errorf("reason: want %s, got %s", storageSecretInvalidReason, got)
+	}
+
+	assertWithheldComponents(t, withheld, componentLokiUsageLogs, componentLokiLogs)
+
+	for _, conditionType := range []string{
+		conditions.ConditionUsageLogsLokiStackAvailable,
+		conditions.ConditionLokiStackAvailable,
+	} {
+		// Unknown, not False: nothing was established about either stack, and
+		// False would clear the published endpoint over a Secret whose
+		// contents the user has to complete.
+		c := mustFindCondition(t, m, conditionType)
+		if c.Status != metav1.ConditionUnknown || c.Reason != storageSecretInvalidReason {
+			t.Errorf("%s: expected Unknown/%s, got %s/%s",
+				conditionType, storageSecretInvalidReason, c.Status, c.Reason)
 		}
 	}
 }

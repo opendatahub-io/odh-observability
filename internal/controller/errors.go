@@ -43,9 +43,10 @@ const (
 )
 
 // errStorageSecretInvalid marks a storage Secret that exists but does not name
-// a bucket, so the classification below matches on the sentinel rather than on
-// message text.
-var errStorageSecretInvalid = errors.New("storage Secret does not name a bucket")
+// a usable object store location — a bucketnames list with nothing usable in
+// it, or an endpoint that is empty, hostless, or unparseable — so the
+// classification below matches on the sentinel rather than on message text.
+var errStorageSecretInvalid = errors.New("storage Secret does not name a usable object store location")
 
 // Condition reasons for the LokiStack API calls that can fail without telling
 // us anything about the stacks themselves. Both are reported Unknown.
