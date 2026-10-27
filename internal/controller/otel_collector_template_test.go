@@ -86,8 +86,28 @@ func TestDCGMMetricsAreRetainedWithOriginalNames(t *testing.T) {
 	}
 }
 
-//nolint:gocyclo // The test validates the complete rendered scrape configuration.
-func TestPrometheusScrapeConfigAndTargetAllocatorSecurity(t *testing.T) {
+func TestPrometheusScrapeConfigContainsOnlyDCGMJob(t *testing.T) {
+	jobs := renderedPrometheusScrapeJobs(t, renderCollectorTemplate(t))
+	if _, found := jobs["data-science-collector-prometheus"]; found {
+		t.Error("unused generic pod scrape job must not be rendered")
+	}
+	if len(jobs) != 1 || jobs["dcgm-exporter-accelerator-metrics"] == nil {
+		t.Fatalf("expected only the DCGM scrape job, got %v", jobs)
+	}
+}
+
+func TestPrometheusReceiverConfigIsEmptyWithoutAcceleratorMetrics(t *testing.T) {
+	collector := renderCollectorTemplateWithAcceleratorMetrics(t, false)
+	prometheusConfig, found, err := unstructured.NestedMap(collector.Object, "spec", "config", "receivers", "prometheus", "config")
+	if err != nil || !found {
+		t.Fatalf("Prometheus receiver config must render as a map: found=%t, error=%v", found, err)
+	}
+	if len(prometheusConfig) != 0 {
+		t.Fatalf("Prometheus receiver config must be empty without manual scrape jobs, got %v", prometheusConfig)
+	}
+}
+
+func TestTargetAllocatorSecurity(t *testing.T) {
 	collector := renderCollectorTemplate(t)
 	targetAllocator, found, err := unstructured.NestedMap(collector.Object, "spec", "targetAllocator")
 	if err != nil || !found {
@@ -99,63 +119,6 @@ func TestPrometheusScrapeConfigAndTargetAllocatorSecurity(t *testing.T) {
 	}
 	if targetAllocator["allowInsecureAuthSecrets"] != false {
 		t.Errorf("target allocator must disable auth secrets over plaintext HTTP, got %v", targetAllocator["allowInsecureAuthSecrets"])
-	}
-
-	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
-	if err != nil || !found {
-		t.Fatalf("collector config must be present in rendered resource: found=%t, error=%v", found, err)
-	}
-	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus", "config", "scrape_configs")
-	if err != nil || !found {
-		t.Fatalf("prometheus scrape configs must be present: found=%t, error=%v", found, err)
-	}
-
-	var podScrapeJob map[string]any
-	for _, rawScrapeConfig := range scrapeConfigs {
-		scrapeConfig, ok := rawScrapeConfig.(map[string]any)
-		if ok && scrapeConfig["job_name"] == "data-science-collector-prometheus" {
-			podScrapeJob = scrapeConfig
-			break
-		}
-	}
-	if podScrapeJob == nil {
-		t.Fatal("data-science-collector-prometheus scrape config must be present")
-	}
-
-	relabelConfigs, found, err := unstructured.NestedSlice(podScrapeJob, "relabel_configs")
-	if err != nil || !found {
-		t.Fatalf("pod scrape relabel configs must be present: found=%t, error=%v", found, err)
-	}
-
-	var hasDefaultPort, hasEPPSchedulerDrop, hasEPPPort bool
-	for _, rawRule := range relabelConfigs {
-		rule, ok := rawRule.(map[string]any)
-		if !ok {
-			t.Fatal("pod scrape relabel rule has unexpected type")
-		}
-		if rule["action"] == "drop" && rule["regex"] == "llminferenceservice-router-scheduler" {
-			sourceLabels, ok := rule["source_labels"].([]any)
-			if !ok || !containsString(sourceLabels, "__meta_kubernetes_pod_label_app_kubernetes_io_component") {
-				t.Errorf("EPP exclusion must inspect the scheduler component label: %v", rule)
-			}
-			hasEPPSchedulerDrop = true
-		}
-		switch rule["replacement"] {
-		case "$1:8080":
-			hasDefaultPort = true
-		case "$1:9090":
-			hasEPPPort = true
-		}
-	}
-
-	if !hasDefaultPort {
-		t.Error("pod scrape config must retain the default 8080 port")
-	}
-	if !hasEPPSchedulerDrop {
-		t.Error("pod scrape config must exclude scheduler pods handled by KServe's ServiceMonitor")
-	}
-	if hasEPPPort {
-		t.Error("pod scrape config must not add a second EPP metrics port")
 	}
 
 	prometheusCR, found, err := unstructured.NestedMap(targetAllocator, "prometheusCR")
@@ -638,7 +601,7 @@ func TestDCGMMetricRelabelingPreservesDRAAttributionLabels(t *testing.T) {
 		t.Fatalf("collector config must be present in rendered resource: found=%t, error=%v", found, err)
 	}
 	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus", "config", "scrape_configs")
-	if err != nil || !found || len(scrapeConfigs) < 2 {
+	if err != nil || !found || len(scrapeConfigs) == 0 {
 		t.Fatalf("expected DCGM scrape config in rendered resource: found=%t, error=%v", found, err)
 	}
 	var dcgmJob map[string]any
@@ -685,6 +648,11 @@ func TestDCGMMetricRelabelingPreservesDRAAttributionLabels(t *testing.T) {
 
 func renderCollectorTemplate(t *testing.T) unstructured.Unstructured {
 	t.Helper()
+	return renderCollectorTemplateWithAcceleratorMetrics(t, true)
+}
+
+func renderCollectorTemplateWithAcceleratorMetrics(t *testing.T, acceleratorMetrics bool) unstructured.Unstructured {
+	t.Helper()
 	resources, err := rendertemplate.Render(context.Background(), nil, []rendertemplate.TemplateSource{{
 		FS:   resourcesFS,
 		Path: OpenTelemetryCollectorTemplate,
@@ -692,7 +660,7 @@ func renderCollectorTemplate(t *testing.T) unstructured.Unstructured {
 		"Namespace":                       "redhat-ods-monitoring",
 		"Metrics":                         true,
 		"MetricsStorage":                  true,
-		"AcceleratorMetrics":              true,
+		"AcceleratorMetrics":              acceleratorMetrics,
 		"Traces":                          false,
 		"CollectorReplicas":               1,
 		"CollectorCPULimit":               "1",
@@ -740,29 +708,22 @@ func extractSection(content, startMarker, endMarker string) string {
 	return content[startIdx : startIdx+endIdx]
 }
 
-func TestManualPrometheusScrapeJobsUseHTTPAndVerifyTLS(t *testing.T) {
+func TestDCGMScrapeJobUsesHTTPAndVerifiesTLS(t *testing.T) {
 	jobs := renderedPrometheusScrapeJobs(t, renderCollectorTemplate(t))
-	for _, name := range []string{
-		"data-science-collector-prometheus",
-		"dcgm-exporter-accelerator-metrics",
-	} {
-		t.Run(name, func(t *testing.T) {
-			job := jobs[name]
-			if job == nil {
-				t.Fatalf("scrape job %q must be present", name)
-			}
-			if job["scheme"] != "http" {
-				t.Errorf("scrape job must explicitly use HTTP, got %v", job["scheme"])
-			}
-			if job["bearer_token_file"] != "/var/run/secrets/kubernetes.io/serviceaccount/token" {
-				t.Errorf("scrape job must retain service-account bearer token authentication, got %v", job["bearer_token_file"])
-			}
-			if tlsConfig, found, err := unstructured.NestedMap(job, "tls_config"); err != nil {
-				t.Errorf("failed to read TLS config: %v", err)
-			} else if found && tlsConfig["insecure_skip_verify"] == true {
-				t.Error("scrape job must not skip TLS certificate verification")
-			}
-		})
+	job := jobs["dcgm-exporter-accelerator-metrics"]
+	if job == nil {
+		t.Fatal("DCGM scrape job must be present")
+	}
+	if job["scheme"] != "http" {
+		t.Errorf("DCGM scrape job must explicitly use HTTP, got %v", job["scheme"])
+	}
+	if job["bearer_token_file"] != "/var/run/secrets/kubernetes.io/serviceaccount/token" {
+		t.Errorf("DCGM scrape job must retain service-account bearer token authentication, got %v", job["bearer_token_file"])
+	}
+	if tlsConfig, found, err := unstructured.NestedMap(job, "tls_config"); err != nil {
+		t.Errorf("failed to read TLS config: %v", err)
+	} else if found && tlsConfig["insecure_skip_verify"] == true {
+		t.Error("DCGM scrape job must not skip TLS certificate verification")
 	}
 }
 

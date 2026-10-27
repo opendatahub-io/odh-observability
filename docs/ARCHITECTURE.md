@@ -53,6 +53,8 @@ If any required operator is missing, `MonitoringDependenciesReady` is set to Fal
 
 The metrics TargetAllocator selects labeled ServiceMonitors and PodMonitors cluster-wide because KServe creates its scheduler monitors and per-workload TLS monitors in inference workload namespaces. The collector ServiceAccount has no Secret permissions. A separate TargetAllocator ServiceAccount receives the OpenTelemetry Operator discovery permissions through a dedicated ClusterRole plus namespace-scoped Roles for the current namespace set; an upgrade-safe legacy binding is retained because ClusterRoleBinding role references are immutable. It is configured with the same `secretNamespaces` allowlist, and namespace events trigger reconciliation so new namespaces receive the binding. `denyFSAccessThroughSMs` prevents selected monitors from making the collector expose file-backed credentials.
 
+Workload metrics are collected through eligible ServiceMonitor and PodMonitor resources. A pod label alone does not create a scrape target; workloads must expose a monitor that specifies the metrics endpoint, port, and any required authentication or TLS settings. Namespaces opt into monitor selection with `monitoring.opendatahub.io/scrape=true`, and the admission webhook adds the matching label to monitors created there.
+
 The TargetAllocator uses mTLS by default, with cert-manager provisioning its CA, serving, and client certificates. The collector is configured only with the HTTPS TargetAllocator endpoint. The upstream TargetAllocator may also expose its non-mTLS discovery port, but `allowInsecureAuthSecrets` remains disabled so authenticated ServiceMonitor credentials cannot be returned over plaintext HTTP.
 
 ## Action Functions
