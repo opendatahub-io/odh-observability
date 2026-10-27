@@ -840,6 +840,11 @@ func TestReconcile_CleansOperatorNetworkPoliciesInEffectiveNamespace(t *testing.
 	}
 }
 
+// TestReconcile_GarbageCollectionError: a failed garbage collection sweep is
+// logged and the reconcile still succeeds. GC is fault tolerant by design —
+// one failed sweep must not fail the round and mark the whole Monitoring
+// degraded. Removal is different: deleteAllOwned on Removed still returns its
+// error for retry (TestReconcile_Removed_CleanupError).
 func TestReconcile_GarbageCollectionError(t *testing.T) {
 	s := newTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
@@ -848,8 +853,8 @@ func TestReconcile_GarbageCollectionError(t *testing.T) {
 		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(cleanupErr)).Build())
 
 	_, err := r.reconcile(context.Background(), m)
-	if !errors.Is(err, cleanupErr) {
-		t.Fatalf("expected garbage collection error to be returned for retry, got %v", err)
+	if err != nil {
+		t.Fatalf("garbage collection error must not fail the reconcile, got %v", err)
 	}
 }
 

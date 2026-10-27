@@ -449,6 +449,9 @@ func (r *MonitoringReconciler) renderMonitoringResources(
 	persesVersion string,
 	persesFound bool,
 ) ([]unstructured.Unstructured, map[string]struct{}, error, error) {
+	// Run the action functions to collect template sources. The three Perses
+	// ones are closures because they also take the pre-resolved API version;
+	// they are otherwise ordinary actions and belong in the same list.
 	var sources []rendertemplate.TemplateSource
 	for _, action := range []func(context.Context, client.Client, *v1alpha1.Monitoring, *conditions.ConditionsManager, *[]rendertemplate.TemplateSource) error{
 		deployWebhookInfrastructure,
@@ -462,32 +465,31 @@ func (r *MonitoringReconciler) renderMonitoringResources(
 		deployNodeMetricsEndpoint,
 		deployClusterLogForwarder,
 		deployKorrel8r,
+		func(ctx context.Context, c client.Client, m *v1alpha1.Monitoring,
+			cm *conditions.ConditionsManager, sources *[]rendertemplate.TemplateSource) error {
+			return deployPerses(ctx, c, m, cm, sources, persesVersion, persesFound)
+		},
+		func(ctx context.Context, c client.Client, m *v1alpha1.Monitoring,
+			cm *conditions.ConditionsManager, sources *[]rendertemplate.TemplateSource) error {
+			return deployPersesTempoIntegration(ctx, c, m, cm, sources, persesVersion, persesFound)
+		},
+		func(ctx context.Context, c client.Client, m *v1alpha1.Monitoring,
+			cm *conditions.ConditionsManager, sources *[]rendertemplate.TemplateSource) error {
+			return deployPersesPrometheusIntegration(ctx, c, m, cm, sources, persesVersion, persesFound)
+		},
 	} {
 		if err := action(ctx, r.Client, monitoring, cm, &sources); err != nil {
 			return nil, nil, nil, err
 		}
 	}
 
-	// A rejected LokiStack storage configuration must not stall metrics, traces
-	// or anything else, so the error is returned for the caller to hold until
-	// the end of the reconcile instead of aborting here. deployLokiStack reports
-	// it on both LokiStack conditions and renders neither stack, which would
-	// read as "deleted by the user" to garbage collection — hence the withheld
-	// component below.
-	withheldComponents := map[string]struct{}{}
-	lokiErr := deployLokiStack(ctx, r.Client, monitoring, cm, &sources)
-	if lokiErr != nil {
-		withheldComponents[componentLoki] = struct{}{}
-	}
+	// The storage gate runs ahead of every claimant it reports on. Its error
+	// is held rather than returned: a rejected storage configuration is a
+	// verdict on the spec, not a failure of the reconcile, so Deploy, the
+	// shielded sweep, the endpoints and the Ready aggregation all still run.
+	withheldComponents, storageErr := validateStorageIsolation(ctx, r.Client, monitoring, cm)
 
-	// Perses actions share the pre-resolved API version.
-	if err := deployPerses(ctx, r.Client, monitoring, cm, &sources, persesVersion, persesFound); err != nil {
-		return nil, nil, nil, err
-	}
-	if err := deployPersesTempoIntegration(ctx, r.Client, monitoring, cm, &sources, persesVersion, persesFound); err != nil {
-		return nil, nil, nil, err
-	}
-	if err := deployPersesPrometheusIntegration(ctx, r.Client, monitoring, cm, &sources, persesVersion, persesFound); err != nil {
+	if err := deployLokiStacks(ctx, r.Client, monitoring, cm, &sources, withheldComponents); err != nil {
 		return nil, nil, nil, err
 	}
 
@@ -495,7 +497,7 @@ func (r *MonitoringReconciler) renderMonitoringResources(
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("rendering templates: %w", err)
 	}
-	return desired, withheldComponents, lokiErr, nil
+	return desired, withheldComponents, storageErr, nil
 }
 
 func (r *MonitoringReconciler) preparePrometheusWebTLSCA(
