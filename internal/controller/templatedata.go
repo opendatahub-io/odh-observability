@@ -256,7 +256,6 @@ func addLokiTemplateData(monitoring *v1alpha1.Monitoring, monitoringNamespace st
 	// Both LokiStacks are configured in OpenShift logging mode. Their
 	// application tenant is the pinned tenant for inference logs.
 	templateData["LokiTenant"] = "application"
-	templateData["UsageLogsLokiQueryEndpoint"] = lokiGatewayURL(usageLogsLokiStackResourceName, monitoringNamespace)
 	templateData["LokiQueryEndpoint"] = lokiGatewayURL(lokiStackResourceName, monitoringNamespace)
 
 	var usageLogsLokiStorage, lokiStorage *v1alpha1.LokiStorageConfig
