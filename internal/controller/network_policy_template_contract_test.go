@@ -4,7 +4,10 @@ import (
 	"reflect"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 func TestOperandNetworkPolicyTemplatesContract(t *testing.T) {
@@ -156,7 +159,13 @@ func policyPorts(t *testing.T, policy unstructured.Unstructured) map[networkPoli
 	return ports
 }
 
-func TestLokiGatewayNetworkPolicyAllowsKorrel8r(t *testing.T) {
+// TestLokiGatewayNetworkPolicyAdmitsOnlyDeclaredPeers pins the whole peer set
+// of the log forwarding gateway policy. Ingress is the write path into Loki, so
+// a rule added casually is a tenant anyone can write to: the contract is the
+// exact three peers, each a single peer on the gateway port — Vector from CLO's
+// dedicated namespace, Korrel8r for log correlation, and the in-namespace
+// Prometheus for metrics scraping.
+func TestLokiGatewayNetworkPolicyAdmitsOnlyDeclaredPeers(t *testing.T) {
 	t.Parallel()
 
 	resources := renderObservabilityTemplate(t, "resources/data-science-lokistack-gateway-network-policy.tmpl.yaml", map[string]any{
@@ -164,22 +173,61 @@ func TestLokiGatewayNetworkPolicyAllowsKorrel8r(t *testing.T) {
 		"LokiStackName":          "data-science-lokistack",
 		"UsageLogsCollectorName": "data-science-usage-logs",
 	})
-	policy := findRenderedResource(t, resources, "NetworkPolicy", "data-science-lokistack-gateway-ingress")
+	rendered := findRenderedResource(t, resources, "NetworkPolicy", "data-science-lokistack-gateway-ingress")
 
-	for _, rawRule := range nestedSlice(t, policy, "spec", "ingress") {
-		for _, rawPeer := range asSlice(t, asMap(t, rawRule)["from"]) {
-			labels, found, err := unstructured.NestedStringMap(asMap(t, rawPeer), "podSelector", "matchLabels")
-			if err == nil && found && reflect.DeepEqual(labels, map[string]string{
-				"app.kubernetes.io/name":      "korrel8r",
-				"app.kubernetes.io/component": "correlation",
-				"app.kubernetes.io/part-of":   "monitoring",
-			}) {
-				return
-			}
-		}
+	var policy networkingv1.NetworkPolicy
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(rendered.Object, &policy); err != nil {
+		t.Fatalf("converting Loki gateway NetworkPolicy: %v", err)
 	}
 
-	t.Fatal("Loki gateway NetworkPolicy must allow Korrel8r on its gateway port")
+	wantPeers := map[string]bool{}
+	see := func(key string) {
+		if wantPeers[key] {
+			t.Errorf("peer %s is declared more than once", key)
+		}
+		wantPeers[key] = true
+	}
+	for _, rule := range policy.Spec.Ingress {
+		if len(rule.From) != 1 {
+			t.Fatalf("every ingress rule must declare exactly one peer, got %#v", rule.From)
+		}
+		if len(rule.Ports) != 1 || rule.Ports[0].Protocol == nil || *rule.Ports[0].Protocol != corev1.ProtocolTCP ||
+			rule.Ports[0].Port == nil || rule.Ports[0].Port.IntValue() != 8080 {
+			t.Fatalf("every ingress rule must admit only the gateway port TCP/8080, got %#v", rule.Ports)
+		}
+		peer := rule.From[0]
+		switch {
+		case peer.NamespaceSelector != nil:
+			if got := peer.NamespaceSelector.MatchLabels["kubernetes.io/metadata.name"]; got != "openshift-logging" {
+				t.Errorf("namespace peer must be CLO's openshift-logging, got %q", got)
+			} else {
+				see("openshift-logging")
+			}
+		case peer.PodSelector != nil:
+			switch peer.PodSelector.MatchLabels["app.kubernetes.io/name"] {
+			case "korrel8r":
+				if peer.PodSelector.MatchLabels["app.kubernetes.io/component"] != "correlation" ||
+					peer.PodSelector.MatchLabels["app.kubernetes.io/part-of"] != "monitoring" {
+					t.Errorf("korrel8r peer must stay scoped to the correlation component, got %#v", peer.PodSelector)
+				}
+				see("korrel8r")
+			case "prometheus":
+				if peer.PodSelector.MatchLabels["app.kubernetes.io/instance"] != "data-science-monitoringstack" {
+					t.Errorf("prometheus peer must stay scoped to the monitoring stack instance, got %#v", peer.PodSelector)
+				}
+				see("prometheus")
+			default:
+				t.Errorf("undeclared pod peer on the gateway: %#v", peer.PodSelector)
+			}
+		default:
+			t.Fatalf("peer selects neither a namespace nor a pod: %#v", peer)
+		}
+	}
+	for _, peer := range []string{"openshift-logging", "korrel8r", "prometheus"} {
+		if !wantPeers[peer] {
+			t.Errorf("gateway policy is missing its %s peer", peer)
+		}
+	}
 }
 
 func asSlice(t *testing.T, value any) []any {

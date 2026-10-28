@@ -90,20 +90,19 @@ func (tc *MonitoringTestCtx) ValidateLogsLokiStackDeployment(t *testing.T) {
 	// These two policies ride with the log forwarding stack, so they are only
 	// rendered while spec.logs is set. They are asserted here rather than
 	// alongside the usage logs policies because nothing in a usage-logs-only
-	// install creates them.
+	// install creates them. Their configuration — selectors, peers, ports,
+	// policy types — is a template contract pinned in unit tests
+	// (TestOperandNetworkPolicyTemplatesContract and
+	// TestLokiGatewayNetworkPolicyAdmitsOnlyDeclaredPeers in
+	// internal/controller); e2e keeps what only a live cluster can show,
+	// existence and Monitoring ownership.
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.NetworkPolicy, types.NamespacedName{
 			Name:      LokiStackNetworkPolicyName,
 			Namespace: tc.MonitoringNamespace,
 		}),
-		WithCondition(And(
-			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/name" == "lokistack"`),
-			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, LokiStackName),
-			jq.Match(`.spec.policyTypes == ["Ingress"]`),
-			jq.Match(`[.spec.ingress[] | select((.from // []) | length == 0)] | length == 0`),
-			jq.Match(`[.spec.ingress[].ports[].port] | unique | sort == [3100, 7946, 9095]`),
-		)),
-		WithCustomErrorMsg("LokiStack NetworkPolicy should restrict component ingress to declared peers"),
+		WithCondition(tc.monitoringOwnerReferencesCondition()),
+		WithCustomErrorMsg("LokiStack NetworkPolicy should exist and be owned by Monitoring while spec.logs is set"),
 	)
 
 	tc.EnsureResourceExists(
@@ -111,21 +110,8 @@ func (tc *MonitoringTestCtx) ValidateLogsLokiStackDeployment(t *testing.T) {
 			Name:      LokiStackGatewayNetworkPolicyName,
 			Namespace: tc.MonitoringNamespace,
 		}),
-		WithCondition(And(
-			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/component" == "lokistack-gateway"`),
-			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, LokiStackName),
-			jq.Match(`.spec.policyTypes == ["Ingress"]`),
-			jq.Match(`[.spec.ingress[] | select((.from // []) | length == 0)] | length == 0`),
-			jq.Match(`[.spec.ingress[].from[] | .namespaceSelector.matchLabels."kubernetes.io/metadata.name"] | map(select(. == "openshift-logging")) | length == 1`),
-			jq.Match(`
-				[.spec.ingress[].from[] | .podSelector.matchLabels |
-					select(."app.kubernetes.io/name" == "korrel8r" and
-						."app.kubernetes.io/component" == "correlation" and
-						."app.kubernetes.io/part-of" == "monitoring")] | length == 1
-			`),
-			jq.Match(`[.spec.ingress[].ports[].port] | unique == [8080]`),
-		)),
-		WithCustomErrorMsg("LokiStack gateway NetworkPolicy should admit only declared in-namespace and CLO traffic"),
+		WithCondition(tc.monitoringOwnerReferencesCondition()),
+		WithCustomErrorMsg("LokiStack gateway NetworkPolicy should exist and be owned by Monitoring while spec.logs is set"),
 	)
 }
 
