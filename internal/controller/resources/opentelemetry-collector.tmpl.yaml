@@ -159,25 +159,24 @@ spec:
             statements:
               - delete_key(attributes, "k8s_namespace_name")
               - delete_key(attributes, "k8s_pod_name")
-      # The dcgm-exporter job's k8s.namespace.name/k8s.pod.name identify the
-      # exporter pod in nvidia-gpu-operator, not the workload consuming the
-      # GPU (that attribution already reaches Prometheus as
-      # exported_namespace/exported_pod). Deleting the attributes makes the
-      # ServiceMonitor promotion a no-op for accelerator series (its regex
-      # (.+) requires the label to exist), keeping them on their existing
-      # labels. node and component are untouched because Korrel8r correlates
-      # DCGM series by node. service.name is set by the prometheus receiver
-      # from the job target label assigned by the dcgm scrape job's
-      # relabeling. This processor runs in the scrape pipeline only: the
-      # scoping label is receiver-derived there, but an OTLP pusher would
-      # control service.name and could use it to opt out of pod attribution.
+      # Monitor relabelings can set the job target label, which the Prometheus
+      # receiver maps to service.name; that name alone is not trusted. Only
+      # exclude exporter identity when Kubernetes enrichment identifies the
+      # target in nvidia-gpu-operator. Those attributes identify the exporter
+      # pod, not the workload consuming the GPU (that attribution already
+      # reaches Prometheus as exported_namespace/exported_pod). Removing them
+      # makes the ServiceMonitor promotion a no-op for accelerator series,
+      # while node/component remain for Korrel8r. Delete pod first because the
+      # namespace guard on the next statement still needs k8s.namespace.name.
+      # This transform stays in the scrape pipeline; OTLP pushers use a
+      # separate sanitizer and cannot opt out of pod attribution this way.
       transform/exclude_dcgm_k8s_labels:
         error_mode: propagate
         metric_statements:
           - context: resource
             statements:
-              - delete_key(attributes, "k8s.namespace.name") where attributes["service.name"] == "rhoai-accelerator-metrics"
-              - delete_key(attributes, "k8s.pod.name") where attributes["service.name"] == "rhoai-accelerator-metrics"
+              - delete_key(attributes, "k8s.pod.name") where attributes["service.name"] == "rhoai-accelerator-metrics" and attributes["k8s.namespace.name"] == "nvidia-gpu-operator"
+              - delete_key(attributes, "k8s.namespace.name") where attributes["service.name"] == "rhoai-accelerator-metrics" and attributes["k8s.namespace.name"] == "nvidia-gpu-operator"
       # OTLP pushers also control their resource attributes, and
       # k8sattributes only fills absent/empty attributes, so client-supplied
       # identity attributes would survive enrichment and poison the labels

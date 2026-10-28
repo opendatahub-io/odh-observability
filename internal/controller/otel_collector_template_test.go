@@ -339,15 +339,13 @@ func TestCollectorStripsWorkloadSuppliedK8sLabelAttributes(t *testing.T) {
 }
 
 // TestSanitizeTransformExcludesDCGMExporterK8sLabels guards the DCGM
-// scope-out of the namespace/pod promotion: the dcgm-exporter scrape job's
-// k8s.namespace.name/k8s.pod.name resource attributes identify the exporter
-// pod in nvidia-gpu-operator, not the workload consuming the GPU, so they
-// must not be promoted to namespace/pod by the collector ServiceMonitor.
-// The resource-context statements delete them for that job, making the
-// promotion a no-op for accelerator series, while node/component are
-// preserved (Korrel8r correlates DCGM series by node). The processor runs
-// in the scrape pipeline only: an OTLP pusher controls service.name and
-// must not be able to use the DCGM job name to opt out of pod attribution.
+// scope-out of namespace/pod promotion. Monitor relabelings can spoof the
+// service.name derived from job, so the exclusion must also require the
+// collector-enriched target namespace to be nvidia-gpu-operator. The ordered
+// resource-context statements remove exporter pod identity without allowing
+// tenant monitors to opt out of namespace/pod attribution. Node/component
+// remain for Korrel8r. The processor stays in the scrape pipeline; OTLP
+// pushers use a separate identity sanitizer.
 func TestSanitizeTransformExcludesDCGMExporterK8sLabels(t *testing.T) {
 	collector := renderCollectorTemplate(t)
 
@@ -379,13 +377,14 @@ func TestSanitizeTransformExcludesDCGMExporterK8sLabels(t *testing.T) {
 		t.Fatalf("resource-context statements have unexpected type: %T", resourceBlock["statements"])
 	}
 
-	// The DCGM job name scoping the statements must match the job target
-	// label assigned by the dcgm scrape job's relabeling, so renaming one
-	// without the other fails here.
+	// Both the DCGM job identity and trusted target namespace must scope these
+	// statements. Their order is significant: the first guard needs the namespace
+	// attribute that the second statement removes.
 	dcgmJobName := dcgmScrapeJobName(t, collector)
+	dcgmTargetNamespace := "nvidia-gpu-operator"
 	expectedStatements := []string{
-		fmt.Sprintf(`delete_key(attributes, "k8s.namespace.name") where attributes["service.name"] == %q`, dcgmJobName),
-		fmt.Sprintf(`delete_key(attributes, "k8s.pod.name") where attributes["service.name"] == %q`, dcgmJobName),
+		fmt.Sprintf(`delete_key(attributes, "k8s.pod.name") where attributes["service.name"] == %q and attributes["k8s.namespace.name"] == %q`, dcgmJobName, dcgmTargetNamespace),
+		fmt.Sprintf(`delete_key(attributes, "k8s.namespace.name") where attributes["service.name"] == %q and attributes["k8s.namespace.name"] == %q`, dcgmJobName, dcgmTargetNamespace),
 	}
 	if len(statements) != len(expectedStatements) {
 		t.Fatalf("expected %d resource-context statements, got %d", len(expectedStatements), len(statements))

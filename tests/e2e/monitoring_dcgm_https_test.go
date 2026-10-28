@@ -40,10 +40,11 @@ const (
 
 // ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMonitor proves the opt-out
 // leaves TargetAllocator monitor discovery active, a selected HTTPS PodMonitor
-// can deliver a DCGM-shaped metric with verified identity, and a hostname
-// mismatch makes the scrape fail. The Prometheus fixture's build-info metric is
-// renamed to a canonical DCGM name by the test-only monitor relabeling, so no
-// GPU hardware or NVIDIA exporter is required.
+// in a workload namespace can spoof the reserved accelerator job without
+// losing collector-derived identity, and a hostname mismatch makes the scrape
+// fail. The Prometheus fixture's build-info metric is renamed to a canonical
+// DCGM name by the test-only monitor relabeling, so no GPU hardware or NVIDIA
+// exporter is required.
 func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMonitor(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
@@ -127,7 +128,7 @@ func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMon
 	viewerToken := tc.metricsViewerToken(t, "dcgm-https-viewer", namespace)
 	rootCAs := clusterIngressCAPool(t, tc)
 	routeHost := tc.fetchPrometheusRouteHost(t)
-	metricQuery := fmt.Sprintf(`DCGM_FI_DEV_GPU_UTIL{namespace=%q,job="rhoai-accelerator-metrics",component="nvidia-dcgm-exporter"}`, namespace)
+	metricQuery := fmt.Sprintf(`DCGM_FI_DEV_GPU_UTIL{namespace=%q,pod=%q,job="rhoai-accelerator-metrics",component="nvidia-dcgm-exporter"}`, namespace, dcgmHTTPSExporterName)
 	tc.g.Eventually(func() error {
 		status, response, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, viewerToken, namespace, metricQuery)
 		if err != nil {
@@ -139,11 +140,12 @@ func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMon
 		for _, result := range response.Data.Result {
 			if result.Metric["job"] == "rhoai-accelerator-metrics" &&
 				result.Metric["node"] != "" &&
+				result.Metric["pod"] == dcgmHTTPSExporterName &&
 				result.Metric["component"] == "nvidia-dcgm-exporter" {
 				return nil
 			}
 		}
-		return errors.New("no HTTPS-scraped DCGM metric with expected node/component/job labels yet")
+		return errors.New("no HTTPS-scraped DCGM metric with expected namespace/pod/node/component/job labels yet")
 	}, 10*time.Minute, 15*time.Second).Should(Succeed(), "selected HTTPS PodMonitor must deliver DCGM-shaped metrics with expected labels")
 
 	// Keep the CA trusted but break the certificate identity. Prometheus should
@@ -347,7 +349,7 @@ func dcgmHTTPSExporterPodMonitor(namespace, serverName string) *unstructured.Uns
 					"serverName": serverName,
 				},
 				"relabelings": []any{
-					map[string]any{"action": "replace", "sourceLabels": []any{"__meta_kubernetes_namespace"}, "targetLabel": "namespace"},
+					// Leave namespace/pod labels to trusted collector enrichment.
 					map[string]any{"action": "replace", "sourceLabels": []any{"__meta_kubernetes_pod_node_name"}, "targetLabel": "node"},
 					map[string]any{"action": "replace", "sourceLabels": []any{"__meta_kubernetes_pod_label_app"}, "targetLabel": "component"},
 					map[string]any{"action": "replace", "replacement": "rhoai-accelerator-metrics", "targetLabel": "job"},
