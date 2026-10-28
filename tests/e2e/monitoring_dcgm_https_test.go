@@ -119,6 +119,7 @@ func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMon
 			jq.Match(`(.spec.config.receivers.prometheus.config.scrape_configs // [] | any(.[]; .job_name == "dcgm-exporter-accelerator-metrics")) | not`),
 			jq.Match(`.spec.config.service.pipelines."metrics/scrape".receivers | contains(["prometheus"])`),
 			jq.Match(`.spec.config.service.pipelines."metrics/scrape".processors | contains(["transform/gpu_metrics"])`),
+			jq.Match(`.spec.config.receivers.prometheus.target_allocator != null`),
 			jq.Match(`.spec.targetAllocator.enabled == true`),
 			jq.Match(`.spec.targetAllocator.prometheusCR.podMonitorSelector.matchLabels."monitoring.opendatahub.io/scrape" == "true"`),
 		)),

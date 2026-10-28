@@ -111,8 +111,10 @@ spec:
               scrape_timeout: 10s
       {{- else }}
       # TargetAllocator supplies selected monitor scrapes. Leave its receiver
-      # config absent; a present config block requires scrape_configs.
-      prometheus: {}
+      # config absent; a present config block requires scrape_configs. The
+      # target_allocator block keeps the receiver non-null for operator validation.
+      prometheus:
+        target_allocator: {}
       {{- end }}
       {{- end }}
       otlp:

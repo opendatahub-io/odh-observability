@@ -85,23 +85,17 @@ func TestPrometheusScrapeConfigContainsOnlyDCGMJob(t *testing.T) {
 	}
 }
 
-func TestDCGMScrapeJobIsOmittedWithoutAcceleratorMetrics(t *testing.T) {
+func TestPrometheusReceiverUsesTargetAllocatorWithoutStaticScrapes(t *testing.T) {
 	collector := renderCollectorTemplateWithAcceleratorMetrics(t, false)
-	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
+	prometheusReceiver, found, err := unstructured.NestedMap(collector.Object, "spec", "config", "receivers", "prometheus")
 	if err != nil || !found {
-		t.Fatalf("collector config must be present: found=%t, error=%v", found, err)
+		t.Fatalf("Prometheus receiver must remain present: found=%t, error=%v", found, err)
 	}
-	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus", "config", "scrape_configs")
-	if err != nil {
-		t.Fatalf("read Prometheus scrape configs: %v", err)
+	if _, found := prometheusReceiver["config"]; found {
+		t.Fatal("Prometheus receiver must omit config when no static scrape jobs are configured")
 	}
-	if !found {
-		return
-	}
-	for _, rawScrapeConfig := range scrapeConfigs {
-		if scrapeConfig, ok := rawScrapeConfig.(map[string]any); ok && scrapeConfig["job_name"] == "dcgm-exporter-accelerator-metrics" {
-			t.Fatal("built-in DCGM scrape job must be absent without accelerator metrics")
-		}
+	if _, found, err := unstructured.NestedMap(prometheusReceiver, "target_allocator"); err != nil || !found {
+		t.Fatalf("Prometheus receiver must seed TargetAllocator config: found=%t, error=%v", found, err)
 	}
 }
 
@@ -122,6 +116,9 @@ func TestBuiltinDCGMScrapeCanBeDisabledWithoutDisablingMonitorCollection(t *test
 	}
 	if _, found := prometheusReceiver["config"]; found {
 		t.Fatal("built-in DCGM opt-out must omit Prometheus config so TargetAllocator can provide monitor scrapes")
+	}
+	if _, found, err := unstructured.NestedMap(prometheusReceiver, "target_allocator"); err != nil || !found {
+		t.Fatalf("built-in DCGM opt-out must retain TargetAllocator receiver config: found=%t, error=%v", found, err)
 	}
 
 	if !containsString(metricsPipelines(t, collector)["metrics/scrape"]["receivers"], "prometheus") {
