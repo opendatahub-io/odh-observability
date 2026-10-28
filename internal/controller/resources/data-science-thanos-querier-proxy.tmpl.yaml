@@ -135,8 +135,11 @@ spec:
             - --upstream=http://thanos-querier-data-science-thanos-querier.{{.Namespace}}.svc.cluster.local:10902
             - --label=namespace
             - --enable-label-apis
-            # Reject duplicate namespace values from URL and POST form data.
-            - --regex-match
+            # No --regex-match: Perses Project=All / multi-select sends
+            # namespace=a&namespace=b; kube-rbac-proxy SAR-checks each value.
+            # Residual risk: POST form namespace= can widen enforcement beyond
+            # URL-only SAR (see ARCHITECTURE.md). Perses uses URL queryParams
+            # only. Follow-up: upstream prom-label-proxy query-param-only.
           resources:
             limits:
               cpu: 100m

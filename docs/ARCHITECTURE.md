@@ -131,8 +131,29 @@ All templates are embedded via `//go:embed` and rendered with Go's `text/templat
 | `perses-tempo-datasource.tmpl.yaml` | PersesDatasource for Tempo |
 | `perses-tempo-dashboard-v1alpha1.tmpl.yaml` | PersesDashboard (v1alpha1 API) |
 | `perses-tempo-dashboard-v1alpha2.tmpl.yaml` | PersesDashboard (v1alpha2 API) |
-| `perses-datasource-prometheus.tmpl.yaml` | PersesDatasource for namespace Prometheus |
-| `perses-datasource-cluster-prometheus.tmpl.yaml` | PersesDatasource for cluster Prometheus |
+| `perses-datasource-prometheus.tmpl.yaml` | PersesDatasource for Data Science metrics via Thanos proxy (:8443, requires `namespace=`, default) |
+| `perses-datasource-cluster-prometheus.tmpl.yaml` | PersesDatasource for OpenShift Monitoring cluster-wide (:9091, **caller token / RBAC**, not shared SA, not default) |
+| `perses-datasource-cluster-prometheus-tenancy.tmpl.yaml` | PersesDatasource for OpenShift Monitoring tenancy (:9092, requires `namespace=`) |
+
+Perses metrics access model (three lanes — pick by **where the series live**, not by dashboard title):
+
+| Lane | Datasource | Backend | Gate | Owns |
+|------|------------|---------|------|------|
+| **DS namespace-scoped** | `data-science-prometheus-datasource` (default) | DS Thanos proxy `:8443` | `namespace=` + caller token + `metrics.k8s.io` SAR | Series in the Data Science MonitoringStack (e.g. `kserve_vllm:*`, DS `accelerator_*` recording rules from OTC/DCGM) |
+| **OCP tenancy** | `cluster-prometheus-tenancy-datasource` | OpenShift Thanos `:9092` | `namespace=` + caller token | Namespaced OpenShift Monitoring series (`node_namespace_pod_container:*`, `kube_*`, OCP accelerator with `exported_namespace` / `exported_pod`) |
+| **OCP admin** | `cluster-prometheus-datasource` | OpenShift Thanos `:9091` | caller RBAC only (e.g. `cluster-monitoring-view`) | Cluster-wide admin views — **not** namespace tenancy |
+
+**Do not conflate the gates.** `:8443` is DS namespace scoping. `:9091` is RBAC. `:9092` is OpenShift tenancy.
+
+**BREAKING (default datasource):** `data-science-prometheus-datasource` is now `default: true` and requires `namespace=` on every query (enforced by the proxy). Panels that omit an explicit datasource name and previously hit cluster Prometheus will now hit the DS proxy and fail without `namespace=`. Product Observe dashboards must pin explicitly (`cluster-prometheus-datasource` / `cluster-prometheus-tenancy-datasource`). Custom/ Perses dashboards that relied on the old default must either pin a datasource or pass `namespace=`.
+
+**Metric ownership / dashboard pins (hard rule):** one PromQL query runs against **one** datasource. You cannot join DS Thanos series with OpenShift series in a single query. Observe dashboards (Dashboard repo) must pin explicitly after the DS default flip:
+- **Models:** `kserve_vllm:*` panels → `data-science-prometheus-datasource` (`:8443`). OCP GPU/CPU panels → `cluster-prometheus-tenancy-datasource` (`:9092`).
+- **Cluster:** → `cluster-prometheus-datasource` (`:9091`).
+- **Out of scope for RHOAIENG-99814:** rewriting GPU/CPU PromQL that still references `kserve_vllm:*` inside a tenancy query (cross-stack join). That is a separate metric-ownership change.
+
+- Upgrade: reconciler deletes legacy SA-token Secrets `data-science-prometheus-datasource-secret`, `cluster-prometheus-datasource-secret`, and `cluster-prometheus-tenancy-datasource-secret` so Perses can recreate TLS CA material under the same names.
+- Observe UI / gateway → Perses ingress is owned by Dashboard (`dashboard-perses-access`), not this operator.
 
 ### Korrel8r (Signal Correlation)
 
@@ -307,21 +328,23 @@ kube-rbac-proxy (port 8443)
     |
 prom-label-proxy (port 9091)
     |-- Validates namespace parameter is present
-    |-- Rejects multiple namespace values, including URL/form duplicates
-    |-- Rewrites PromQL queries to inject namespace label filter
+    |-- Accepts repeated namespace=a&namespace=b (Perses :queryparam / Project=All as concrete list)
+    |-- Rewrites PromQL to enforce namespace="a" or namespace=~"a|b"
     |
 Prometheus (port 9090)
 ```
 
 **Authentication**: kube-rbac-proxy validates bearer tokens via Kubernetes TokenReview API.
 
-**Authorization**: SubjectAccessReview checks that the user can `get` `metrics.k8s.io/pods` in the requested namespace. The proxy uses this read permission for both GET and read-only Prometheus POST queries. The old aggregated `data-science-metrics-view` ClusterRole is no longer rendered and is eligible for removal by the monitoring resource garbage collector on upgrade.
+**Authorization**: SubjectAccessReview checks that the user can `get` `metrics.k8s.io/pods` in the requested namespace. The proxy uses this read permission for both GET and read-only Prometheus POST queries. Repeated `namespace=` values produce one SAR per namespace; the request is allowed only if the caller is authorized for every listed namespace. The old aggregated `data-science-metrics-view` ClusterRole is no longer rendered and is eligible for removal by the monitoring resource garbage collector on upgrade.
 
-**Query isolation**: prom-label-proxy rewrites PromQL queries to inject `{namespace="<value>"}`, ensuring users only see metrics from namespaces they are authorized for, regardless of how they craft their queries. Its single-value regex mode rejects duplicate namespace values supplied across URL and POST form parameters instead of widening the enforced matcher.
+**Query isolation**: prom-label-proxy rewrites PromQL to inject the authorized namespace matcher (`namespace="a"` or `namespace=~"a|b"` for multi-select / Project=All). Do **not** send a PromQL wildcard (`namespace=.*`) as the HTTP `namespace` query param — Project=All must expand to the concrete project list via Perses `${namespace:queryparam}`. The **Thanos** Perses proxy omits `--regex-match` so repeated `namespace=` works; kube-rbac-proxy still requires a successful SAR for **every** listed namespace. The Prometheus namespace-proxy path keeps `--regex-match` (single-value) — it is not the Perses Observe lane.
+
+**Known limitation — POST form body namespace injection**: kube-rbac-proxy reads namespace values from `r.URL.Query()` (URL query string only). prom-label-proxy's `HTTPFormEnforcer` calls `r.ParseForm()`, which merges URL query and POST form body into `r.Form`. A POST request with URL `namespace=A` (SAR-checked) and form body `namespace=B` (not SAR-checked) can cause prom-label-proxy to enforce `namespace=~"A|B"`, widening the matcher beyond what SAR authorized. This residual risk appears when the Thanos Perses proxy omits `--regex-match` (required for multi-namespace / Project=All). Mitigating factors: (1) the attacker must be authenticated and hold SAR for at least one namespace, (2) the Perses product path sends `namespace` via `queryParams` (URL query string only) — Perses never sends a form-body `namespace`, (3) OpenShift Monitoring's tenancy endpoint (`thanos-querier:9092`) uses the same proxy composition. No query-only extraction flag exists in the currently pinned prom-label-proxy (v0.15.1). Follow-up: bump to a release that includes `-query-param-only` (RHOAIENG-101998 / upstream #444) and enable it here.
 
 **TLS profile ownership**: The controller resolves the effective APIServer TLS profile and writes the resulting version, cipher-suite, and curve-preference flags into the PodTemplates of all generated kube-rbac-proxy workloads: the Prometheus namespace proxy, Prometheus cluster proxy, and Thanos Querier proxy. The proxy image does not watch OpenShift TLS resources. `RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE` only selects the image; it does not configure TLS. Under strict adherence, an unrepresentable profile fails reconciliation before any workload is applied. TLS 1.3 omits the cipher-suite restriction because Go does not make TLS 1.3 cipher suites configurable. Curve preferences are emitted as numeric Go CurveIDs, with non-FIPS-approved curves dropped when the cluster install configuration reports FIPS mode. If cluster FIPS status cannot be determined, reconciliation fails before any workload is applied.
 
-**Network isolation**: The Prometheus proxy NetworkPolicy restricts ingress to the configured gateway namespace and Alertmanager. The Thanos proxy NetworkPolicy restricts ingress to the configured gateway namespace. `GATEWAY_NAMESPACE` supplies the namespace identity for deployment variants; when it is empty, the policies use the OpenShift ingress policy-group label rather than assuming a namespace.
+**Network isolation**: The Prometheus proxy NetworkPolicy restricts ingress to the configured gateway namespace and Alertmanager. The Thanos proxy NetworkPolicy restricts ingress to the configured gateway (or OpenShift ingress policy-group when `GATEWAY_NAMESPACE` is empty) **and** to Perses pods (`instance` / `app.kubernetes.io/name: data-science-perses`) on TCP/8443 — in-cluster Observe queries must hit the namespace gate, not raw Thanos `:10902`.
 
 **API-server and webhook paths**: Korrel8r's egress policy allows only the ready Kubernetes API EndpointSlice addresses on TCP/6443 and records the node-sourced API-server path as an explicit exception. The mutating webhook has the same platform-managed exception because admission calls originate from the control plane and standard NetworkPolicy cannot reliably express that node source; the rendered `MutatingWebhookConfiguration` records `platform.opendatahub.io/webhook-network-policy=platform-managed-exception`. These annotations are descriptive contracts, not enforcement. The operator does not install a host-network NetworkPolicy or `AdminNetworkPolicy`; the owning control, when present, is the cluster platform/network-admin configuration for host-network or external control-plane traffic, scoped to the API-server/admission path. A cluster without that complementary control must be qualified live and reported as an explicit limitation.
 

@@ -233,13 +233,14 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		"--tls-cipher-suites=TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
 		"--tls-curve-preferences=29,25",
 	)
-	assertContainerArgs(t, findContainer(t, containers, "prom-label-proxy"),
+	promLabelProxy := findContainer(t, containers, "prom-label-proxy")
+	assertContainerArgs(t, promLabelProxy,
 		"--insecure-listen-address=127.0.0.1:9091",
 		"--upstream=http://thanos-querier-data-science-thanos-querier."+testMonitoringNamespace+".svc.cluster.local:10902",
 		"--label=namespace",
 		"--enable-label-apis",
-		"--regex-match",
 	)
+	assertContainerArgAbsent(t, promLabelProxy, "--regex-match")
 
 	service := findRenderedResource(t, resources, "Service", "data-science-thanos-querier-proxy")
 	ports := nestedSlice(t, service, "spec", "ports")
@@ -257,13 +258,14 @@ func TestThanosQuerierProxyNetworkPolicyTemplateContract(t *testing.T) {
 		t.Fatalf("Thanos proxy NetworkPolicy must select the proxy pods: found=%t value=%q error=%v", found, selector, err)
 	}
 	ingress := nestedSlice(t, policy, "spec", "ingress")
-	if len(ingress) != 1 {
-		t.Fatalf("Thanos proxy NetworkPolicy must have one ingress rule, got %d", len(ingress))
+	if len(ingress) != 2 {
+		t.Fatalf("Thanos proxy NetworkPolicy must have gateway and Perses ingress rules, got %d", len(ingress))
 	}
-	ingressRule := asMap(t, ingress[0])
-	fromValues, ok := ingressRule["from"].([]any)
+
+	gatewayRule := asMap(t, ingress[0])
+	fromValues, ok := gatewayRule["from"].([]any)
 	if !ok || len(fromValues) != 1 {
-		t.Fatalf("Thanos proxy NetworkPolicy must have one ingress source, got %#v", ingressRule["from"])
+		t.Fatalf("Thanos proxy NetworkPolicy gateway rule must have one ingress source, got %#v", gatewayRule["from"])
 	}
 	from := asMap(t, fromValues[0])
 	namespaceSelector := asMap(t, from["namespaceSelector"])
@@ -271,13 +273,33 @@ func TestThanosQuerierProxyNetworkPolicyTemplateContract(t *testing.T) {
 	if len(matchLabels) != 1 || matchLabels["policy-group.network.openshift.io/ingress"] != "" {
 		t.Fatalf("Thanos proxy NetworkPolicy must select the OpenShift ingress policy group: %#v", matchLabels)
 	}
-	portValues, ok := ingressRule["ports"].([]any)
+	portValues, ok := gatewayRule["ports"].([]any)
 	if !ok || len(portValues) != 1 {
-		t.Fatalf("Thanos proxy NetworkPolicy must have one port, got %#v", ingressRule["ports"])
+		t.Fatalf("Thanos proxy NetworkPolicy gateway rule must have one port, got %#v", gatewayRule["ports"])
 	}
 	ports := asMap(t, portValues[0])
 	if ports["protocol"] != "TCP" || ports["port"] != int64(8443) {
 		t.Fatalf("Thanos proxy NetworkPolicy must allow router HTTPS ingress: %#v", ports)
+	}
+
+	persesRule := asMap(t, ingress[1])
+	persesFrom, ok := persesRule["from"].([]any)
+	if !ok || len(persesFrom) != 1 {
+		t.Fatalf("Thanos proxy NetworkPolicy Perses rule must have one ingress source, got %#v", persesRule["from"])
+	}
+	persesPeer := asMap(t, persesFrom[0])
+	persesSelector := asMap(t, persesPeer["podSelector"])
+	persesLabels, found, err := unstructured.NestedStringMap(persesSelector, "matchLabels")
+	wantPerses := map[string]string{
+		"instance":               "data-science-perses",
+		"app.kubernetes.io/name": "data-science-perses",
+	}
+	if err != nil || !found || !reflect.DeepEqual(persesLabels, wantPerses) {
+		t.Fatalf("Thanos proxy NetworkPolicy must allow Perses pods: got %#v, error=%v", persesLabels, err)
+	}
+	persesPorts, ok := persesRule["ports"].([]any)
+	if !ok || len(persesPorts) != 1 || asMap(t, persesPorts[0])["port"] != int64(8443) {
+		t.Fatalf("Thanos proxy NetworkPolicy Perses rule must allow HTTPS 8443: %#v", persesRule["ports"])
 	}
 }
 
@@ -318,8 +340,8 @@ func TestThanosQuerierNetworkPolicyTemplateContract(t *testing.T) {
 	}
 
 	peers, ok := rule["from"].([]any)
-	if !ok || len(peers) != 4 {
-		t.Fatalf("Thanos Querier NetworkPolicy must allow only four internal sources, got %#v", rule["from"])
+	if !ok || len(peers) != 3 {
+		t.Fatalf("Thanos Querier NetworkPolicy must allow only three internal sources (no Perses bypass), got %#v", rule["from"])
 	}
 	prometheusPolicy := findRenderedResource(t,
 		renderObservabilityTemplate(t, PrometheusNetworkPolicyTemplate, map[string]any{"Namespace": testMonitoringNamespace}),
@@ -331,7 +353,6 @@ func TestThanosQuerierNetworkPolicyTemplateContract(t *testing.T) {
 	}
 	wantSources := []map[string]string{
 		prometheusSelector,
-		{"instance": "data-science-perses", "app.kubernetes.io/name": "data-science-perses"},
 		{"app": "data-science-thanos-querier-proxy"},
 		{"app.kubernetes.io/name": "korrel8r", "app.kubernetes.io/component": "correlation", "app.kubernetes.io/part-of": "monitoring"},
 	}
@@ -679,6 +700,11 @@ func TestPersesTemplateContract(t *testing.T) {
 	if err != nil || !found || !reflect.DeepEqual(labels, wantLabels) {
 		t.Fatalf("Perses pod labels must match the access NetworkPolicy selector: got %#v, error=%v", labels, err)
 	}
+	if _, found, err := unstructured.NestedMap(perses.Object, "spec", "config", "security"); err != nil {
+		t.Fatalf("reading Perses security config: %v", err)
+	} else if found {
+		t.Fatal("Perses must leave security/auth disabled; metrics tenancy is enforced by the Thanos proxy")
+	}
 }
 
 func TestThanosQuerierRouteUsesAuthorizedProxy(t *testing.T) {
@@ -856,20 +882,24 @@ type persesDatasourceContract struct {
 func TestPersesPrometheusDatasourceTemplateContracts(t *testing.T) {
 	tests := []persesDatasourceContract{
 		{
-			name:         "data science datasource",
-			template:     PersesDatasourcePrometheusTemplate,
-			datasource:   "data-science-prometheus-datasource",
-			url:          "http://thanos-querier-data-science-thanos-querier." + testMonitoringNamespace + ".svc.cluster.local:10902",
-			defaultValue: false,
+			name:          "data science datasource",
+			template:      PersesDatasourcePrometheusTemplate,
+			datasource:    "data-science-prometheus-datasource",
+			secret:        "data-science-prometheus-datasource-secret",
+			url:           "https://data-science-thanos-querier-proxy." + testMonitoringNamespace + ".svc.cluster.local:8443",
+			defaultValue:  true,
+			expectTLS:     true,
+			queryParamKey: "namespace",
 		},
 		{
-			name:         "cluster datasource",
-			template:     PersesDatasourceClusterPrometheusTemplate,
-			datasource:   "cluster-prometheus-datasource",
-			secret:       "cluster-prometheus-datasource-secret",
-			url:          "https://thanos-querier.openshift-monitoring.svc:9091",
-			defaultValue: true,
-			expectTLS:    true,
+			name:          "cluster prometheus datasource",
+			template:      PersesDatasourceClusterPrometheusTemplate,
+			datasource:    "cluster-prometheus-datasource",
+			secret:        "cluster-prometheus-datasource-secret",
+			url:           "https://thanos-querier.openshift-monitoring.svc:9091",
+			defaultValue:  false,
+			expectTLS:     true,
+			queryParamKey: "",
 		},
 		{
 			name:          "cluster tenancy datasource",
@@ -1008,7 +1038,32 @@ func assertPersesDatasourceTLS(t *testing.T, datasource unstructured.Unstructure
 
 func assertPersesDatasourceSecret(t *testing.T, resources []unstructured.Unstructured, datasource unstructured.Unstructured, contract persesDatasourceContract) {
 	t.Helper()
+	secretReference, found, err := unstructured.NestedString(datasource.Object, "spec", "config", "plugin", "spec", "proxy", "spec", "secret")
+	if err != nil {
+		t.Fatalf("reading datasource proxy secret reference: %v", err)
+	}
 	if contract.secret == "" {
+		if found {
+			t.Fatalf("datasource must not use a shared proxy secret (caller token is forwarded), got %q", secretReference)
+		}
+		for _, resource := range resources {
+			if resource.GetKind() == "Secret" {
+				t.Fatalf("caller-token datasources must not render a shared Secret, found %q", resource.GetName())
+			}
+		}
+		return
+	}
+	if !found || secretReference != contract.secret {
+		t.Fatalf("datasource must reference Secret %q: found=%t value=%q", contract.secret, found, secretReference)
+	}
+	// TLS CA secrets are created by the Perses operator from client.tls — our
+	// templates must only reference them (same pattern as tempo-datasource).
+	if contract.expectTLS {
+		for _, resource := range resources {
+			if resource.GetKind() == "Secret" {
+				t.Fatalf("TLS datasource must not render a Secret (Perses operator creates %q from client.tls), found %q", contract.secret, resource.GetName())
+			}
+		}
 		return
 	}
 	secret := findRenderedResource(t, resources, "Secret", contract.secret)
@@ -1024,10 +1079,6 @@ func assertPersesDatasourceSecret(t *testing.T, resources []unstructured.Unstruc
 	serviceAccount, found, err := unstructured.NestedString(secret.Object, "metadata", "annotations", "kubernetes.io/service-account.name")
 	if err != nil || !found || serviceAccount != "data-science-prometheus-cluster-proxy" {
 		t.Fatalf("datasource Secret must reference the cluster proxy service account: found=%t value=%q error=%v", found, serviceAccount, err)
-	}
-	secretReference, found, err := unstructured.NestedString(datasource.Object, "spec", "config", "plugin", "spec", "proxy", "spec", "secret")
-	if err != nil || !found || secretReference != contract.secret {
-		t.Fatalf("datasource must reference Secret %q: found=%t value=%q error=%v", contract.secret, found, secretReference, err)
 	}
 }
 

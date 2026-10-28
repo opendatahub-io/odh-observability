@@ -96,6 +96,13 @@ const (
 	Korrel8rRBACTemplate                             = "resources/korrel8r-rbac.tmpl.yaml"
 	Korrel8rNetworkPolicyTemplate                    = "resources/korrel8r-network-policy.tmpl.yaml"
 
+	// Pre-scoping Perses datasources used shared SA-token Secrets. Perses now
+	// expects TLS-CA-only Secrets under the same names; SA-token forms must be
+	// deleted on upgrade or TLS reconcile fails.
+	legacyDataSciencePrometheusDatasourceSecret    = "data-science-prometheus-datasource-secret"
+	legacyClusterPrometheusDatasourceSecret        = "cluster-prometheus-datasource-secret"
+	legacyClusterPrometheusTenancyDatasourceSecret = "cluster-prometheus-tenancy-datasource-secret"
+
 	PersesTempoDatasourceName = "tempo-datasource"
 	PersesTempoDashboardName  = "data-science-tempo-traces"
 
@@ -523,12 +530,57 @@ func deployPersesPrometheusIntegration(
 		return nil
 	}
 
+	if err := cleanupLegacyPersesDatasourceSATokenSecrets(ctx, c, monitoring.Spec.Namespace); err != nil {
+		return err
+	}
+
 	cm.MarkTrue(conditions.ConditionPersesPrometheusDataSourceAvailable)
+	// Feature: default DS datasource → namespace-enforcing Thanos proxy :8443.
+	// Guardrail: cluster :9091 / tenancy :9092 use caller token (no shared SA).
 	*sources = append(*sources,
 		src(PersesDatasourcePrometheusTemplate),
 		src(PersesDatasourceClusterPrometheusTemplate),
 		src(PersesDatasourceClusterPrometheusTenancyTemplate),
 	)
+	return nil
+}
+
+// cleanupLegacyPersesDatasourceSATokenSecrets removes pre-scoping
+// service-account token Secrets so Perses can recreate them as TLS CA secrets.
+func cleanupLegacyPersesDatasourceSATokenSecrets(ctx context.Context, c client.Client, namespace string) error {
+	for _, name := range []string{
+		legacyDataSciencePrometheusDatasourceSecret,
+		legacyClusterPrometheusDatasourceSecret,
+		legacyClusterPrometheusTenancyDatasourceSecret,
+	} {
+		if err := cleanupLegacyPersesDatasourceSATokenSecret(ctx, c, namespace, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cleanupLegacyPersesDatasourceSATokenSecret(ctx context.Context, c client.Client, namespace, name string) error {
+	if namespace == "" || name == "" {
+		return nil
+	}
+	secret := &corev1.Secret{}
+	err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, secret)
+	if err != nil {
+		if k8serr.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("getting legacy Perses datasource secret %s/%s: %w", namespace, name, err)
+	}
+	// Only delete the SA-token form. Opaque TLS CA secrets (same name) stay.
+	if secret.Type != corev1.SecretTypeServiceAccountToken {
+		return nil
+	}
+	if err := c.Delete(ctx, secret); err != nil && !k8serr.IsNotFound(err) {
+		return fmt.Errorf("deleting legacy Perses datasource SA token secret %s/%s: %w", namespace, name, err)
+	}
+	logf.FromContext(ctx).Info("deleted legacy shared-SA Perses datasource secret",
+		"secret", name, "namespace", namespace)
 	return nil
 }
 

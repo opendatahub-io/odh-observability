@@ -138,7 +138,8 @@ spec:
             - --upstream=https://prometheus-operated.{{.Namespace}}.svc:9090
             - --label=namespace
             - --enable-label-apis
-            # Reject duplicate namespace values from URL and POST form data.
+            # Single-value tenancy (not the Perses Observe lane). Perses multi-ns All
+            # uses data-science-thanos-querier-proxy without --regex-match.
             - --regex-match
           env:
             - name: SSL_CERT_DIR

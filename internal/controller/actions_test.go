@@ -31,6 +31,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -822,12 +823,81 @@ func TestDeployPersesPrometheusIntegration_CRDPresent(t *testing.T) {
 	}
 
 	if len(sources) != 3 {
-		t.Errorf("expected 3 sources (prometheus + cluster prometheus + tenancy datasource), got %d", len(sources))
+		t.Errorf("expected 3 sources (DS proxy + cluster caller-token + tenancy), got %d", len(sources))
 	}
+	assertTemplatePaths(t, sources, []string{
+		PersesDatasourcePrometheusTemplate,
+		PersesDatasourceClusterPrometheusTemplate,
+		PersesDatasourceClusterPrometheusTenancyTemplate,
+	})
 
 	c := findCondition(m, conditions.ConditionPersesPrometheusDataSourceAvailable)
 	if c == nil || c.Status != metav1.ConditionTrue {
 		t.Error("PersesPrometheusDataSourceAvailable should be True")
+	}
+}
+
+func TestCleanupLegacyPersesDatasourceSATokenSecrets_DeletesSATokens(t *testing.T) {
+	t.Parallel()
+
+	s := newActionsTestScheme(t)
+	dsLegacy := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      legacyDataSciencePrometheusDatasourceSecret,
+			Namespace: "opendatahub",
+		},
+		Type: corev1.SecretTypeServiceAccountToken,
+	}
+	clusterLegacy := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      legacyClusterPrometheusDatasourceSecret,
+			Namespace: "opendatahub",
+		},
+		Type: corev1.SecretTypeServiceAccountToken,
+	}
+	tenancyLegacy := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      legacyClusterPrometheusTenancyDatasourceSecret,
+			Namespace: "opendatahub",
+		},
+		Type: corev1.SecretTypeServiceAccountToken,
+	}
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(dsLegacy, clusterLegacy, tenancyLegacy).Build()
+
+	if err := cleanupLegacyPersesDatasourceSATokenSecrets(context.Background(), cli, "opendatahub"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, obj := range []client.Object{dsLegacy, clusterLegacy, tenancyLegacy} {
+		err := cli.Get(context.Background(), client.ObjectKeyFromObject(obj), &corev1.Secret{})
+		if !k8serr.IsNotFound(err) {
+			t.Fatalf("legacy SA token secret %s must be deleted, got %v", obj.GetName(), err)
+		}
+	}
+}
+
+func TestCleanupLegacyPersesDatasourceSATokenSecrets_KeepsTLSSecret(t *testing.T) {
+	t.Parallel()
+
+	s := newActionsTestScheme(t)
+	tlsSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      legacyClusterPrometheusDatasourceSecret,
+			Namespace: "opendatahub",
+			Annotations: map[string]string{
+				// Stale annotation must not cause delete of TLS CA material.
+				"kubernetes.io/service-account.name": "data-science-prometheus-cluster-proxy",
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{"ca.crt": []byte("dummy")},
+	}
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(tlsSecret).Build()
+
+	if err := cleanupLegacyPersesDatasourceSATokenSecrets(context.Background(), cli, "opendatahub"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := cli.Get(context.Background(), client.ObjectKeyFromObject(tlsSecret), &corev1.Secret{}); err != nil {
+		t.Fatalf("TLS CA secret must be kept: %v", err)
 	}
 }
 

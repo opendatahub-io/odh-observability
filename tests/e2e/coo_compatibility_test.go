@@ -809,7 +809,9 @@ func (tc *MonitoringTestCtx) kubernetesServiceGET(namespace, service string, por
 	if err != nil {
 		return "", 0, err
 	}
-	if token := tc.AuthToken(); token != "" {
+	// Attach a bearer token when available (kubeconfig / oc whoami). Perses auth is
+	// disabled for the metrics-proxy fix, but authenticated probes remain useful.
+	if token, tokenErr := tc.kubernetesBearerToken(); tokenErr == nil && token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := httpClient.Do(req)
