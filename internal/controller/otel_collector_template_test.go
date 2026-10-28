@@ -96,6 +96,89 @@ func TestPrometheusReceiverConfigIsEmptyWithoutAcceleratorMetrics(t *testing.T) 
 	}
 }
 
+func TestBuiltinDCGMScrapeCanBeDisabledWithoutDisablingMonitorCollection(t *testing.T) {
+	collector := renderCollectorTemplateWithDCGMScrapeEnabled(t, false)
+
+	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
+	if err != nil || !found {
+		t.Fatalf("collector config must be present: found=%t, error=%v", found, err)
+	}
+	receivers, found, err := unstructured.NestedMap(config, "receivers")
+	if err != nil || !found {
+		t.Fatalf("collector receivers must be present: found=%t, error=%v", found, err)
+	}
+	prometheusReceiver, ok := receivers["prometheus"].(map[string]any)
+	if !ok {
+		t.Fatalf("Prometheus receiver must remain configured, got %T", receivers["prometheus"])
+	}
+	prometheusConfig, ok := prometheusReceiver["config"].(map[string]any)
+	if !ok || len(prometheusConfig) != 0 {
+		t.Fatalf("built-in DCGM opt-out must omit only scrape config, got %v", prometheusReceiver["config"])
+	}
+
+	if !containsString(metricsPipelines(t, collector)["metrics/scrape"]["receivers"], "prometheus") {
+		t.Fatal("metrics/scrape pipeline must keep Prometheus receiver for TargetAllocator-discovered monitors")
+	}
+	if !containsString(metricsPipelines(t, collector)["metrics/scrape"]["processors"], "transform/gpu_metrics") {
+		t.Fatal("metrics/scrape pipeline must retain accelerator metric processing")
+	}
+
+	targetAllocator, found, err := unstructured.NestedMap(collector.Object, "spec", "targetAllocator")
+	if err != nil || !found || targetAllocator["enabled"] != true {
+		t.Fatalf("TargetAllocator must remain enabled for monitor discovery: found=%t config=%v error=%v", found, targetAllocator, err)
+	}
+	prometheusCR, found, err := unstructured.NestedMap(targetAllocator, "prometheusCR")
+	if err != nil || !found {
+		t.Fatalf("TargetAllocator Prometheus CR discovery must remain configured: found=%t error=%v", found, err)
+	}
+	for _, selector := range []string{"podMonitorSelector", "serviceMonitorSelector"} {
+		matchLabels, found, err := unstructured.NestedStringMap(prometheusCR, selector, "matchLabels")
+		if err != nil || !found || matchLabels["monitoring.opendatahub.io/scrape"] != "true" {
+			t.Errorf("TargetAllocator %s must remain selected: found=%t labels=%v error=%v", selector, found, matchLabels, err)
+		}
+	}
+}
+
+func TestBuiltinDCGMScrapeRequiresAcceleratorAndScrapeFlags(t *testing.T) {
+	tests := []struct {
+		name               string
+		acceleratorMetrics bool
+		scrapeEnabled      bool
+		wantJob            bool
+	}{
+		{name: "both disabled", acceleratorMetrics: false, scrapeEnabled: false},
+		{name: "only scrape enabled", acceleratorMetrics: false, scrapeEnabled: true},
+		{name: "only accelerator metrics enabled", acceleratorMetrics: true, scrapeEnabled: false},
+		{name: "both enabled", acceleratorMetrics: true, scrapeEnabled: true, wantJob: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			collector := renderCollectorTemplateWithOptions(t, test.acceleratorMetrics, test.scrapeEnabled)
+			config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
+			if err != nil || !found {
+				t.Fatalf("collector config must be present: found=%t, error=%v", found, err)
+			}
+			scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus", "config", "scrape_configs")
+			if err != nil {
+				t.Fatalf("read Prometheus scrape configs: %v", err)
+			}
+			if test.wantJob {
+				if !found || len(scrapeConfigs) != 1 {
+					t.Fatalf("both flags enabled must render exactly one DCGM job: found=%t configs=%v", found, scrapeConfigs)
+				}
+				job, ok := scrapeConfigs[0].(map[string]any)
+				if !ok || job["job_name"] != "dcgm-exporter-accelerator-metrics" {
+					t.Fatalf("unexpected built-in DCGM job: %v", scrapeConfigs[0])
+				}
+				return
+			}
+			if found && len(scrapeConfigs) != 0 {
+				t.Fatalf("DCGM job must be absent unless both flags are enabled, got %v", scrapeConfigs)
+			}
+		})
+	}
+}
+
 func TestTargetAllocatorSecurity(t *testing.T) {
 	collector := renderCollectorTemplate(t)
 	targetAllocator, found, err := unstructured.NestedMap(collector.Object, "spec", "targetAllocator")
@@ -642,6 +725,16 @@ func renderCollectorTemplate(t *testing.T) unstructured.Unstructured {
 
 func renderCollectorTemplateWithAcceleratorMetrics(t *testing.T, acceleratorMetrics bool) unstructured.Unstructured {
 	t.Helper()
+	return renderCollectorTemplateWithOptions(t, acceleratorMetrics, acceleratorMetrics)
+}
+
+func renderCollectorTemplateWithDCGMScrapeEnabled(t *testing.T, enabled bool) unstructured.Unstructured {
+	t.Helper()
+	return renderCollectorTemplateWithOptions(t, true, enabled)
+}
+
+func renderCollectorTemplateWithOptions(t *testing.T, acceleratorMetrics, builtinDCGMScrapeEnabled bool) unstructured.Unstructured {
+	t.Helper()
 	resources, err := rendertemplate.Render(context.Background(), nil, []rendertemplate.TemplateSource{{
 		FS:   resourcesFS,
 		Path: OpenTelemetryCollectorTemplate,
@@ -650,6 +743,7 @@ func renderCollectorTemplateWithAcceleratorMetrics(t *testing.T, acceleratorMetr
 		"Metrics":                         true,
 		"MetricsStorage":                  true,
 		"AcceleratorMetrics":              acceleratorMetrics,
+		"BuiltinDCGMScrapeEnabled":        builtinDCGMScrapeEnabled,
 		"Traces":                          false,
 		"CollectorReplicas":               1,
 		"CollectorCPULimit":               "1",
@@ -697,7 +791,7 @@ func extractSection(content, startMarker, endMarker string) string {
 	return content[startIdx : startIdx+endIdx]
 }
 
-func TestDCGMScrapeJobUsesHTTPAndVerifiesTLS(t *testing.T) {
+func TestDCGMScrapeJobUsesHTTPWithoutCredentialsAndKeepsDefaultRedirects(t *testing.T) {
 	jobs := renderedPrometheusScrapeJobs(t, renderCollectorTemplate(t))
 	job := jobs["dcgm-exporter-accelerator-metrics"]
 	if job == nil {
@@ -706,8 +800,13 @@ func TestDCGMScrapeJobUsesHTTPAndVerifiesTLS(t *testing.T) {
 	if job["scheme"] != "http" {
 		t.Errorf("DCGM scrape job must explicitly use HTTP, got %v", job["scheme"])
 	}
-	if job["bearer_token_file"] != "/var/run/secrets/kubernetes.io/serviceaccount/token" {
-		t.Errorf("DCGM scrape job must retain service-account bearer token authentication, got %v", job["bearer_token_file"])
+	for _, credentialField := range []string{"bearer_token_file", "bearer_token", "authorization", "basic_auth"} {
+		if _, found := job[credentialField]; found {
+			t.Errorf("DCGM scrape job must not configure %s, got %v", credentialField, job[credentialField])
+		}
+	}
+	if _, found := job["follow_redirects"]; found {
+		t.Errorf("DCGM scrape job must preserve Prometheus default redirect behavior, got %v", job["follow_redirects"])
 	}
 	if tlsConfig, found, err := unstructured.NestedMap(job, "tls_config"); err != nil {
 		t.Errorf("failed to read TLS config: %v", err)

@@ -77,6 +77,10 @@ type Metrics struct {
 	// Storage configures the built-in MonitoringStack backend. Omit when using exporters only (external observability).
 	// +optional
 	Storage *MetricsStorage `json:"storage,omitempty"`
+	// BuiltinDCGMScrapeEnabled controls the built-in HTTP scrape for DCGM exporter metrics.
+	// It defaults to enabled; set false when collecting DCGM through a ServiceMonitor or PodMonitor instead.
+	// +optional
+	BuiltinDCGMScrapeEnabled *bool `json:"builtinDCGMScrapeEnabled,omitempty"`
 	// Replicas specifies the number of replicas in the MonitoringStack.
 	// +kubebuilder:validation:Minimum=0
 	Replicas int32 `json:"replicas,omitempty"`

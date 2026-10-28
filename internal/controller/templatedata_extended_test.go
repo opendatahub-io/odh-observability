@@ -1021,6 +1021,9 @@ func TestBuildTemplateData_BasicNoFeatures(t *testing.T) {
 	if data["Metrics"] != false {
 		t.Errorf("Metrics: want false, got %v", data["Metrics"])
 	}
+	if data["BuiltinDCGMScrapeEnabled"] != false {
+		t.Errorf("BuiltinDCGMScrapeEnabled: want false without metrics, got %v", data["BuiltinDCGMScrapeEnabled"])
+	}
 	if data["Traces"] != false {
 		t.Errorf("Traces: want false, got %v", data["Traces"])
 	}
@@ -1170,6 +1173,9 @@ func TestBuildTemplateData_WithMetrics(t *testing.T) {
 	if data["Metrics"] != true {
 		t.Error("Metrics: want true")
 	}
+	if data["BuiltinDCGMScrapeEnabled"] != true {
+		t.Error("BuiltinDCGMScrapeEnabled: omitted setting must default to enabled")
+	}
 	if data["MetricsStorage"] != true {
 		t.Error("MetricsStorage: want true")
 	}
@@ -1185,6 +1191,47 @@ func TestBuildTemplateData_WithMetrics(t *testing.T) {
 		FS: resourcesFS, Path: Korrel8rConfigTemplate,
 	}}, data); err != nil {
 		t.Fatalf("Korrel8r config must render for metrics-only Monitoring: %v", err)
+	}
+}
+
+func TestBuildTemplateData_BuiltinDCGMScrapeOverride(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		enabled bool
+	}{
+		{name: "explicitly enabled", enabled: true},
+		{name: "explicitly disabled", enabled: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := newTestScheme(t)
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			enabled := test.enabled
+			m.Spec.Metrics = &v1alpha1.Metrics{
+				Storage:                  &v1alpha1.MetricsStorage{},
+				BuiltinDCGMScrapeEnabled: &enabled,
+			}
+
+			cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
+			data, err := buildTemplateData(context.Background(), cli, m, "")
+			if err != nil {
+				t.Fatalf("build template data: %v", err)
+			}
+			if data["BuiltinDCGMScrapeEnabled"] != test.enabled {
+				t.Errorf("BuiltinDCGMScrapeEnabled: want %t, got %v", test.enabled, data["BuiltinDCGMScrapeEnabled"])
+			}
+			if data["AcceleratorMetrics"] != true {
+				t.Errorf("AcceleratorMetrics must remain enabled when only the built-in scrape is disabled, got %v", data["AcceleratorMetrics"])
+			}
+			rules, err := rendertemplate.Render(context.Background(), nil, []rendertemplate.TemplateSource{{
+				FS: resourcesFS, Path: AcceleratorRecordingRulesTemplate,
+			}}, data)
+			if err != nil {
+				t.Fatalf("render accelerator recording rules with built-in DCGM scrape %t: %v", test.enabled, err)
+			}
+			if len(rules) != 1 {
+				t.Errorf("accelerator recording rules must remain rendered with built-in DCGM scrape %t, got %d resources", test.enabled, len(rules))
+			}
+		})
 	}
 }
 

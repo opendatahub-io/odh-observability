@@ -138,11 +138,12 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	templateData := map[string]any{
-		"Namespace":        monitoringNamespace,
-		"GatewayNamespace": gatewayNamespace,
-		"Traces":           monitoring.Spec.Traces != nil,
-		"Metrics":          monitoring.Spec.Metrics != nil,
-		"MetricsStorage":   monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil,
+		"Namespace":                monitoringNamespace,
+		"GatewayNamespace":         gatewayNamespace,
+		"Traces":                   monitoring.Spec.Traces != nil,
+		"Metrics":                  monitoring.Spec.Metrics != nil,
+		"MetricsStorage":           monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil,
+		"BuiltinDCGMScrapeEnabled": builtinDCGMScrapeEnabled(monitoring.Spec.Metrics),
 		// Always set: templates use missingkey=error; metrics-only never calls addTracesTemplateData.
 		"TempoStorage":                    false,
 		"Logs":                            monitoring.Spec.Logs != nil,
@@ -447,6 +448,10 @@ func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitori
 		return &missingOperatorsError{err: err}
 	}
 	return nil
+}
+
+func builtinDCGMScrapeEnabled(metrics *v1alpha1.Metrics) bool {
+	return metrics != nil && (metrics.BuiltinDCGMScrapeEnabled == nil || *metrics.BuiltinDCGMScrapeEnabled)
 }
 
 func addMetricsData(metrics *v1alpha1.Metrics, isSNO bool, templateData map[string]any) error {
