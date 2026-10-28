@@ -154,8 +154,12 @@ const (
 	OtlpCustomExporter     = "otlp/custom"
 	OtlpHttpCustomExporter = "otlphttp/custom"
 	OtlpTempoExporter      = "otlp/tempo"
-	MetricsCPURequest      = "100m"
-	MetricsMemoryRequest   = "256Mi"
+	// Distinct Mode 2 exporter names so metrics+traces combined configs do not collide
+	// in the collector's shared exporters map.
+	OtlpHttpMetricsExternalExporter = "otlphttp/metrics-external"
+	OtlpHttpTracesExternalExporter  = "otlphttp/traces-external"
+	MetricsCPURequest               = "100m"
+	MetricsMemoryRequest            = "256Mi"
 
 	TracesStorageBackendPV  = "pv"
 	TracesStorageBackendS3  = "s3"
@@ -819,6 +823,34 @@ func withCustomTracesExporters() jq.TransformFn {
             }
         }
     }`, OtlpHttpCustomExporter)
+}
+
+// withMetricsExportersOnly configures metrics with custom exporters and no built-in storage (Mode 2).
+func withMetricsExportersOnly(exporterName string) jq.TransformFn {
+	return jq.Transform(`.spec.metrics = {
+		"exporters": {
+			"%s": {
+				"endpoint": "http://metrics-external.example.svc:4318",
+				"tls": {
+					"insecure": true
+				}
+			}
+		}
+	}`, exporterName)
+}
+
+// withTracesExportersOnly configures traces with custom exporters and no built-in storage (Mode 2).
+func withTracesExportersOnly(exporterName string) jq.TransformFn {
+	return jq.Transform(`.spec.traces = {
+		"exporters": {
+			"%s": {
+				"endpoint": "http://traces-external.example.svc:4318",
+				"tls": {
+					"insecure": true
+				}
+			}
+		}
+	}`, exporterName)
 }
 
 func withReservedTracesExporter() jq.TransformFn {

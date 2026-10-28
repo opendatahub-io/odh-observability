@@ -66,6 +66,8 @@ func monitoringTestSuite(t *testing.T) {
 		t.Run("Thanos Querier absent", phaseCtx.ValidateThanosQuerierNotDeployedWithoutMetrics)
 		t.Run("Perses absent", phaseCtx.ValidatePersesNotDeployedWithoutMetricsOrTraces)
 	})
+	// Modes before cloud Tempo/Loki so Mode 2 absence checks are not fighting leftover heavy operands.
+	t.Run("Observability Modes", monitoringServiceCtx.runObservabilityModesTests)
 	t.Run("Metrics ready", func(t *testing.T) {
 		phaseCtx := monitoringServiceCtx.WithT(t)
 		t.Cleanup(func() { phaseCtx.cleanupGroup(t, "") })
