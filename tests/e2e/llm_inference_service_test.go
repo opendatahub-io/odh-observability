@@ -612,7 +612,6 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	workloadNS := llmInferenceWorkloadNamespace()
 	llmSvcNN := types.NamespacedName{Name: llmSvcName, Namespace: workloadNS}
 	proxyName := llmSvcName + "-p"
-	proxyNN := types.NamespacedName{Name: proxyName, Namespace: workloadNS}
 	tlsSecretName := proxyName + "-tls"
 	cookieSecretName := proxyName + "-cookie"
 	saName := proxyName
@@ -765,114 +764,18 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	require.NotEmpty(t, ocToken, "Kubernetes bearer token is required for the OAuth proxy request")
 
 	routeHost := llmSvcName + "." + clusterDomain
-
-	t.Logf("[%s] Creating OAuth proxy ServiceAccount and delegated-auth RBAC", topology)
-	tc.EventuallyResourceCreatedOrPatched(
-		WithMinimalObject(gvk.ServiceAccount, types.NamespacedName{Name: saName, Namespace: workloadNS}),
-		WithMutateFunc(func(u *unstructured.Unstructured) error {
-			u.SetAnnotations(map[string]string{"serviceaccounts.openshift.io/oauth-redirecturi." + proxyName: "https://" + routeHost + "/oauth2/callback"})
-			return nil
-		}),
-	)
-	tc.EventuallyResourceCreatedOrPatched(WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{Name: bindingName}), WithMutateFunc(func(u *unstructured.Unstructured) error {
-		u.Object["roleRef"] = map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:auth-delegator"}
-		u.Object["subjects"] = []any{map[string]any{"kind": "ServiceAccount", "name": saName, "namespace": workloadNS}}
-		return nil
-	}))
-	t.Logf("[%s] Creating OAuth proxy cookie Secret and service-ca-backed Service", topology)
-	var sessionSecret [32]byte
-	_, err = rand.Read(sessionSecret[:])
-	require.NoError(t, err, "failed to generate OAuth session secret")
-	tc.EventuallyResourceCreatedOrPatched(
-		WithMinimalObject(gvk.Secret, types.NamespacedName{Name: cookieSecretName, Namespace: workloadNS}),
-		WithMutateFunc(func(u *unstructured.Unstructured) error {
-			u.Object["type"] = "Opaque"
-			u.Object["stringData"] = map[string]any{"session_secret": base64.StdEncoding.EncodeToString(sessionSecret[:])}
-			return nil
-		}),
-	)
-	tc.EventuallyResourceCreatedOrPatched(WithMinimalObject(gvk.Service, proxyNN), WithMutateFunc(func(u *unstructured.Unstructured) error {
-		u.SetAnnotations(map[string]string{"service.beta.openshift.io/serving-cert-secret-name": tlsSecretName})
-		u.Object["spec"] = map[string]any{"selector": map[string]any{"app": proxyName}, "ports": []any{map[string]any{"name": "https", "port": int64(8443), "targetPort": int64(8443)}}}
-		return nil
-	}))
 	t.Logf("[%s] Creating OAuth proxy Deployment with upstream %s", topology, inferenceService)
 	upstream := fmt.Sprintf("https://%s.%s.svc.cluster.local:%d", inferenceService, workloadNS, inferencePort)
-	proxyArgs := []any{
-		"--provider=openshift", "--https-address=:8443", "--http-address=", "--upstream=" + upstream,
-		"--tls-cert=/etc/proxy/tls/tls.crt", "--tls-key=/etc/proxy/tls/tls.key",
-		"--cookie-secret-file=/etc/proxy/secrets/session_secret",
-		"--openshift-service-account=" + saName,
-		"--openshift-delegate-urls={\"/\":{}}",
-		"--openshift-ca=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-		"--openshift-ca=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt",
-		"--upstream-ca=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt",
-	}
-	proxyContainer := map[string]any{
-		"name": "oauth-proxy", "image": "quay.io/openshift/origin-oauth-proxy:4.22.0", "args": proxyArgs,
-		"ports": []any{map[string]any{"name": "https", "containerPort": int64(8443)}},
-		"volumeMounts": []any{
-			map[string]any{"name": "tls", "mountPath": "/etc/proxy/tls", "readOnly": true},
-			map[string]any{"name": "session-secret", "mountPath": "/etc/proxy/secrets", "readOnly": true},
-		},
-	}
-	tc.EventuallyResourceCreatedOrPatched(WithMinimalObject(gvk.Deployment, proxyNN), WithMutateFunc(func(u *unstructured.Unstructured) error {
-		u.Object["spec"] = map[string]any{
-			"replicas": int64(1), "selector": map[string]any{"matchLabels": map[string]any{"app": proxyName}},
-			"template": map[string]any{"metadata": map[string]any{"labels": map[string]any{"app": proxyName}}, "spec": map[string]any{
-				"serviceAccountName": saName, "containers": []any{proxyContainer},
-				"volumes": []any{
-					map[string]any{"name": "tls", "secret": map[string]any{"secretName": tlsSecretName}},
-					map[string]any{"name": "session-secret", "secret": map[string]any{"secretName": cookieSecretName}},
-				},
-			}},
-		}
-		return nil
-	}))
-	t.Logf("[%s] Creating Route %s", topology, routeHost)
-	tc.EventuallyResourceCreatedOrPatched(
-		WithMinimalObject(gvk.Route, types.NamespacedName{Name: proxyName, Namespace: workloadNS}),
-		WithMutateFunc(func(u *unstructured.Unstructured) error {
-			u.Object["spec"] = map[string]any{
-				"host": routeHost,
-				"to":   map[string]any{"kind": "Service", "name": proxyName, "weight": int64(100)},
-				"port": map[string]any{"targetPort": "https"},
-				"tls":  map[string]any{"termination": "reencrypt", "insecureEdgeTerminationPolicy": "Redirect"},
-			}
-			return nil
-		}),
-	)
-	t.Logf("[%s] Waiting for service-ca TLS Secret", topology)
-	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.Secret, types.NamespacedName{Name: tlsSecretName, Namespace: workloadNS}),
-		WithCondition(jq.Match(`.data["tls.crt"] != null and .data["tls.key"] != null`)),
-	)
-	t.Logf("[%s] Waiting for OAuth proxy Deployment availability", topology)
-	tc.EnsureResourceConditionMet(gvk.Deployment, proxyNN, "Available", metav1.ConditionTrue)
-	t.Logf("[%s] Waiting for Route admission", topology)
-	g.Eventually(func() error {
-		route := &unstructured.Unstructured{}
-		route.SetGroupVersionKind(gvk.Route)
-		if err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: proxyName, Namespace: workloadNS}, route); err != nil {
-			return err
-		}
-		ingress, found, err := unstructured.NestedSlice(route.Object, "status", "ingress")
-		if err != nil || !found || len(ingress) == 0 {
-			return errors.New("route has not been admitted yet")
-		}
-		entry, ok := ingress[0].(map[string]any)
-		if !ok {
-			return errors.New("route admission status is malformed")
-		}
-		conditions, _, _ := unstructured.NestedSlice(entry, "conditions")
-		for _, raw := range conditions {
-			condition, ok := raw.(map[string]any)
-			if ok && condition["type"] == "Admitted" && condition["status"] == "False" {
-				return fmt.Errorf("route admission failed: %v", condition["message"])
-			}
-		}
-		return nil
-	}).Should(gomega.Succeed(), "Route %s should be admitted", routeHost)
+	createOAuthProxy(t, tc, oauthProxyConfig{
+		namespace:          workloadNS,
+		proxyName:          proxyName,
+		serviceAccountName: saName,
+		bindingName:        bindingName,
+		tlsSecretName:      tlsSecretName,
+		cookieSecretName:   cookieSecretName,
+		routeHost:          routeHost,
+		upstream:           upstream,
+	})
 
 	t.Logf("[%s] Waiting for LLMInferenceService Ready=True", topology)
 	tc.EnsureResourceConditionMet(

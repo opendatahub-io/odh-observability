@@ -248,8 +248,8 @@ func TestAssertVLLMSpanHasInjectedParentAcceptsOTLPBase64IDs(t *testing.T) {
 	const parentHex = "57190950d0c80215"
 	parentBytes, err := hex.DecodeString(parentHex)
 	require.NoError(t, err)
-	raw := []byte(fmt.Sprintf(`{"spans":[{"name":"llm_request","spanId":"hrGjYEDrYZ4=","parentSpanId":%q}]}`,
-		base64.StdEncoding.EncodeToString(parentBytes)))
+	raw := fmt.Appendf(nil, `{"spans":[{"name":"llm_request","spanId":"hrGjYEDrYZ4=","parentSpanId":%q}]}`,
+		base64.StdEncoding.EncodeToString(parentBytes))
 	spans, err := parseTraceSpansFromGCXJSON(raw)
 	require.NoError(t, err)
 	require.Len(t, spans, 1)

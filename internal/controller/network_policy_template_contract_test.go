@@ -47,8 +47,14 @@ func TestOperandNetworkPolicyTemplatesContract(t *testing.T) {
 				"app.kubernetes.io/name":     "tempo-monolithic",
 				"app.kubernetes.io/instance": "data-science-tempomonolithic",
 			},
-			policyTypes:   []any{"Ingress"},
-			expectedPorts: []networkPolicyPort{{protocol: "TCP", port: 8080}, {protocol: "TCP", port: 3200}, {protocol: "TCP", port: 4317}, {protocol: "TCP", port: 4318}, {protocol: "TCP", port: 8090}},
+			policyTypes: []any{"Ingress"},
+			expectedPorts: []networkPolicyPort{
+				{protocol: "TCP", port: 8080},
+				{protocol: "TCP", port: 3200},
+				{protocol: "TCP", port: 4317},
+				{protocol: "TCP", port: 4318},
+				{protocol: "TCP", port: 8090},
+			},
 		},
 		{
 			name:       "loki stack components",
