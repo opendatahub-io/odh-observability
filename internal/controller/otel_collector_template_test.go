@@ -81,18 +81,27 @@ func TestPrometheusScrapeConfigContainsOnlyDCGMJob(t *testing.T) {
 		t.Error("unused generic pod scrape job must not be rendered")
 	}
 	if len(jobs) != 1 || jobs["dcgm-exporter-accelerator-metrics"] == nil {
-		t.Fatalf("expected only the DCGM scrape job, got %v", jobs)
+		t.Fatalf("expected one DCGM scrape job; job count=%d, DCGM job present=%t", len(jobs), jobs["dcgm-exporter-accelerator-metrics"] != nil)
 	}
 }
 
-func TestPrometheusReceiverConfigIsEmptyWithoutAcceleratorMetrics(t *testing.T) {
+func TestDCGMScrapeJobIsOmittedWithoutAcceleratorMetrics(t *testing.T) {
 	collector := renderCollectorTemplateWithAcceleratorMetrics(t, false)
-	prometheusConfig, found, err := unstructured.NestedMap(collector.Object, "spec", "config", "receivers", "prometheus", "config")
+	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
 	if err != nil || !found {
-		t.Fatalf("Prometheus receiver config must render as a map: found=%t, error=%v", found, err)
+		t.Fatalf("collector config must be present: found=%t, error=%v", found, err)
 	}
-	if len(prometheusConfig) != 0 {
-		t.Fatalf("Prometheus receiver config must be empty without manual scrape jobs, got %v", prometheusConfig)
+	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus", "config", "scrape_configs")
+	if err != nil {
+		t.Fatalf("read Prometheus scrape configs: %v", err)
+	}
+	if !found {
+		return
+	}
+	for _, rawScrapeConfig := range scrapeConfigs {
+		if scrapeConfig, ok := rawScrapeConfig.(map[string]any); ok && scrapeConfig["job_name"] == "dcgm-exporter-accelerator-metrics" {
+			t.Fatal("built-in DCGM scrape job must be absent without accelerator metrics")
+		}
 	}
 }
 
@@ -111,9 +120,8 @@ func TestBuiltinDCGMScrapeCanBeDisabledWithoutDisablingMonitorCollection(t *test
 	if !ok {
 		t.Fatalf("Prometheus receiver must remain configured, got %T", receivers["prometheus"])
 	}
-	prometheusConfig, ok := prometheusReceiver["config"].(map[string]any)
-	if !ok || len(prometheusConfig) != 0 {
-		t.Fatalf("built-in DCGM opt-out must omit only scrape config, got %v", prometheusReceiver["config"])
+	if _, found := prometheusReceiver["config"]; found {
+		t.Fatal("built-in DCGM opt-out must omit Prometheus config so TargetAllocator can provide monitor scrapes")
 	}
 
 	if !containsString(metricsPipelines(t, collector)["metrics/scrape"]["receivers"], "prometheus") {
@@ -125,7 +133,7 @@ func TestBuiltinDCGMScrapeCanBeDisabledWithoutDisablingMonitorCollection(t *test
 
 	targetAllocator, found, err := unstructured.NestedMap(collector.Object, "spec", "targetAllocator")
 	if err != nil || !found || targetAllocator["enabled"] != true {
-		t.Fatalf("TargetAllocator must remain enabled for monitor discovery: found=%t config=%v error=%v", found, targetAllocator, err)
+		t.Fatalf("TargetAllocator must remain enabled for monitor discovery: found=%t enabled=%t error=%v", found, targetAllocator["enabled"] == true, err)
 	}
 	prometheusCR, found, err := unstructured.NestedMap(targetAllocator, "prometheusCR")
 	if err != nil || !found {
@@ -164,16 +172,19 @@ func TestBuiltinDCGMScrapeRequiresAcceleratorAndScrapeFlags(t *testing.T) {
 			}
 			if test.wantJob {
 				if !found || len(scrapeConfigs) != 1 {
-					t.Fatalf("both flags enabled must render exactly one DCGM job: found=%t configs=%v", found, scrapeConfigs)
+					t.Fatalf("both flags enabled must render exactly one DCGM job: found=%t count=%d", found, len(scrapeConfigs))
 				}
 				job, ok := scrapeConfigs[0].(map[string]any)
-				if !ok || job["job_name"] != "dcgm-exporter-accelerator-metrics" {
-					t.Fatalf("unexpected built-in DCGM job: %v", scrapeConfigs[0])
+				if !ok {
+					t.Fatalf("built-in DCGM scrape config has unexpected type %T", scrapeConfigs[0])
+				}
+				if job["job_name"] != "dcgm-exporter-accelerator-metrics" {
+					t.Fatalf("unexpected built-in DCGM job name %q", job["job_name"])
 				}
 				return
 			}
 			if found && len(scrapeConfigs) != 0 {
-				t.Fatalf("DCGM job must be absent unless both flags are enabled, got %v", scrapeConfigs)
+				t.Fatalf("DCGM job must be absent unless both flags are enabled; scrape config count=%d", len(scrapeConfigs))
 			}
 		})
 	}
@@ -801,7 +812,7 @@ func TestDCGMScrapeJobUsesHTTPWithoutCredentialsAndKeepsDefaultRedirects(t *test
 	}
 	for _, credentialField := range []string{"bearer_token_file", "bearer_token", "authorization", "basic_auth"} {
 		if _, found := job[credentialField]; found {
-			t.Errorf("DCGM scrape job must not configure %s, got %v", credentialField, job[credentialField])
+			t.Errorf("DCGM scrape job must not configure credential field %s", credentialField)
 		}
 	}
 	if _, found := job["follow_redirects"]; found {

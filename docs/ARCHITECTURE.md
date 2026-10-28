@@ -92,6 +92,8 @@ spec:
             key: ca.crt
         serverName: nvidia-dcgm-exporter.nvidia-gpu-operator.svc
       relabelings:
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
         - sourceLabels: [__meta_kubernetes_pod_node_name]
           targetLabel: node
         - sourceLabels: [__meta_kubernetes_pod_label_app]
@@ -104,7 +106,7 @@ spec:
           action: keep
 ```
 
-Set `spec.metrics.builtinDCGMScrapeEnabled: false` on the `Monitoring` resource when this monitor scrapes the same DCGM targets. Omit the field (or set it to `true`) to retain built-in HTTP scraping. The monitor keeps the `rhoai-accelerator-metrics` job identity, node/component labels, and DCGM metric filter expected by accelerator processing and recording rules. The collector suppresses exporter-pod attribution only for targets discovered in `nvidia-gpu-operator`; using this job label elsewhere does not disable namespace/pod attribution. Do not add a bearer token for the collector ServiceAccount: it is used for Kubernetes discovery, not DCGM authentication. If the exporter requires authentication, configure the monitor's Secret-backed `authorization` or `basicAuth`; TargetAllocator transfers those credentials only over mTLS. Never configure `insecureSkipVerify` or file-backed credential paths. The certificate must chain to the referenced CA and match `serverName`.
+Set `spec.metrics.builtinDCGMScrapeEnabled: false` on a standalone `Monitoring` resource, or `spec.monitoring.metrics.builtinDCGMScrapeEnabled: false` on `DSCInitialization`, when this monitor scrapes the same DCGM targets. Omit the field (or set it to `true`) to retain built-in HTTP scraping. The namespace relabel supports namespace-proxy queries. The monitor keeps the `rhoai-accelerator-metrics` job identity, node/component labels, and DCGM metric filter expected by accelerator processing and recording rules. The collector suppresses exporter-pod attribution only for targets discovered in `nvidia-gpu-operator`; using this job label elsewhere does not disable namespace/pod attribution. Do not add a bearer token for the collector ServiceAccount: it is used for Kubernetes discovery, not DCGM authentication. If the exporter requires authentication, configure the monitor's Secret-backed `authorization` or `basicAuth`; TargetAllocator transfers those credentials only over mTLS. Never configure `insecureSkipVerify` or file-backed credential paths. The certificate must chain to the referenced CA and match `serverName`.
 
 Prometheus follows redirects by default, so the built-in scrape keeps that behavior for compatibility. HTTPS-only DCGM endpoints should use a monitor with explicit TLS trust and hostname settings rather than relying on an HTTP-to-HTTPS redirect. Keep built-in scraping enabled only when it does not duplicate the monitor's target.
 
