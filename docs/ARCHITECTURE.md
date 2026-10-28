@@ -61,10 +61,12 @@ The TargetAllocator uses mTLS by default, with cert-manager provisioning its CA,
 
 The built-in DCGM scrape uses unauthenticated HTTP on port 9400 by default. For clusters configured with a direct HTTPS DCGM endpoint, disable only that built-in job and select a ServiceMonitor or PodMonitor instead. Ensure the monitor's namespace is opted in with `monitoring.opendatahub.io/scrape=true`, label the monitor `monitoring.opendatahub.io/scrape: "true"`, and reference a CA Secret rather than a file path; the TargetAllocator has permission to read selected monitor Secrets in allowed namespaces, while `denyFSAccessThroughSMs` blocks file-backed credentials.
 
+TargetAllocator Prometheus CR discovery supports the `monitoring.coreos.com/v1` API group. The webhook also labels `monitoring.rhobs/v1` monitors, but those are not discovered by TargetAllocator.
+
 Example PodMonitor (adapt selector, port, CA Secret, and server name to the installed exporter):
 
 ```yaml
-apiVersion: monitoring.rhobs/v1
+apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
   name: dcgm-exporter-https

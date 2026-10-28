@@ -95,7 +95,7 @@ func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMon
 	tc.createFixtureResource(t, gvk.Service, dcgmHTTPSExporterService(namespace))
 	monitor := dcgmHTTPSExporterPodMonitor(namespace, serviceDNS)
 	tc.EventuallyResourceCreated(
-		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{Name: dcgmHTTPSMonitorName, Namespace: namespace}),
+		WithMinimalObject(gvk.PodMonitorCoreos, types.NamespacedName{Name: dcgmHTTPSMonitorName, Namespace: namespace}),
 		WithObjectContent(monitor.Object),
 	)
 
@@ -115,7 +115,7 @@ func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMon
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{Name: OpenTelemetryCollectorName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
-			jq.Match(`.spec.config.receivers.prometheus.config == {}`),
+			jq.Match(`(.spec.config.receivers.prometheus.config.scrape_configs // [] | any(.[]; .job_name == "dcgm-exporter-accelerator-metrics")) | not`),
 			jq.Match(`.spec.config.service.pipelines."metrics/scrape".receivers | contains(["prometheus"])`),
 			jq.Match(`.spec.config.service.pipelines."metrics/scrape".processors | contains(["transform/gpu_metrics"])`),
 			jq.Match(`.spec.targetAllocator.enabled == true`),
@@ -149,7 +149,7 @@ func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMon
 	// Keep the CA trusted but break the certificate identity. Prometheus should
 	// expose up == 0 for this target, proving hostname verification is enforced.
 	tc.EventuallyResourcePatched(
-		WithMinimalObject(gvk.PodMonitor, types.NamespacedName{Name: dcgmHTTPSMonitorName, Namespace: namespace}),
+		WithMinimalObject(gvk.PodMonitorCoreos, types.NamespacedName{Name: dcgmHTTPSMonitorName, Namespace: namespace}),
 		WithMutateFunc(func(monitor *unstructured.Unstructured) error {
 			endpoints, found, err := unstructured.NestedSlice(monitor.Object, "spec", "podMetricsEndpoints")
 			if err != nil {
@@ -326,7 +326,7 @@ func dcgmHTTPSExporterService(namespace string) *corev1.Service {
 
 func dcgmHTTPSExporterPodMonitor(namespace, serverName string) *unstructured.Unstructured {
 	monitor := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "monitoring.rhobs/v1",
+		"apiVersion": "monitoring.coreos.com/v1",
 		"kind":       "PodMonitor",
 		"metadata": map[string]any{
 			"name":      dcgmHTTPSMonitorName,
@@ -369,6 +369,6 @@ func dcgmHTTPSExporterPodMonitor(namespace, serverName string) *unstructured.Uns
 			}},
 		},
 	}}
-	monitor.SetGroupVersionKind(gvk.PodMonitor)
+	monitor.SetGroupVersionKind(gvk.PodMonitorCoreos)
 	return monitor
 }
