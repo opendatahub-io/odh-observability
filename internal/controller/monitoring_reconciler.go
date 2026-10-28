@@ -337,9 +337,15 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		return ctrl.Result{}, fmt.Errorf("cleaning up OpenTelemetry Operator NetworkPolicies: %w", err)
 	}
 
-	// Garbage-collect stale owned resources via API discovery.
+	// Garbage-collect stale owned resources via API discovery. Desired state
+	// is already applied, so a failed sweep must not fail the round — the
+	// deferred handler would mark the whole Monitoring degraded over leftover
+	// cleanup — but neither may it be dropped: the requeue at the end of this
+	// function is what guarantees the sweep is retried.
+	gcFailed := false
 	if err := r.collectGarbage(ctx, monitoring, desired, withheldComponents); err != nil {
 		log.Error(err, "Garbage collection encountered errors")
+		gcFailed = true
 	}
 
 	r.syncPostDeployResources(ctx, monitoring, cm)
@@ -378,6 +384,16 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	// crash the controller if KServe is not installed).
 	if monitoring.Spec.Logs != nil {
 		return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+	}
+
+	// Every earlier return after the garbage collection sweep either already
+	// requeues (CA, endpoints, logs) or returns an error and lands in backoff.
+	// Bare success is the one path that would strand a failed sweep until some
+	// unrelated watch event fires, so it carries the retry here — without it,
+	// stale owned resources could outlive their desired state indefinitely
+	// while status reports success.
+	if gcFailed {
+		return ctrl.Result{RequeueAfter: 1 * time.Minute}, nil
 	}
 
 	return ctrl.Result{}, nil
@@ -453,17 +469,18 @@ func (r *MonitoringReconciler) renderMonitoringResources(
 	// ones are closures because they also take the pre-resolved API version;
 	// they are otherwise ordinary actions and belong in the same list.
 	var sources []rendertemplate.TemplateSource
+	// The usage logs collector and the ClusterLogForwarder are not in this
+	// list: each deploys from inside its LokiStack's action, behind the
+	// storage gate, so a withheld pipeline is skipped as one unit.
 	for _, action := range []func(context.Context, client.Client, *v1alpha1.Monitoring, *conditions.ConditionsManager, *[]rendertemplate.TemplateSource) error{
 		deployWebhookInfrastructure,
 		deployMonitoringAdmissionPolicies,
 		deployMonitoringStackWithQuerierAndRestrictions,
 		deployTracingStack,
 		deployOpenTelemetryCollector,
-		deployUsageLogsCollector,
 		deployAlerting,
 		deployOperatorMonitoring,
 		deployNodeMetricsEndpoint,
-		deployClusterLogForwarder,
 		deployKorrel8r,
 		func(ctx context.Context, c client.Client, m *v1alpha1.Monitoring,
 			cm *conditions.ConditionsManager, sources *[]rendertemplate.TemplateSource) error {
@@ -651,9 +668,6 @@ func (r *MonitoringReconciler) collectGarbage(
 	desired []unstructured.Unstructured,
 	withheldComponents map[string]struct{},
 ) error {
-	if monitoring.Spec.Namespace == "" {
-		return errors.New("monitoring.Spec.Namespace is empty, cannot safely perform garbage collection")
-	}
 	namespace := monitoringNamespace(monitoring)
 
 	desiredSet := make(map[resourceKey]struct{}, len(desired))
@@ -672,7 +686,7 @@ func (r *MonitoringReconciler) collectGarbage(
 		gc.WithDeletePropagationPolicy(metav1.DeletePropagationBackground),
 		gc.WithObjectPredicate(func(_ gc.RunParams, obj unstructured.Unstructured) (bool, error) {
 			return shouldCollectOwnedResource(
-				monitoring, obj, desiredSet, monitoring.Spec.Namespace, withheldComponents), nil
+				monitoring, obj, desiredSet, namespace, withheldComponents), nil
 		}),
 	)
 

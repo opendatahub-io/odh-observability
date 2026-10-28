@@ -5,6 +5,7 @@ metadata:
   namespace: {{.Namespace}}
   labels:
     app.kubernetes.io/part-of: data-science-observability
+    platform.opendatahub.io/component: loki-usage-logs
 spec:
   mode: deployment
   replicas: {{.CollectorReplicas}}  

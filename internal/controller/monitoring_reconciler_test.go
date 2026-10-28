@@ -233,11 +233,19 @@ func operatorConditionListForbidden() interceptor.Funcs {
 func selfSubjectRulesReviewInterceptor(reviewErr error) interceptor.Funcs {
 	return interceptor.Funcs{
 		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			if _, ok := obj.(*authorizationv1.SelfSubjectRulesReview); ok {
-				// An empty rule set models a clean namespace with no collectable resources.
+			if _, ok := obj.(*authorizationv1.SelfSubjectRulesReview); !ok {
+				return c.Create(ctx, obj, opts...)
+			}
+			if reviewErr != nil {
 				return reviewErr
 			}
-			return c.Create(ctx, obj, opts...)
+			// Serve the review directly instead of passing it through: the
+			// library creates it without a metadata.name, which the real API
+			// server assigns but the fake client rejects, so a passthrough
+			// turns every otherwise-clean sweep into a silent GC failure.
+			// The empty rule set models a namespace with no collectable
+			// resources.
+			return nil
 		},
 	}
 }
@@ -841,10 +849,13 @@ func TestReconcile_CleansOperatorNetworkPoliciesInEffectiveNamespace(t *testing.
 }
 
 // TestReconcile_GarbageCollectionError: a failed garbage collection sweep is
-// logged and the reconcile still succeeds. GC is fault tolerant by design —
+// logged and the reconcile still succeeds — GC is fault tolerant by design, so
 // one failed sweep must not fail the round and mark the whole Monitoring
-// degraded. Removal is different: deleteAllOwned on Removed still returns its
-// error for retry (TestReconcile_Removed_CleanupError).
+// degraded. But swallowing alone would strand the sweep: with no watch events
+// there is no retry, and stale owned resources could outlive their desired
+// state indefinitely while status reports success. The explicit requeue is the
+// other half of the contract. Removal is different: deleteAllOwned on Removed
+// still returns its error for retry (TestReconcile_Removed_CleanupError).
 func TestReconcile_GarbageCollectionError(t *testing.T) {
 	s := newTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
@@ -852,9 +863,57 @@ func TestReconcile_GarbageCollectionError(t *testing.T) {
 	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
 		WithInterceptorFuncs(selfSubjectRulesReviewInterceptor(cleanupErr)).Build())
 
-	_, err := r.reconcile(context.Background(), m)
+	result, err := r.reconcile(context.Background(), m)
 	if err != nil {
 		t.Fatalf("garbage collection error must not fail the reconcile, got %v", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Fatal("a failed garbage collection sweep must schedule an explicit requeue, or stale owned resources wait on an unrelated watch event")
+	}
+}
+
+// TestReconcile_GarbageCollectionTransientFailure: the requeue above exists
+// for transient failures, so the recovery half needs pinning too — once the
+// sweep succeeds again, the reconcile must stop requeueing and report success.
+// The fake discovery client exposes no API resources, so the recovered sweep
+// finds nothing to delete; what this guards is that the failure flag does not
+// latch and turn a healed controller into a permanent one-minute poller.
+func TestReconcile_GarbageCollectionTransientFailure(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+
+	// Fail only the first SelfSubjectRulesReview, then serve the rest
+	// directly — the fake client rejects the nameless review that the real
+	// API server would accept (see selfSubjectRulesReviewInterceptor).
+	sweeps := 0
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).WithStatusSubresource(m).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*authorizationv1.SelfSubjectRulesReview); ok {
+					sweeps++
+					if sweeps == 1 {
+						return errors.New("rule review failed")
+					}
+					return nil
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		}).Build())
+
+	result, err := r.reconcile(context.Background(), m)
+	if err != nil {
+		t.Fatalf("failed sweep must not fail the reconcile, got %v", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Fatal("failed sweep must schedule a requeue so a transient failure is retried")
+	}
+
+	result, err = r.reconcile(context.Background(), m)
+	if err != nil {
+		t.Fatalf("reconcile after the sweep recovered must succeed, got %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("a recovered sweep must clear the requeue, got %v", result.RequeueAfter)
 	}
 }
 
@@ -1465,7 +1524,7 @@ func TestStorageSecretRequests(t *testing.T) {
 // It drives shouldCollectOwnedResource against hand-built withheld sets so it
 // can cover combinations the reconciler cannot produce in one round, including
 // the asymmetric one the two component labels exist for.
-// TestReconcile_StorageConflictShieldsBothStacks covers the wiring that
+// TestReconcile_StorageConflictWithholdsBothStacks covers the wiring that
 // produces those sets.
 func TestStorageConflictShieldsLokiFromGarbageCollection(t *testing.T) {
 	ctx := context.Background()
@@ -1499,22 +1558,33 @@ func TestStorageConflictShieldsLokiFromGarbageCollection(t *testing.T) {
 	desired := map[resourceKey]struct{}{}
 
 	ns := monitoring.Spec.Namespace
-	labelled := func(gvk schema.GroupVersionKind, name, component string) unstructured.Unstructured {
-		obj := ownedGarbageCollectionTestObject(gvk, ns, name, monitoring.UID)
+	labelled := func(gvk schema.GroupVersionKind, namespace, name, component string) unstructured.Unstructured {
+		obj := ownedGarbageCollectionTestObject(gvk, namespace, name, monitoring.UID)
 		obj.SetLabels(map[string]string{componentLabel: component})
 		return obj
 	}
 
-	// Every resource the two stack actions render, by the label its template
-	// carries.
+	// Every resource the two pipeline actions render, by the label its template
+	// carries. The dependents carry their stack's label because the gate
+	// withholds the pipeline as one unit: an unlabelled collector or forwarder
+	// dropped from the desired set would read to the sweep as a deletion.
 	usageLogsResources := []unstructured.Unstructured{
-		labelled(controllergvk.LokiStack, usageLogsLokiStackResourceName, componentLokiUsageLogs),
-		labelled(controllergvk.NetworkPolicy, usageLogsLokiStackResourceName+"-allow", componentLokiUsageLogs),
+		labelled(controllergvk.LokiStack, ns, usageLogsLokiStackResourceName, componentLokiUsageLogs),
+		labelled(controllergvk.NetworkPolicy, ns, usageLogsLokiStackResourceName+"-allow", componentLokiUsageLogs),
+		labelled(controllergvk.OpenTelemetryCollector, ns, "data-science-usage-logs", componentLokiUsageLogs),
+		labelled(controllergvk.NetworkPolicy, ns, "data-science-usage-logs-collector-allow", componentLokiUsageLogs),
+		labelled(controllergvk.ClusterRole, "", "data-science-usage-logs-processor", componentLokiUsageLogs),
+		labelled(controllergvk.ClusterRoleBinding, "", "data-science-usage-logs-processor", componentLokiUsageLogs),
 	}
 	logsResources := []unstructured.Unstructured{
-		labelled(controllergvk.LokiStack, lokiStackResourceName, componentLokiLogs),
-		labelled(controllergvk.NetworkPolicy, "data-science-lokistack-ingress", componentLokiLogs),
-		labelled(controllergvk.NetworkPolicy, "data-science-lokistack-gateway-ingress", componentLokiLogs),
+		labelled(controllergvk.LokiStack, ns, lokiStackResourceName, componentLokiLogs),
+		labelled(controllergvk.NetworkPolicy, ns, "data-science-lokistack-ingress", componentLokiLogs),
+		labelled(controllergvk.NetworkPolicy, ns, "data-science-lokistack-gateway-ingress", componentLokiLogs),
+		labelled(controllergvk.ClusterLogForwarder, clusterLoggingNamespace, clusterLogForwarderResourceName, componentLokiLogs),
+		labelled(controllergvk.ServiceAccount, clusterLoggingNamespace, clusterLogForwarderResourceName+"-collector", componentLokiLogs),
+		labelled(controllergvk.NetworkPolicy, clusterLoggingNamespace, ClusterLogForwarderNetworkPolicyName, componentLokiLogs),
+		labelled(controllergvk.ClusterRoleBinding, "", clusterLogForwarderResourceName+"-collector-collect-app-logs", componentLokiLogs),
+		labelled(controllergvk.ClusterRoleBinding, "", clusterLogForwarderResourceName+"-collector-loki-writer", componentLokiLogs),
 	}
 	for _, live := range append(append([]unstructured.Unstructured{}, usageLogsResources...), logsResources...) {
 		if shouldCollectOwnedResource(monitoring, live, desired, ns, withheld) {
@@ -1675,6 +1745,19 @@ func TestReconcile_StorageConflictWithholdsBothStacks(t *testing.T) {
 			t.Errorf("%s: expected False/%s, got %s/%s", conditionType, storageConflictReason, c.Status, c.Reason)
 		}
 	}
+
+	// The dependents no longer have actions of their own to write their
+	// conditions, so the withheld branch mirrors the gate's verdict onto them.
+	// A stale True here would report a shipping pipeline while it is frozen.
+	for _, conditionType := range []string{
+		conditions.ConditionUsageLogsCollectorAvailable,
+		conditions.ConditionClusterLogForwarderAvailable,
+	} {
+		c := mustFindCondition(t, m, conditionType)
+		if c.Status != metav1.ConditionFalse || c.Reason != storageConflictReason {
+			t.Errorf("%s: expected the mirrored False/%s, got %s/%s", conditionType, storageConflictReason, c.Status, c.Reason)
+		}
+	}
 }
 
 // TestReconcile_LokiCRDDiscoveryFailureAbortsBeforeGarbageCollection pins the
@@ -1686,13 +1769,13 @@ func TestReconcile_StorageConflictWithholdsBothStacks(t *testing.T) {
 // way every other action's does: no apply, no sweep, backoff, retry. Hold it
 // to the end instead and the sweep deletes the live stack.
 //
-// Only usage logs are configured. deployClusterLogForwarder asks the same
-// question earlier in the action loop and returns a byte-identical message, so
-// with Spec.Logs set the error assertion below would pass on that abort
-// without the Loki action ever running. Spec.Logs=nil sends the forwarder down
-// its not-configured path, and the condition assertion — which only
-// deployLokiStack writes — is what proves the check under test is the one that
-// fired.
+// Only usage logs are configured. The ClusterLogForwarder's own CRD check now
+// runs inside the log forwarding stack's action, behind its deployLokiStack —
+// which asks the same question with a byte-identical message — so with
+// Spec.Logs set the error assertion below could pass on either abort without
+// proving which check fired. Spec.Logs=nil keeps the forwarder out of the
+// round entirely, and the condition assertion — which only deployLokiStack
+// writes — is what proves the check under test is the one that fired.
 func TestReconcile_LokiCRDDiscoveryFailureAbortsBeforeGarbageCollection(t *testing.T) {
 	ctx := context.Background()
 	s, m, objects := lokiReconcileFixture(t)
@@ -1839,10 +1922,15 @@ func ownedGarbageCollectionTestObject(gvk schema.GroupVersionKind, namespace, na
 // the stack is confirmed not ready so nothing dials an address the stack behind
 // it has outlived, and held when readiness could not be observed at all.
 //
-// That last case is the one with teeth. Clearing UsageLogsEndpoint makes
-// deployUsageLogsCollector return early, so garbage collection removes the
-// collector and its policies — a response far too destructive for one failed
-// API call. Unknown therefore keeps the previous value.
+// That last case is the one with teeth. Clearing UsageLogsEndpoint makes the
+// collector half of the usage logs pipeline action return early, so on a clean
+// round garbage collection removes the collector and its policies — a
+// response far too destructive for one failed API call. Unknown therefore
+// keeps the previous value.
+//
+// The storage gate's shield is no substitute for this hold: it covers the
+// pipeline only while its component is withheld, while an unobservable stack
+// on a clean round is exactly the case the endpoint hold has to carry alone.
 //
 // The table deliberately crosses each pipeline's configuration with the other
 // pipeline's readiness. The two stacks are independent and each reads its own

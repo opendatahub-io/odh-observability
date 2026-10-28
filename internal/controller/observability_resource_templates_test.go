@@ -614,17 +614,40 @@ func TestLokiStackTemplatesCarryComponentLabel(t *testing.T) {
 		"UsageLogsLokiStorageClassName":      "usage-logs-sc",
 		"Korrel8rName":                       Korrel8rServiceName,
 		// The usage logs gateway policy names the collector as its only peer.
-		"UsageLogsCollectorName": "data-science-usage-logs",
+		"UsageLogsCollectorName":               "data-science-usage-logs",
+		"UsageLogs":                            true,
+		"UsageLogsEndpoint":                    "https://usage-logs.example.com/otlp",
+		"CollectorReplicas":                    1,
+		"CollectorCPURequest":                  "100m",
+		"CollectorCPULimit":                    "500m",
+		"CollectorMemoryRequest":               "128Mi",
+		"CollectorMemoryLimit":                 "256Mi",
+		"ClusterLogForwarderName":              "data-science-cluster-log-forwarder",
+		"ClusterLogForwarderServiceAccount":    "data-science-cluster-log-forwarder",
+		"ClusterLogForwarderNetworkPolicyName": ClusterLogForwarderNetworkPolicyName,
+		"ClusterLoggingNamespace":              "openshift-logging",
+		"KubernetesAPIServerCIDRs":             []string{"172.20.0.1/32"},
+		"InferenceNamespaces":                  []string{"redhat-ods-applications"},
 	}
 
-	// Must stay in step with the two stack actions' templates in actions.go,
-	// grouped the same way they are grouped there.
+	// Must stay in step with the two pipeline actions' templates in
+	// actions.go, grouped the same way they are grouped there. The dependents
+	// carry the same component label as their stack because the storage gate
+	// withholds the pipeline as one unit: an unlabelled collector or
+	// forwarder dropped from the desired set would read to the sweep as a
+	// deletion.
 	for template, wantComponent := range map[string]string{
-		UsageLogsLokiStackTemplate:            componentLokiUsageLogs,
-		UsageLogsLokiStackNPTemplate:          componentLokiUsageLogs,
-		LokiStackTemplate:                     componentLokiLogs,
-		LokiStackNetworkPolicyTemplate:        componentLokiLogs,
-		LokiStackGatewayNetworkPolicyTemplate: componentLokiLogs,
+		UsageLogsLokiStackTemplate:                  componentLokiUsageLogs,
+		UsageLogsLokiStackNPTemplate:                componentLokiUsageLogs,
+		UsageLogsOpenTelemetryCollectorTemplate:     componentLokiUsageLogs,
+		UsageLogsOpenTelemetryCollectorRBACTemplate: componentLokiUsageLogs,
+		UsageLogsOpenTelemetryCollectorNPTemplate:   componentLokiUsageLogs,
+		LokiStackTemplate:                           componentLokiLogs,
+		LokiStackNetworkPolicyTemplate:              componentLokiLogs,
+		LokiStackGatewayNetworkPolicyTemplate:       componentLokiLogs,
+		ClusterLogForwarderTemplate:                 componentLokiLogs,
+		ClusterLogForwarderRBACTemplate:             componentLokiLogs,
+		ClusterLogForwarderNetworkPolicyTemplate:    componentLokiLogs,
 	} {
 		t.Run(template, func(t *testing.T) {
 			t.Parallel()

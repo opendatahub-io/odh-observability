@@ -28,6 +28,7 @@ import (
 	"slices"
 	"strings"
 
+	libconditions "github.com/opendatahub-io/odh-platform-utilities/pkg/controller/conditions"
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -608,11 +609,18 @@ func deployUsageLogsCollector(
 	return nil
 }
 
-// deployUsageLogsLokiStack renders the LokiStack that backs usage logs.
+// deployUsageLogsLokiStack renders the usage logs pipeline: the LokiStack that
+// stores the logs, then the collector that ships them. The collector keeps its
+// own gates — it renders only once the endpoint of a ready stack was published
+// by an earlier round — so on the first round, or while the stack is starting,
+// only the stack renders, exactly as when the two were separate actions.
 //
 // The reconciler runs it only when validateStorageIsolation has not withheld
 // componentLokiUsageLogs, so by the time it is called its storage has either
 // been proven disjoint from every other claimant's or was never contested.
+// The collector's templates carry the same component label as the stack's, so
+// withholding freezes the pipeline as one unit: nothing renders, the sweep
+// shields all of it, and it resumes when the storage is fixed.
 func deployUsageLogsLokiStack(
 	ctx context.Context,
 	c client.Client,
@@ -620,7 +628,7 @@ func deployUsageLogsLokiStack(
 	cm *conditions.ConditionsManager,
 	sources *[]rendertemplate.TemplateSource,
 ) error {
-	return deployLokiStack(ctx, c, monitoring, cm, sources, lokiStackDeployment{
+	if err := deployLokiStack(ctx, c, monitoring, cm, sources, lokiStackDeployment{
 		configured:   monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil,
 		resourceName: usageLogsLokiStackResourceName,
 		condition:    conditions.ConditionUsageLogsLokiStackAvailable,
@@ -630,17 +638,27 @@ func deployUsageLogsLokiStack(
 			UsageLogsLokiStackTemplate,
 			UsageLogsLokiStackNPTemplate,
 		},
-	})
+	}); err != nil {
+		return err
+	}
+
+	return deployUsageLogsCollector(ctx, c, monitoring, cm, sources)
 }
 
-// deployRHOAILogsLokiStack renders the LokiStack that backs log forwarding.
+// deployRHOAILogsLokiStack renders the log forwarding pipeline: the LokiStack
+// that stores the logs, then the ClusterLogForwarder that feeds it. The
+// forwarder keeps its own CRD and readiness gates, and its templates stay in
+// the desired set while the stack is starting, exactly as when it was a
+// separate action.
 //
 // It is gated on Spec.Logs alone rather than on Spec.Logs.Storage, because the
 // CRD marks Storage required within Logs; the nil check in storageClaims is
 // there for the isolation comparison, which must not read through a nil.
 //
 // Like its counterpart above, the reconciler runs it only when
-// validateStorageIsolation has not withheld componentLokiLogs.
+// validateStorageIsolation has not withheld componentLokiLogs, and the
+// forwarder's templates carry the stack's component label so withholding
+// freezes the pipeline as one unit.
 func deployRHOAILogsLokiStack(
 	ctx context.Context,
 	c client.Client,
@@ -648,7 +666,7 @@ func deployRHOAILogsLokiStack(
 	cm *conditions.ConditionsManager,
 	sources *[]rendertemplate.TemplateSource,
 ) error {
-	return deployLokiStack(ctx, c, monitoring, cm, sources, lokiStackDeployment{
+	if err := deployLokiStack(ctx, c, monitoring, cm, sources, lokiStackDeployment{
 		configured:   monitoring.Spec.Logs != nil,
 		resourceName: lokiStackResourceName,
 		condition:    conditions.ConditionLokiStackAvailable,
@@ -659,18 +677,25 @@ func deployRHOAILogsLokiStack(
 			LokiStackNetworkPolicyTemplate,
 			LokiStackGatewayNetworkPolicyTemplate,
 		},
-	})
+	}); err != nil {
+		return err
+	}
+
+	return deployClusterLogForwarder(ctx, c, monitoring, cm, sources)
 }
 
-// deployLokiStacks renders each LokiStack whose component the storage gate
-// left standing.
+// deployLokiStacks renders each logs pipeline whose component the storage gate
+// left standing: its LokiStack and the workload that ships into it.
 //
 // The withheld check is the only thing separating these from the other deploy
 // actions: past it they are ordinary actions whose errors abort the round,
 // which is what keeps them free of any shield of their own. It walks
 // lokiComponents rather than calling the two in sequence so that the set of
 // components the gate can withhold and the set the reconcile deploys cannot
-// drift apart.
+// drift apart. A withheld pipeline is skipped whole — its templates carry the
+// component label, so the sweep shields the stack and its dependent together —
+// and the dependent's condition is marked with the gate's verdict, because the
+// folded action that would normally report on it never runs.
 func deployLokiStacks(
 	ctx context.Context,
 	c client.Client,
@@ -680,15 +705,25 @@ func deployLokiStacks(
 	withheldComponents map[string]struct{},
 ) error {
 	for _, component := range lokiComponents {
-		if _, withheld := withheldComponents[component]; withheld {
-			continue
-		}
-
 		var err error
 		switch component {
 		case componentLokiUsageLogs:
+			if _, withheld := withheldComponents[component]; withheld {
+				markWithheldPipeline(monitoring, cm,
+					conditions.ConditionUsageLogsLokiStackAvailable,
+					conditions.ConditionUsageLogsCollectorAvailable,
+					"usage logs collector")
+				continue
+			}
 			err = deployUsageLogsLokiStack(ctx, c, monitoring, cm, sources)
 		case componentLokiLogs:
+			if _, withheld := withheldComponents[component]; withheld {
+				markWithheldPipeline(monitoring, cm,
+					conditions.ConditionLokiStackAvailable,
+					conditions.ConditionClusterLogForwarderAvailable,
+					"cluster log forwarder")
+				continue
+			}
 			err = deployRHOAILogsLokiStack(ctx, c, monitoring, cm, sources)
 		}
 		if err != nil {
@@ -697,6 +732,38 @@ func deployLokiStacks(
 	}
 
 	return nil
+}
+
+// markWithheldPipeline copies the storage gate's verdict from a stack's
+// condition onto the condition of the workload that ships into that stack.
+//
+// The gate has just written the stack's condition when this runs, and the
+// folded action that would normally report on the dependent is being skipped,
+// so without this a previously-True condition would stand while the pipeline
+// sits frozen. The dependent carries the same verdict because it is withheld
+// for the same reason: in the desired set and in the shield, the pipeline is
+// one unit.
+func markWithheldPipeline(
+	monitoring *v1alpha1.Monitoring,
+	cm *conditions.ConditionsManager,
+	stackCondition, dependentCondition, dependent string,
+) {
+	stack := libconditions.FindStatusCondition(monitoring, stackCondition)
+	if stack == nil {
+		return
+	}
+	message := fmt.Sprintf("%s withheld with its LokiStack: %s",
+		capitalizeFirst(dependent), stack.Message)
+	switch stack.Status {
+	case metav1.ConditionFalse:
+		cm.MarkFalse(dependentCondition, stack.Reason, message)
+	case metav1.ConditionUnknown:
+		cm.MarkUnknown(dependentCondition, stack.Reason, message)
+	default:
+		// True is not a verdict the gate writes: it withholds only on a
+		// refused or unobservable configuration. Leave the dependent alone
+		// rather than invent a verdict the stack does not carry.
+	}
 }
 
 // lokiStackDeployment is everything that differs between the two stacks, so

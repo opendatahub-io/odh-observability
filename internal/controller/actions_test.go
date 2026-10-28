@@ -1309,17 +1309,38 @@ func TestDeployLokiStack_LogsOnlyNoUsageLogs(t *testing.T) {
 		t.Fatalf("unexpected errors: usage logs %v, logs %v", usageLogsErr, logsErr)
 	}
 
-	// Log forwarding brings its own stack and the network policies guarding it,
-	// and nothing belonging to usage logs.
+	// Log forwarding brings its whole pipeline: its stack, the network
+	// policies guarding it, and the forwarder that feeds it. The forwarder's
+	// templates stay in the desired set while the stack is starting — that is
+	// the rule that keeps the sweep from taking them down during a transient
+	// Loki outage — so they are here even though no stack exists yet.
 	assertTemplatePaths(t, sources, []string{
 		LokiStackTemplate,
 		LokiStackNetworkPolicyTemplate,
 		LokiStackGatewayNetworkPolicyTemplate,
+		ClusterLogForwarderTemplate,
+		ClusterLogForwarderRBACTemplate,
+		ClusterLogForwarderNetworkPolicyTemplate,
 	})
 
 	c := mustFindCondition(t, m, conditions.ConditionUsageLogsLokiStackAvailable)
 	if c.Status != metav1.ConditionFalse || c.Reason != "LokiNotRequired" {
 		t.Errorf("UsageLogsLokiStackAvailable: expected False/LokiNotRequired, got %s/%s", c.Status, c.Reason)
+	}
+
+	// The folded collector reports its own not-configured verdict: the
+	// pipeline is one action now, but each part still writes its own
+	// condition.
+	if c := mustFindCondition(t, m, conditions.ConditionUsageLogsCollectorAvailable); c.Status != metav1.ConditionFalse ||
+		c.Reason != "UsageLogsNotConfigured" {
+		t.Errorf("UsageLogsCollectorAvailable: expected False/UsageLogsNotConfigured, got %s/%s", c.Status, c.Reason)
+	}
+
+	// The forwarder waits for the stack it ships into, which does not exist
+	// yet in this cluster.
+	if c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable); c.Status != metav1.ConditionFalse ||
+		c.Reason != "LokiStackNotReady" {
+		t.Errorf("ClusterLogForwarderAvailable: expected False/LokiStackNotReady, got %s/%s", c.Status, c.Reason)
 	}
 }
 
@@ -1338,6 +1359,11 @@ func TestDeployLokiStack_UsageLogsOnlyNoLogs(t *testing.T) {
 		},
 	}
 
+	// The endpoint of a ready stack, published by an earlier round: the
+	// collector gates its rendering on it, so setting it is what makes this
+	// test see the whole folded pipeline rather than the stack alone.
+	m.Status.UsageLogsEndpoint = usageLogsEndpoint
+
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
 
@@ -1346,15 +1372,32 @@ func TestDeployLokiStack_UsageLogsOnlyNoLogs(t *testing.T) {
 		t.Fatalf("unexpected errors: usage logs %v, logs %v", usageLogsErr, logsErr)
 	}
 
-	// Usage logs brings its own stack and the policy guarding that stack's
-	// gateway. The policy belongs to the stack rather than to the collector
-	// that dials it, so it is in place for the whole startup window.
-	assertTemplatePaths(t, sources, []string{UsageLogsLokiStackTemplate, UsageLogsLokiStackNPTemplate})
+	// Usage logs brings its whole pipeline: the stack, the policy guarding
+	// that stack's gateway, and the collector that dials it. The gateway
+	// policy belongs to the stack rather than to the collector, so it is in
+	// place for the whole startup window — before any collector exists.
+	assertTemplatePaths(t, sources, []string{
+		UsageLogsLokiStackTemplate, UsageLogsLokiStackNPTemplate,
+		UsageLogsOpenTelemetryCollectorTemplate,
+		UsageLogsOpenTelemetryCollectorRBACTemplate,
+		UsageLogsOpenTelemetryCollectorNPTemplate,
+	})
 
-	// Log forwarding is not configured, so its stack must stay out of the way.
+	// One action, two verdicts: the stack reports from its readiness, the
+	// collector from the endpoint that readiness published.
+	if c := mustFindCondition(t, m, conditions.ConditionUsageLogsCollectorAvailable); c.Status != metav1.ConditionTrue {
+		t.Errorf("UsageLogsCollectorAvailable: expected True with the endpoint published, got %s/%s", c.Status, c.Reason)
+	}
+
+	// Log forwarding is not configured, so its stack must stay out of the way
+	// and its forwarder must say so.
 	c := mustFindCondition(t, m, conditions.ConditionLokiStackAvailable)
 	if c.Status != metav1.ConditionFalse || c.Reason != "LokiNotRequired" {
 		t.Errorf("LokiStackAvailable: expected False/LokiNotRequired, got %s/%s", c.Status, c.Reason)
+	}
+	if c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable); c.Status != metav1.ConditionFalse ||
+		c.Reason != "LogsNotConfigured" {
+		t.Errorf("ClusterLogForwarderAvailable: expected False/LogsNotConfigured, got %s/%s", c.Status, c.Reason)
 	}
 }
 
@@ -1383,6 +1426,10 @@ func TestDeployLokiStack_BothConfigured(t *testing.T) {
 		},
 	}
 
+	// The endpoints of two ready stacks, published by earlier rounds: with
+	// them set, both folded pipelines render whole.
+	m.Status.UsageLogsEndpoint = usageLogsEndpoint
+
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
 
@@ -1407,18 +1454,32 @@ func TestDeployLokiStack_BothConfigured(t *testing.T) {
 	assertTemplatePaths(t, sources, []string{
 		UsageLogsLokiStackTemplate,
 		UsageLogsLokiStackNPTemplate,
+		UsageLogsOpenTelemetryCollectorTemplate,
+		UsageLogsOpenTelemetryCollectorRBACTemplate,
+		UsageLogsOpenTelemetryCollectorNPTemplate,
 		LokiStackTemplate,
 		LokiStackNetworkPolicyTemplate,
 		LokiStackGatewayNetworkPolicyTemplate,
+		ClusterLogForwarderTemplate,
+		ClusterLogForwarderRBACTemplate,
+		ClusterLogForwarderNetworkPolicyTemplate,
 	})
 
 	for _, conditionType := range []string{
 		conditions.ConditionUsageLogsLokiStackAvailable,
+		conditions.ConditionUsageLogsCollectorAvailable,
 		conditions.ConditionLokiStackAvailable,
 	} {
 		if c := mustFindCondition(t, m, conditionType); c.Status != metav1.ConditionTrue {
 			t.Errorf("%s: expected True once the stack is ready, got %s/%s", conditionType, c.Status, c.Reason)
 		}
+	}
+
+	// The forwarder's stack is ready, but the forwarder itself has not been
+	// applied yet in this cluster, so it reports its own startup state.
+	if c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable); c.Status != metav1.ConditionFalse ||
+		c.Reason != "ClusterLogForwarderNotReady" {
+		t.Errorf("ClusterLogForwarderAvailable: expected False/ClusterLogForwarderNotReady, got %s/%s", c.Status, c.Reason)
 	}
 }
 
@@ -1442,13 +1503,20 @@ func TestDeployLokiStack_NeitherConfigured(t *testing.T) {
 		t.Fatalf("expected no sources when neither feature is configured, got %d", len(sources))
 	}
 
-	for _, conditionType := range []string{
-		conditions.ConditionUsageLogsLokiStackAvailable,
-		conditions.ConditionLokiStackAvailable,
+	// Both pipelines report NotConfigured down to their dependents: the fold
+	// must not leave the collector's or the forwarder's condition unwritten.
+	for conditionType, wantReason := range map[string]string{
+		conditions.ConditionUsageLogsLokiStackAvailable:  "LokiNotRequired",
+		conditions.ConditionUsageLogsCollectorAvailable:  "UsageLogsNotConfigured",
+		conditions.ConditionLokiStackAvailable:           "LokiNotRequired",
+		conditions.ConditionClusterLogForwarderAvailable: "LogsNotConfigured",
 	} {
 		c := mustFindCondition(t, m, conditionType)
 		if c.Status != metav1.ConditionFalse || c.Severity != platformcommon.ConditionSeverityInfo {
 			t.Errorf("%s: expected False+Info when not configured, got %s/%s", conditionType, c.Status, c.Severity)
+		}
+		if c.Reason != wantReason {
+			t.Errorf("%s: expected reason %s, got %s", conditionType, wantReason, c.Reason)
 		}
 	}
 }
@@ -1486,6 +1554,18 @@ func TestDeployLokiStack_CRDMissing(t *testing.T) {
 		if c.Status != metav1.ConditionFalse || c.Reason != conditions.MissingOperatorReason {
 			t.Errorf("%s: expected False/%s, got %s/%s", conditionType, conditions.MissingOperatorReason, c.Status, c.Reason)
 		}
+	}
+
+	// The folded dependents still write their own verdicts. The collector
+	// waits for an endpoint no stack can publish while the operator is
+	// missing; the forwarder names the missing CRD for itself.
+	if c := mustFindCondition(t, m, conditions.ConditionUsageLogsCollectorAvailable); c.Status != metav1.ConditionFalse ||
+		c.Reason != "LokiStackNotReady" {
+		t.Errorf("UsageLogsCollectorAvailable: expected False/LokiStackNotReady, got %s/%s", c.Status, c.Reason)
+	}
+	if c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable); c.Status != metav1.ConditionFalse ||
+		c.Reason != "LokiStackCRDNotFound" {
+		t.Errorf("ClusterLogForwarderAvailable: expected False/LokiStackCRDNotFound, got %s/%s", c.Status, c.Reason)
 	}
 }
 
@@ -2813,10 +2893,16 @@ func TestDeployLokiStack_ReadinessNotFoundMarksFalse(t *testing.T) {
 				}
 			},
 			condition: conditions.ConditionLokiStackAvailable,
+			// The forwarder's templates render alongside the stack's: they
+			// stay in the desired set while Loki starts, so the sweep cannot
+			// read a starting stack as a deletion of the forwarder.
 			wantTemplates: []string{
 				LokiStackTemplate,
 				LokiStackNetworkPolicyTemplate,
 				LokiStackGatewayNetworkPolicyTemplate,
+				ClusterLogForwarderTemplate,
+				ClusterLogForwarderRBACTemplate,
+				ClusterLogForwarderNetworkPolicyTemplate,
 			},
 		},
 	} {
@@ -2966,10 +3052,13 @@ func TestDeployLokiStack_OneStackFailingDoesNotPoisonTheOther(t *testing.T) {
 
 	// Both stacks render: the failed one because withholding its template
 	// would keep it from ever being created, the healthy one because nothing
-	// about it failed.
+	// about it failed. The usage logs collector does not render — its action
+	// aborted at the readiness check before reaching it — while the log
+	// forwarding pipeline renders whole, forwarder included.
 	assertTemplatePaths(t, sources, []string{
 		UsageLogsLokiStackTemplate, UsageLogsLokiStackNPTemplate,
 		LokiStackTemplate, LokiStackNetworkPolicyTemplate, LokiStackGatewayNetworkPolicyTemplate,
+		ClusterLogForwarderTemplate, ClusterLogForwarderRBACTemplate, ClusterLogForwarderNetworkPolicyTemplate,
 	})
 
 	if c := mustFindCondition(t, m, conditions.ConditionUsageLogsLokiStackAvailable); c.Status != metav1.ConditionUnknown ||
@@ -3165,12 +3254,13 @@ func TestDeployUsageLogsCollector_CRDMissing(t *testing.T) {
 // pipeline end to end and checks that the two NetworkPolicies name the pods
 // that the collector and LokiStack templates actually create.
 //
-// The two policies are contributed by different actions — the collector policy
-// by deployUsageLogsCollector, the gateway policy by the usage logs LokiStack
-// deployment, which owns it because the gateway has to be guarded before any
-// collector exists to dial it. Splitting this test along that seam would lose the only check that
-// the gateway policy's "from" peer and the collector policy's podSelector
-// still refer to the same workload.
+// The two policies are contributed by different halves of the usage logs
+// pipeline action — the collector policy by the folded deployUsageLogsCollector
+// half, the gateway policy by the LokiStack half, which owns it because the
+// gateway has to be guarded before any collector exists to dial it. Splitting
+// this test along that seam would lose the only check that the gateway
+// policy's "from" peer and the collector policy's podSelector still refer to
+// the same workload.
 func TestUsageLogsNetworkPoliciesAgreeAcrossActions(t *testing.T) {
 	s := newActionsTestScheme(t)
 	registerCRDs(s, gvk.OpenTelemetryCollector, gvk.LokiStack)
@@ -3189,8 +3279,11 @@ func TestUsageLogsNetworkPoliciesAgreeAcrossActions(t *testing.T) {
 	var sources []rendertemplate.TemplateSource
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
-	if err := deployUsageLogsCollector(context.Background(), cli, m, cm, &sources); err != nil {
-		t.Fatalf("deployUsageLogsCollector error: %v", err)
+
+	// Spec.Logs is unset, so only the usage logs pipeline renders here — the
+	// stack pair and, folded behind them, the collector trio.
+	if usageLogsErr, _ := deployBothLokiStacks(context.Background(), cli, m, cm, &sources); usageLogsErr != nil {
+		t.Fatalf("usage logs LokiStack error: %v", usageLogsErr)
 	}
 
 	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
@@ -3198,20 +3291,17 @@ func TestUsageLogsNetworkPoliciesAgreeAcrossActions(t *testing.T) {
 		t.Errorf("UsageLogsCollectorAvailable: expected True, got %v", c)
 	}
 	// By path, not by count: the gateway policy leaving this action and the
-	// collector policy arriving in its place would keep the count at three.
-	// The gateway policy must not be here — it has to outlive the collector's
-	// readiness gate, which is the whole reason it moved to the LokiStack
-	// deployment.
+	// collector policy arriving in its place would keep the count at five.
+	// The gateway policy must arrive ahead of the collector's own templates —
+	// it has to outlive the collector's readiness gate, which is the whole
+	// reason it belongs to the LokiStack half of the action.
 	assertTemplatePaths(t, sources, []string{
+		UsageLogsLokiStackTemplate,
+		UsageLogsLokiStackNPTemplate,
 		UsageLogsOpenTelemetryCollectorTemplate,
 		UsageLogsOpenTelemetryCollectorRBACTemplate,
 		UsageLogsOpenTelemetryCollectorNPTemplate,
 	})
-
-	// Spec.Logs is unset, so only the usage logs stack renders here.
-	if usageLogsErr, _ := deployBothLokiStacks(context.Background(), cli, m, cm, &sources); usageLogsErr != nil {
-		t.Fatalf("usage logs LokiStack error: %v", usageLogsErr)
-	}
 
 	data, err := buildTemplateData(context.Background(), cli, m, "")
 	if err != nil {
