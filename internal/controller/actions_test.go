@@ -1909,6 +1909,74 @@ func TestCanonicalStorageLocation(t *testing.T) {
 	}
 }
 
+// TestCanonicalStorageLocationDoesNotEchoCredentials pins the security property
+// of the two error returns above. The endpoint is Secret data and may carry
+// credentials in its userinfo, and these errors surface in status conditions
+// and operator logs that far more principals can read than the Secret itself —
+// echoing them there would hand out the credentials to anyone who can `kubectl
+// get monitoring`. The wrapper in lokiStorageLocations is what keeps the
+// message diagnosable instead: it names the Secret, never its contents.
+func TestCanonicalStorageLocationDoesNotEchoCredentials(t *testing.T) {
+	t.Parallel()
+
+	const (
+		accessKey = "AKIAIOSFODNN7EXAMPLE"
+		password  = "wJalrXUtnFEMI7K7MDENGsecret"
+	)
+	credentialed := "https://" + accessKey + ":" + password + "@"
+	for name, endpoint := range map[string]string{
+		// url.Parse rejects the control character. Its own error message
+		// quotes the raw URL it failed on, which is why that cause is not
+		// wrapped into ours.
+		"unparseable": credentialed + "exa\x7fmple.com:9000",
+		// Parses, but to a path: the hostless branch.
+		"hostless": credentialed + "/just-a-path",
+	} {
+		_, err := canonicalStorageLocation(endpoint, "logs")
+		if err == nil {
+			t.Fatalf("%s endpoint: expected an error", name)
+		}
+		for _, credential := range []string{accessKey, password} {
+			if strings.Contains(err.Error(), credential) {
+				t.Errorf("%s endpoint: error must not echo the endpoint's credentials, got %q", name, err)
+			}
+		}
+	}
+}
+
+// TestLokiStorageLocationsDoesNotEchoCredentials is the same property one
+// layer up, at the boundary the condition message actually renders: the
+// message must name the Secret so its owner can fix it, while the credentials
+// embedded in that Secret's endpoint stay in the Secret.
+func TestLokiStorageLocationsDoesNotEchoCredentials(t *testing.T) {
+	t.Parallel()
+
+	const (
+		ns         = "test-ns"
+		accessKey  = "AKIAIOSFODNN7EXAMPLE"
+		password   = "wJalrXUtnFEMI7K7MDENGsecret"
+		secretName = "usage-logs-secret"
+	)
+	s := newActionsTestScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		lokiStorageSecret(secretName, ns,
+			"https://"+accessKey+":"+password+"@exa\x7fmple.com:9000", "logs"),
+	).Build()
+
+	_, err := lokiStorageLocations(context.Background(), cli, ns, secretName)
+	if err == nil {
+		t.Fatal("expected the unparseable endpoint to fail the resolution")
+	}
+	if !strings.Contains(err.Error(), secretName) {
+		t.Errorf("error must name the Secret so its owner can fix it, got %q", err)
+	}
+	for _, credential := range []string{accessKey, password} {
+		if strings.Contains(err.Error(), credential) {
+			t.Errorf("error must not echo the endpoint's credentials, got %q", err)
+		}
+	}
+}
+
 // storageIsolationTest is one checkStorageIsolation case: the Secrets that
 // exist, the spec that claims them, and the verdict expected of the two.
 type storageIsolationTest struct {

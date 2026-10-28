@@ -1133,6 +1133,13 @@ func lokiStorageLocations(ctx context.Context, c client.Client, namespace, secre
 // still collide, so comparing access keys would only mask the conflict. DNS
 // aliases pointing at one server are not detected; that needs resolution, not
 // parsing.
+//
+// The endpoint is also never echoed into an error. It is Secret data and may
+// carry credentials in its userinfo, and these errors surface in status
+// conditions and logs that far more principals can read than the Secret
+// itself. The Secret-naming wrapper in lokiStorageLocations is what keeps the
+// message diagnosable. The url.Parse cause is not wrapped for the same
+// reason: its message quotes the raw URL it failed on.
 func canonicalStorageLocation(endpoint, bucket string) (string, error) {
 	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
@@ -1148,14 +1155,14 @@ func canonicalStorageLocation(endpoint, bucket string) (string, error) {
 	}
 	parsed, err := url.Parse(toParse)
 	if err != nil {
-		return "", fmt.Errorf("parsing storage endpoint %q: %w", endpoint, err)
+		return "", errors.New("storage endpoint is not a valid URL")
 	}
 
 	// Hostnames are case-insensitive (RFC 4343) and the DNS root dot names the
 	// same host as its absence.
 	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
 	if host == "" {
-		return "", fmt.Errorf("storage endpoint %q names no host", endpoint)
+		return "", errors.New("storage endpoint URL names no host")
 	}
 
 	// Virtual-host-style addressing folds the bucket into the hostname; strip it
