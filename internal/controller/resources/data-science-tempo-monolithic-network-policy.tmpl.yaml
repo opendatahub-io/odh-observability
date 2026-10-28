@@ -22,6 +22,11 @@ spec:
               app.kubernetes.io/managed-by: opentelemetry-operator
               app.kubernetes.io/part-of: opentelemetry
       ports:
+        # The Tempo gateway Service exposes OTLP gRPC on 4317 and forwards it
+        # to the gateway container's grpc-public port (8090). NetworkPolicy
+        # ports are evaluated against the destination pod port.
+        - protocol: TCP
+          port: 8090
         - protocol: TCP
           port: 4317
         - protocol: TCP

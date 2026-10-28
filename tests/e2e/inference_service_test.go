@@ -63,7 +63,22 @@ func TestInferenceServiceTracing(t *testing.T) {
 
 	oatsBin := ensureOatsBinary(t, projectRoot)
 	oatsEnv := buildOatsEnv(t, tc)
-	g := gomega.NewWithT(t)
+	ensureInferenceWorkloadNamespaceScrape(t, tc, inferenceServiceNamespace)
+
+	t.Run("explicitExporterEndpoint", func(t *testing.T) {
+		runInferenceServiceTracingScenario(t, tc, gomega.NewWithT(t), oatsBin, oatsEnv, projectRoot)
+	})
+}
+
+func runInferenceServiceTracingScenario(
+	t *testing.T,
+	tc *TestContext,
+	g *gomega.WithT,
+	oatsBin string,
+	oatsEnv []string,
+	projectRoot string,
+) {
+	t.Helper()
 
 	serviceName, err := randomServiceName("vllm-trace-isvc")
 	require.NoError(t, err, "failed to generate per-run InferenceService name")
@@ -88,8 +103,6 @@ func TestInferenceServiceTracing(t *testing.T) {
 		{gvk.ServiceAccount, serviceAccountName, inferenceServiceNamespace},
 		{gvk.InferenceService, serviceName, inferenceServiceNamespace},
 	}
-	// Register cleanup before creating anything so failures do not leave the
-	// stable, test-specific ISVC or OAuth proxy resources behind.
 	t.Cleanup(func() {
 		for _, resource := range cleanupResources {
 			tc.DeleteResource(
@@ -100,11 +113,12 @@ func TestInferenceServiceTracing(t *testing.T) {
 		}
 	})
 
+	platformEndpoint := inferenceServiceTracingEndpoint()
 	t.Logf("Creating traced InferenceService %s/%s", serviceNN.Namespace, serviceNN.Name)
 	tc.EventuallyResourceCreatedOrPatched(
 		WithMinimalObject(gvk.InferenceService, serviceNN),
 		WithMutateFunc(func(service *unstructured.Unstructured) error {
-			service.Object["spec"] = map[string]any{
+			spec := map[string]any{
 				"predictor": map[string]any{
 					"model": map[string]any{
 						"modelFormat": map[string]any{"name": "vLLM"},
@@ -119,11 +133,12 @@ func TestInferenceServiceTracing(t *testing.T) {
 						},
 					},
 				},
-				"tracing": map[string]any{
-					"exporterEndpoint": inferenceServiceTracingEndpoint(),
-					"sampler":          "always_on",
-				},
 			}
+			spec["tracing"] = map[string]any{
+				"exporterEndpoint": platformEndpoint,
+				"sampler":          "always_on",
+			}
+			service.Object["spec"] = spec
 			return nil
 		}),
 	)
@@ -134,7 +149,7 @@ func TestInferenceServiceTracing(t *testing.T) {
 	require.True(t, tracingEndpointFound,
 		"KServe admission dropped spec.tracing.exporterEndpoint even though the CRD schema exposes it; "+
 			"the installed KServe webhook/controller must include InferenceService tracing support")
-	require.Equal(t, inferenceServiceTracingEndpoint(), tracingEndpoint, "KServe must preserve the configured tracing exporter endpoint")
+	require.Equal(t, platformEndpoint, tracingEndpoint, "KServe must preserve the configured tracing exporter endpoint")
 	tracingSampler, tracingSamplerFound, err := unstructured.NestedString(persistedService.Object, "spec", "tracing", "sampler")
 	require.NoError(t, err, "failed to read persisted InferenceService tracing sampler")
 	require.True(t, tracingSamplerFound, "the KServe InferenceService CRD must preserve spec.tracing.sampler")
@@ -165,20 +180,28 @@ func TestInferenceServiceTracing(t *testing.T) {
 	require.NoError(t, err, "failed to generate per-run trace context")
 	traceID, err := traceIDFromTraceparent(traceparent)
 	require.NoError(t, err, "failed to parse trace ID from traceparent")
+	parentSpanID, err := parentSpanIDFromTraceparent(traceparent)
+	require.NoError(t, err, "failed to parse parent span ID from traceparent")
 	t.Logf("Sending traced completion with trace ID %s", traceID)
 	g.Eventually(func() error {
 		return sendInferenceServiceCompletion(tc.Context(), requestURL, ocToken, serviceName, traceparent, routeCAs)
 	}, 5*time.Minute, 5*time.Second).Should(gomega.Succeed(), "completion request with traceparent should succeed through the OAuth proxy")
 
 	g.Eventually(func() error {
-		return assertTraceIDInTempo(tc.Context(), t, traceID, oatsEnv)
+		return assertInferenceServiceTraceIDInTempo(tc.Context(), t, traceID, oatsEnv)
 	}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "injected trace ID should be retrievable from Tempo via gcx")
+	g.Eventually(func() error {
+		return assertVLLMSpanHasInjectedParent(tc.Context(), traceID, parentSpanID, oatsEnv)
+	}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "vLLM llm_request span should retain the injected parent span ID")
 
 	t.Logf("Running OATS case with dedicated tag %q and trace ID %s", inferenceServiceOATSCase, traceID)
-	casePath := writeOatsTraceCaseFile(t, inferenceServiceOATSCase, serviceName, traceID)
+	casePath := writeInferenceServiceOatsTraceCaseFile(t, inferenceServiceOATSCase, serviceName, traceID)
 	g.Eventually(func() error {
 		return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
 	}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "InferenceService tracing OATS checks should succeed")
+
+	t.Log("Verifying traced OTLP export succeeds under collector NetworkPolicy enforcement")
+	runInferenceServiceOTLPNetworkPolicyProbe(t, tc, serviceNN.Namespace, serviceNN.Name)
 }
 
 func requireStandardVLLMCPURuntime(t *testing.T, tc *TestContext) {

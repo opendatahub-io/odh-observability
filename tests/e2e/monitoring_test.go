@@ -1580,7 +1580,7 @@ func (tc *MonitoringTestCtx) ValidateTempoMonolithicCRCreation(t *testing.T) {
 			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "data-science-tempomonolithic"`),
 			jq.Match(`.spec.policyTypes == ["Ingress"]`),
 			jq.Match(`[.spec.ingress[] | select((.from // []) | length == 0)] | length == 0`),
-			jq.Match(`[.spec.ingress[].ports[].port] | unique | sort == [3200, 4317, 4318, 8080]`),
+			jq.Match(`[.spec.ingress[].ports[].port] | unique | sort == [3200, 4317, 4318, 8080, 8090]`),
 		)),
 		WithCustomErrorMsg("TempoMonolithic NetworkPolicy should expose only the collector, Prometheus, and Perses paths"),
 	)
