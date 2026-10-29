@@ -99,6 +99,11 @@ const (
 	lokiOpName      = "loki-operator"
 	lokiOpNamespace = "openshift-operators-redhat"
 
+	// clusterLoggingOpName is the OLM package of the OpenShift Logging operator.
+	// It installs into clusterLoggingNamespace (monitoring_observability_contract_test.go),
+	// the same namespace the operator applies the ClusterLogForwarder into.
+	clusterLoggingOpName = "cluster-logging"
+
 	// defaultInferenceMonitoringNamespace is the literal spec.monitoring.namespace written in
 	// tests/e2e/prerequisites/inference/dsci.yaml, and defaultInferenceApplicationsNamespace the
 	// literal spec.applicationsNamespace. renderManifest rewrites both to -monitoring-namespace
@@ -976,6 +981,7 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 		"opentelemetry-operator",
 		certManagerOpPackage,
 		"loki-operator",
+		clusterLoggingOpName,
 	} {
 		if testOpts.installOperators {
 			tc.g.Eventually(func() error {
@@ -994,6 +1000,7 @@ func (tc *MonitoringTestCtx) ensurePrerequisites(t *testing.T) {
 		gvk.OpenTelemetryCollector,
 		gvk.Instrumentation,
 		gvk.LokiStack,
+		gvk.ClusterLogForwarder,
 		gvk.Perses,
 		gvk.ThanosQuerier,
 		gvk.PodMonitorCoreos,
@@ -1112,6 +1119,7 @@ func (tc *TestContext) installDependentOperators(t *testing.T) {
 	}
 
 	tc.ensureLokiOperatorInstalled(t)
+	tc.ensureClusterLoggingOperatorInstalled(t)
 }
 
 // ensureOpenTelemetryCertManagerRBAC supplies the certificate permissions
@@ -1208,6 +1216,43 @@ func (tc *TestContext) ensureLokiOperatorInstalled(t *testing.T) {
 		t.Fatalf("failed to check LokiStack CRD: %v", err)
 	}
 
+	channel := tc.redhatOperatorsDefaultChannel(t, lokiOpName)
+	t.Logf("installing Loki Operator from redhat-operators channel %s", channel)
+	tc.EnsureOperatorInstalled(lokiOpNamespace, lokiOpName, channel)
+}
+
+// ensureClusterLoggingOperatorInstalled installs the OpenShift Logging operator
+// unless the ClusterLogForwarder CRD is already served. That operator owns the
+// CRD and reconciles ClusterLogForwarders into Vector, and the monitoring
+// operator's spec.logs precondition refuses to reconcile without it — so the
+// log forwarding tests require it the way the Loki ones require the Loki
+// operator. Installing it also creates clusterLoggingNamespace, which the
+// operator applies the ClusterLogForwarder and its companions into.
+func (tc *TestContext) ensureClusterLoggingOperatorInstalled(t *testing.T) {
+	t.Helper()
+
+	// Like Loki: channels are versioned, and a preinstalled operator may not
+	// have a PackageManifest in the catalog.
+	forwarders := &unstructured.UnstructuredList{}
+	forwarders.SetGroupVersionKind(gvk.ClusterLogForwarder)
+	if err := tc.Client().List(tc.Context(), forwarders); err == nil {
+		t.Log("ClusterLogForwarder CRD is already available")
+		return
+	} else if !meta.IsNoMatchError(err) && !k8serr.IsNotFound(err) {
+		t.Fatalf("failed to check ClusterLogForwarder CRD: %v", err)
+	}
+
+	channel := tc.redhatOperatorsDefaultChannel(t, clusterLoggingOpName)
+	t.Logf("installing OpenShift Logging Operator from redhat-operators channel %s", channel)
+	tc.EnsureOperatorInstalled(clusterLoggingNamespace, clusterLoggingOpName, channel)
+}
+
+// redhatOperatorsDefaultChannel resolves the cluster catalog's default channel
+// for an operator package whose channels are versioned, so the suite does not
+// pin a channel that a catalog upgrade retires.
+func (tc *TestContext) redhatOperatorsDefaultChannel(t *testing.T, packageName string) string {
+	t.Helper()
+
 	manifests := &unstructured.UnstructuredList{}
 	manifests.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: "packages.operators.coreos.com", Version: "v1", Kind: "PackageManifestList",
@@ -1216,21 +1261,20 @@ func (tc *TestContext) ensureLokiOperatorInstalled(t *testing.T) {
 		client.InNamespace("openshift-marketplace"),
 		client.MatchingLabels{"catalog": "redhat-operators"},
 	); err != nil {
-		t.Fatalf("Loki Operator is required; failed to list redhat-operators PackageManifests: %v", err)
+		t.Fatalf("%s Operator is required; failed to list redhat-operators PackageManifests: %v", packageName, err)
 	}
 	for _, manifest := range manifests.Items {
-		if manifest.GetName() != lokiOpName {
+		if manifest.GetName() != packageName {
 			continue
 		}
 		channel, _, err := unstructured.NestedString(manifest.Object, "status", "defaultChannel")
 		if err != nil || channel == "" {
-			t.Fatalf("redhat-operators Loki PackageManifest has no default channel: %v", err)
+			t.Fatalf("redhat-operators %s PackageManifest has no default channel: %v", packageName, err)
 		}
-		t.Logf("installing Loki Operator from redhat-operators channel %s", channel)
-		tc.EnsureOperatorInstalled(lokiOpNamespace, lokiOpName, channel)
-		return
+		return channel
 	}
-	t.Fatalf("Loki Operator is required; %s PackageManifest is missing from redhat-operators", lokiOpName)
+	t.Fatalf("%s Operator is required; its PackageManifest is missing from redhat-operators", packageName)
+	return ""
 }
 
 // ensureOperatorServiceMonitor creates the operator's ServiceMonitor after COO is installed.
