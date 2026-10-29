@@ -194,6 +194,31 @@ func assertVLLMSpanHasInjectedParent(ctx context.Context, traceID, parentSpanID 
 	return fmt.Errorf("trace %s has no %q span with injected parent ID %s", traceID, vLLMRequestSpanName, wantParent)
 }
 
+func assertAdapterVLLMSpanRelationship(ctx context.Context, traceID string, oatsEnv []string) error {
+	raw, err := fetchTraceJSON(ctx, traceID, oatsEnv)
+	if err != nil {
+		return err
+	}
+	spans, err := parseTraceSpansFromGCXJSON(raw)
+	if err != nil {
+		return err
+	}
+	spansByID := make(map[string]parsedTraceSpan, len(spans))
+	for _, span := range spans {
+		spansByID[span.SpanID] = span
+	}
+	for _, span := range spans {
+		if span.Name != vLLMRequestSpanName || span.ParentSpanID == "" {
+			continue
+		}
+		parent, found := spansByID[span.ParentSpanID]
+		if found && parent.Name == "request" {
+			return nil
+		}
+	}
+	return fmt.Errorf("trace %s has no EPP %q span directly parenting a vLLM %q span", traceID, "request", vLLMRequestSpanName)
+}
+
 func findInferenceServicePredictorPod(ctx context.Context, kube client.Client, namespace, serviceName string) (*corev1.Pod, string, error) {
 	pods := &corev1.PodList{}
 	if err := kube.List(ctx, pods, client.InNamespace(namespace), client.MatchingLabels{
