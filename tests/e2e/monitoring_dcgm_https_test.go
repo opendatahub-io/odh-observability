@@ -129,7 +129,9 @@ func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMon
 	viewerToken := tc.metricsViewerToken(t, "dcgm-https-viewer", namespace)
 	rootCAs := clusterIngressCAPool(t, tc)
 	routeHost := tc.fetchPrometheusRouteHost(t)
-	metricQuery := fmt.Sprintf(`DCGM_FI_DEV_GPU_UTIL{namespace=%q,job="rhoai-accelerator-metrics",component="nvidia-dcgm-exporter"}`, namespace)
+	// MonitoringStack reserves `job` for its collector target; the source
+	// PodMonitor job label is preserved as `exported_job`.
+	metricQuery := fmt.Sprintf(`DCGM_FI_DEV_GPU_UTIL{namespace=%q,exported_job="rhoai-accelerator-metrics",component="nvidia-dcgm-exporter"}`, namespace)
 	tc.g.Eventually(func() error {
 		status, response, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, viewerToken, namespace, metricQuery)
 		if err != nil {
@@ -139,7 +141,7 @@ func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMon
 			return fmt.Errorf("DCGM-shaped metric query returned HTTP %d", status)
 		}
 		for _, result := range response.Data.Result {
-			if result.Metric["job"] == "rhoai-accelerator-metrics" &&
+			if result.Metric["exported_job"] == "rhoai-accelerator-metrics" &&
 				result.Metric["node"] != "" &&
 				result.Metric["component"] == "nvidia-dcgm-exporter" {
 				return nil
@@ -173,7 +175,7 @@ func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMon
 			return unstructured.SetNestedSlice(monitor.Object, endpoints, "spec", "podMetricsEndpoints")
 		}),
 	)
-	failedScrapeQuery := fmt.Sprintf(`up{namespace=%q,job="rhoai-accelerator-metrics",component="nvidia-dcgm-exporter"} == 0`, namespace)
+	failedScrapeQuery := fmt.Sprintf(`up{namespace=%q,exported_job="rhoai-accelerator-metrics",component="nvidia-dcgm-exporter"} == 0`, namespace)
 	tc.g.Eventually(func() error {
 		status, response, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, viewerToken, namespace, failedScrapeQuery)
 		if err != nil {
