@@ -74,9 +74,9 @@ func requireWriteFile(t *testing.T, path, content string) {
 
 func fetchTraceJSON(ctx context.Context, traceID string, oatsEnv []string) ([]byte, error) {
 	traceHex, traceUUID := traceIDForTraceQL(traceID)
-	gcxBin := gcxBinaryPath()
-	if _, err := os.Stat(gcxBin); err != nil {
-		return nil, fmt.Errorf("gcx binary not found at %s: %w", gcxBin, err)
+	gcxBin, err := gcxBinaryPath()
+	if err != nil {
+		return nil, err
 	}
 	var lastErr error
 	for _, id := range []string{traceHex, traceUUID} {
@@ -240,6 +240,18 @@ func TestWriteOatsTraceCaseFileIncludesTraceID(t *testing.T) {
 	content := string(raw)
 	require.Contains(t, content, `resource.k8s.pod.name =~ "vllm-trace-isvc-abc.*" && span:parentID = "0000000000000000"`)
 	require.Contains(t, content, `trace:id = "0123456789abcdef0123456789abcdef"`)
+}
+
+func TestWriteLLMOatsTraceCaseFileIncludesTraceID(t *testing.T) {
+	t.Parallel()
+
+	path := writeOatsTraceCaseFile(t, "single-node", "facebook-opt-125m-single-node-abc", "fedcba9876543210fedcba9876543210")
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	content := string(raw)
+	require.Contains(t, content, `trace:id = "fedcba9876543210fedcba9876543210"`)
+	require.Contains(t, content, `resource.k8s.pod.name =~ "facebook-opt-125m-single-node-abc.*"`)
+	require.Contains(t, content, `span:parentID != "0000000000000000"`)
 }
 
 func TestAssertVLLMSpanHasInjectedParentAcceptsOTLPBase64IDs(t *testing.T) {

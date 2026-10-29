@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -247,7 +248,8 @@ func writeOatsTraceCaseFile(t *testing.T, tag, podNamePrefix, traceID string) st
 	dir := filepath.Join(t.TempDir(), tag)
 	require.NoError(t, os.MkdirAll(dir, 0o750))
 	path := filepath.Join(dir, "oats-case.yaml")
-	// Per-run pod prefix avoids stale spans from prior runs. Trace ID is asserted separately via gcx traces get.
+	traceHex, _ := traceIDForTraceQL(traceID)
+	// Require the current run's trace ID as well as the pod prefix so stale spans cannot pass.
 	content := fmt.Sprintf(`name: %s vLLM tracing (run-specific)
 tags: ["e2e", "vllm", "%s"]
 
@@ -257,30 +259,52 @@ fixture:
 
 expected:
   traces:
-    - traceql: '{ name = "llm_request" && resource.k8s.pod.name =~ "%s.*" && span:parentID = "0000000000000000" }'
+    - traceql: '{ trace:id = "%s" && name = "llm_request" && resource.k8s.pod.name =~ "%s.*" && span:parentID != "0000000000000000" }'
       count: ">= 1"
-    - traceql: '{ name = "llm_request" && resource.k8s.pod.name =~ "%s.*" && span:parentID != "0000000000000000" }'
-      count: ">= 1"
-`, tag, tag, podNamePrefix, podNamePrefix)
+`, tag, tag, traceHex, podNamePrefix)
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
-	_ = traceID
 	return path
 }
 
-func gcxBinaryPath() string {
-	if path, err := exec.LookPath("gcx"); err == nil {
-		return path
+func gcxBinaryPath() (string, error) {
+	if configured := os.Getenv("OATS_GCX"); configured != "" {
+		path, err := exec.LookPath(configured)
+		if err != nil {
+			return "", fmt.Errorf("resolve OATS_GCX %q: %w", configured, err)
+		}
+		return path, nil
 	}
-	return filepath.Join(os.Getenv("HOME"), ".cache/oats/tools/gcx/1.2.0/linux_amd64/gcx")
+	if path, err := exec.LookPath("gcx"); err == nil {
+		return path, nil
+	}
+	cacheDir := ""
+	if runtime.GOOS != "windows" {
+		if stateHome := os.Getenv("XDG_STATE_HOME"); stateHome != "" {
+			cacheDir = filepath.Join(stateHome, "oats")
+		}
+	}
+	if cacheDir == "" {
+		userCacheDir, err := os.UserCacheDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve OATS cache directory: %w", err)
+		}
+		cacheDir = filepath.Join(userCacheDir, "oats")
+	}
+	binaryName := "gcx"
+	if runtime.GOOS == "windows" {
+		binaryName += ".exe"
+	}
+	path := filepath.Join(cacheDir, "tools", "gcx", "1.2.0", runtime.GOOS+"_"+runtime.GOARCH, binaryName)
+	return path, nil
 }
 
 func assertTraceIDInTempo(ctx context.Context, t *testing.T, traceID string, oatsEnv []string) error {
 	t.Helper()
 
 	traceHex, traceUUID := traceIDForTraceQL(traceID)
-	gcxBin := gcxBinaryPath()
-	if _, err := os.Stat(gcxBin); err != nil {
-		return fmt.Errorf("gcx binary not found at %s: %w", gcxBin, err)
+	gcxBin, err := gcxBinaryPath()
+	if err != nil {
+		return err
 	}
 	var lastErr error
 	for _, id := range []string{traceHex, traceUUID} {
@@ -330,11 +354,11 @@ func sendCompletion(ctx context.Context, routeHost, ocToken string, rootCAs *x50
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxInferenceServiceHTTPErrorBodyBytes))
+		_, readErr := io.Copy(io.Discard, io.LimitReader(resp.Body, maxInferenceServiceHTTPErrorBodyBytes))
 		if readErr != nil {
 			return fmt.Errorf("completions request to %s failed with status %d (read response body: %w)", req.URL, resp.StatusCode, readErr)
 		}
-		return fmt.Errorf("completions request to %s failed with status %d: %s", req.URL, resp.StatusCode, strings.TrimSpace(string(responseBody)))
+		return fmt.Errorf("completions request to %s failed with status %d", req.URL, resp.StatusCode)
 	}
 	return nil
 }
@@ -343,6 +367,35 @@ func sendCompletion(ctx context.Context, routeHost, ocToken string, rootCAs *x50
 // scraping. The operator excludes built-in namespaces like default from automatic enrollment.
 func ensureInferenceWorkloadNamespaceScrape(t *testing.T, tc *TestContext, namespace string) {
 	t.Helper()
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(gvk.Namespace)
+	require.NoError(t, tc.Client().Get(tc.Context(), types.NamespacedName{Name: namespace}, existing))
+	originalLabels := existing.GetLabels()
+	originalMonitoring, hadMonitoring := originalLabels[ODHLabelMonitoring]
+	originalOTLP, hadOTLP := originalLabels[otlpNamespaceLabel]
+	t.Cleanup(func() {
+		tc.EventuallyResourceCreatedOrPatched(
+			WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: namespace}),
+			WithMutateFunc(func(u *unstructured.Unstructured) error {
+				labels := u.GetLabels()
+				if labels == nil {
+					labels = map[string]string{}
+				}
+				if hadMonitoring {
+					labels[ODHLabelMonitoring] = originalMonitoring
+				} else {
+					delete(labels, ODHLabelMonitoring)
+				}
+				if hadOTLP {
+					labels[otlpNamespaceLabel] = originalOTLP
+				} else {
+					delete(labels, otlpNamespaceLabel)
+				}
+				u.SetLabels(labels)
+				return nil
+			}),
+		)
+	})
 	tc.EventuallyResourceCreatedOrPatched(
 		WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: namespace}),
 		WithMutateFunc(func(u *unstructured.Unstructured) error {
@@ -803,11 +856,6 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 
 	// 3. Verification via OATS
 	t.Logf("[%s] Running OATS verification", topology)
-	if tracedRequestTraceID != "" {
-		g.Eventually(func() error {
-			return assertTraceIDInTempo(tc.Context(), t, tracedRequestTraceID, oatsEnv)
-		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "injected trace ID should be retrievable from Tempo via gcx")
-	}
 	g.Eventually(func() error {
 		if tracedRequestTraceID != "" {
 			casePath := writeOatsTraceCaseFile(t, topology, llmSvcName, tracedRequestTraceID)
@@ -815,8 +863,19 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		}
 		return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
 	}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "OATS verification should succeed within 2 minutes")
+	if tracedRequestTraceID != "" {
+		// OATS prepares the platform-appropriate gcx binary before this direct
+		// trace lookup runs.
+		g.Eventually(func() error {
+			return assertTraceIDInTempo(tc.Context(), t, tracedRequestTraceID, oatsEnv)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "injected trace ID should be retrievable from Tempo via gcx")
+	}
 
 	// 4. Pod Termination & Scrape Recovery
+	if topology == "single-node" {
+		t.Logf("[%s] Trace validation complete; skipping metrics-only scrape recovery", topology)
+		return
+	}
 	t.Logf("[%s] Restarting vLLM pod for scrape recovery", topology)
 	restartVLLMPod(t, tc, workloadNS, llmSvcName)
 

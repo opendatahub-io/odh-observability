@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 	"testing"
 	"time"
 
@@ -25,7 +24,6 @@ import (
 )
 
 const (
-	inferenceServiceNamespace             = "default"
 	inferenceServiceRuntime               = "csr-kserve-vllm-cpu-x86"
 	inferenceServiceOATSCase              = "isvc"
 	maxInferenceServiceHTTPErrorBodyBytes = 1 << 20
@@ -59,7 +57,6 @@ func TestInferenceServiceTracing(t *testing.T) {
 
 	oatsBin := ensureOatsBinary(t, projectRoot)
 	oatsEnv := buildOatsEnv(t, tc)
-	ensureInferenceWorkloadNamespaceScrape(t, tc, inferenceServiceNamespace)
 
 	t.Run("explicitExporterEndpoint", func(t *testing.T) {
 		runInferenceServiceTracingScenario(t, tc, gomega.NewWithT(t), oatsBin, oatsEnv, projectRoot)
@@ -78,7 +75,20 @@ func runInferenceServiceTracingScenario(
 
 	serviceName, err := randomServiceName("vllm-trace-isvc")
 	require.NoError(t, err, "failed to generate per-run InferenceService name")
-	serviceNN := types.NamespacedName{Name: serviceName, Namespace: inferenceServiceNamespace}
+	workloadNamespace, err := randomServiceName("vllm-trace")
+	require.NoError(t, err, "failed to generate per-run workload namespace")
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: workloadNamespace}),
+	)
+	t.Cleanup(func() {
+		tc.DeleteResource(
+			WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: workloadNamespace}),
+			WithIgnoreNotFound(true),
+			WithWaitForDeletion(true),
+		)
+	})
+	ensureInferenceWorkloadNamespaceScrape(t, tc, workloadNamespace)
+	serviceNN := types.NamespacedName{Name: serviceName, Namespace: workloadNamespace}
 	proxyName := serviceName + "-p"
 	tlsSecretName := proxyName + "-tls"
 	cookieSecretName := proxyName + "-cookie"
@@ -89,14 +99,14 @@ func runInferenceServiceTracingScenario(
 		name string
 		ns   string
 	}{
-		{gvk.Route, proxyName, inferenceServiceNamespace},
-		{gvk.Deployment, proxyName, inferenceServiceNamespace},
-		{gvk.Service, proxyName, inferenceServiceNamespace},
-		{gvk.Secret, tlsSecretName, inferenceServiceNamespace},
-		{gvk.Secret, cookieSecretName, inferenceServiceNamespace},
+		{gvk.Route, proxyName, workloadNamespace},
+		{gvk.Deployment, proxyName, workloadNamespace},
+		{gvk.Service, proxyName, workloadNamespace},
+		{gvk.Secret, tlsSecretName, workloadNamespace},
+		{gvk.Secret, cookieSecretName, workloadNamespace},
 		{gvk.ClusterRoleBinding, bindingName, ""},
-		{gvk.ServiceAccount, serviceAccountName, inferenceServiceNamespace},
-		{gvk.InferenceService, serviceName, inferenceServiceNamespace},
+		{gvk.ServiceAccount, serviceAccountName, workloadNamespace},
+		{gvk.InferenceService, serviceName, workloadNamespace},
 	}
 	t.Cleanup(func() {
 		for _, resource := range cleanupResources {
@@ -195,18 +205,20 @@ func runInferenceServiceTracingScenario(
 		return sendInferenceServiceCompletion(tc.Context(), requestURL, ocToken, serviceName, traceparent, routeCAs)
 	}, 5*time.Minute, 5*time.Second).Should(gomega.Succeed(), "completion request with traceparent should succeed through the OAuth proxy")
 
+	t.Logf("Running OATS case with dedicated tag %q and trace ID %s", inferenceServiceOATSCase, traceID)
+	casePath := writeInferenceServiceOatsTraceCaseFile(t, inferenceServiceOATSCase, serviceName, traceID)
+	g.Eventually(func() error {
+		return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
+	}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "InferenceService tracing OATS checks should succeed")
+
+	// OATS prepares the platform-appropriate gcx binary before these direct
+	// trace inspections run.
 	g.Eventually(func() error {
 		return assertInferenceServiceTraceIDInTempo(tc.Context(), t, traceID, oatsEnv)
 	}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "injected trace ID should be retrievable from Tempo via gcx")
 	g.Eventually(func() error {
 		return assertVLLMSpanHasInjectedParent(tc.Context(), traceID, parentSpanID, oatsEnv)
 	}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "vLLM llm_request span should retain the injected parent span ID")
-
-	t.Logf("Running OATS case with dedicated tag %q and trace ID %s", inferenceServiceOATSCase, traceID)
-	casePath := writeInferenceServiceOatsTraceCaseFile(t, inferenceServiceOATSCase, serviceName, traceID)
-	g.Eventually(func() error {
-		return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
-	}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "InferenceService tracing OATS checks should succeed")
 
 	t.Log("Verifying traced OTLP export succeeds under collector NetworkPolicy enforcement")
 	runInferenceServiceOTLPNetworkPolicyProbe(t, tc, serviceNN.Namespace, serviceNN.Name)
@@ -274,11 +286,11 @@ func sendInferenceServiceCompletion(ctx context.Context, endpoint, ocToken, mode
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxInferenceServiceHTTPErrorBodyBytes))
+		_, readErr := io.Copy(io.Discard, io.LimitReader(resp.Body, maxInferenceServiceHTTPErrorBodyBytes))
 		if readErr != nil {
 			return fmt.Errorf("completion request to %s failed with status %d (read response body: %w)", req.URL, resp.StatusCode, readErr)
 		}
-		return fmt.Errorf("completion request to %s failed with status %d: %s", req.URL, resp.StatusCode, strings.TrimSpace(string(responseBody)))
+		return fmt.Errorf("completion request to %s failed with status %d", req.URL, resp.StatusCode)
 	}
 	return nil
 }
