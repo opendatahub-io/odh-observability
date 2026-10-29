@@ -75,7 +75,7 @@ func requireWriteFile(t *testing.T, path, content string) {
 
 func fetchTraceJSON(ctx context.Context, traceID string, oatsEnv []string) ([]byte, error) {
 	traceHex, traceUUID := traceIDForTraceQL(traceID)
-	gcxBin, err := gcxBinaryPath()
+	gcxBin, err := gcxBinaryPath(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -263,16 +263,34 @@ func TestWriteLLMOatsTraceCaseFileIncludesTraceID(t *testing.T) {
 
 func TestGCXToolingUsesPinnedCacheBinary(t *testing.T) {
 	t.Setenv("OATS_GCX", "")
+	t.Setenv("PATH", "")
 	cacheDir := t.TempDir()
 	t.Setenv("OATS_CACHE_DIR", cacheDir)
 
-	path, args, err := gcxTooling()
+	path, args, err := gcxTooling(t.Context())
 	require.NoError(t, err)
 	require.Contains(t, path, filepath.Join("tools", "gcx", oatsGCXVersion, runtime.GOOS+"_"+runtime.GOARCH))
 	require.Contains(t, args, "--cache-dir")
 	require.Contains(t, args, cacheDir)
 	require.Contains(t, args, oatsGCXVersion)
 	require.NotContains(t, args, path, "OATS must be allowed to download the initially missing cached binary")
+}
+
+func TestGCXToolingUsesMatchingPATHBinary(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test helper uses a POSIX shell script")
+	}
+	t.Setenv("OATS_GCX", "")
+	binDir := t.TempDir()
+	path := filepath.Join(binDir, "gcx")
+	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\necho 'gcx v"+oatsGCXVersion+"'\n"), 0o600))
+	require.NoError(t, os.Chmod(path, 0o700))
+	t.Setenv("PATH", binDir)
+
+	gotPath, args, err := gcxTooling(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, path, gotPath)
+	require.Equal(t, []string{"--gcx-version", oatsGCXVersion, "--gcx-download", "auto"}, args)
 }
 
 func TestAssertVLLMSpanHasInjectedParentAcceptsOTLPBase64IDs(t *testing.T) {

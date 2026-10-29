@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
@@ -268,13 +269,31 @@ expected:
 
 const oatsGCXVersion = "1.2.0"
 
-func gcxTooling() (string, []string, error) {
+var gcxVersionPattern = regexp.MustCompile(`(?:^|[^0-9A-Za-z])v?([0-9]+\.[0-9]+\.[0-9]+)(?:[^0-9A-Za-z]|$)`)
+
+func gcxHasVersion(ctx context.Context, path, expected string) bool {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, path, "--version").Output()
+	if err != nil {
+		return false
+	}
+	match := gcxVersionPattern.FindStringSubmatch(string(out))
+	return len(match) > 1 && match[1] == expected
+}
+
+func gcxTooling(ctx context.Context) (string, []string, error) {
 	if configured := os.Getenv("OATS_GCX"); configured != "" {
 		path, err := exec.LookPath(configured)
 		if err != nil {
 			return "", nil, fmt.Errorf("resolve OATS_GCX %q: %w", configured, err)
 		}
 		return path, []string{"--gcx", path, "--gcx-download", "never"}, nil
+	}
+	// Match OATS's --gcx-version resolution order: an exact version on PATH
+	// wins over the cache, otherwise OATS uses/downloads the pinned cache copy.
+	if path, err := exec.LookPath("gcx"); err == nil && gcxHasVersion(ctx, path, oatsGCXVersion) {
+		return path, []string{"--gcx-version", oatsGCXVersion, "--gcx-download", "auto"}, nil
 	}
 	cacheDir := os.Getenv("OATS_CACHE_DIR")
 	if cacheDir == "" && runtime.GOOS != "windows" {
@@ -302,8 +321,8 @@ func gcxTooling() (string, []string, error) {
 	return path, args, nil
 }
 
-func gcxBinaryPath() (string, error) {
-	path, _, err := gcxTooling()
+func gcxBinaryPath(ctx context.Context) (string, error) {
+	path, _, err := gcxTooling(ctx)
 	return path, err
 }
 
@@ -311,7 +330,7 @@ func assertTraceIDInTempo(ctx context.Context, t *testing.T, traceID string, oat
 	t.Helper()
 
 	traceHex, traceUUID := traceIDForTraceQL(traceID)
-	gcxBin, err := gcxBinaryPath()
+	gcxBin, err := gcxBinaryPath(ctx)
 	if err != nil {
 		return err
 	}
@@ -422,7 +441,7 @@ func ensureInferenceWorkloadNamespaceScrape(t *testing.T, tc *TestContext, names
 
 func runOatsCase(ctx context.Context, t *testing.T, oatsBin, topology string, oatsEnv []string, projectRoot string) error {
 	t.Helper()
-	_, gcxArgs, err := gcxTooling()
+	_, gcxArgs, err := gcxTooling(ctx)
 	if err != nil {
 		return err
 	}
@@ -445,7 +464,7 @@ func runOatsCaseFile(ctx context.Context, t *testing.T, oatsBin, caseFile string
 	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		return fmt.Errorf("write OATS config: %w", err)
 	}
-	_, gcxArgs, err := gcxTooling()
+	_, gcxArgs, err := gcxTooling(ctx)
 	if err != nil {
 		return err
 	}
