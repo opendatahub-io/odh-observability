@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -245,13 +246,33 @@ func TestWriteOatsTraceCaseFileIncludesTraceID(t *testing.T) {
 func TestWriteLLMOatsTraceCaseFileIncludesTraceID(t *testing.T) {
 	t.Parallel()
 
-	path := writeOatsTraceCaseFile(t, "single-node", "facebook-opt-125m-single-node-abc", "fedcba9876543210fedcba9876543210")
+	path := writeOatsTraceCaseFile(
+		t,
+		"single-node",
+		"facebook-opt-125m-single-node-abc",
+		"fedcba9876543210fedcba9876543210",
+		"0123456789abcdef",
+	)
 	raw, err := os.ReadFile(path)
 	require.NoError(t, err)
 	content := string(raw)
 	require.Contains(t, content, `trace:id = "fedcba9876543210fedcba9876543210"`)
 	require.Contains(t, content, `resource.k8s.pod.name =~ "facebook-opt-125m-single-node-abc.*"`)
-	require.Contains(t, content, `span:parentID != "0000000000000000"`)
+	require.Contains(t, content, `span:parentID = "0123456789abcdef"`)
+}
+
+func TestGCXToolingUsesPinnedCacheBinary(t *testing.T) {
+	t.Setenv("OATS_GCX", "")
+	cacheDir := t.TempDir()
+	t.Setenv("OATS_CACHE_DIR", cacheDir)
+
+	path, args, err := gcxTooling()
+	require.NoError(t, err)
+	require.Contains(t, path, filepath.Join("tools", "gcx", oatsGCXVersion, runtime.GOOS+"_"+runtime.GOARCH))
+	require.Contains(t, args, "--cache-dir")
+	require.Contains(t, args, cacheDir)
+	require.Contains(t, args, oatsGCXVersion)
+	require.NotContains(t, args, path, "OATS must be allowed to download the initially missing cached binary")
 }
 
 func TestAssertVLLMSpanHasInjectedParentAcceptsOTLPBase64IDs(t *testing.T) {
