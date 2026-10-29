@@ -35,11 +35,8 @@ spec:
               name: data
             - mountPath: /var/tempo
               name: tempo
-            # ENABLE_LOGS_ALL writes Grafana logs beneath the image tree. Give
-            # OpenShift's arbitrary UID a writable log directory; plugins and
-            # the Grafana database are already covered by the /data volume.
-            - mountPath: /otel-lgtm/grafana/data/log
-              name: grafana-logs
+            - mountPath: /otel-lgtm/grafana/data
+              name: grafana-data
           env:
             - name: ENABLE_LOGS_ALL
               value: "true"
@@ -49,7 +46,7 @@ spec:
           emptyDir: {}
         - name: tempo
           emptyDir: {}
-        - name: grafana-logs
+        - name: grafana-data
           emptyDir: {}
 ---
 apiVersion: v1

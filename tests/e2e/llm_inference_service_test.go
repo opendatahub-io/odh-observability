@@ -662,14 +662,39 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 
 	llmSvcName, err := randomServiceName("facebook-opt-125m-" + topology)
 	require.NoError(t, err, "failed to generate a unique LLMInferenceService name")
+	noCleanup := os.Getenv("NO_CLEANUP") == "1"
 	workloadNS := llmInferenceWorkloadNamespace()
+	proxyNS, err := randomServiceName("llmisvc-proxy")
+	require.NoError(t, err, "failed to generate a unique OAuth proxy namespace")
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: proxyNS}),
+		WithMutateFunc(func(namespace *unstructured.Unstructured) error {
+			labels := namespace.GetLabels()
+			if labels == nil {
+				labels = map[string]string{}
+			}
+			labels["opendatahub.io/generated-namespace"] = "true"
+			namespace.SetLabels(labels)
+			return nil
+		}),
+	)
+	t.Cleanup(func() {
+		if noCleanup {
+			t.Logf("[%s] NO_CLEANUP=1; leaving OAuth proxy namespace %s in place", topology, proxyNS)
+			return
+		}
+		tc.DeleteResource(
+			WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: proxyNS}),
+			WithIgnoreNotFound(true),
+			WithWaitForDeletion(true),
+		)
+	})
 	llmSvcNN := types.NamespacedName{Name: llmSvcName, Namespace: workloadNS}
 	proxyName := llmSvcName + "-p"
 	tlsSecretName := proxyName + "-tls"
 	cookieSecretName := proxyName + "-cookie"
 	saName := proxyName
 	bindingName := proxyName + "-auth-delegator"
-	noCleanup := os.Getenv("NO_CLEANUP") == "1"
 	t.Logf("Starting %s topology with LLMInferenceService %s", topology, llmSvcNN)
 	if topology == "multi-node" {
 		checkCtx, cancel := context.WithTimeout(tc.Context(), 10*time.Second)
@@ -685,15 +710,15 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		name string
 		ns   string
 	}{
-		{gvk.Route, proxyName, workloadNS}, {gvk.Deployment, proxyName, workloadNS}, {gvk.Service, proxyName, workloadNS},
-		{gvk.Secret, tlsSecretName, workloadNS}, {gvk.Secret, cookieSecretName, workloadNS}, {gvk.ClusterRoleBinding, bindingName, ""}, {gvk.ServiceAccount, saName, workloadNS},
+		{gvk.Route, proxyName, proxyNS}, {gvk.Deployment, proxyName, proxyNS}, {gvk.Service, proxyName, proxyNS},
+		{gvk.Secret, tlsSecretName, proxyNS}, {gvk.Secret, cookieSecretName, proxyNS}, {gvk.ClusterRoleBinding, bindingName, ""}, {gvk.ServiceAccount, saName, proxyNS},
 		{gvkLLMInferenceService, llmSvcName, workloadNS},
 	}
 	// Register cleanup before creating anything so failures or aborted subtests
 	// do not leave topology-specific resources behind unless NO_CLEANUP=1.
 	t.Cleanup(func() {
 		if noCleanup {
-			logManualCleanupCommands(t, topology, llmSvcName, proxyName, tlsSecretName, cookieSecretName, bindingName, saName)
+			logManualCleanupCommands(t, topology, workloadNS, proxyNS, llmSvcName, bindingName)
 			return
 		}
 		t.Logf("[%s] Cleaning up topology resources", topology)
@@ -820,7 +845,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	t.Logf("[%s] Creating OAuth proxy Deployment with upstream %s", topology, inferenceService)
 	upstream := fmt.Sprintf("https://%s.%s.svc.cluster.local:%d", inferenceService, workloadNS, inferencePort)
 	createOAuthProxy(t, tc, oauthProxyConfig{
-		namespace:          workloadNS,
+		namespace:          proxyNS,
 		proxyName:          proxyName,
 		serviceAccountName: saName,
 		bindingName:        bindingName,
@@ -874,19 +899,19 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	// 4. Pod Termination & Scrape Recovery
 	if topology == "single-node" {
 		t.Logf("[%s] Trace validation complete; skipping metrics-only scrape recovery", topology)
-		return
+	} else {
+		t.Logf("[%s] Restarting vLLM pod for scrape recovery", topology)
+		restartVLLMPod(t, tc, workloadNS, llmSvcName)
+
+		t.Logf("[%s] Sending completion request after pod restart", topology)
+		g.Eventually(func() error {
+			return send()
+		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Second completion request should succeed after pod restart")
+
+		g.Eventually(func() error {
+			return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
+		}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "Scrape recovery verification should succeed after pod restart")
 	}
-	t.Logf("[%s] Restarting vLLM pod for scrape recovery", topology)
-	restartVLLMPod(t, tc, workloadNS, llmSvcName)
-
-	t.Logf("[%s] Sending completion request after pod restart", topology)
-	g.Eventually(func() error {
-		return send()
-	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Second completion request should succeed after pod restart")
-
-	g.Eventually(func() error {
-		return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
-	}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "Scrape recovery verification should succeed after pod restart")
 
 	// 5. Teardown & PodMonitor Cleanup
 	if noCleanup {
@@ -911,13 +936,15 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	}, 1*time.Minute, 2*time.Second).Should(gomega.BeTrue(), "Associated PodMonitor should be deleted within 1 reconciliation cycle of LLMInferenceService deletion")
 }
 
-func logManualCleanupCommands(t *testing.T, topology, llmSvcName, proxyName, tlsSecretName, cookieSecretName, bindingName, saName string) {
+func logManualCleanupCommands(t *testing.T, topology, workloadNS, proxyNS, llmSvcName, bindingName string) {
 	t.Helper()
 	t.Logf(
-		"[%s] NO_CLEANUP=1; retained resources: LLMInferenceService/%s, Route/%s, Deployment/%s, "+
-			"Service/%s, Secrets/%s and %s, ServiceAccount/%s, ClusterRoleBinding/%s",
-		topology, llmSvcName, proxyName, proxyName, proxyName,
-		tlsSecretName, cookieSecretName, saName, bindingName,
+		"[%s] NO_CLEANUP=1; retained LLMInferenceService/%s in namespace %s, OAuth proxy resources in namespace %s, and ClusterRoleBinding/%s",
+		topology, llmSvcName, workloadNS, proxyNS, bindingName,
+	)
+	t.Logf(
+		"[%s] Manual cleanup: oc delete llminferenceservice %s -n %s; oc delete namespace %s; oc delete clusterrolebinding %s",
+		topology, llmSvcName, workloadNS, proxyNS, bindingName,
 	)
 }
 
