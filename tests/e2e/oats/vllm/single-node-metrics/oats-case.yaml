@@ -1,0 +1,22 @@
+name: single-node topology llmisvc vLLM metrics
+tags: ["e2e", "vllm", "single-node-metrics"]
+
+fixture:
+  remote:
+    endpoint: default
+
+expected:
+  metrics:
+    # vLLM recording-rule metrics are checked independently from tracing.
+    - promql: 'vllm:prompt_tokens_total{llm_isvc_name=~".*single-node.*"}'
+      value: ">= 0"
+    - promql: 'vllm:generation_tokens_total{llm_isvc_name=~".*single-node.*"}'
+      value: ">= 0"
+    - promql: 'vllm:time_to_first_token_seconds_bucket{llm_isvc_name=~".*single-node.*"}'
+      value: ">= 0"
+    - promql: 'vllm:e2e_request_latency_seconds_bucket{llm_isvc_name=~".*single-node.*"}'
+      value: ">= 0"
+    - promql: 'max by (__name__) (count by (__name__) ({__name__=~"vllm:.*|vllm_.*",__name__!~".*_bucket",llm_isvc_name=~".*single-node.*"}))'
+      value: "<= 20"
+    - promql: 'max by (__name__) (count by (__name__) ({__name__=~"vllm:.*|vllm_.*",__name__=~".*_bucket",llm_isvc_name=~".*single-node.*"}))'
+      value: "<= 50"
