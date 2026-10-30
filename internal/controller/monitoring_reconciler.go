@@ -75,6 +75,42 @@ const (
 	targetAllocatorOperatorPolicyName     = "data-science-collector-targetallocator-networkpolicy"
 )
 
+//nolint:goconst // Resource names intentionally mirror the rendered RBAC templates.
+var scopedClusterRoleNames = map[string]struct{}{
+	"data-science-collector-mlflow-trace-export": {},
+	"data-science-collector-tempo-trace-export":  {},
+	"data-science-metrics-view":                  {},
+	"data-science-usage-logs-processor":          {},
+	"generate-processors-role":                   {},
+	"generate-processors-targetallocator-role":   {},
+	"korrel8r-query":                             {},
+	"usage-logs-processor":                       {},
+}
+
+//nolint:goconst // Resource names intentionally mirror the rendered RBAC templates.
+var scopedClusterRoleBindingNames = map[string]struct{}{
+	"data-science-cluster-log-forwarder-collector-collect-app-logs":       {},
+	"data-science-cluster-log-forwarder-collector-loki-writer":            {},
+	"data-science-collector-mlflow-trace-export":                          {},
+	"data-science-collector-tempo-trace-export":                           {},
+	"data-science-monitoringstack-alertmanager-prometheus-metrics-reader": {},
+	"data-science-prometheus-cluster-proxy":                               {},
+	"data-science-prometheus-cluster-proxy-auth-delegator":                {},
+	"data-science-prometheus-namespace-proxy":                             {},
+	"data-science-prometheus-namespace-proxy-auth-delegator":              {},
+	"data-science-thanos-querier-proxy":                                   {},
+	"data-science-thanos-querier-proxy-auth-delegator":                    {},
+	"data-science-usage-logs-processor":                                   {},
+	"generate-processors-collector-rolebinding":                           {},
+	"generate-processors-targetallocator-discovery-rolebinding":           {},
+	"generate-processors-targetallocator-rolebinding":                     {},
+	"korrel8r-auth-delegator":                                             {},
+	"korrel8r-query":                                                      {},
+	"usage-logs-processor":                                                {},
+	"usage-logs-loki-writer":                                              {},
+	"data-science-usage-logs-loki-writer":                                 {},
+}
+
 func operatorVersion() string {
 	return os.Getenv("OPERATOR_VERSION")
 }
@@ -101,7 +137,7 @@ type MonitoringReconciler struct {
 // +kubebuilder:rbac:groups=opentelemetry.io,resources=opentelemetrycollectors;instrumentations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=perses.dev,resources=perses;persesdatasources;persesdashboards,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings;clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings;clusterroles;clusterrolebindings,verbs=get;list;watch
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=podmonitors;servicemonitors,verbs=*
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=scrapeconfigs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch
@@ -309,6 +345,9 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("applying resources: %w", err)
 	}
+	if err := r.verifyRBACScoper(ctx, monitoring, data); err != nil {
+		return ctrl.Result{}, fmt.Errorf("verifying RBAC scoper resources: %w", err)
+	}
 	if err := r.cleanupOpenTelemetryOperatorNetworkPolicies(ctx, monitoringNamespace(monitoring)); err != nil {
 		return ctrl.Result{}, fmt.Errorf("cleaning up OpenTelemetry Operator NetworkPolicies: %w", err)
 	}
@@ -472,7 +511,27 @@ func (r *MonitoringReconciler) renderMonitoringResources(
 	if err != nil {
 		return nil, fmt.Errorf("rendering templates: %w", err)
 	}
+	if targetAllocatorRBACScoperEnabled() {
+		desired = withoutRBACScoperResources(desired)
+	}
 	return desired, nil
+}
+
+func withoutRBACScoperResources(resources []unstructured.Unstructured) []unstructured.Unstructured {
+	filtered := make([]unstructured.Unstructured, 0, len(resources))
+	for _, resource := range resources {
+		if !isRBACResource(resource.GroupVersionKind()) {
+			filtered = append(filtered, resource)
+		}
+	}
+	return filtered
+}
+
+func isRBACResource(gvk schema.GroupVersionKind) bool {
+	return gvk == controllergvk.Role ||
+		gvk == controllergvk.RoleBinding ||
+		gvk == controllergvk.ClusterRole ||
+		gvk == controllergvk.ClusterRoleBinding
 }
 
 func (r *MonitoringReconciler) preparePrometheusWebTLSCA(
@@ -565,6 +624,9 @@ func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v
 		gc.InNamespace(namespace),
 		gc.WithDeletePropagationPolicy(metav1.DeletePropagationBackground),
 		gc.WithObjectPredicate(func(_ gc.RunParams, obj unstructured.Unstructured) (bool, error) {
+			if targetAllocatorRBACScoperEnabled() && isRBACResource(obj.GroupVersionKind()) {
+				return false, nil
+			}
 			return shouldCollectOwnedResource(monitoring, obj, desiredSet, namespace), nil
 		}),
 	)
@@ -581,6 +643,16 @@ func (r *MonitoringReconciler) collectGarbage(ctx context.Context, monitoring *v
 		return err
 	}
 
+	if err := r.collectScopedClusterRBACGarbage(ctx, monitoring, desiredSet); err != nil {
+		return err
+	}
+
+	if targetAllocatorRBACScoperEnabled() {
+		return nil
+	}
+	if err := r.cleanupTargetAllocatorScoperRBAC(ctx); err != nil {
+		return err
+	}
 	return r.collectTargetAllocatorRBACGarbage(ctx, params, desiredSet, namespace)
 }
 
@@ -593,6 +665,9 @@ func (r *MonitoringReconciler) deleteAllOwned(ctx context.Context, monitoring *v
 		gc.InNamespace(namespace),
 		gc.WithDeletePropagationPolicy(metav1.DeletePropagationBackground),
 		gc.WithObjectPredicate(func(_ gc.RunParams, obj unstructured.Unstructured) (bool, error) {
+			if targetAllocatorRBACScoperEnabled() && isRBACResource(obj.GroupVersionKind()) {
+				return false, nil
+			}
 			return isOwnedByMonitoring(monitoring, &obj) && isInMonitoringScope(&obj, namespace), nil
 		}),
 	)
@@ -609,7 +684,90 @@ func (r *MonitoringReconciler) deleteAllOwned(ctx context.Context, monitoring *v
 		return err
 	}
 
+	if err := r.collectScopedClusterRBACGarbage(ctx, monitoring, nil); err != nil {
+		return err
+	}
+
+	if targetAllocatorRBACScoperEnabled() {
+		return nil
+	}
+	if err := r.cleanupTargetAllocatorScoperRBAC(ctx); err != nil {
+		return err
+	}
 	return r.collectTargetAllocatorRBACGarbage(ctx, params, nil, namespace)
+}
+
+func (r *MonitoringReconciler) collectScopedClusterRBACGarbage(
+	ctx context.Context,
+	monitoring *v1alpha1.Monitoring,
+	desiredSet map[resourceKey]struct{},
+) error {
+	if targetAllocatorRBACScoperEnabled() {
+		return nil
+	}
+	roles := &rbacv1.ClusterRoleList{}
+	if err := r.List(ctx, roles, client.MatchingLabels{
+		odhLabels.PlatformPartOf: monitoringPartOf,
+	}); err != nil {
+		return fmt.Errorf("listing scoped ClusterRoles: %w", err)
+	}
+	for i := range roles.Items {
+		role := &roles.Items[i]
+		if !shouldCollectScopedClusterRBAC(monitoring, controllergvk.ClusterRole, role, scopedClusterRoleNames, desiredSet) {
+			continue
+		}
+		if err := r.Delete(ctx, role, scopedRBACDeleteOptions(role)); err != nil && !k8serr.IsNotFound(err) {
+			return fmt.Errorf("deleting scoped ClusterRole %s: %w", role.Name, err)
+		}
+	}
+
+	bindings := &rbacv1.ClusterRoleBindingList{}
+	if err := r.List(ctx, bindings, client.MatchingLabels{
+		odhLabels.PlatformPartOf: monitoringPartOf,
+	}); err != nil {
+		return fmt.Errorf("listing scoped ClusterRoleBindings: %w", err)
+	}
+	for i := range bindings.Items {
+		binding := &bindings.Items[i]
+		if !shouldCollectScopedClusterRBAC(monitoring, controllergvk.ClusterRoleBinding, binding, scopedClusterRoleBindingNames, desiredSet) {
+			continue
+		}
+		if err := r.Delete(ctx, binding, scopedRBACDeleteOptions(binding)); err != nil && !k8serr.IsNotFound(err) {
+			return fmt.Errorf("deleting scoped ClusterRoleBinding %s: %w", binding.Name, err)
+		}
+	}
+
+	return nil
+}
+
+func scopedRBACDeleteOptions(obj metav1.Object) *client.DeleteOptions {
+	uid := obj.GetUID()
+	resourceVersion := obj.GetResourceVersion()
+	return &client.DeleteOptions{
+		Preconditions: &metav1.Preconditions{
+			UID:             &uid,
+			ResourceVersion: &resourceVersion,
+		},
+	}
+}
+
+func shouldCollectScopedClusterRBAC(
+	monitoring *v1alpha1.Monitoring,
+	gvk schema.GroupVersionKind,
+	obj metav1.Object,
+	allowedNames map[string]struct{},
+	desiredSet map[resourceKey]struct{},
+) bool {
+	if _, allowed := allowedNames[obj.GetName()]; !allowed {
+		return false
+	}
+	if !isOwnedByMonitoring(monitoring, obj) {
+		return false
+	}
+
+	key := resourceKey{gvk: gvk, name: obj.GetName()}
+	_, desired := desiredSet[key]
+	return !desired
 }
 
 func (r *MonitoringReconciler) collectTargetAllocatorRBACGarbage(
@@ -853,13 +1011,21 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		predicate.NewPredicateFuncs(isOpenTelemetryOperatorNetworkPolicyEvent))
 	platformConfigPredicate := predicate.NewPredicateFuncs(isPlatformConfigMap)
 
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&v1alpha1.Monitoring{}).
-		// Watch managed resources for drift detection.
-		Watches(&rbacv1.Role{}, toSingleton, builder.WithPredicates(managedPredicate)).
-		Watches(&rbacv1.RoleBinding{}, toSingleton, builder.WithPredicates(managedPredicate)).
-		Watches(&rbacv1.ClusterRole{}, toSingleton, builder.WithPredicates(managedPredicate)).
-		Watches(&rbacv1.ClusterRoleBinding{}, toSingleton, builder.WithPredicates(managedPredicate)).
+	controller := ctrl.NewControllerManagedBy(mgr).
+		For(&v1alpha1.Monitoring{})
+
+	// In scoper mode RBAC drift belongs to the separate controller. Keep these
+	// watches only for the legacy manager-owned fallback.
+	if !targetAllocatorRBACScoperEnabled() {
+		controller = controller.
+			// Watch managed resources for drift detection.
+			Watches(&rbacv1.Role{}, toSingleton, builder.WithPredicates(managedPredicate)).
+			Watches(&rbacv1.RoleBinding{}, toSingleton, builder.WithPredicates(managedPredicate)).
+			Watches(&rbacv1.ClusterRole{}, toSingleton, builder.WithPredicates(managedPredicate)).
+			Watches(&rbacv1.ClusterRoleBinding{}, toSingleton, builder.WithPredicates(managedPredicate))
+	}
+
+	return controller.
 		Watches(&networkingv1.NetworkPolicy{}, toSingleton, builder.WithPredicates(networkPolicyPredicate)).
 		Watches(&appsv1.Deployment{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&batchv1.Job{}, toSingleton, builder.WithPredicates(managedPredicate)).

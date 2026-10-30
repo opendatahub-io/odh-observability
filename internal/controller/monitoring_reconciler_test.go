@@ -25,6 +25,7 @@ import (
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
+	odhLabels "github.com/opendatahub-io/odh-platform-utilities/pkg/metadata/labels"
 	configv1 "github.com/openshift/api/config/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -1252,6 +1253,105 @@ func TestGarbageCollectionOwnershipAndNamespaceScope(t *testing.T) {
 	withoutUID.UID = ""
 	if shouldCollectTargetAllocatorRBAC(withoutUID, staleTargetRole, nil) {
 		t.Error("GC must fail closed when the Monitoring UID is unavailable")
+	}
+}
+
+func TestScopedClusterRBACGarbageCollection(t *testing.T) {
+	scheme := newTestScheme(t)
+	monitoring := newMonitoring(v1alpha1.MonitoringInstanceName)
+	monitoring.UID = types.UID("monitoring-owner")
+	controller := true
+	ownerReference := metav1.OwnerReference{
+		APIVersion: v1alpha1.GroupVersion.String(),
+		Kind:       "Monitoring",
+		Name:       monitoring.Name,
+		UID:        monitoring.UID,
+		Controller: &controller,
+	}
+	labels := map[string]string{odhLabels.PlatformPartOf: monitoringPartOf}
+
+	clusterRole := func(name string) *rbacv1.ClusterRole {
+		return &rbacv1.ClusterRole{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            name,
+				Labels:          labels,
+				OwnerReferences: []metav1.OwnerReference{ownerReference},
+			},
+		}
+	}
+	clusterRoleBinding := func(name string) *rbacv1.ClusterRoleBinding {
+		return &rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            name,
+				Labels:          labels,
+				OwnerReferences: []metav1.OwnerReference{ownerReference},
+			},
+		}
+	}
+	otherOwnerReference := ownerReference
+	otherOwnerReference.UID = types.UID("other-monitoring")
+
+	staleRole := clusterRole("data-science-collector-mlflow-trace-export")
+	desiredRole := clusterRole("generate-processors-role")
+	otherOwnerRole := clusterRole("data-science-collector-tempo-trace-export")
+	unknownRole := clusterRole("unrelated-owned-role")
+	staleBinding := clusterRoleBinding("data-science-collector-mlflow-trace-export")
+	desiredBinding := clusterRoleBinding("generate-processors-collector-rolebinding")
+
+	otherOwnerRole.OwnerReferences = []metav1.OwnerReference{otherOwnerReference}
+	reconciler := &MonitoringReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(staleRole, desiredRole, otherOwnerRole, unknownRole, staleBinding, desiredBinding).
+			Build(),
+	}
+
+	err := reconciler.collectScopedClusterRBACGarbage(context.Background(), monitoring, map[resourceKey]struct{}{
+		{gvk: controllergvk.ClusterRole, name: desiredRole.Name}:           {},
+		{gvk: controllergvk.ClusterRoleBinding, name: desiredBinding.Name}: {},
+	})
+	if err != nil {
+		t.Fatalf("scoped RBAC garbage collection returned an error: %v", err)
+	}
+
+	for name, exists := range map[string]bool{
+		staleRole.Name:      false,
+		staleBinding.Name:   false,
+		desiredRole.Name:    true,
+		desiredBinding.Name: true,
+		otherOwnerRole.Name: true,
+		unknownRole.Name:    true,
+	} {
+		role := &rbacv1.ClusterRole{}
+		roleErr := reconciler.Get(context.Background(), types.NamespacedName{Name: name}, role)
+		binding := &rbacv1.ClusterRoleBinding{}
+		bindingErr := reconciler.Get(context.Background(), types.NamespacedName{Name: name}, binding)
+		found := roleErr == nil || bindingErr == nil
+		if found != exists {
+			t.Errorf("%s: found=%t, want %t", name, found, exists)
+		}
+	}
+}
+
+func TestScopedRBACDeleteOptionsIncludeIdentityPreconditions(t *testing.T) {
+	t.Parallel()
+
+	role := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "data-science-collector-mlflow-trace-export",
+			UID:             types.UID("scoped-role-uid"),
+			ResourceVersion: "42",
+		},
+	}
+
+	options := scopedRBACDeleteOptions(role)
+	if options.Preconditions == nil {
+		t.Fatal("scoped RBAC delete must set identity preconditions")
+	}
+	if options.Preconditions.UID == nil || *options.Preconditions.UID != role.UID {
+		t.Errorf("scoped RBAC delete UID precondition: got %v, want %s", options.Preconditions.UID, role.UID)
+	}
+	if options.Preconditions.ResourceVersion == nil || *options.Preconditions.ResourceVersion != role.ResourceVersion {
+		t.Errorf("scoped RBAC delete resourceVersion precondition: got %v, want %q", options.Preconditions.ResourceVersion, role.ResourceVersion)
 	}
 }
 

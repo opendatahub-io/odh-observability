@@ -172,6 +172,7 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		"Korrel8rSessionTimeout":          "5m",
 		"TargetAllocatorServiceAccount":   targetAllocatorServiceAccountName,
 		"TargetAllocatorSecretNamespaces": []string{monitoringNamespace},
+		"RBACScoperEnabled":               targetAllocatorRBACScoperEnabled(),
 	}
 
 	addResourceData(templateData)
@@ -285,6 +286,11 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	return templateData, nil
+}
+
+func targetAllocatorRBACScoperEnabled() bool {
+	value := os.Getenv("TARGETALLOCATOR_RBAC_SCOPER_ENABLED")
+	return value == "1" || strings.EqualFold(value, "true")
 }
 
 // addKorrel8rConfigChecksum derives the Pod-template value that restarts

@@ -46,6 +46,10 @@ spec:
               value: {{ include "odh-observability.webhookProbeNamespace" . | quote }}
             - name: GATEWAY_NAMESPACE
               value: {{ .Values.gatewayNamespace | quote }}
+            {{- if .Values.rbacScoper.enabled }}
+            - name: TARGETALLOCATOR_RBAC_SCOPER_ENABLED
+              value: "true"
+            {{- end }}
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

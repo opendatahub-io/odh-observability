@@ -38,6 +38,18 @@ resources:
 # Leader election - enable when running multiple replicas.
 leaderElect: false
 
+# Operator RBAC Toolkit integration. The protected scoper owns all dynamic
+# RoleBindings; the manager retains read-only RBAC access.
+rbacScoper:
+  enabled: true
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 10m
+      memory: 32Mi
+
 # Webhook admission policy configuration.
 # failurePolicy controls what happens when the webhook is unavailable.
 # Fail is the secure default: admission timeouts reject PodMonitor and

@@ -205,3 +205,26 @@ func TestCollectorRBACOmitsTargetAllocatorResourcesWithoutMetrics(t *testing.T) 
 		}
 	}
 }
+
+func TestCollectorRBACDefersTargetAllocatorSecretRBACToScoper(t *testing.T) {
+	resources, err := rendertemplate.Render(context.Background(), nil, []rendertemplate.TemplateSource{{
+		FS:   resourcesFS,
+		Path: CollectorRBACTemplate,
+	}}, map[string]any{
+		"Namespace":                       "redhat-ods-monitoring",
+		"Metrics":                         true,
+		"RBACScoperEnabled":               true,
+		"TargetAllocatorServiceAccount":   targetAllocatorServiceAccountName,
+		"TargetAllocatorSecretNamespaces": []string{"inference"},
+	})
+	if err != nil {
+		t.Fatalf("collector RBAC template must render in scoper mode: %v", err)
+	}
+
+	for _, resource := range resources {
+		if resource.GetName() == targetAllocatorSecretRBACName &&
+			(resource.GetKind() == "Role" || resource.GetKind() == "RoleBinding") {
+			t.Errorf("TargetAllocator Secret RBAC %s must be owned by the scoper, not the manager", resource.GetKind())
+		}
+	}
+}

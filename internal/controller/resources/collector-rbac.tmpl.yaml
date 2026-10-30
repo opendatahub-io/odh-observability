@@ -161,6 +161,7 @@ subjects:
 - kind: ServiceAccount
   name: {{.TargetAllocatorServiceAccount}}
   namespace: {{.Namespace}}
+{{ if not (index . "RBACScoperEnabled") }}
 {{ range .TargetAllocatorSecretNamespaces }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -191,5 +192,6 @@ subjects:
 - kind: ServiceAccount
   name: {{ $.TargetAllocatorServiceAccount }}
   namespace: {{ $.Namespace }}
+{{ end }}
 {{ end }}
 {{ end }}

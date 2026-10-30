@@ -11,6 +11,7 @@ require (
 	github.com/onsi/gomega v1.42.0
 	github.com/opendatahub-io/odh-platform-utilities v0.5.0
 	github.com/opendatahub-io/odh-platform-utilities/framework v0.2.0
+	github.com/opendatahub-io/operator-rbac-toolkit v0.1.1-0.20260904115409-a6a0f1459736
 	github.com/openshift/api v0.0.0-20261002115817-f8795cdde518
 	github.com/openshift/library-go v0.0.0-20261001144932-192662696fc7
 	github.com/prometheus/client_golang v1.24.0

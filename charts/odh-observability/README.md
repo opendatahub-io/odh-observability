@@ -4,13 +4,14 @@ This chart installs the odh-observability operator, which manages the full obser
 
 The chart deploys:
 - Operator Deployment
+- Protected RBAC scoper Deployment
 - ServiceAccount
 - ClusterRole and ClusterRoleBinding
 - Monitoring CRD (`services.platform.opendatahub.io/v1alpha1`)
 
 ## Prerequisites
 
-- OpenShift 4.14+ or Kubernetes 1.27+
+- OpenShift 4.17+ or Kubernetes 1.30+ with `ValidatingAdmissionPolicy` enabled
 - Helm 3
 - cert-manager (for the webhook and metrics TargetAllocator mTLS)
 
@@ -43,6 +44,7 @@ helm uninstall odh-observability --namespace odh-observability-system
 | `image.repository` | string | `"quay.io/opendatahub/odh-observability"` | Controller container image repository |
 | `image.tag` | string | `"odh-stable"` | Controller container image tag |
 | `image.pullPolicy` | string | `"Always"` | Image pull policy |
+| `rbacScoper.enabled` | bool | `true` | Deploy the protected Operator RBAC Toolkit scoper. Disable only for the legacy fallback. |
 | `gatewayNamespace` | string | `""` | Namespace containing the external router or gateway; empty uses the OpenShift ingress policy-group selector |
 | `replicaCount` | int | `1` | Number of operator replicas |
 | `resources.limits.cpu` | string | `"500m"` | CPU limit |
@@ -67,6 +69,12 @@ helm uninstall odh-observability --namespace odh-observability-system
 | `metrics.prometheusServiceAccount` | string | `data-science-monitoringstack-prometheus` | Prometheus ServiceAccount granted `get` on `/metrics`. The MonitoringStack creates it as `<monitoringstack-name>-prometheus` in `monitoringNamespace`. |
 | `metrics.serviceMonitor.enabled` | bool | `false` | Create a ServiceMonitor for operator metrics. Enable only after the `monitoring.rhobs` ServiceMonitor CRD is installed. |
 | `metrics.serviceMonitor.apiVersion` | string | `monitoring.rhobs/v1` | API version of that ServiceMonitor. |
+
+## RBAC trust boundary
+
+The manager Deployment has read-only access to Roles, RoleBindings, ClusterRoles, and ClusterRoleBindings. A separate scoper Deployment owns the dynamic TargetAllocator Secret RoleBindings and feature-dependent ClusterRoleBindings. Static ClusterRoles are chart-owned permission ceilings.
+
+ValidatingAdmissionPolicies protect the scoper ServiceAccount, Deployment, RBAC, and policies from the manager. They also prevent the manager from running a pod as the scoper or binding itself to the scoper ClusterRole. Disable `rbacScoper.enabled` only on clusters that do not support ValidatingAdmissionPolicy; that fallback restores the legacy manager-owned RBAC path.
 
 ## Network policy
 

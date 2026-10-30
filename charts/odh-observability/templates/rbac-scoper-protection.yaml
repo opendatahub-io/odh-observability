@@ -1,0 +1,239 @@
+{{- if .Values.rbacScoper.enabled }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "odh-observability.fullname" . }}-constrain-managed-clusterrolebindings
+  labels:
+    security.opendatahub.io/rbac-scoper: protected
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["clusterrolebindings"]
+  validations:
+    - expression: >-
+        request.userInfo.username != "system:serviceaccount:{{ .Values.operatorNamespace }}:{{ include "odh-observability.fullname" . }}-rbac-scoper" ||
+        (request.operation == "DELETE"
+          ? has(oldObject.metadata.labels) &&
+            oldObject.metadata.labels["operator-rbac-toolkit.io/managed"] == "true"
+          : has(object.metadata.labels) &&
+            object.metadata.labels["operator-rbac-toolkit.io/managed"] == "true" &&
+            ((object.metadata.name == "data-science-cluster-log-forwarder-collector-collect-app-logs" && object.roleRef.name == "collect-application-logs" && object.subjects[0].name == "data-science-cluster-log-forwarder-collector" && object.subjects[0].namespace == "openshift-logging") ||
+             (object.metadata.name == "data-science-cluster-log-forwarder-collector-loki-writer" && object.roleRef.name == "cluster-logging-write-application-logs" && object.subjects[0].name == "data-science-cluster-log-forwarder-collector" && object.subjects[0].namespace == "openshift-logging") ||
+             (object.metadata.name == "data-science-collector-mlflow-trace-export" && object.roleRef.name == "data-science-collector-mlflow-trace-export" && object.subjects[0].name == "data-science-collector-collector" && object.subjects[0].namespace == "{{ include "odh-observability.monitoringNamespace" . }}") ||
+             (object.metadata.name == "data-science-collector-tempo-trace-export" && object.roleRef.name == "data-science-collector-tempo-trace-export" && object.subjects[0].name == "data-science-collector-collector" && object.subjects[0].namespace == "{{ include "odh-observability.monitoringNamespace" . }}") ||
+             (object.metadata.name == "data-science-monitoringstack-alertmanager-prometheus-metrics-reader" && object.roleRef.name == "cluster-monitoring-view" && object.subjects[0].name == "data-science-monitoringstack-alertmanager" && object.subjects[0].namespace == "{{ include "odh-observability.monitoringNamespace" . }}") ||
+             (object.metadata.name == "data-science-usage-logs-processor" && object.roleRef.name == "data-science-usage-logs-processor" && object.subjects[0].name == "data-science-usage-logs-collector" && object.subjects[0].namespace == "{{ include "odh-observability.monitoringNamespace" . }}") ||
+             (object.metadata.name == "generate-processors-collector-rolebinding" && object.roleRef.name == "generate-processors-role" && object.subjects[0].name == "data-science-collector-collector" && object.subjects[0].namespace == "{{ include "odh-observability.monitoringNamespace" . }}") ||
+             (object.metadata.name == "generate-processors-targetallocator-discovery-rolebinding" && object.roleRef.name == "generate-processors-targetallocator-role" && object.subjects[0].name == "data-science-collector-targetallocator" && object.subjects[0].namespace == "{{ include "odh-observability.monitoringNamespace" . }}") ||
+             (object.metadata.name == "generate-processors-targetallocator-rolebinding" && object.roleRef.name == "generate-processors-role" && object.subjects[0].name == "data-science-collector-targetallocator" && object.subjects[0].namespace == "{{ include "odh-observability.monitoringNamespace" . }}") ||
+             (object.metadata.name == "korrel8r-auth-delegator" && object.roleRef.name == "system:auth-delegator" && object.subjects[0].name == "korrel8r" && object.subjects[0].namespace == "{{ include "odh-observability.monitoringNamespace" . }}") ||
+             (object.metadata.name == "korrel8r-query" && object.roleRef.name == "korrel8r-query" && object.subjects[0].name == "korrel8r" && object.subjects[0].namespace == "{{ include "odh-observability.monitoringNamespace" . }}")) &&
+            size(object.subjects) == 1 &&
+            object.subjects[0].kind == "ServiceAccount" &&
+            object.roleRef.apiGroup == "rbac.authorization.k8s.io" &&
+            object.roleRef.kind == "ClusterRole")
+      message: "The RBAC scoper may only create the exact managed ClusterRoleBindings."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "odh-observability.fullname" . }}-constrain-managed-clusterrolebindings
+  labels:
+    security.opendatahub.io/rbac-scoper: protected
+spec:
+  policyName: {{ include "odh-observability.fullname" . }}-constrain-managed-clusterrolebindings
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "odh-observability.fullname" . }}-constrain-targetallocator-rbac
+  labels:
+    security.opendatahub.io/rbac-scoper: protected
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["roles"]
+  validations:
+    - expression: >-
+        request.userInfo.username != "system:serviceaccount:{{ .Values.operatorNamespace }}:{{ include "odh-observability.fullname" . }}-rbac-scoper" ||
+        (request.operation == "DELETE"
+          ? oldObject.metadata.name == "data-science-collector-targetallocator-secrets" &&
+            has(oldObject.metadata.labels) &&
+            oldObject.metadata.labels["operator-rbac-toolkit.io/crossns-managed"] == "true"
+          : object.metadata.name == "data-science-collector-targetallocator-secrets" &&
+            object.metadata.labels["operator-rbac-toolkit.io/crossns-managed"] == "true" &&
+            size(object.rules) == 1 &&
+            object.rules[0].apiGroups[0] == "" &&
+            object.rules[0].resources[0] == "secrets" &&
+            object.rules[0].verbs[0] == "get" &&
+            object.rules[0].verbs[1] == "list" &&
+            object.rules[0].verbs[2] == "watch")
+      message: "The RBAC scoper may only manage the fixed TargetAllocator Secret Role."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "odh-observability.fullname" . }}-constrain-targetallocator-rbac
+  labels:
+    security.opendatahub.io/rbac-scoper: protected
+spec:
+  policyName: {{ include "odh-observability.fullname" . }}-constrain-targetallocator-rbac
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "odh-observability.fullname" . }}-constrain-targetallocator-rolebinding
+  labels:
+    security.opendatahub.io/rbac-scoper: protected
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["rolebindings"]
+  validations:
+    - expression: >-
+        request.userInfo.username != "system:serviceaccount:{{ .Values.operatorNamespace }}:{{ include "odh-observability.fullname" . }}-rbac-scoper" ||
+        (request.operation == "DELETE"
+          ? oldObject.metadata.name == "data-science-collector-targetallocator-secrets-binding" &&
+            has(oldObject.metadata.labels) &&
+            oldObject.metadata.labels["operator-rbac-toolkit.io/crossns-managed"] == "true"
+          : object.metadata.name == "data-science-collector-targetallocator-secrets-binding" &&
+            object.metadata.labels["operator-rbac-toolkit.io/crossns-managed"] == "true" &&
+            object.roleRef.apiGroup == "rbac.authorization.k8s.io" &&
+            object.roleRef.kind == "Role" &&
+            object.roleRef.name == "data-science-collector-targetallocator-secrets" &&
+            size(object.subjects) == 1 &&
+            object.subjects[0].kind == "ServiceAccount" &&
+            object.subjects[0].name == "data-science-collector-targetallocator" &&
+            object.subjects[0].namespace == "{{ include "odh-observability.monitoringNamespace" . }}")
+      message: "The RBAC scoper may only manage the fixed TargetAllocator Secret RoleBinding."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "odh-observability.fullname" . }}-constrain-targetallocator-rolebinding
+  labels:
+    security.opendatahub.io/rbac-scoper: protected
+spec:
+  policyName: {{ include "odh-observability.fullname" . }}-constrain-targetallocator-rolebinding
+  validationActions: [Deny]
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "odh-observability.fullname" . }}-protect-rbac-scoper
+  labels:
+    security.opendatahub.io/rbac-scoper: protected
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["serviceaccounts"]
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["deployments"]
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["clusterroles", "clusterrolebindings"]
+      - apiGroups: ["admissionregistration.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["validatingadmissionpolicies", "validatingadmissionpolicybindings"]
+  validations:
+    - expression: >-
+        request.userInfo.username != "system:serviceaccount:{{ .Values.operatorNamespace }}:{{ include "odh-observability.fullname" . }}" ||
+        !((request.operation == "DELETE" && has(oldObject.metadata.labels) && oldObject.metadata.labels["security.opendatahub.io/rbac-scoper"] == "protected") ||
+          (request.operation != "DELETE" && has(object.metadata.labels) && object.metadata.labels["security.opendatahub.io/rbac-scoper"] == "protected"))
+      message: "The observability manager may not modify or delete protected RBAC scoper resources."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "odh-observability.fullname" . }}-protect-rbac-scoper
+  labels:
+    security.opendatahub.io/rbac-scoper: protected
+spec:
+  policyName: {{ include "odh-observability.fullname" . }}-protect-rbac-scoper
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "odh-observability.fullname" . }}-deny-rbac-scoper-impersonation
+  labels:
+    security.opendatahub.io/rbac-scoper: protected
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  validations:
+    - expression: >-
+        request.userInfo.username != "system:serviceaccount:{{ .Values.operatorNamespace }}:{{ include "odh-observability.fullname" . }}" ||
+        ((!has(object.spec.serviceAccountName) || object.spec.serviceAccountName != "{{ include "odh-observability.fullname" . }}-rbac-scoper") &&
+          (!has(object.spec.serviceAccount) || object.spec.serviceAccount != "{{ include "odh-observability.fullname" . }}-rbac-scoper"))
+      message: "The observability manager may not run pods with the RBAC scoper ServiceAccount."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "odh-observability.fullname" . }}-deny-rbac-scoper-impersonation
+  labels:
+    security.opendatahub.io/rbac-scoper: protected
+spec:
+  policyName: {{ include "odh-observability.fullname" . }}-deny-rbac-scoper-impersonation
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "odh-observability.fullname" . }}-deny-rbac-scoper-binding
+  labels:
+    security.opendatahub.io/rbac-scoper: protected
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["rolebindings", "clusterrolebindings"]
+  validations:
+    - expression: >-
+        request.userInfo.username != "system:serviceaccount:{{ .Values.operatorNamespace }}:{{ include "odh-observability.fullname" . }}" ||
+        !has(object.roleRef) ||
+        object.roleRef.name != "{{ include "odh-observability.fullname" . }}-rbac-scoper" ||
+        !has(object.subjects) ||
+        object.subjects.all(subject, subject.kind != "ServiceAccount" || subject.name != "{{ include "odh-observability.fullname" . }}" || subject.namespace != "{{ .Values.operatorNamespace }}")
+      message: "The observability manager may not bind itself to the RBAC scoper ClusterRole."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "odh-observability.fullname" . }}-deny-rbac-scoper-binding
+  labels:
+    security.opendatahub.io/rbac-scoper: protected
+spec:
+  policyName: {{ include "odh-observability.fullname" . }}-deny-rbac-scoper-binding
+  validationActions: [Deny]
+{{- end }}

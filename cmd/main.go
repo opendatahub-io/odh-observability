@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
+	"github.com/opendatahub-io/operator-rbac-toolkit/pkg/crossns"
 	configv1 "github.com/openshift/api/config/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -68,6 +69,7 @@ func main() {
 		leaderElect    bool
 		webhookCertDir string
 		enableWebhook  bool
+		mode           string
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8443", "The address the metrics endpoint binds to.")
@@ -75,6 +77,7 @@ func main() {
 	flag.BoolVar(&leaderElect, "leader-elect", false, "Enable leader election for controller manager.")
 	flag.StringVar(&webhookCertDir, "webhook-cert-dir", "/tmp/k8s-webhook-server/serving-certs", "Directory containing the webhook TLS certificate.")
 	flag.BoolVar(&enableWebhook, "enable-webhook", false, "Enable the mutating admission webhook (requires TLS certs to be mounted).")
+	flag.StringVar(&mode, "mode", "manager", "Controller mode: manager or rbac-scoper.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -114,48 +117,67 @@ func main() {
 		os.Exit(1)
 	}
 
-	deployer := deploy.NewDeployer(
-		deploy.WithFieldOwner("monitoring"),
-		deploy.WithMode(deploy.ModeSSA),
-		deploy.WithCache(),
-		deploy.WithApplyOrder(),
-	)
+	switch mode {
+	case "manager":
+		deployer := deploy.NewDeployer(
+			deploy.WithFieldOwner("monitoring"),
+			deploy.WithMode(deploy.ModeSSA),
+			deploy.WithCache(),
+			deploy.WithApplyOrder(),
+		)
 
-	dynamicClient := dynamic.NewForConfigOrDie(cfg)
-	discoveryClient := discovery.NewDiscoveryClientForConfigOrDie(cfg)
+		dynamicClient := dynamic.NewForConfigOrDie(cfg)
+		discoveryClient := discovery.NewDiscoveryClientForConfigOrDie(cfg)
 
-	if err := (&moncontroller.MonitoringReconciler{
-		Client:          mgr.GetClient(),
-		Scheme:          mgr.GetScheme(),
-		Deployer:        deployer,
-		DynamicClient:   dynamicClient,
-		DiscoveryClient: discoveryClient,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Unable to create Monitoring controller")
-		os.Exit(1)
-	}
-
-	if enableWebhook {
-		injector := &monwebhook.Injector{
-			Client:  mgr.GetClient(),
-			Decoder: admission.NewDecoder(mgr.GetScheme()),
-		}
-		if err := injector.SetupWithManager(mgr); err != nil {
-			setupLog.Error(err, "Unable to register monitoring webhook")
+		if err := (&moncontroller.MonitoringReconciler{
+			Client:          mgr.GetClient(),
+			Scheme:          mgr.GetScheme(),
+			Deployer:        deployer,
+			DynamicClient:   dynamicClient,
+			DiscoveryClient: discoveryClient,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Unable to create Monitoring controller")
 			os.Exit(1)
 		}
 
-		// The probe namespace must carry monitoring.opendatahub.io/scrape=true for the
-		// webhook namespaceSelector to match the canary; the Helm chart provisions it.
-		if probeNamespace := os.Getenv("WEBHOOK_PROBE_NAMESPACE"); probeNamespace != "" {
-			probe := monwebhook.NewAdmissionProbe(mgr.GetClient(), probeNamespace, 5*time.Minute)
-			if err := mgr.Add(probe); err != nil {
-				setupLog.Error(err, "Unable to register webhook admission probe")
+		if enableWebhook {
+			injector := &monwebhook.Injector{
+				Client:  mgr.GetClient(),
+				Decoder: admission.NewDecoder(mgr.GetScheme()),
+			}
+			if err := injector.SetupWithManager(mgr); err != nil {
+				setupLog.Error(err, "Unable to register monitoring webhook")
 				os.Exit(1)
 			}
-		} else {
-			setupLog.Info("Webhook admission probe disabled: WEBHOOK_PROBE_NAMESPACE not set")
+
+			if probeNamespace := os.Getenv("WEBHOOK_PROBE_NAMESPACE"); probeNamespace != "" {
+				probe := monwebhook.NewAdmissionProbe(mgr.GetClient(), probeNamespace, 5*time.Minute)
+				if err := mgr.Add(probe); err != nil {
+					setupLog.Error(err, "Unable to register webhook admission probe")
+					os.Exit(1)
+				}
+			} else {
+				setupLog.Info("Webhook admission probe disabled: WEBHOOK_PROBE_NAMESPACE not set")
+			}
 		}
+	case "rbac-scoper":
+		if enableWebhook {
+			setupLog.Error(nil, "The RBAC scoper mode does not support the admission webhook")
+			os.Exit(1)
+		}
+		if err := (&moncontroller.TargetAllocatorRBACScoper{
+			Client: mgr.GetClient(),
+			Reconciler: crossns.New(mgr.GetClient(), crossns.OwnerLabel{
+				Key:   moncontroller.TargetAllocatorRBACScoperOwnerLabelKey,
+				Value: moncontroller.TargetAllocatorRBACScoperOwnerLabelValue,
+			}),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Unable to create TargetAllocator RBAC scoper")
+			os.Exit(1)
+		}
+	default:
+		setupLog.Error(nil, "Unknown controller mode", "mode", mode)
+		os.Exit(1)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
