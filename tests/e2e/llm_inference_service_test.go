@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -14,7 +15,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -160,6 +162,10 @@ func buildOatsEnv(t *testing.T, tc *TestContext) []string {
 		}
 	}
 
+	if envMap["GRAFANA_TLS_CA_FILE"] == "" {
+		envMap["GRAFANA_TLS_CA_FILE"] = writeClusterIngressCAFile(t, tc.Context(), tc.Client())
+	}
+
 	envList := make([]string, 0, len(envMap))
 	for k, v := range envMap {
 		envList = append(envList, fmt.Sprintf("%s=%s", k, v))
@@ -196,7 +202,153 @@ func getAuthToken(tc *TestContext) string {
 	return tc.AuthToken()
 }
 
-func sendCompletion(ctx context.Context, routeHost, ocToken string) error {
+func newTestTraceparent() (string, error) {
+	var traceID [16]byte
+	var parentSpanID [8]byte
+	var zeroTraceID [16]byte
+	var zeroParentSpanID [8]byte
+
+	for traceID == zeroTraceID {
+		if _, err := rand.Read(traceID[:]); err != nil {
+			return "", fmt.Errorf("generate test trace ID: %w", err)
+		}
+	}
+	for parentSpanID == zeroParentSpanID {
+		if _, err := rand.Read(parentSpanID[:]); err != nil {
+			return "", fmt.Errorf("generate test parent span ID: %w", err)
+		}
+	}
+
+	return fmt.Sprintf("00-%x-%x-01", traceID, parentSpanID), nil
+}
+
+func traceIDFromTraceparent(traceparent string) (string, error) {
+	parts := strings.Split(traceparent, "-")
+	if len(parts) != 4 || parts[0] != "00" {
+		return "", fmt.Errorf("invalid traceparent %q", traceparent)
+	}
+	if len(parts[1]) != 32 {
+		return "", fmt.Errorf("invalid trace ID in traceparent %q", traceparent)
+	}
+	return parts[1], nil
+}
+
+// traceIDForTraceQL returns the trace ID forms gcx/Tempo accept in TraceQL (hex and UUID).
+func traceIDForTraceQL(hexID string) (string, string) {
+	hex := strings.ToLower(hexID)
+	if len(hex) != 32 {
+		return hex, hex
+	}
+	uuid := fmt.Sprintf("%s-%s-%s-%s-%s", hex[0:8], hex[8:12], hex[12:16], hex[16:20], hex[20:32])
+	return hex, uuid
+}
+
+func writeOatsTraceCaseFile(t *testing.T, tag, podNamePrefix, traceID, parentSpanID string) string {
+	t.Helper()
+
+	dir := filepath.Join(t.TempDir(), tag)
+	require.NoError(t, os.MkdirAll(dir, 0o750))
+	path := filepath.Join(dir, "oats-case.yaml")
+	traceHex, _ := traceIDForTraceQL(traceID)
+	// Require the current run's trace ID as well as the pod prefix so stale spans cannot pass.
+	content := fmt.Sprintf(`name: %s vLLM tracing (run-specific)
+tags: ["e2e", "vllm", "%s"]
+
+fixture:
+  remote:
+    endpoint: default
+
+expected:
+  traces:
+    - traceql: '{ trace:id = "%s" && name = "llm_request" && resource.k8s.pod.name =~ "%s.*" && span:parentID = "%s" }'
+      count: ">= 1"
+`, tag, tag, traceHex, podNamePrefix, parentSpanID)
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	return path
+}
+
+const oatsGCXVersion = "1.2.0"
+
+var gcxVersionPattern = regexp.MustCompile(`(?:^|[^0-9A-Za-z])v?([0-9]+\.[0-9]+\.[0-9]+)(?:[^0-9A-Za-z]|$)`)
+
+func gcxHasVersion(ctx context.Context, path, expected string) bool {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, path, "--version").Output()
+	if err != nil {
+		return false
+	}
+	match := gcxVersionPattern.FindStringSubmatch(string(out))
+	return len(match) > 1 && match[1] == expected
+}
+
+func gcxTooling(ctx context.Context) (string, []string, error) {
+	if configured := os.Getenv("OATS_GCX"); configured != "" {
+		path, err := exec.LookPath(configured)
+		if err != nil {
+			return "", nil, fmt.Errorf("resolve OATS_GCX %q: %w", configured, err)
+		}
+		return path, []string{"--gcx", path, "--gcx-download", "never"}, nil
+	}
+	// Match OATS's --gcx-version resolution order: an exact version on PATH
+	// wins over the cache, otherwise OATS uses/downloads the pinned cache copy.
+	if path, err := exec.LookPath("gcx"); err == nil && gcxHasVersion(ctx, path, oatsGCXVersion) {
+		return path, []string{"--gcx-version", oatsGCXVersion, "--gcx-download", "auto"}, nil
+	}
+	cacheDir := os.Getenv("OATS_CACHE_DIR")
+	if cacheDir == "" && runtime.GOOS != "windows" {
+		if stateHome := os.Getenv("XDG_STATE_HOME"); stateHome != "" {
+			cacheDir = filepath.Join(stateHome, "oats")
+		}
+	}
+	if cacheDir == "" {
+		userCacheDir, err := os.UserCacheDir()
+		if err != nil {
+			return "", nil, fmt.Errorf("resolve OATS cache directory: %w", err)
+		}
+		cacheDir = filepath.Join(userCacheDir, "oats")
+	}
+	binaryName := "gcx"
+	if runtime.GOOS == "windows" {
+		binaryName += ".exe"
+	}
+	path := filepath.Join(cacheDir, "tools", "gcx", oatsGCXVersion, runtime.GOOS+"_"+runtime.GOARCH, binaryName)
+	// Do not pass the not-yet-downloaded path through --gcx: OATS treats an
+	// explicit missing binary as an error instead of applying its auto-download
+	// fallback. The shared cache directory and pinned version make the binary
+	// OATS downloads the same one used by the direct checks below.
+	args := []string{"--cache-dir", cacheDir, "--gcx-download", "auto", "--gcx-version", oatsGCXVersion}
+	return path, args, nil
+}
+
+func gcxBinaryPath(ctx context.Context) (string, error) {
+	path, _, err := gcxTooling(ctx)
+	return path, err
+}
+
+func assertTraceIDInTempo(ctx context.Context, t *testing.T, traceID string, oatsEnv []string) error {
+	t.Helper()
+
+	traceHex, traceUUID := traceIDForTraceQL(traceID)
+	gcxBin, err := gcxBinaryPath(ctx)
+	if err != nil {
+		return err
+	}
+	var lastErr error
+	for _, id := range []string{traceHex, traceUUID} {
+		cmd := exec.CommandContext(ctx, gcxBin, "traces", "get", id)
+		cmd.Env = oatsEnv
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Logf("gcx traces get %s succeeded (%d bytes)", id, len(out))
+			return nil
+		}
+		lastErr = fmt.Errorf("gcx traces get %s: %w\n%s", id, err, strings.TrimSpace(string(out)))
+	}
+	return lastErr
+}
+
+func sendCompletion(ctx context.Context, routeHost, ocToken string, rootCAs *x509.CertPool, traceparent ...string) error {
 	payload := map[string]any{
 		"model":       "facebook/opt-125m",
 		"prompt":      "San Francisco is a",
@@ -209,9 +361,11 @@ func sendCompletion(ctx context.Context, routeHost, ocToken string) error {
 	}
 
 	httpClient := &http.Client{
-		// ROSA route certificates are trusted by the runner's system CA bundle.
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}},
-		Timeout:   30 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    rootCAs,
+		}},
+		Timeout: 30 * time.Second,
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+routeHost+"/v1/completions", bytes.NewReader(body))
 	if err != nil {
@@ -219,25 +373,111 @@ func sendCompletion(ctx context.Context, routeHost, ocToken string) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+ocToken)
 	req.Header.Set("Content-Type", "application/json")
+	if len(traceparent) > 0 && traceparent[0] != "" {
+		req.Header.Set("Traceparent", traceparent[0])
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		responseBody, readErr := io.ReadAll(resp.Body)
+		_, readErr := io.Copy(io.Discard, io.LimitReader(resp.Body, maxInferenceServiceHTTPErrorBodyBytes))
 		if readErr != nil {
 			return fmt.Errorf("completions request to %s failed with status %d (read response body: %w)", req.URL, resp.StatusCode, readErr)
 		}
-		return fmt.Errorf("completions request to %s failed with status %d: %s", req.URL, resp.StatusCode, strings.TrimSpace(string(responseBody)))
+		return fmt.Errorf("completions request to %s failed with status %d", req.URL, resp.StatusCode)
 	}
 	return nil
 }
 
+// ensureInferenceWorkloadNamespaceScrape opts the workload namespace into tenant metrics
+// scraping. The operator excludes built-in namespaces like default from automatic enrollment.
+func ensureInferenceWorkloadNamespaceScrape(t *testing.T, tc *TestContext, namespace string) {
+	t.Helper()
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(gvk.Namespace)
+	require.NoError(t, tc.Client().Get(tc.Context(), types.NamespacedName{Name: namespace}, existing))
+	originalLabels := existing.GetLabels()
+	originalMonitoring, hadMonitoring := originalLabels[ODHLabelMonitoring]
+	originalOTLP, hadOTLP := originalLabels[otlpNamespaceLabel]
+	t.Cleanup(func() {
+		tc.EventuallyResourceCreatedOrPatched(
+			WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: namespace}),
+			WithMutateFunc(func(u *unstructured.Unstructured) error {
+				labels := u.GetLabels()
+				if labels == nil {
+					labels = map[string]string{}
+				}
+				if hadMonitoring {
+					labels[ODHLabelMonitoring] = originalMonitoring
+				} else {
+					delete(labels, ODHLabelMonitoring)
+				}
+				if hadOTLP {
+					labels[otlpNamespaceLabel] = originalOTLP
+				} else {
+					delete(labels, otlpNamespaceLabel)
+				}
+				u.SetLabels(labels)
+				return nil
+			}),
+		)
+	})
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: namespace}),
+		WithMutateFunc(func(u *unstructured.Unstructured) error {
+			labels := u.GetLabels()
+			if labels == nil {
+				labels = map[string]string{}
+			}
+			labels[ODHLabelMonitoring] = "true"
+			labels[otlpNamespaceLabel] = "true"
+			u.SetLabels(labels)
+			return nil
+		}),
+	)
+}
+
 func runOatsCase(ctx context.Context, t *testing.T, oatsBin, topology string, oatsEnv []string, projectRoot string) error {
 	t.Helper()
+	_, gcxArgs, err := gcxTooling(ctx)
+	if err != nil {
+		return err
+	}
+	args := append([]string{"-vv"}, gcxArgs...)
+	args = append(args, "--tags", topology, "--gcx-context", "default")
+	return runOats(ctx, t, oatsBin, oatsEnv, projectRoot, args)
+}
 
-	args := []string{"-vv", "--gcx-download", "auto", "--gcx-version", "v1.2.0", "--tags", topology, "--gcx-context", "default"}
+func runOatsCaseFile(ctx context.Context, t *testing.T, oatsBin, caseFile string, oatsEnv []string, projectRoot string) error {
+	t.Helper()
+
+	caseDir := filepath.Dir(caseFile)
+	configDir := filepath.Dir(caseDir)
+	relCase, err := filepath.Rel(configDir, caseFile)
+	if err != nil {
+		return fmt.Errorf("resolve OATS case path: %w", err)
+	}
+	configPath := filepath.Join(configDir, "oats-config.yaml")
+	config := fmt.Sprintf("meta:\n  version: 3\ncases:\n  - \"%s\"\n", filepath.ToSlash(relCase))
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		return fmt.Errorf("write OATS config: %w", err)
+	}
+	_, gcxArgs, err := gcxTooling(ctx)
+	if err != nil {
+		return err
+	}
+	args := make([]string, 0, 3+len(gcxArgs)+2)
+	args = append(args, "--config", configPath, "-vv")
+	args = append(args, gcxArgs...)
+	args = append(args, "--gcx-context", "default")
+	return runOats(ctx, t, oatsBin, oatsEnv, configDir, args)
+}
+
+func runOats(ctx context.Context, t *testing.T, oatsBin string, oatsEnv []string, projectRoot string, args []string) error {
+	t.Helper()
+
 	cmd := exec.CommandContext(ctx, oatsBin, args...)
 	cmd.Dir = projectRoot
 	cmd.Env = oatsEnv
@@ -246,20 +486,21 @@ func runOatsCase(ctx context.Context, t *testing.T, oatsBin, topology string, oa
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &outBuf
 
-	t.Logf("Running OATS topology %s: %s", topology, formatOatsCommand(oatsEnv, append([]string{oatsBin}, args...)))
+	t.Logf("Running OATS: %s", formatOatsCommand(oatsEnv, append([]string{oatsBin}, args...)))
 	err := cmd.Run()
 	if err != nil {
-		return fmt.Errorf("OATS topology %s failed: %w\nOutput: %s", topology, err, outBuf.String())
+		return fmt.Errorf("OATS failed: %w\nOutput: %s", err, outBuf.String())
 	}
 	return nil
 }
 
 func formatOatsCommand(env []string, args []string) string {
 	wanted := map[string]bool{
-		"GCX_TELEMETRY":  true,
-		"GRAFANA_SERVER": true,
-		"GRAFANA_ORG_ID": true,
-		"GRAFANA_TOKEN":  true,
+		"GCX_TELEMETRY":       true,
+		"GRAFANA_ORG_ID":      true,
+		"GRAFANA_SERVER":      true,
+		"GRAFANA_TLS_CA_FILE": true,
+		"GRAFANA_TOKEN":       true,
 	}
 	assignments := make([]string, 0, len(wanted))
 	for _, entry := range env {
@@ -382,14 +623,14 @@ func randomServiceName(base string) (string, error) {
 	return name, nil
 }
 
-func discoverInferenceService(tc *TestContext, llmSvcName string) (string, int64, error) {
+func discoverInferenceService(tc *TestContext, namespace, llmSvcName string) (string, int64, error) {
 	services := &unstructured.UnstructuredList{}
 	services.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ServiceList"})
 	listCtx, cancel := context.WithTimeout(tc.Context(), 10*time.Second)
 	defer cancel()
 	started := time.Now()
-	tc.t.Logf("[%s] listing Services in default for owner %q", tc.t.Name(), llmSvcName)
-	if err := tc.Client().List(listCtx, services, client.InNamespace("default")); err != nil {
+	tc.t.Logf("[%s] listing Services in %s for owner %q", tc.t.Name(), namespace, llmSvcName)
+	if err := tc.Client().List(listCtx, services, client.InNamespace(namespace)); err != nil {
 		tc.t.Logf("[%s] Service list for owner %q failed after %s: %v", tc.t.Name(), llmSvcName, time.Since(started).Round(time.Millisecond), err)
 		return "", 0, fmt.Errorf("list Services for LLMInferenceService %q: %w", llmSvcName, err)
 	}
@@ -460,14 +701,39 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 
 	llmSvcName, err := randomServiceName("facebook-opt-125m-" + topology)
 	require.NoError(t, err, "failed to generate a unique LLMInferenceService name")
-	llmSvcNN := types.NamespacedName{Name: llmSvcName, Namespace: "default"}
+	noCleanup := os.Getenv("NO_CLEANUP") == "1"
+	workloadNS := llmInferenceWorkloadNamespace()
+	proxyNS, err := randomServiceName("llmisvc-proxy")
+	require.NoError(t, err, "failed to generate a unique OAuth proxy namespace")
+	tc.EventuallyResourceCreatedOrPatched(
+		WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: proxyNS}),
+		WithMutateFunc(func(namespace *unstructured.Unstructured) error {
+			labels := namespace.GetLabels()
+			if labels == nil {
+				labels = map[string]string{}
+			}
+			labels["opendatahub.io/generated-namespace"] = "true"
+			namespace.SetLabels(labels)
+			return nil
+		}),
+	)
+	t.Cleanup(func() {
+		if noCleanup {
+			t.Logf("[%s] NO_CLEANUP=1; leaving OAuth proxy namespace %s in place", topology, proxyNS)
+			return
+		}
+		tc.DeleteResource(
+			WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: proxyNS}),
+			WithIgnoreNotFound(true),
+			WithWaitForDeletion(true),
+		)
+	})
+	llmSvcNN := types.NamespacedName{Name: llmSvcName, Namespace: workloadNS}
 	proxyName := llmSvcName + "-p"
-	proxyNN := types.NamespacedName{Name: proxyName, Namespace: "default"}
 	tlsSecretName := proxyName + "-tls"
 	cookieSecretName := proxyName + "-cookie"
 	saName := proxyName
 	bindingName := proxyName + "-auth-delegator"
-	noCleanup := os.Getenv("NO_CLEANUP") == "1"
 	t.Logf("Starting %s topology with LLMInferenceService %s", topology, llmSvcNN)
 	if topology == "multi-node" {
 		checkCtx, cancel := context.WithTimeout(tc.Context(), 10*time.Second)
@@ -483,15 +749,15 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		name string
 		ns   string
 	}{
-		{gvk.Route, proxyName, "default"}, {gvk.Deployment, proxyName, "default"}, {gvk.Service, proxyName, "default"},
-		{gvk.Secret, tlsSecretName, "default"}, {gvk.Secret, cookieSecretName, "default"}, {gvk.ClusterRoleBinding, bindingName, ""}, {gvk.ServiceAccount, saName, "default"},
-		{gvkLLMInferenceService, llmSvcName, "default"},
+		{gvk.Route, proxyName, proxyNS}, {gvk.Deployment, proxyName, proxyNS}, {gvk.Service, proxyName, proxyNS},
+		{gvk.Secret, tlsSecretName, proxyNS}, {gvk.Secret, cookieSecretName, proxyNS}, {gvk.ClusterRoleBinding, bindingName, ""}, {gvk.ServiceAccount, saName, proxyNS},
+		{gvkLLMInferenceService, llmSvcName, workloadNS},
 	}
 	// Register cleanup before creating anything so failures or aborted subtests
 	// do not leave topology-specific resources behind unless NO_CLEANUP=1.
 	t.Cleanup(func() {
 		if noCleanup {
-			logManualCleanupCommands(t, topology, llmSvcName, proxyName, tlsSecretName, cookieSecretName, bindingName, saName)
+			logManualCleanupCommands(t, topology, workloadNS, proxyNS, llmSvcName, bindingName)
 			return
 		}
 		t.Logf("[%s] Cleaning up topology resources", topology)
@@ -607,7 +873,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	var inferencePort int64
 	g.Eventually(func() error {
 		var discoveryErr error
-		inferenceService, inferencePort, discoveryErr = discoverInferenceService(tc, llmSvcName)
+		inferenceService, inferencePort, discoveryErr = discoverInferenceService(tc, workloadNS, llmSvcName)
 		return discoveryErr
 	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "generated inference Service should become discoverable")
 	t.Logf("[%s] Using inference Service %s on port %d", topology, inferenceService, inferencePort)
@@ -615,114 +881,18 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	require.NotEmpty(t, ocToken, "Kubernetes bearer token is required for the OAuth proxy request")
 
 	routeHost := llmSvcName + "." + clusterDomain
-
-	t.Logf("[%s] Creating OAuth proxy ServiceAccount and delegated-auth RBAC", topology)
-	tc.EventuallyResourceCreatedOrPatched(
-		WithMinimalObject(gvk.ServiceAccount, types.NamespacedName{Name: saName, Namespace: "default"}),
-		WithMutateFunc(func(u *unstructured.Unstructured) error {
-			u.SetAnnotations(map[string]string{"serviceaccounts.openshift.io/oauth-redirecturi." + proxyName: "https://" + routeHost + "/oauth2/callback"})
-			return nil
-		}),
-	)
-	tc.EventuallyResourceCreatedOrPatched(WithMinimalObject(gvk.ClusterRoleBinding, types.NamespacedName{Name: bindingName}), WithMutateFunc(func(u *unstructured.Unstructured) error {
-		u.Object["roleRef"] = map[string]any{"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": "system:auth-delegator"}
-		u.Object["subjects"] = []any{map[string]any{"kind": "ServiceAccount", "name": saName, "namespace": "default"}}
-		return nil
-	}))
-	t.Logf("[%s] Creating OAuth proxy cookie Secret and service-ca-backed Service", topology)
-	var sessionSecret [32]byte
-	_, err = rand.Read(sessionSecret[:])
-	require.NoError(t, err, "failed to generate OAuth session secret")
-	tc.EventuallyResourceCreatedOrPatched(
-		WithMinimalObject(gvk.Secret, types.NamespacedName{Name: cookieSecretName, Namespace: "default"}),
-		WithMutateFunc(func(u *unstructured.Unstructured) error {
-			u.Object["type"] = "Opaque"
-			u.Object["stringData"] = map[string]any{"session_secret": base64.StdEncoding.EncodeToString(sessionSecret[:])}
-			return nil
-		}),
-	)
-	tc.EventuallyResourceCreatedOrPatched(WithMinimalObject(gvk.Service, proxyNN), WithMutateFunc(func(u *unstructured.Unstructured) error {
-		u.SetAnnotations(map[string]string{"service.beta.openshift.io/serving-cert-secret-name": tlsSecretName})
-		u.Object["spec"] = map[string]any{"selector": map[string]any{"app": proxyName}, "ports": []any{map[string]any{"name": "https", "port": int64(8443), "targetPort": int64(8443)}}}
-		return nil
-	}))
 	t.Logf("[%s] Creating OAuth proxy Deployment with upstream %s", topology, inferenceService)
-	upstream := "https://" + inferenceService + ".default.svc.cluster.local:" + strconv.FormatInt(inferencePort, 10)
-	proxyArgs := []any{
-		"--provider=openshift", "--https-address=:8443", "--http-address=", "--upstream=" + upstream,
-		"--tls-cert=/etc/proxy/tls/tls.crt", "--tls-key=/etc/proxy/tls/tls.key",
-		"--cookie-secret-file=/etc/proxy/secrets/session_secret",
-		"--openshift-service-account=" + saName,
-		"--openshift-delegate-urls={\"/\":{}}",
-		"--openshift-ca=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-		"--openshift-ca=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt",
-		"--upstream-ca=/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt",
-	}
-	proxyContainer := map[string]any{
-		"name": "oauth-proxy", "image": "quay.io/openshift/origin-oauth-proxy:4.22.0", "args": proxyArgs,
-		"ports": []any{map[string]any{"name": "https", "containerPort": int64(8443)}},
-		"volumeMounts": []any{
-			map[string]any{"name": "tls", "mountPath": "/etc/proxy/tls", "readOnly": true},
-			map[string]any{"name": "session-secret", "mountPath": "/etc/proxy/secrets", "readOnly": true},
-		},
-	}
-	tc.EventuallyResourceCreatedOrPatched(WithMinimalObject(gvk.Deployment, proxyNN), WithMutateFunc(func(u *unstructured.Unstructured) error {
-		u.Object["spec"] = map[string]any{
-			"replicas": int64(1), "selector": map[string]any{"matchLabels": map[string]any{"app": proxyName}},
-			"template": map[string]any{"metadata": map[string]any{"labels": map[string]any{"app": proxyName}}, "spec": map[string]any{
-				"serviceAccountName": saName, "containers": []any{proxyContainer},
-				"volumes": []any{
-					map[string]any{"name": "tls", "secret": map[string]any{"secretName": tlsSecretName}},
-					map[string]any{"name": "session-secret", "secret": map[string]any{"secretName": cookieSecretName}},
-				},
-			}},
-		}
-		return nil
-	}))
-	t.Logf("[%s] Creating Route %s", topology, routeHost)
-	tc.EventuallyResourceCreatedOrPatched(
-		WithMinimalObject(gvk.Route, types.NamespacedName{Name: proxyName, Namespace: "default"}),
-		WithMutateFunc(func(u *unstructured.Unstructured) error {
-			u.Object["spec"] = map[string]any{
-				"host": routeHost,
-				"to":   map[string]any{"kind": "Service", "name": proxyName, "weight": int64(100)},
-				"port": map[string]any{"targetPort": "https"},
-				"tls":  map[string]any{"termination": "reencrypt", "insecureEdgeTerminationPolicy": "Redirect"},
-			}
-			return nil
-		}),
-	)
-	t.Logf("[%s] Waiting for service-ca TLS Secret", topology)
-	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.Secret, types.NamespacedName{Name: tlsSecretName, Namespace: "default"}),
-		WithCondition(jq.Match(`.data["tls.crt"] != null and .data["tls.key"] != null`)),
-	)
-	t.Logf("[%s] Waiting for OAuth proxy Deployment availability", topology)
-	tc.EnsureResourceConditionMet(gvk.Deployment, proxyNN, "Available", metav1.ConditionTrue)
-	t.Logf("[%s] Waiting for Route admission", topology)
-	g.Eventually(func() error {
-		route := &unstructured.Unstructured{}
-		route.SetGroupVersionKind(gvk.Route)
-		if err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: proxyName, Namespace: "default"}, route); err != nil {
-			return err
-		}
-		ingress, found, err := unstructured.NestedSlice(route.Object, "status", "ingress")
-		if err != nil || !found || len(ingress) == 0 {
-			return errors.New("route has not been admitted yet")
-		}
-		entry, ok := ingress[0].(map[string]any)
-		if !ok {
-			return errors.New("route admission status is malformed")
-		}
-		conditions, _, _ := unstructured.NestedSlice(entry, "conditions")
-		for _, raw := range conditions {
-			condition, ok := raw.(map[string]any)
-			if ok && condition["type"] == "Admitted" && condition["status"] == "False" {
-				return fmt.Errorf("route admission failed: %v", condition["message"])
-			}
-		}
-		return nil
-	}).Should(gomega.Succeed(), "Route %s should be admitted", routeHost)
+	upstream := fmt.Sprintf("https://%s.%s.svc.cluster.local:%d", inferenceService, workloadNS, inferencePort)
+	createOAuthProxy(t, tc, oauthProxyConfig{
+		namespace:          proxyNS,
+		proxyName:          proxyName,
+		serviceAccountName: saName,
+		bindingName:        bindingName,
+		tlsSecretName:      tlsSecretName,
+		cookieSecretName:   cookieSecretName,
+		routeHost:          routeHost,
+		upstream:           upstream,
+	})
 
 	t.Logf("[%s] Waiting for LLMInferenceService Ready=True", topology)
 	tc.EnsureResourceConditionMet(
@@ -733,27 +903,60 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		WithEventuallyTimeout(10*time.Minute),
 	)
 	t.Logf("[%s] LLMInferenceService is Ready; sending authenticated completion request", topology)
-	send := func() error { return sendCompletion(tc.Context(), routeHost, ocToken) }
+	routeCAs := ingressCAPool(t, tc.Context(), tc.Client())
+	send := func() error { return sendCompletion(tc.Context(), routeHost, ocToken, routeCAs) }
 	g.Eventually(send, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Should successfully send completion request through OAuth proxy")
+	var tracedRequestTraceID string
+	var tracedRequestParentSpanID string
+	if topology == "single-node" {
+		traceparent, err := newTestTraceparent()
+		require.NoError(t, err, "failed to generate randomized test trace context")
+		tracedRequestTraceID, err = traceIDFromTraceparent(traceparent)
+		require.NoError(t, err, "failed to parse trace ID from traceparent")
+		tracedRequestParentSpanID, err = parentSpanIDFromTraceparent(traceparent)
+		require.NoError(t, err, "failed to parse parent span ID from traceparent")
+		t.Logf("[%s] Sending completion request with trace ID %s", topology, tracedRequestTraceID)
+		g.Eventually(func() error {
+			return sendCompletion(tc.Context(), routeHost, ocToken, routeCAs, traceparent)
+		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Should successfully send completion request with traceparent through OAuth proxy")
+	}
 
 	// 3. Verification via OATS
 	t.Logf("[%s] Running OATS verification", topology)
 	g.Eventually(func() error {
+		if tracedRequestTraceID != "" {
+			casePath := writeOatsTraceCaseFile(t, topology, llmSvcName, tracedRequestTraceID, tracedRequestParentSpanID)
+			return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
+		}
 		return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
-	}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "OATS verification should succeed within 2 minutes")
+	}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "OATS verification should succeed within 2 minutes")
+	if tracedRequestTraceID != "" {
+		// OATS prepares the platform-appropriate gcx binary before this direct
+		// trace lookup runs.
+		g.Eventually(func() error {
+			return assertTraceIDInTempo(tc.Context(), t, tracedRequestTraceID, oatsEnv)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "injected trace ID should be retrievable from Tempo via gcx")
+		g.Eventually(func() error {
+			return assertVLLMSpanHasInjectedParent(tc.Context(), tracedRequestTraceID, tracedRequestParentSpanID, oatsEnv)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "vLLM llm_request span should retain the injected parent span ID")
+	}
 
 	// 4. Pod Termination & Scrape Recovery
-	t.Logf("[%s] Restarting vLLM pod for scrape recovery", topology)
-	restartVLLMPod(t, tc, "default", llmSvcName)
+	if topology == "single-node" {
+		t.Logf("[%s] Trace validation complete; skipping metrics-only scrape recovery", topology)
+	} else {
+		t.Logf("[%s] Restarting vLLM pod for scrape recovery", topology)
+		restartVLLMPod(t, tc, workloadNS, llmSvcName)
 
-	t.Logf("[%s] Sending completion request after pod restart", topology)
-	g.Eventually(func() error {
-		return send()
-	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Second completion request should succeed after pod restart")
+		t.Logf("[%s] Sending completion request after pod restart", topology)
+		g.Eventually(func() error {
+			return send()
+		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Second completion request should succeed after pod restart")
 
-	g.Eventually(func() error {
-		return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
-	}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "Scrape recovery verification should succeed after pod restart")
+		g.Eventually(func() error {
+			return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
+		}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "Scrape recovery verification should succeed after pod restart")
+	}
 
 	// 5. Teardown & PodMonitor Cleanup
 	if noCleanup {
@@ -766,7 +969,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	g.Eventually(func() bool {
 		pmList := &unstructured.UnstructuredList{}
 		pmList.SetGroupVersionKind(gvk.PodMonitorCoreos)
-		if err := tc.Client().List(tc.Context(), pmList, client.InNamespace("default")); err != nil {
+		if err := tc.Client().List(tc.Context(), pmList, client.InNamespace(workloadNS)); err != nil {
 			return true
 		}
 		for _, pm := range pmList.Items {
@@ -778,13 +981,15 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	}, 1*time.Minute, 2*time.Second).Should(gomega.BeTrue(), "Associated PodMonitor should be deleted within 1 reconciliation cycle of LLMInferenceService deletion")
 }
 
-func logManualCleanupCommands(t *testing.T, topology, llmSvcName, proxyName, tlsSecretName, cookieSecretName, bindingName, saName string) {
+func logManualCleanupCommands(t *testing.T, topology, workloadNS, proxyNS, llmSvcName, bindingName string) {
 	t.Helper()
 	t.Logf(
-		"[%s] NO_CLEANUP=1; retained resources: LLMInferenceService/%s, Route/%s, Deployment/%s, "+
-			"Service/%s, Secrets/%s and %s, ServiceAccount/%s, ClusterRoleBinding/%s",
-		topology, llmSvcName, proxyName, proxyName, proxyName,
-		tlsSecretName, cookieSecretName, saName, bindingName,
+		"[%s] NO_CLEANUP=1; retained LLMInferenceService/%s in namespace %s, OAuth proxy resources in namespace %s, and ClusterRoleBinding/%s",
+		topology, llmSvcName, workloadNS, proxyNS, bindingName,
+	)
+	t.Logf(
+		"[%s] Manual cleanup: oc delete llminferenceservice %s -n %s; oc delete namespace %s; oc delete clusterrolebinding %s",
+		topology, llmSvcName, workloadNS, proxyNS, bindingName,
 	)
 }
 
@@ -881,7 +1086,7 @@ func requireNamespacesMatchExistingDSCI(t *testing.T, tc *TestContext) {
 // operator builds a namespace-scoped cache when its pod starts, so a namespace created later
 // fails every module deploy with "unknown namespace for the cache" -- which surfaces only as
 // odh-observability never appearing, several minutes into the run.
-func warnIfOperatorPredatesNamespace(t *testing.T, tc *TestContext, namespace string) {
+func warnIfOperatorPredatesNamespace(t *testing.T, tc *TestContext, platformOp platformOperator, namespace string) {
 	t.Helper()
 
 	ns, err := tc.fetchResource(t, gvk.Namespace, types.NamespacedName{Name: namespace})
@@ -890,7 +1095,7 @@ func warnIfOperatorPredatesNamespace(t *testing.T, tc *TestContext, namespace st
 	}
 	pods := &unstructured.UnstructuredList{}
 	pods.SetGroupVersionKind(gvk.Pod.GroupVersion().WithKind(gvk.Pod.Kind + "List"))
-	if err := tc.Client().List(tc.Context(), pods, client.InNamespace(odhOperatorNamespace)); err != nil {
+	if err := tc.Client().List(tc.Context(), pods, client.InNamespace(platformOp.Namespace)); err != nil {
 		return
 	}
 
@@ -906,8 +1111,8 @@ func warnIfOperatorPredatesNamespace(t *testing.T, tc *TestContext, namespace st
 		t.Logf("WARNING: namespace %s was created at %s but %s/%s started at %s; the operator's "+
 			"namespace cache predates it and module deploys will fail with \"unknown namespace "+
 			"for the cache\". Run: oc rollout restart deploy/%s -n %s",
-			namespace, ns.GetCreationTimestamp().Format(time.RFC3339), odhOperatorNamespace,
-			pod.GetName(), started, odhOperatorDeployment, odhOperatorNamespace)
+			namespace, ns.GetCreationTimestamp().Format(time.RFC3339), platformOp.Namespace,
+			pod.GetName(), started, platformOp.Deployment, platformOp.Namespace)
 		return
 	}
 }
@@ -930,6 +1135,12 @@ func inferenceMonitoringNamespace() string {
 		return testOpts.monitoringNamespace
 	}
 	return defaultInferenceMonitoringNamespace
+}
+
+// llmInferenceWorkloadNamespace is where LLMInferenceService e2e deploys workloads so
+// PodMonitors are scraped as tenant metrics (built-in namespaces like default are excluded).
+func llmInferenceWorkloadNamespace() string {
+	return inferenceApplicationsNamespace()
 }
 
 func inferenceApplicationsNamespace() string {
@@ -1402,11 +1613,11 @@ func installInferenceOperators(t *testing.T, tc *TestContext) {
 // pointed at the same namespaces the prerequisites used. It can only run after dsci.yaml: the
 // ODH operator deploys odh-observability in response to the DSCI monitoring stanza, and the
 // applications namespace is the operator's to create.
-func requireObservabilityAgreesOnNamespaces(t *testing.T, tc *TestContext) {
+func requireObservabilityAgreesOnNamespaces(t *testing.T, tc *TestContext, platformOp platformOperator) {
 	t.Helper()
 
 	for _, namespace := range []string{inferenceApplicationsNamespace(), inferenceMonitoringNamespace()} {
-		warnIfOperatorPredatesNamespace(t, tc, namespace)
+		warnIfOperatorPredatesNamespace(t, tc, platformOp, namespace)
 	}
 
 	// Nothing else reconciles the Monitoring CR, so without this the waits that follow spend
@@ -1419,6 +1630,24 @@ func requireObservabilityAgreesOnNamespaces(t *testing.T, tc *TestContext) {
 			"spec.monitoring.namespace=%q; the operator will refuse to reconcile the Monitoring CR",
 			operatorMonitoringNamespace, inferenceMonitoringNamespace())
 	}
+}
+
+func requireUsageLogsMonitoringReady(t *testing.T, tc *TestContext) {
+	t.Helper()
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
+		WithCondition(gomega.And(
+			jq.Match(`.spec.namespace == %q`, inferenceMonitoringNamespace()),
+			jq.Match(`.spec.usageLogs.storage.secretName == %q`, lokiS3SecretName),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
+				platformcommon.ConditionTypeProvisioningSucceeded, metav1.ConditionTrue),
+			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
+				platformcommon.ConditionTypeDegraded, metav1.ConditionFalse),
+			jq.Match(`(.status.usageLogsEndpoint // "") != ""`),
+		)),
+		WithEventuallyTimeout(10*time.Minute),
+		WithCustomErrorMsg("Monitoring %s should expose a usage logs endpoint and not be Degraded", tc.MonitoringCRName),
+	)
 }
 
 func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot string) {
@@ -1435,6 +1664,11 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	t.Logf("Inference prerequisites use applicationsNamespace=%s, monitoring.namespace=%s, storageClassName=%s",
 		inferenceApplicationsNamespace(), inferenceMonitoringNamespace(), inferenceStorageClassName)
 	requireNamespacesMatchExistingDSCI(t, tc)
+
+	platformOp, err := detectPlatformOperator(tc.Context(), tc.Client())
+	require.NoError(t, err, "platform operator must be installed before inference prerequisites")
+	t.Logf("Using platform operator deployment %s/%s (webhook Service %s/%s)",
+		platformOp.Namespace, platformOp.Deployment, platformOp.Namespace, platformOp.WebhookService)
 
 	waitFor := func(description string, gvk schema.GroupVersionKind, nn types.NamespacedName, condition string, timeout ...time.Duration) {
 		wait := 5 * time.Minute
@@ -1501,7 +1735,8 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	// usage logs is the difference between reading a run's log and guessing.
 	logUsageLogsPropagation(t, tc)
 
-	requireObservabilityAgreesOnNamespaces(t, tc)
+	requireObservabilityAgreesOnNamespaces(t, tc, platformOp)
+	ensureInferenceWorkloadNamespaceScrape(t, tc, llmInferenceWorkloadNamespace())
 
 	if testOpts.applyMonitoringManifest {
 		applyMonitoringManifest(t, tc, dir)
@@ -1529,25 +1764,7 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	// write the Monitoring spec yourself, but this test does not: the spec propagates
 	// DSCI -> opendatahub-operator -> Monitoring. The guard above only proves the stanza
 	// survived the DSCI CRD, so confirm the ask landed here before trusting Degraded.
-	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.Monitoring, types.NamespacedName{Name: tc.MonitoringCRName}),
-		WithCondition(gomega.And(
-			jq.Match(`.spec.namespace == %q`, inferenceMonitoringNamespace()),
-			jq.Match(`.spec.usageLogs.storage.secretName == %q`, lokiS3SecretName),
-			// Every action function runs before AggregateReady in the same pass, so
-			// ProvisioningSucceeded=True means the feature conditions Degraded reads are from
-			// this reconcile. The early-return paths skip the aggregation and leave them stale.
-			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
-				platformcommon.ConditionTypeProvisioningSucceeded, metav1.ConditionTrue),
-			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
-				platformcommon.ConditionTypeDegraded, metav1.ConditionFalse),
-			// Implied by the above, but asserted directly because it is the artifact the envoy
-			// filter consumes. An absent field compares as null, so default it first.
-			jq.Match(`(.status.usageLogsEndpoint // "") != ""`),
-		)),
-		WithEventuallyTimeout(10*time.Minute),
-		WithCustomErrorMsg("Monitoring %s should expose a usage logs endpoint and not be Degraded", tc.MonitoringCRName),
-	)
+	requireUsageLogsMonitoringReady(t, tc)
 	waitFor(
 		"DSC default-dsc should be Ready",
 		schema.GroupVersionKind{
@@ -1604,9 +1821,9 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 	}
 	applyPrerequisite("lgtm.yaml")
 	waitFor(
-		"opendatahub-operator should be Available",
+		fmt.Sprintf("platform operator %s/%s should be Available", platformOp.Namespace, platformOp.Deployment),
 		schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"},
-		types.NamespacedName{Name: odhOperatorDeployment, Namespace: odhOperatorNamespace},
+		types.NamespacedName{Name: platformOp.Deployment, Namespace: platformOp.Namespace},
 		"Available",
 	)
 	waitFor(
@@ -1616,7 +1833,7 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 		"Available",
 	)
 	for _, endpoint := range []struct{ service, namespace string }{
-		{odhOperatorWebhookService, odhOperatorNamespace},
+		{platformOp.WebhookService, platformOp.Namespace},
 		{"kserve-webhook-server-service", inferenceApplicationsNamespace()},
 		{"llmisvc-webhook-server-service", inferenceApplicationsNamespace()},
 		{"lgtm", inferenceMonitoringNamespace()},

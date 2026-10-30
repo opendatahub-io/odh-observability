@@ -2553,10 +2553,37 @@ func runStorageIsolationTests(t *testing.T, ns string, tests []storageIsolationT
 			if !errors.As(err, &conflict) {
 				t.Fatalf("expected a *storageConflictError, got %T (%v)", err, err)
 			}
-			if !strings.Contains(err.Error(), tt.wantBuckets) {
-				t.Errorf("error should name the shared location %q, got %v", tt.wantBuckets, err)
+			if !slices.Contains(conflict.shared, tt.wantBuckets) {
+				t.Errorf("conflict should include the shared location %q, got %v", tt.wantBuckets, conflict.shared)
 			}
 		})
+	}
+}
+
+func TestStorageConflictDoesNotExposeSecretLocation(t *testing.T) {
+	const namespace = "test-ns"
+	s := newActionsTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = namespace
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{Storage: &v1alpha1.LokiStorageConfig{SecretName: "usage-secret"}}
+	m.Spec.Logs = &v1alpha1.Logs{Storage: &v1alpha1.LokiStorageConfig{SecretName: "logs-secret"}}
+	endpoint := "https://user:password@s3.example.com/private-token"
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		lokiStorageSecret("usage-secret", namespace, endpoint, "shared-bucket"),
+		lokiStorageSecret("logs-secret", namespace, endpoint, "shared-bucket"),
+	).Build()
+	_, err := validateStorageIsolation(context.Background(), cli, m, conditions.NewConditionsManager(m, m.Generation))
+	if err == nil {
+		t.Fatal("expected storage conflict")
+	}
+	for _, message := range []string{err.Error(),
+		findCondition(m, conditions.ConditionLokiStackAvailable).Message,
+		findCondition(m, conditions.ConditionUsageLogsLokiStackAvailable).Message} {
+		for _, secret := range []string{"password", "private-token", "s3.example.com", "shared-bucket"} {
+			if strings.Contains(message, secret) {
+				t.Errorf("conflict message exposes secret location: %q", message)
+			}
+		}
 	}
 }
 
@@ -3213,7 +3240,7 @@ func TestDeployUsageLogsCollector_NoUsageLogs(t *testing.T) {
 	}
 }
 
-func TestDeployUsageLogsCollector_NoStorage(t *testing.T) {
+func TestDeployUsageLogsCollector_NoStorageNoExporters(t *testing.T) {
 	s := newActionsTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.UsageLogs = &v1alpha1.UsageLogs{}
@@ -3228,7 +3255,7 @@ func TestDeployUsageLogsCollector_NoStorage(t *testing.T) {
 	}
 
 	if len(sources) != 0 {
-		t.Errorf("expected no sources when usageLogs has no storage, got %d", len(sources))
+		t.Errorf("expected no sources when usageLogs asks for neither a store nor forwarding, got %d", len(sources))
 	}
 
 	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
@@ -3929,5 +3956,346 @@ func TestHasReadyConditionAcceptsNamespacedConditionType(t *testing.T) {
 	}
 	if !ready {
 		t.Fatal("hasReadyCondition returned false for a namespaced Ready condition")
+	}
+}
+
+// TestDeployUsageLogsCollector_RemoteExporters covers the dual-write: custom
+// exporters get their own pipeline off the shared receiver, cluster identity is
+// stamped after the cleanup stage that deletes cluster_name, and the local write
+// keeps the record shape its dashboards and tenancy proxy expect.
+func usageLogsCredentialSecret() *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "hub-usage-logs-auth",
+			Namespace: "test-ns",
+		},
+		Data: map[string][]byte{"token": []byte("not-a-real-token")},
+	}
+}
+
+// A named credential the cluster does not have yet withholds the collector instead of
+// letting it fail to mount, and names the Secret it is waiting for. On a fresh spoke
+// this is the window between the chart naming the Secret and ACM delivering it.
+func TestDeployUsageLogsCollector_CredentialSecretMissing(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Exporters: map[string]runtime.RawExtension{
+			"otlphttp/hub": {Raw: []byte(`{"endpoint":"https://hub.example.com/api/logs/v1/infrastructure/otlp"}`)},
+		},
+		CredentialSecret: "hub-usage-logs-auth",
+	}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployUsageLogsCollector(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 0 {
+		t.Errorf("expected no sources while the credential Secret is absent, got %d", len(sources))
+	}
+
+	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
+	if c == nil {
+		t.Fatal("expected UsageLogsCollectorAvailable condition to be set")
+		return
+	}
+	if c.Status != metav1.ConditionFalse {
+		t.Errorf("expected status False, got %s", c.Status)
+	}
+	if c.Reason != conditions.CredentialNotFoundReason {
+		t.Errorf("expected reason %s, got %s", conditions.CredentialNotFoundReason, c.Reason)
+	}
+	if !strings.Contains(c.Message, "hub-usage-logs-auth") {
+		t.Errorf("message must name the Secret being waited for, got %q", c.Message)
+	}
+}
+
+func TestDeployUsageLogsCollector_RemoteExporters(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{
+			Type:           "s3",
+			SecretName:     "usage-logs-secret",
+			CredentialMode: "static",
+		},
+		Size: "1x.demo",
+		Exporters: map[string]runtime.RawExtension{
+			"otlphttp/hub": {Raw: []byte(`{"endpoint":"https://hub.example.com/api/logs/v1/infrastructure/otlp"}`)},
+		},
+		Attributes: map[string]string{
+			"cluster_name": "jeyoungspoke1",
+			"cluster_id":   "eea5f0b3-5982-4eb1-b256-8e2443f7b3a0",
+		},
+		CredentialSecret: "hub-usage-logs-auth",
+	}
+	m.Status.UsageLogsEndpoint = usageLogsEndpoint
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(kubernetesAPIServerEndpointSlice(), usageLogsCredentialSecret()).Build()
+	if err := deployUsageLogsCollector(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("deployUsageLogsCollector error: %v", err)
+	}
+
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("buildTemplateData error: %v", err)
+	}
+	if got := data["LokiStackSize"]; got != "1x.demo" {
+		t.Errorf("LokiStackSize: want 1x.demo, got %v", got)
+	}
+	objects, err := rendertemplate.Render(context.Background(), s, sources, data)
+	if err != nil {
+		t.Fatalf("rendering usage logs templates: %v", err)
+	}
+
+	var collector *unstructured.Unstructured
+	for i := range objects {
+		if objects[i].GetKind() == "OpenTelemetryCollector" {
+			collector = objects[i].DeepCopy()
+		}
+	}
+	if collector == nil {
+		t.Fatal("no OpenTelemetryCollector rendered")
+	}
+
+	exporters, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "exporters")
+	if _, ok := exporters["otlphttp/hub"]; !ok {
+		t.Errorf("custom exporter missing; got %v", slices.Sorted(maps.Keys(exporters)))
+	}
+	if _, ok := exporters["otlphttp/loki"]; !ok {
+		t.Error("local exporter must survive alongside the remote one")
+	}
+
+	pipelines, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "service", "pipelines")
+	remote, ok := pipelines["logs/remote"].(map[string]any)
+	if !ok {
+		t.Fatalf("logs/remote pipeline missing; got %v", slices.Sorted(maps.Keys(pipelines)))
+	}
+	if recv, _, _ := unstructured.NestedStringSlice(remote, "receivers"); !slices.Equal(recv, []string{"otlp"}) {
+		t.Errorf("logs/remote must share the otlp receiver, got %v", recv)
+	}
+	if exp, _, _ := unstructured.NestedStringSlice(remote, "exporters"); !slices.Equal(exp, []string{"otlphttp/hub"}) {
+		t.Errorf("logs/remote exporters: want [otlphttp/hub], got %v", exp)
+	}
+
+	// Identity must come after transform/cleanup, which deletes cluster_name.
+	procs, _, _ := unstructured.NestedStringSlice(remote, "processors")
+	cleanup := slices.Index(procs, "transform/cleanup")
+	identity := slices.Index(procs, "resource/usage_logs_remote")
+	if cleanup < 0 || identity < 0 || identity < cleanup {
+		t.Errorf("resource/usage_logs_remote must run after transform/cleanup, got %v", procs)
+	}
+
+	// And it must not touch the local pipeline.
+	local, _ := pipelines["logs"].(map[string]any)
+	localProcs, _, _ := unstructured.NestedStringSlice(local, "processors")
+	if slices.Contains(localProcs, "resource/usage_logs_remote") {
+		t.Errorf("cluster identity leaked into the local write: %v", localProcs)
+	}
+	if exp, _, _ := unstructured.NestedStringSlice(local, "exporters"); !slices.Equal(exp, []string{"otlphttp/loki"}) {
+		t.Errorf("local pipeline exporters changed: %v", exp)
+	}
+
+	// The credential is mounted, not inlined: a bearertokenauth instance reading a
+	// file, so a rotated Secret reaches the running collector.
+	exts, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "extensions")
+	if _, ok := exts["bearertokenauth/remote"]; !ok {
+		t.Errorf("bearertokenauth/remote extension missing; got %v", slices.Sorted(maps.Keys(exts)))
+	}
+	if fn, _, _ := unstructured.NestedString(exts, "bearertokenauth/remote", "filename"); fn != "/var/run/secrets/usage-logs-remote/token" {
+		t.Errorf("unexpected credential path %q", fn)
+	}
+	if enabled, _, _ := unstructured.NestedStringSlice(collector.Object, "spec", "config", "service", "extensions"); !slices.Contains(enabled, "bearertokenauth/remote") {
+		t.Errorf("bearertokenauth/remote not enabled in service.extensions: %v", enabled)
+	}
+	vols, _, _ := unstructured.NestedSlice(collector.Object, "spec", "volumes")
+	if len(vols) != 1 {
+		t.Fatalf("expected one volume for the credential, got %v", vols)
+	}
+	vol, ok := vols[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected the volume to be an object, got %T", vols[0])
+	}
+	if name, _, _ := unstructured.NestedString(vol, "secret", "secretName"); name != "hub-usage-logs-auth" {
+		t.Errorf("volume does not reference the credential Secret: %v", vols[0])
+	}
+	// The authenticator is attached by the controller, not written by the user:
+	// exporter configs are validated against an allowlist that excludes auth.
+	if a, _, _ := unstructured.NestedString(exporters, "otlphttp/hub", "auth", "authenticator"); a != "bearertokenauth/remote" {
+		t.Errorf("controller did not attach the authenticator to the exporter, got %q", a)
+	}
+
+	// The local write must keep using the collector's own ServiceAccount token.
+	if fn, _, _ := unstructured.NestedString(exts, "bearertokenauth", "filename"); fn != "/var/run/secrets/kubernetes.io/serviceaccount/token" {
+		t.Errorf("local write credential changed: %q", fn)
+	}
+}
+
+// TestDeployUsageLogsCollector_CredentialWithoutExporters covers a credential set
+// with nothing to authenticate. The mount must not be rendered: there is no remote
+// write to carry it, and a Secret that does not exist yet would leave the collector
+// in ContainerCreating on FailedMount, taking the cluster-local write down with it.
+// Forwarding only, with no cluster-local store at all. The collector must deploy
+// without waiting for a LokiStack endpoint nothing will ever publish, render only the
+// remote pipeline, and say which mode it is in.
+func TestDeployUsageLogsCollector_ForwardingOnly(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Exporters: map[string]runtime.RawExtension{
+			"otlphttp/hub": {Raw: []byte(`{"endpoint":"https://hub.example.com/api/logs/v1/infrastructure/otlp"}`)},
+		},
+		Attributes:       map[string]string{"cluster_name": "jeyoungspoke1"},
+		CredentialSecret: "hub-usage-logs-auth",
+	}
+	// Deliberately empty: no LokiStack is deployed here, so nothing ever sets it.
+	m.Status.UsageLogsEndpoint = ""
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(kubernetesAPIServerEndpointSlice(), usageLogsCredentialSecret()).Build()
+	if err := deployUsageLogsCollector(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("deployUsageLogsCollector error: %v", err)
+	}
+
+	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
+	if c == nil || c.Status != metav1.ConditionTrue || c.Reason != "ForwardingOnly" {
+		t.Fatalf("UsageLogsCollectorAvailable: want True/ForwardingOnly, got %v", c)
+	}
+
+	var pipelineSources []rendertemplate.TemplateSource
+	if err := deployUsageLogsLokiStack(context.Background(), cli, m,
+		conditions.NewConditionsManager(m, m.Generation), &pipelineSources); err != nil {
+		t.Fatalf("deployUsageLogsLokiStack error: %v", err)
+	}
+	if len(pipelineSources) != len(sources) {
+		t.Errorf("forwarding alone must render only collector resources, got %d sources, want %d", len(pipelineSources), len(sources))
+	}
+
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("buildTemplateData error: %v", err)
+	}
+	if got := data["UsageLogs"]; got != false {
+		t.Errorf("UsageLogs: want false without storage, got %v", got)
+	}
+	if got := data["UsageLogsEndpoint"]; got != "" {
+		t.Errorf("UsageLogsEndpoint: want empty without storage, got %v", got)
+	}
+
+	objects, err := rendertemplate.Render(context.Background(), s, sources, data)
+	if err != nil {
+		t.Fatalf("rendering usage logs templates: %v", err)
+	}
+
+	var collector *unstructured.Unstructured
+	for i := range objects {
+		if objects[i].GetKind() == "OpenTelemetryCollector" {
+			collector = objects[i].DeepCopy()
+		}
+	}
+	if collector == nil {
+		t.Fatal("no OpenTelemetryCollector rendered")
+	}
+
+	exporters, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "exporters")
+	if _, ok := exporters["otlphttp/loki"]; ok {
+		t.Error("the local exporter must not render without storage")
+	}
+	if _, ok := exporters["otlphttp/hub"]; !ok {
+		t.Errorf("remote exporter missing; got %v", slices.Sorted(maps.Keys(exporters)))
+	}
+
+	pipelines, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "service", "pipelines")
+	if _, ok := pipelines["logs"]; ok {
+		t.Error("the local pipeline must not render without storage: an empty exporter list is invalid collector config")
+	}
+	remote, ok := pipelines["logs/remote"].(map[string]any)
+	if !ok {
+		t.Fatalf("logs/remote pipeline missing; got %v", slices.Sorted(maps.Keys(pipelines)))
+	}
+	if exp, _, _ := unstructured.NestedStringSlice(remote, "exporters"); !slices.Equal(exp, []string{"otlphttp/hub"}) {
+		t.Errorf("logs/remote exporters: want [otlphttp/hub], got %v", exp)
+	}
+}
+
+func TestDeployUsageLogsCollector_CredentialWithoutExporters(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{
+			Type:           "s3",
+			SecretName:     "usage-logs-secret",
+			CredentialMode: "static",
+		},
+		CredentialSecret: "hub-usage-logs-auth",
+	}
+	m.Status.UsageLogsEndpoint = usageLogsEndpoint
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
+	if err := deployUsageLogsCollector(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("deployUsageLogsCollector error: %v", err)
+	}
+
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("buildTemplateData error: %v", err)
+	}
+	objects, err := rendertemplate.Render(context.Background(), s, sources, data)
+	if err != nil {
+		t.Fatalf("rendering usage logs templates: %v", err)
+	}
+
+	var collector *unstructured.Unstructured
+	for i := range objects {
+		if objects[i].GetKind() == "OpenTelemetryCollector" {
+			collector = objects[i].DeepCopy()
+		}
+	}
+	if collector == nil {
+		t.Fatal("no OpenTelemetryCollector rendered")
+	}
+
+	if vols, found, _ := unstructured.NestedSlice(collector.Object, "spec", "volumes"); found && len(vols) > 0 {
+		t.Errorf("credential mounted with no exporter to authenticate: %v", vols)
+	}
+	if mounts, found, _ := unstructured.NestedSlice(collector.Object, "spec", "volumeMounts"); found && len(mounts) > 0 {
+		t.Errorf("credential mount rendered with no exporter to authenticate: %v", mounts)
+	}
+
+	exts, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "extensions")
+	if _, present := exts["bearertokenauth/remote"]; present {
+		t.Error("bearertokenauth/remote declared with no exporter to authenticate")
+	}
+	if enabled, _, _ := unstructured.NestedStringSlice(collector.Object, "spec", "config", "service", "extensions"); slices.Contains(enabled, "bearertokenauth/remote") {
+		t.Errorf("bearertokenauth/remote enabled with no exporter to authenticate: %v", enabled)
+	}
+
+	// The local write is untouched: still one pipeline, still the SA token.
+	pipelines, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "service", "pipelines")
+	if _, present := pipelines["logs/remote"]; present {
+		t.Error("logs/remote pipeline rendered with no exporters")
+	}
+	if fn, _, _ := unstructured.NestedString(exts, "bearertokenauth", "filename"); fn != "/var/run/secrets/kubernetes.io/serviceaccount/token" {
+		t.Errorf("local write credential changed: %q", fn)
 	}
 }

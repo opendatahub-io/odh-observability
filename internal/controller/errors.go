@@ -81,14 +81,13 @@ type storageConflictError struct {
 	shared    []string
 }
 
-// Error names the claimants generically and then explains the Loki-specific
-// consequence, which is the accurate one while every claimant is a LokiStack.
+// Error names the claimants without exposing the Secret-derived locations.
 func (e *storageConflictError) Error() string {
 	return fmt.Sprintf(
-		"%s resolve to the same object storage [%s]: "+
+		"%s resolve to the same object storage: "+
 			"both LokiStacks serve the \"application\" tenant and Loki keys objects by tenant rather than by stack, "+
 			"so they would overwrite each other's index and chunks. Give each stack its own bucket",
-		strings.Join(e.claimants, " and "), strings.Join(e.shared, ", "))
+		strings.Join(e.claimants, " and "))
 }
 
 func (e *storageConflictError) conditionReason() string {

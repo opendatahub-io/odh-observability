@@ -72,35 +72,12 @@ spec:
               static_configs:
               - targets: ['127.0.0.1:8888']
       {{- if .Metrics }}
+      {{- if and .AcceleratorMetrics .BuiltinDCGMScrapeEnabled }}
       prometheus:
         config:
           scrape_configs:
-            - job_name: 'data-science-collector-prometheus'
-              bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
-              kubernetes_sd_configs:
-                - role: pod
-              metrics_path: /metrics
-              relabel_configs:
-                - action: keep
-                  regex: true
-                  source_labels: [__meta_kubernetes_pod_label_monitoring_opendatahub_io_scrape]
-                # EPP metrics are collected by KServe's authorized ServiceMonitor.
-                # Exclude scheduler pods here to avoid a second, unauthorized scrape.
-                - action: drop
-                  regex: 'llminferenceservice-router-scheduler'
-                  source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
-                - action: replace
-                  regex: '([^:]+)(?::\d+)?'
-                  replacement: '$1:8080'
-                  source_labels: [__address__]
-                  target_label: __address__
-              scrape_interval: 30s
-              scrape_timeout: 10s
-              tls_config:
-                insecure_skip_verify: true
-            {{- if .AcceleratorMetrics }}
             - job_name: 'dcgm-exporter-accelerator-metrics'
-              bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+              scheme: http
               kubernetes_sd_configs:
                 - role: pod
                   namespaces:
@@ -132,9 +109,13 @@ spec:
                   action: keep
               scrape_interval: 30s
               scrape_timeout: 10s
-              tls_config:
-                insecure_skip_verify: true
-            {{- end }}
+      {{- else }}
+      # TargetAllocator supplies selected monitor scrapes. Leave its receiver
+      # config absent; a present config block requires scrape_configs. The
+      # target_allocator block keeps the receiver non-null for operator validation.
+      prometheus:
+        target_allocator: {}
+      {{- end }}
       {{- end }}
       otlp:
         protocols:
@@ -182,25 +163,24 @@ spec:
             statements:
               - delete_key(attributes, "k8s_namespace_name")
               - delete_key(attributes, "k8s_pod_name")
-      # The dcgm-exporter job's k8s.namespace.name/k8s.pod.name identify the
-      # exporter pod in nvidia-gpu-operator, not the workload consuming the
-      # GPU (that attribution already reaches Prometheus as
-      # exported_namespace/exported_pod). Deleting the attributes makes the
-      # ServiceMonitor promotion a no-op for accelerator series (its regex
-      # (.+) requires the label to exist), keeping them on their existing
-      # labels. node and component are untouched because Korrel8r correlates
-      # DCGM series by node. service.name is set by the prometheus receiver
-      # from the job target label assigned by the dcgm scrape job's
-      # relabeling. This processor runs in the scrape pipeline only: the
-      # scoping label is receiver-derived there, but an OTLP pusher would
-      # control service.name and could use it to opt out of pod attribution.
+      # Monitor relabelings can set the job target label, which the Prometheus
+      # receiver maps to service.name; that name alone is not trusted. Only
+      # exclude exporter identity when Kubernetes enrichment identifies the
+      # target in nvidia-gpu-operator. Those attributes identify the exporter
+      # pod, not the workload consuming the GPU (that attribution already
+      # reaches Prometheus as exported_namespace/exported_pod). Removing them
+      # makes the ServiceMonitor promotion a no-op for accelerator series,
+      # while node/component remain for Korrel8r. Delete pod first because the
+      # namespace guard on the next statement still needs k8s.namespace.name.
+      # This transform stays in the scrape pipeline; OTLP pushers use a
+      # separate sanitizer and cannot opt out of pod attribution this way.
       transform/exclude_dcgm_k8s_labels:
         error_mode: propagate
         metric_statements:
           - context: resource
             statements:
-              - delete_key(attributes, "k8s.namespace.name") where attributes["service.name"] == "rhoai-accelerator-metrics"
-              - delete_key(attributes, "k8s.pod.name") where attributes["service.name"] == "rhoai-accelerator-metrics"
+              - delete_key(attributes, "k8s.pod.name") where attributes["service.name"] == "rhoai-accelerator-metrics" and attributes["k8s.namespace.name"] == "nvidia-gpu-operator"
+              - delete_key(attributes, "k8s.namespace.name") where attributes["service.name"] == "rhoai-accelerator-metrics" and attributes["k8s.namespace.name"] == "nvidia-gpu-operator"
       # OTLP pushers also control their resource attributes, and
       # k8sattributes only fills absent/empty attributes, so client-supplied
       # identity attributes would survive enrichment and poison the labels

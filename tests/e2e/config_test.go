@@ -37,6 +37,11 @@ type TestContextConfig struct {
 	dsciCRName              string
 	cooChannel              string
 	compatibilityReport     string
+	upgradeEnabled          bool
+	upgradeOperators        string
+	upgradeCOOChannel       string
+	upgradeTempoChannel     string
+	upgradeReport           string
 	Timeouts                TestTimeouts
 }
 
@@ -57,6 +62,11 @@ func (c *TestContextConfig) registerFlags() {
 	flag.StringVar(&c.dsciCRName, "dsci-cr-name", "default-dsci", "name of the DSCInitialization CR (DSC mode only)")
 	flag.StringVar(&c.cooChannel, "coo-channel", "", "OLM channel for Cluster Observability Operator (default: stable)")
 	flag.StringVar(&c.compatibilityReport, "compatibility-report", "", "optional path to write JSON compatibility diagnostics (always logged on failure)")
+	flag.BoolVar(&c.upgradeEnabled, "upgrade-enabled", false, "run in-place OLM upgrade survivability test (TestOLMUpgradeSurvivability); requires explicit enable")
+	flag.StringVar(&c.upgradeOperators, "upgrade-operators", "coo,tempo", "comma-separated operators to upgrade: coo, tempo")
+	flag.StringVar(&c.upgradeCOOChannel, "upgrade-coo-channel", "", "target OLM channel for Cluster Observability Operator (empty skips COO upgrade)")
+	flag.StringVar(&c.upgradeTempoChannel, "upgrade-tempo-channel", "", "target OLM channel for Tempo Operator (empty skips Tempo upgrade)")
+	flag.StringVar(&c.upgradeReport, "upgrade-report", "", "optional path to write JSON upgrade survivability diagnostics (always logged on failure)")
 
 	flag.DurationVar(&c.Timeouts.defaultEventuallyTimeout, "eventually-timeout", 0, "default eventually timeout")
 	flag.DurationVar(&c.Timeouts.defaultEventuallyPollInterval, "eventually-poll-interval", 0, "default eventually poll interval")
@@ -74,6 +84,23 @@ func (c *TestContextConfig) validate() error {
 	if c.compatibilityReport != "" {
 		if _, err := resolveCompatibilityReportPath(c.compatibilityReport); err != nil {
 			return fmt.Errorf("invalid compatibility-report: %w", err)
+		}
+	}
+	if c.upgradeReport != "" {
+		if _, err := resolveCompatibilityReportPath(c.upgradeReport); err != nil {
+			return fmt.Errorf("invalid upgrade-report: %w", err)
+		}
+	}
+	if c.upgradeEnabled {
+		if c.installOperators {
+			return errors.New("upgrade-enabled requires -install-operators=false; upgrade operators and operands must exist before the baseline")
+		}
+		operators, err := parseUpgradeOperators(c.upgradeOperators)
+		if err != nil {
+			return fmt.Errorf("invalid upgrade-operators: %w", err)
+		}
+		if !upgradeConfigHasTargetChannel(*c, operators) {
+			return errors.New("upgrade-enabled requires at least one target channel (-upgrade-coo-channel or -upgrade-tempo-channel) for the selected -upgrade-operators")
 		}
 	}
 	if err := validateForbiddenCompatibilityGateOverrides(); err != nil {
@@ -99,8 +126,28 @@ func (c *TestContextConfig) applyDefaults() {
 		c.Timeouts.defaultConsistentlyPollInterval = 2 * time.Second
 	}
 	if c.Timeouts.olmOperationTimeout <= 0 {
-		c.Timeouts.olmOperationTimeout = 5 * time.Minute
+		if c.upgradeEnabled {
+			c.Timeouts.olmOperationTimeout = 30 * time.Minute
+		} else {
+			c.Timeouts.olmOperationTimeout = 5 * time.Minute
+		}
 	}
+}
+
+func upgradeConfigHasTargetChannel(c TestContextConfig, operators []string) bool {
+	for _, operator := range operators {
+		switch operator {
+		case upgradeOperatorCOO:
+			if strings.TrimSpace(c.upgradeCOOChannel) != "" {
+				return true
+			}
+		case upgradeOperatorTempo:
+			if strings.TrimSpace(c.upgradeTempoChannel) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func compatibilityReportBaseDir() (string, error) {

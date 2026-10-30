@@ -519,12 +519,14 @@ func TestLokiStackTemplatesRenderIndependentStorage(t *testing.T) {
 		"LokiStorageType":           "s3",
 		"LokiStorageCredentialMode": "static",
 		"LokiStorageClassName":      "logs-sc",
+		"LogsLokiStackSize":         "1x.small",
 
 		"UsageLogsLokiStackName":             usageLogsLokiStackResourceName,
 		"UsageLogsLokiStorageSecretName":     "usage-logs-secret",
 		"UsageLogsLokiStorageType":           "s3",
 		"UsageLogsLokiStorageCredentialMode": "token",
 		"UsageLogsLokiStorageClassName":      "usage-logs-sc",
+		"LokiStackSize":                      "1x.demo",
 	}
 
 	tests := []struct {
@@ -534,6 +536,7 @@ func TestLokiStackTemplatesRenderIndependentStorage(t *testing.T) {
 		credentialMode  string
 		storageClass    string
 		storageTypeName string
+		size            string
 	}{
 		{
 			template:        LokiStackTemplate,
@@ -542,6 +545,7 @@ func TestLokiStackTemplatesRenderIndependentStorage(t *testing.T) {
 			credentialMode:  "static",
 			storageClass:    "logs-sc",
 			storageTypeName: "s3",
+			size:            "1x.small",
 		},
 		{
 			template:        UsageLogsLokiStackTemplate,
@@ -550,6 +554,7 @@ func TestLokiStackTemplatesRenderIndependentStorage(t *testing.T) {
 			credentialMode:  "token",
 			storageClass:    "usage-logs-sc",
 			storageTypeName: "s3",
+			size:            "1x.demo",
 		},
 	}
 
@@ -568,6 +573,7 @@ func TestLokiStackTemplatesRenderIndependentStorage(t *testing.T) {
 				{[]string{"spec", "storage", "secret", "type"}, tt.storageTypeName},
 				{[]string{"spec", "storage", "secret", "credentialMode"}, tt.credentialMode},
 				{[]string{"spec", "storageClassName"}, tt.storageClass},
+				{[]string{"spec", "size"}, tt.size},
 				// Both stacks serve the same tenant, which is why they cannot
 				// share a bucket; checkStorageIsolation depends on it.
 				{[]string{"spec", "tenants", "mode"}, "openshift-logging"},
@@ -607,16 +613,21 @@ func TestLokiStackTemplatesCarryComponentLabel(t *testing.T) {
 		"LokiStorageType":                    "s3",
 		"LokiStorageCredentialMode":          "static",
 		"LokiStorageClassName":               "logs-sc",
+		"LogsLokiStackSize":                  "1x.extra-small",
 		"UsageLogsLokiStackName":             usageLogsLokiStackResourceName,
 		"UsageLogsLokiStorageSecretName":     "usage-logs-secret",
 		"UsageLogsLokiStorageType":           "s3",
 		"UsageLogsLokiStorageCredentialMode": "token",
 		"UsageLogsLokiStorageClassName":      "usage-logs-sc",
+		"LokiStackSize":                      "1x.demo",
 		"Korrel8rName":                       Korrel8rServiceName,
 		// The usage logs gateway policy names the collector as its only peer.
 		"UsageLogsCollectorName":               "data-science-usage-logs",
 		"UsageLogs":                            true,
 		"UsageLogsEndpoint":                    "https://usage-logs.example.com/otlp",
+		"UsageLogsCredentialSecret":            "",
+		"UsageLogsExporterNames":               []string{},
+		"UsageLogsAttributeNames":              []string{},
 		"CollectorReplicas":                    1,
 		"CollectorCPURequest":                  "100m",
 		"CollectorCPULimit":                    "500m",

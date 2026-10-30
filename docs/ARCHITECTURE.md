@@ -53,7 +53,62 @@ If any required operator is missing, `MonitoringDependenciesReady` is set to Fal
 
 The metrics TargetAllocator selects labeled ServiceMonitors and PodMonitors cluster-wide because KServe creates its scheduler monitors and per-workload TLS monitors in inference workload namespaces. The collector ServiceAccount has no Secret permissions. A separate TargetAllocator ServiceAccount receives the OpenTelemetry Operator discovery permissions through a dedicated ClusterRole plus namespace-scoped Roles for the current namespace set; an upgrade-safe legacy binding is retained because ClusterRoleBinding role references are immutable. It is configured with the same `secretNamespaces` allowlist, and namespace events trigger reconciliation so new namespaces receive the binding. `denyFSAccessThroughSMs` prevents selected monitors from making the collector expose file-backed credentials.
 
+Workload metrics are collected through eligible ServiceMonitor and PodMonitor resources. A pod label alone does not create a scrape target; workloads must expose a monitor that specifies the metrics endpoint, port, and any required authentication or TLS settings. Namespaces opt into monitor selection with `monitoring.opendatahub.io/scrape=true`, and the admission webhook adds the matching label to monitors created there.
+
 The TargetAllocator uses mTLS by default, with cert-manager provisioning its CA, serving, and client certificates. The collector is configured only with the HTTPS TargetAllocator endpoint. The upstream TargetAllocator may also expose its non-mTLS discovery port, but `allowInsecureAuthSecrets` remains disabled so authenticated ServiceMonitor credentials cannot be returned over plaintext HTTP.
+
+### HTTPS DCGM exporter scraping
+
+The built-in DCGM scrape uses unauthenticated HTTP on port 9400 by default. For clusters configured with a direct HTTPS DCGM endpoint, disable only that built-in job and select a ServiceMonitor or PodMonitor instead. Ensure the monitor's namespace is opted in with `monitoring.opendatahub.io/scrape=true`, label the monitor `monitoring.opendatahub.io/scrape: "true"`, and reference a CA Secret rather than a file path; the TargetAllocator has permission to read selected monitor Secrets in allowed namespaces, while `denyFSAccessThroughSMs` blocks file-backed credentials.
+
+TargetAllocator Prometheus CR discovery supports the `monitoring.coreos.com/v1` API group. The webhook also labels `monitoring.rhobs/v1` monitors, but those are not discovered by TargetAllocator.
+
+Example PodMonitor (adapt selector, port, CA Secret, and server name to the installed exporter):
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: dcgm-exporter-https
+  namespace: nvidia-gpu-operator
+  labels:
+    monitoring.opendatahub.io/scrape: "true"
+spec:
+  namespaceSelector:
+    matchNames: [nvidia-gpu-operator]
+  selector:
+    matchLabels:
+      app: nvidia-dcgm-exporter
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      scheme: https
+      interval: 30s
+      scrapeTimeout: 10s
+      tlsConfig:
+        ca:
+          secret:
+            name: dcgm-exporter-ca
+            key: ca.crt
+        serverName: nvidia-dcgm-exporter.nvidia-gpu-operator.svc
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        - sourceLabels: [__meta_kubernetes_pod_label_app]
+          targetLabel: component
+        - targetLabel: job
+          replacement: rhoai-accelerator-metrics
+      metricRelabelings:
+        - sourceLabels: [__name__]
+          regex: '(DCGM_FI_DEV_GPU_TEMP|DCGM_FI_DEV_GPU_UTIL|DCGM_FI_PROF_GR_ENGINE_ACTIVE|DCGM_FI_DEV_MEM_COPY_UTIL|DCGM_FI_DEV_FB_USED|DCGM_FI_DEV_FB_FREE|DCGM_FI_DEV_POWER_USAGE|DCGM_FI_DEV_SM_CLOCK|DCGM_FI_DEV_MEM_CLOCK)'
+          action: keep
+```
+
+Set `spec.metrics.builtinDCGMScrapeEnabled: false` on a standalone `Monitoring` resource, or `spec.monitoring.metrics.builtinDCGMScrapeEnabled: false` on `DSCInitialization`, when this monitor scrapes the same DCGM targets. Omit the field (or set it to `true`) to retain built-in HTTP scraping. The namespace relabel supports namespace-proxy queries. The monitor keeps the `rhoai-accelerator-metrics` job identity, node/component labels, and DCGM metric filter expected by accelerator processing and recording rules. The collector suppresses exporter-pod attribution only for targets discovered in `nvidia-gpu-operator`; using this job label elsewhere does not disable namespace/pod attribution. Do not add a bearer token for the collector ServiceAccount: it is used for Kubernetes discovery, not DCGM authentication. If the exporter requires authentication, configure the monitor's Secret-backed `authorization` or `basicAuth`; TargetAllocator transfers those credentials only over mTLS. Never configure `insecureSkipVerify` or file-backed credential paths. The certificate must chain to the referenced CA and match `serverName`.
+
+Prometheus follows redirects by default, so the built-in scrape keeps that behavior for compatibility. HTTPS-only DCGM endpoints should use a monitor with explicit TLS trust and hostname settings rather than relying on an HTTP-to-HTTPS redirect. Keep built-in scraping enabled only when it does not duplicate the monitor's target.
 
 ## Action Functions
 

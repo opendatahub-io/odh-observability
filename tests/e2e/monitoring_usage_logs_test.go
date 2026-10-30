@@ -42,7 +42,7 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 		// Set up the resources the validation tests share once. The two LokiStacks
 		// have independent storage, so the fixture serves one bucket per stack.
 		tc.startSeaweedFS(t, lokiS3Bucket, logsS3Bucket)
-		t.Run("Setup UsageLogs resources", func(t *testing.T) {
+		if !t.Run("Setup UsageLogs resources", func(t *testing.T) {
 			tc = tc.WithT(t)
 			tc.setupUsageLogsWithStorage(t, "s3", usageLogsLokiSecretName)
 
@@ -63,7 +63,9 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 					Namespace: tc.MonitoringNamespace,
 				}),
 			)
-		})
+		}) {
+			return
+		}
 
 		// All validation tests run against the same resources (read-only)
 		// LokiStack tests run first since OTEL depends on LokiStack
@@ -76,7 +78,9 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 
 		// Log forwarding owns a second, independent LokiStack. It is configured on
 		// top of the usage logs setup so the two are exercised side by side.
-		t.Run("Setup log forwarding resources", tc.setupLogsLokiStack)
+		if !t.Run("Setup log forwarding resources", tc.setupLogsLokiStack) {
+			return
+		}
 		t.Run("Validate log forwarding LokiStack deployment", tc.ValidateLogsLokiStackDeployment)
 		t.Run("Validate log forwarding LokiStack configuration", tc.ValidateLogsLokiStackConfiguration)
 		t.Run("Validate optional ClusterLogForwarder and Vector contract", tc.ValidateClusterLogForwarderContract)
@@ -493,7 +497,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLokiStackDeployment(t *testing.T) 
 		}),
 		WithCondition(And(
 			tc.monitoringOwnerReferencesCondition(),
-			jq.Match(`.spec.size == "1x.extra-small"`),
+			jq.Match(`.spec.size == "1x.demo"`),
 			jq.Match(`.spec.storage.secret.type == "s3"`),
 			jq.Match(`.spec.storage.secret.credentialMode == "static"`),
 			jq.Match(`.spec.storageClassName == "%s"`, tc.DefaultStorageClass),

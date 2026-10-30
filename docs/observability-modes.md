@@ -287,6 +287,8 @@ Metrics, traces, and `dsci.logs` can be set from Helm / `DSCInitialization`. Log
    > chunks. Using two secrets is not enough — the operator compares the resolved `endpoint` and `bucketnames`, and
    > refuses to reconcile with `StorageConflict` on `LokiStackAvailable` and `UsageLogsLokiStackAvailable` when they
    > overlap.
+   > Endpoint aliases for the same backend cannot be detected. Changing a Secret used by an existing stack can also
+   > change its storage before the operator detects a conflict; keep the buckets separate when updating Secrets.
 
 2. Create a secret in the monitoring namespace (`redhat-ods-monitoring`) with **all** of these keys (required by the Monitoring API):
 
@@ -329,6 +331,9 @@ spec:
       credentialMode: static
       storageClassName: gp3-csi  # API default; change if your cluster uses a different StorageClass
 ```
+
+   On the Monitoring resource, `spec.logs.size` defaults to `1x.extra-small`. Set it to `1x.demo` for a smaller,
+   non-redundant stack on development clusters. `spec.usageLogs.size` controls the usage-log stack independently.
 
 4. Confirm `LokiStackAvailable` and `ClusterLogForwarderAvailable` are `True` on the Monitoring resource (`oc get monitoring default-monitoring -o yaml`).
 5. Label the monitoring namespace for privileged Pod Security so OpenShift Logging collectors can use `hostPath` volumes:

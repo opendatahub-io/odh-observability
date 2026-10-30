@@ -18,11 +18,41 @@ spec:
       memory: {{.CollectorMemoryRequest}}
   networkPolicy:
     enabled: false
+{{- if and .UsageLogsCredentialSecret .UsageLogsExporterNames }}
+
+  # Remote-write credential, mounted rather than inlined. Nothing secret reaches the
+  # collector object, and the extension below re-reads the file, so rotating the
+  # Secret reaches a running collector.
+  #
+  # Gated on there being an exporter to authenticate. A credential on its own has
+  # nothing to do, and mounting a Secret that may not exist yet would leave the
+  # collector in ContainerCreating on FailedMount — which takes the cluster-local
+  # write down with it, since both pipelines share one deployment.
+  volumes:
+    - name: usage-logs-remote-credential
+      secret:
+        secretName: {{ .UsageLogsCredentialSecret }}
+        items:
+          - key: token
+            path: token
+  volumeMounts:
+    - name: usage-logs-remote-credential
+      mountPath: /var/run/secrets/usage-logs-remote
+      readOnly: true
+{{- end }}
 
   config:
     extensions:
       bearertokenauth:
         filename: /var/run/secrets/kubernetes.io/serviceaccount/token
+{{- if and .UsageLogsCredentialSecret .UsageLogsExporterNames }}
+      # Authenticates the remote write. An exporter selects it with
+      # auth: {authenticator: bearertokenauth/remote}. The local write above keeps
+      # using the collector's own ServiceAccount token, authorized by this cluster;
+      # this one carries an identity from the receiving cluster.
+      bearertokenauth/remote:
+        filename: /var/run/secrets/usage-logs-remote/token
+{{- end }}
 
     receivers:
       otlp:
@@ -165,6 +195,20 @@ spec:
       # 7. Batch logs for optimal export performance
       batch: {}
 
+{{- if .UsageLogsAttributeNames }}
+      # 8. Identity for records leaving the cluster. Runs after transform/cleanup,
+      # which deletes cluster_name and node_name: the gateway stamps its own upstream
+      # cluster on those keys, so a fleet identity merged in earlier would be removed
+      # here. upsert, not insert, so the value wins over anything already present.
+      resource/usage_logs_remote:
+        attributes:
+{{- range .UsageLogsAttributeNames }}
+          - action: upsert
+            key: {{ . }}
+            value: {{ printf "%q" (index $.UsageLogsAttributes .) }}
+{{- end }}
+{{- end }}
+
     exporters:
 {{- if .UsageLogs}}
       otlphttp/loki:
@@ -176,9 +220,20 @@ spec:
         headers:
           "X-Scope-OrgID": "application"
 {{- end}}
+{{- range .UsageLogsExporterNames }}
+      {{ . }}:
+{{ index $.UsageLogsExporters . | indent 8 }}
+{{- if $.UsageLogsCredentialSecret }}
+        # Attached here rather than written by the user: exporter configs are
+        # validated against an allowlist that excludes auth, and the authenticator
+        # name is an implementation detail of the mount below.
+        auth:
+          authenticator: bearertokenauth/remote
+{{- end }}
+{{- end }}
 
     service:
-      extensions: [bearertokenauth]
+      extensions: [bearertokenauth{{ if and .UsageLogsCredentialSecret .UsageLogsExporterNames }}, bearertokenauth/remote{{ end }}]
       telemetry:
         metrics:
           readers:
@@ -189,10 +244,28 @@ spec:
                     port: 8888
 
       pipelines:
+{{- if .UsageLogs}}
+        # The cluster-local write. Gated as a whole, not just on its exporter: a
+        # pipeline with an empty exporter list is rejected by the collector, so a
+        # cluster that only forwards must not render this at all.
         logs:
           receivers: [otlp]
           processors: [memory_limiter, resource, groupbyattrs/upstream_host, transform, k8sattributes, transform/gateway_k8sattributes, k8sattributes/upstream_pod, transform/upstream_pod_k8sattributes, transform/cleanup, groupbyattrs/maas, batch]
           exporters:
-{{- if .UsageLogs}}
             - otlphttp/loki
 {{- end}}
+{{- if .UsageLogsExporterNames }}
+        # The forwarding write: a pipeline on the same receiver, alongside the local
+        # one above when storage is configured and alone when it is not. It repeats
+        # the enrichment chain rather than branching after it: the processors above
+        # are per-pipeline, and omitting them would drop log_type, which is one of
+        # the few attributes Loki promotes to an index label — the record would
+        # arrive and then be unfindable.
+        logs/remote:
+          receivers: [otlp]
+          processors: [memory_limiter, resource, groupbyattrs/upstream_host, transform, k8sattributes, transform/gateway_k8sattributes, k8sattributes/upstream_pod, transform/upstream_pod_k8sattributes, transform/cleanup{{ if .UsageLogsAttributeNames }}, resource/usage_logs_remote{{ end }}, groupbyattrs/maas, batch]
+          exporters:
+{{- range .UsageLogsExporterNames }}
+            - {{ . }}
+{{- end }}
+{{- end }}

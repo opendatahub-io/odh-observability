@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,9 +26,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 
@@ -269,7 +269,7 @@ func (tc *MonitoringTestCtx) validateDashboardProxyAPIs(t *testing.T, report *co
 	route := tc.FetchResource(WithMinimalObject(gvk.Route, types.NamespacedName{Name: prometheusDashboardRouteName, Namespace: tc.MonitoringNamespace}))
 	report.PrometheusRouteHost = prometheusDashboardRouteHost(route)
 
-	persesBody, persesStatus, err := tc.kubernetesServiceGET(tc.MonitoringNamespace, PersesName, persesServicePort, "/api/v1/health", false)
+	persesBody, persesStatus, err := tc.persesServiceGET(t, "/api/v1/health")
 	if err != nil {
 		failCompatibilityGate(t, report, "Perses health request failed", err)
 	}
@@ -287,7 +287,7 @@ func (tc *MonitoringTestCtx) validateDashboardProxyAPIs(t *testing.T, report *co
 		t.Fatalf("%s: %v", report.FailedAssertion, err)
 	}
 
-	projectsBody, projectsStatus, err := tc.kubernetesServiceGET(tc.MonitoringNamespace, PersesName, persesServicePort, "/api/v1/projects", false)
+	projectsBody, projectsStatus, err := tc.persesServiceGET(t, "/api/v1/projects")
 	if err != nil {
 		failCompatibilityGate(t, report, "Perses projects API request failed", err)
 	}
@@ -426,7 +426,7 @@ func (tc *MonitoringTestCtx) enrichPersesOperandSnapshot(t *testing.T, report *c
 func (tc *MonitoringTestCtx) enrichDashboardProbeSnapshot(t *testing.T, report *cooCompatibilityReport) {
 	t.Helper()
 	if report.PersesProbe == "" {
-		_, status, err := tc.kubernetesServiceGET(tc.MonitoringNamespace, PersesName, persesServicePort, "/api/v1/health", false)
+		_, status, err := tc.persesServiceGET(t, "/api/v1/health")
 		if err != nil {
 			report.CompatibilityNotes = append(report.CompatibilityNotes, "Perses probe: "+err.Error())
 		} else {
@@ -780,48 +780,81 @@ func (tc *MonitoringTestCtx) optionalCRDAvailable(g schema.GroupVersionKind) (bo
 	return false, err
 }
 
-func (tc *MonitoringTestCtx) kubernetesServiceGET(namespace, service string, port int, path string, tls bool) (string, int, error) {
-	if err := validateKubernetesNamespace(namespace); err != nil {
-		return "", 0, err
-	}
-	if err := validateKubernetesServiceName(service); err != nil {
-		return "", 0, err
-	}
+func (tc *MonitoringTestCtx) persesServiceGET(t *testing.T, path string) (string, int, error) {
+	t.Helper()
 	if err := validateKubernetesProxyPath(path); err != nil {
 		return "", 0, err
 	}
 
-	cfg, err := ctrlcfg.GetConfig()
+	name := fmt.Sprintf("perses-api-probe-%x", time.Now().UnixNano())
+	nn := types.NamespacedName{Name: name, Namespace: observabilityOpNamespace}
+	url := fmt.Sprintf("http://%s.%s.svc:%d%s", PersesName, tc.MonitoringNamespace, persesServicePort, path)
+	script := fmt.Sprintf(`set -eu
+status=$(curl --noproxy '*' -sS -o /tmp/body -w '%%{http_code}' %q)
+printf 'HTTP_STATUS=%%s\n' "$status"
+cat /tmp/body`, url)
+
+	t.Cleanup(func() {
+		tc.DeleteResource(WithMinimalObject(gvk.Pod, nn), WithIgnoreNotFound(true))
+	})
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: observabilityOpNamespace,
+			Labels:    map[string]string{"app.kubernetes.io/name": "perses-operator"},
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy:   corev1.RestartPolicyNever,
+			SecurityContext: fixturePodSecurityContext(),
+			Containers: []corev1.Container{{
+				Name:            "probe",
+				Image:           fakeGCSClientImage,
+				Command:         []string{"/bin/sh", "-c"},
+				Args:            []string{script},
+				SecurityContext: fixtureContainerSecurityContext(),
+			}},
+		},
+	}
+	if err := tc.Client().Create(tc.Context(), pod); err != nil {
+		return "", 0, fmt.Errorf("create Perses API probe pod: %w", err)
+	}
+
+	var phase corev1.PodPhase
+	err := wait.PollUntilContextTimeout(tc.Context(), 2*time.Second, 3*time.Minute, true, func(ctx context.Context) (bool, error) {
+		current := &corev1.Pod{}
+		if err := tc.Client().Get(ctx, nn, current); err != nil {
+			if k8serr.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		phase = current.Status.Phase
+		return phase == corev1.PodSucceeded || phase == corev1.PodFailed, nil
+	})
 	if err != nil {
-		return "", 0, err
+		return "", 0, fmt.Errorf("wait for Perses API probe pod (last phase %q): %w", phase, err)
 	}
-	httpClient, err := rest.HTTPClientFor(cfg)
+
+	logs, err := tc.podLogTail(nn, "probe", 1000)
 	if err != nil {
-		return "", 0, err
+		return "", 0, fmt.Errorf("read Perses API probe logs after phase %q: %w", phase, err)
 	}
-	requestURL, err := kubernetesServiceProxyURL(cfg.Host, namespace, service, port, path, tls)
+	if phase != corev1.PodSucceeded {
+		return "", 0, fmt.Errorf("Perses API probe pod failed: %s", logs)
+	}
+	return parseHTTPProbeLog(logs)
+}
+
+func parseHTTPProbeLog(logs string) (string, int, error) {
+	statusLine, body, found := strings.Cut(logs, "\n")
+	if !found || !strings.HasPrefix(statusLine, "HTTP_STATUS=") {
+		return "", 0, fmt.Errorf("probe output does not start with HTTP status: %q", logs)
+	}
+	status, err := strconv.Atoi(strings.TrimPrefix(statusLine, "HTTP_STATUS="))
 	if err != nil {
-		return "", 0, err
+		return "", 0, fmt.Errorf("parse probe HTTP status: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(tc.Context(), compatibilityHTTPRequestTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
-	if err != nil {
-		return "", 0, err
-	}
-	if token := tc.AuthToken(); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return "", 0, err
-	}
-	defer resp.Body.Close()
-	body, err := readLimitedHTTPBody(resp.Body)
-	if err != nil {
-		return "", resp.StatusCode, err
-	}
-	return string(body), resp.StatusCode, nil
+	return body, status, nil
 }
 
 func (tc *MonitoringTestCtx) podLogTail(nn types.NamespacedName, container string, lines int64) (string, error) {
@@ -1057,20 +1090,6 @@ func sanitizeLogExcerpt(logs string) string {
 	return out
 }
 
-func validateKubernetesNamespace(namespace string) error {
-	if errs := validation.IsDNS1123Subdomain(namespace); len(errs) > 0 {
-		return fmt.Errorf("invalid namespace %q: %s", namespace, strings.Join(errs, "; "))
-	}
-	return nil
-}
-
-func validateKubernetesServiceName(service string) error {
-	if errs := validation.IsDNS1123Subdomain(service); len(errs) > 0 {
-		return fmt.Errorf("invalid service name %q: %s", service, strings.Join(errs, "; "))
-	}
-	return nil
-}
-
 func validateKubernetesProxyPath(path string) error {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
@@ -1079,40 +1098,6 @@ func validateKubernetesProxyPath(path string) error {
 		return fmt.Errorf("invalid proxy path %q: path traversal is not allowed", path)
 	}
 	return nil
-}
-
-func kubernetesServiceProxyURL(apiHost, namespace, service string, port int, path string, tls bool) (string, error) {
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
-	}
-	resourcePath, rawQuery, _ := strings.Cut(path, "?")
-	if err := validateKubernetesProxyPath(resourcePath); err != nil {
-		return "", err
-	}
-	scheme := "http"
-	if tls {
-		scheme = "https"
-	}
-	serviceRef := fmt.Sprintf("%s:%s:%d", scheme, service, port)
-	segments := strings.Split(strings.Trim(resourcePath, "/"), "/")
-	for i, segment := range segments {
-		segments[i] = url.PathEscape(segment)
-	}
-	proxyPath := fmt.Sprintf(
-		"/api/v1/namespaces/%s/services/%s/proxy/%s",
-		namespace,
-		serviceRef,
-		strings.Join(segments, "/"),
-	)
-	if rawQuery != "" {
-		proxyPath += "?" + rawQuery
-	}
-	endpoint, err := url.Parse(apiHost)
-	if err != nil {
-		return "", fmt.Errorf("invalid Kubernetes API host: %w", err)
-	}
-	endpoint.Path = proxyPath
-	return endpoint.String(), nil
 }
 
 func readLimitedHTTPBody(r io.Reader) ([]byte, error) {

@@ -5,8 +5,11 @@ import (
 	"time"
 
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
@@ -30,6 +33,11 @@ const lokiStackReadyTimeout = 20 * time.Minute
 func (tc *MonitoringTestCtx) setupLogsLokiStack(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
+	t.Cleanup(func() {
+		if t.Failed() {
+			tc.logLokiStackDiagnostics(t, LokiStackName, UsageLogsLokiStackName)
+		}
+	})
 
 	tc.setupLogsWithStorage(t, "s3", logsLokiSecretName)
 
@@ -45,6 +53,30 @@ func (tc *MonitoringTestCtx) setupLogsLokiStack(t *testing.T) {
 	)
 }
 
+// Log the state before cleanup removes the stacks and their pods.
+func (tc *MonitoringTestCtx) logLokiStackDiagnostics(t *testing.T, names ...string) {
+	t.Helper()
+	for _, name := range names {
+		stack, err := tc.fetchResource(t, gvk.LokiStack, types.NamespacedName{Name: name, Namespace: tc.MonitoringNamespace})
+		if err != nil {
+			t.Logf("LokiStack %s: %v", name, err)
+		} else {
+			status, _, _ := unstructured.NestedMap(stack.Object, "status")
+			t.Logf("LokiStack %s status: %v", name, status)
+		}
+		pods := &corev1.PodList{}
+		if err := tc.Client().List(tc.Context(), pods, client.InNamespace(tc.MonitoringNamespace),
+			client.MatchingLabels{"app.kubernetes.io/instance": name}); err != nil {
+			t.Logf("LokiStack %s pods: %v", name, err)
+			continue
+		}
+		for _, pod := range pods.Items {
+			t.Logf("LokiStack %s pod %s: phase=%s conditions=%v containers=%v",
+				name, pod.Name, pod.Status.Phase, pod.Status.Conditions, pod.Status.ContainerStatuses)
+		}
+	}
+}
+
 // ValidateLogsLokiStackDeployment tests that the log forwarding LokiStack is
 // deployed from spec.logs.storage with correct configuration.
 func (tc *MonitoringTestCtx) ValidateLogsLokiStackDeployment(t *testing.T) {
@@ -58,7 +90,7 @@ func (tc *MonitoringTestCtx) ValidateLogsLokiStackDeployment(t *testing.T) {
 		}),
 		WithCondition(And(
 			tc.monitoringOwnerReferencesCondition(),
-			jq.Match(`.spec.size == "1x.extra-small"`),
+			jq.Match(`.spec.size == "1x.demo"`),
 			jq.Match(`.spec.storage.secret.name == "%s"`, logsLokiSecretName),
 			jq.Match(`.spec.storage.secret.type == "s3"`),
 			jq.Match(`.spec.storage.secret.credentialMode == "static"`),

@@ -17,6 +17,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
@@ -135,6 +137,7 @@ func TestMonitoring_StatusMutationThroughPointer(t *testing.T) {
 }
 
 func TestMonitoring_DeepCopy(t *testing.T) {
+	builtinDCGMScrapeEnabled := false
 	m := &Monitoring{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       MonitoringInstanceName,
@@ -145,7 +148,10 @@ func TestMonitoring_DeepCopy(t *testing.T) {
 				ManagementState: platformcommon.Managed,
 			},
 			Namespace: "opendatahub",
-			Metrics:   &Metrics{Replicas: 2},
+			Metrics: &Metrics{
+				Replicas:                 2,
+				BuiltinDCGMScrapeEnabled: &builtinDCGMScrapeEnabled,
+			},
 		},
 		Status: MonitoringStatus{
 			Status: platformcommon.Status{
@@ -170,6 +176,9 @@ func TestMonitoring_DeepCopy(t *testing.T) {
 	if copy.Spec.Metrics == nil {
 		t.Fatal("DeepCopy Metrics should not be nil")
 	}
+	if copy.Spec.Metrics.BuiltinDCGMScrapeEnabled == nil || *copy.Spec.Metrics.BuiltinDCGMScrapeEnabled {
+		t.Fatal("DeepCopy must preserve an explicit false built-in DCGM scrape setting")
+	}
 	if copy.Status.URL != m.Status.URL {
 		t.Errorf("DeepCopy URL mismatch")
 	}
@@ -178,10 +187,38 @@ func TestMonitoring_DeepCopy(t *testing.T) {
 	if m.Spec.Metrics.Replicas == 99 {
 		t.Error("DeepCopy should produce independent Metrics pointer")
 	}
+	*copy.Spec.Metrics.BuiltinDCGMScrapeEnabled = true
+	if *m.Spec.Metrics.BuiltinDCGMScrapeEnabled {
+		t.Error("DeepCopy should produce an independent built-in DCGM scrape setting")
+	}
 
 	copy.Status.Status.Conditions[0].Status = metav1.ConditionFalse
 	if m.Status.Status.Conditions[0].Status == metav1.ConditionFalse {
 		t.Error("DeepCopy should produce independent conditions slice")
+	}
+}
+
+func TestMetrics_BuiltinDCGMScrapeEnabledJSON(t *testing.T) {
+	var omitted Metrics
+	encoded, err := json.Marshal(omitted)
+	if err != nil {
+		t.Fatalf("marshal Metrics without built-in DCGM setting: %v", err)
+	}
+	if strings.Contains(string(encoded), "builtinDCGMScrapeEnabled") {
+		t.Fatalf("unset built-in DCGM setting should be omitted, got %s", encoded)
+	}
+
+	disabled := false
+	encoded, err = json.Marshal(Metrics{BuiltinDCGMScrapeEnabled: &disabled})
+	if err != nil {
+		t.Fatalf("marshal Metrics with built-in DCGM scrape disabled: %v", err)
+	}
+	var decoded Metrics
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal Metrics with built-in DCGM scrape disabled: %v", err)
+	}
+	if decoded.BuiltinDCGMScrapeEnabled == nil || *decoded.BuiltinDCGMScrapeEnabled {
+		t.Fatalf("explicit false built-in DCGM setting must survive JSON round-trip: %s", encoded)
 	}
 }
 

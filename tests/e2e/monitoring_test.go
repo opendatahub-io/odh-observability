@@ -852,6 +852,44 @@ func (tc *MonitoringTestCtx) ValidateTargetAllocatorServiceAndConfigMap(t *testi
 		}),
 		WithCustomErrorMsg("Target Allocator ConfigMap should be created by OpenTelemetry Operator"),
 	)
+
+	tc.g.Eventually(func() error {
+		configMap := &corev1.ConfigMap{}
+		if err := tc.Client().Get(tc.Context(), types.NamespacedName{
+			Name:      TargetAllocatorDeploymentName,
+			Namespace: tc.MonitoringNamespace,
+		}, configMap); err != nil {
+			return err
+		}
+		configYAML := configMap.Data["targetallocator.yaml"]
+		if configYAML == "" {
+			return errors.New("TargetAllocator config is not populated yet")
+		}
+		var config map[string]any
+		if err := yaml.Unmarshal([]byte(configYAML), &config); err != nil {
+			return fmt.Errorf("decode generated TargetAllocator config: %w", err)
+		}
+		prometheusConfig, ok := config["config"].(map[string]any)
+		if !ok {
+			return errors.New("generated TargetAllocator config has no Prometheus config")
+		}
+		scrapeConfigs, ok := prometheusConfig["scrape_configs"].([]any)
+		if !ok {
+			return errors.New("generated TargetAllocator config has no scrape_configs")
+		}
+		for _, rawScrapeConfig := range scrapeConfigs {
+			scrapeConfig, ok := rawScrapeConfig.(map[string]any)
+			if !ok || scrapeConfig["job_name"] != "dcgm-exporter-accelerator-metrics" {
+				continue
+			}
+			if scrapeConfig["scheme"] != "http" {
+				return fmt.Errorf("TargetAllocator-generated DCGM job scheme=%v, want http", scrapeConfig["scheme"])
+			}
+			return nil
+		}
+		return errors.New("TargetAllocator-generated config is missing the built-in DCGM job")
+	}).WithTimeout(2*time.Minute).WithPolling(5*time.Second).Should(Succeed(),
+		"TargetAllocator must preserve the built-in DCGM scrape job in generated config")
 }
 
 // ValidateTargetAllocatorLifecycle tests the complete lifecycle of Target Allocator deployment and cleanup.
@@ -1542,7 +1580,7 @@ func (tc *MonitoringTestCtx) ValidateTempoMonolithicCRCreation(t *testing.T) {
 			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "data-science-tempomonolithic"`),
 			jq.Match(`.spec.policyTypes == ["Ingress"]`),
 			jq.Match(`[.spec.ingress[] | select((.from // []) | length == 0)] | length == 0`),
-			jq.Match(`[.spec.ingress[].ports[].port] | unique | sort == [3200, 4317, 4318, 8080]`),
+			jq.Match(`[.spec.ingress[].ports[].port] | unique | sort == [3200, 4317, 4318, 8080, 8090]`),
 		)),
 		WithCustomErrorMsg("TempoMonolithic NetworkPolicy should expose only the collector, Prometheus, and Perses paths"),
 	)
@@ -2530,6 +2568,7 @@ func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 		t.Run("Prometheus secure proxy authentication", tc.ValidatePrometheusSecureProxyAuthentication)
 		t.Run("Monitoring proxy TLS profile rollout", tc.ValidateMonitoringProxyTLSProfileRollout)
 		t.Run("Tenant workload metrics namespace restriction", tc.ValidateTenantWorkloadMetricsNamespaceRestriction)
+		t.Run("Built-in DCGM opt-out with verified HTTPS monitor", tc.ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMonitor)
 		t.Run("OTLP metric identity cannot be spoofed", tc.ValidateOTLPMetricIdentityCannotBeSpoofed)
 		t.Run("Node metrics endpoint deployment", tc.ValidateNodeMetricsEndpointDeployment)
 		t.Run("Node metrics endpoint RBAC configuration", tc.ValidateNodeMetricsEndpointRBACConfiguration)

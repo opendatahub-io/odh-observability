@@ -1,0 +1,16 @@
+# Manual / make oats reference case. TestInferenceServiceTracing writes a
+# run-specific oats-case.yaml that filters on the injected trace:ID and pod name.
+name: InferenceService vLLM tracing
+
+tags: ["e2e", "vllm", "isvc"]
+
+fixture:
+  remote:
+    endpoint: default
+
+expected:
+  traces:
+    - traceql: '{ name = "llm_request" && resource.k8s.pod.name =~ "vllm-trace-isvc.*" && span:parentID = "0000000000000000" }'
+      count: ">= 1"
+    - traceql: '{ name = "llm_request" && resource.k8s.pod.name =~ "vllm-trace-isvc.*" && span:parentID != "0000000000000000" }'
+      count: ">= 1"

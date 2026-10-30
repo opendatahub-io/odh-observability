@@ -90,7 +90,9 @@ const (
 
 // Reason constants.
 const (
-	MissingOperatorReason                = "MissingOperator"
+	MissingOperatorReason = "MissingOperator"
+	// G101 fires on the name, not the value: this is a condition reason, not a credential.
+	CredentialNotFoundReason             = "CredentialNotFound" //nolint:gosec
 	MetricsNotConfiguredReason           = "MetricsNotConfigured"
 	TracesNotConfiguredReason            = "TracesNotConfigured"
 	AlertingNotConfiguredReason          = "AlertingNotConfigured"
@@ -155,6 +157,19 @@ func (cm *ConditionsManager) MarkTrue(condType string) {
 		Type:               condType,
 		Status:             metav1.ConditionTrue,
 		Reason:             "Available",
+		ObservedGeneration: cm.generation,
+	})
+}
+
+// MarkTrueWithReason sets a condition to True with a specific reason and message,
+// for a feature that is available but in a mode the plain "Available" reason cannot
+// distinguish.
+func (cm *ConditionsManager) MarkTrueWithReason(condType, reason, message string) {
+	libconditions.SetStatusCondition(cm.accessor, platformcommon.Condition{
+		Type:               condType,
+		Status:             metav1.ConditionTrue,
+		Reason:             reason,
+		Message:            message,
 		ObservedGeneration: cm.generation,
 	})
 }

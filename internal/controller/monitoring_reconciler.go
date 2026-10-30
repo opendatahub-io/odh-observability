@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"time"
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
@@ -299,9 +300,8 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		if errors.Is(err, errProxyTLSResolutionFailed) {
 			return ctrl.Result{}, err
 		}
-		cm.MarkFalse(string(platformcommon.ConditionTypeProvisioningSucceeded), "ConfigurationError", err.Error())
-		cm.MarkFalse(string(platformcommon.ConditionTypeReady), "ConfigurationError", err.Error())
-		cm.MarkFalse(string(platformcommon.ConditionTypeDegraded), "NotDegraded", "")
+		markConfigurationError(cm, err)
+
 		return ctrl.Result{}, nil
 	}
 
@@ -352,6 +352,8 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 
 	requeueNeeded := publishLokiEndpoints(monitoring, data)
 
+	setUsageLogsForwardingStatus(monitoring, data)
+
 	cm.AggregateReady()
 
 	// Surface the withheld storage configuration now that every other feature
@@ -374,7 +376,7 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	if requeueNeeded {
+	if requeueNeeded || usageLogsAwaitingCredential(monitoring) {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -931,6 +933,61 @@ func isPlatformConfigMap(obj client.Object) bool {
 		return false
 	}
 	return obj.GetName() == platformConfigName && obj.GetNamespace() == ns
+}
+
+// markConfigurationError reports a template-data failure that leaves the service
+// unconfigurable. A rejected usage-log exporter is attributed to its own condition as
+// well: the failure aborts the reconcile before the collector action runs, so otherwise
+// that condition keeps whatever the previous pass left — True, if the exporter was added
+// to a cluster that was already forwarding, which is a green condition over a dead
+// pipeline.
+func markConfigurationError(cm *conditions.ConditionsManager, err error) {
+	if errors.Is(err, errUsageLogsExporterInvalid) {
+		cm.MarkFalse(conditions.ConditionUsageLogsCollectorAvailable, "ConfigurationError", err.Error())
+	}
+
+	cm.MarkFalse(string(platformcommon.ConditionTypeProvisioningSucceeded), "ConfigurationError", err.Error())
+	cm.MarkFalse(string(platformcommon.ConditionTypeReady), "ConfigurationError", err.Error())
+	cm.MarkFalse(string(platformcommon.ConditionTypeDegraded), "NotDegraded", "")
+}
+
+// setUsageLogsForwardingStatus publishes the exporters the collector actually carries.
+// Gated on the collector having been rendered, so status cannot advertise forwarding
+// from a cluster where it was withheld — for a credential that never arrived, say.
+// Kept out of reconcile so that function stays under the cyclomatic complexity limit.
+func setUsageLogsForwardingStatus(monitoring *v1alpha1.Monitoring, data map[string]any) {
+	monitoring.Status.UsageLogsForwarding = nil
+
+	condition := findUsageLogsCollectorCondition(monitoring)
+	if condition == nil || condition.Status != metav1.ConditionTrue {
+		return
+	}
+
+	if names, ok := data["UsageLogsExporterNames"].([]string); ok && len(names) > 0 {
+		monitoring.Status.UsageLogsForwarding = slices.Clone(names)
+	}
+}
+
+func findUsageLogsCollectorCondition(monitoring *v1alpha1.Monitoring) *platformcommon.Condition {
+	for i := range monitoring.Status.Conditions {
+		if monitoring.Status.Conditions[i].Type == conditions.ConditionUsageLogsCollectorAvailable {
+			return &monitoring.Status.Conditions[i]
+		}
+	}
+
+	return nil
+}
+
+// usageLogsAwaitingCredential reports whether the usage-log collector was withheld
+// this pass for a credential Secret that has not arrived. No watch brings us back for
+// it: ACM's config-policy-controller writes that Secret without the labels the
+// managed-resource predicates match, so the reconcile has to return on its own.
+func usageLogsAwaitingCredential(monitoring *v1alpha1.Monitoring) bool {
+	condition := findUsageLogsCollectorCondition(monitoring)
+
+	return condition != nil &&
+		condition.Status == metav1.ConditionFalse &&
+		condition.Reason == conditions.CredentialNotFoundReason
 }
 
 func isPrometheusWebTLSCASecret(obj client.Object) bool {

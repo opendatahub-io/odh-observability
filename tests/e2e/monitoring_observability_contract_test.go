@@ -97,7 +97,7 @@ func (tc *MonitoringTestCtx) ValidateSignalSpecificCollectorContract(t *testing.
 		WithCondition(And(
 			jq.Match(`.metadata.labels."platform.opendatahub.io/part-of" == "monitoring"`),
 			jq.Match(`.spec.config.receivers | has("prometheus") and has("prometheus/self") and has("otlp")`),
-			jq.Match(`.spec.config.receivers.prometheus.config.scrape_configs[0].bearer_token_file == "/var/run/secrets/kubernetes.io/serviceaccount/token"`),
+			jq.Match(`(.spec.config.receivers.prometheus.config.scrape_configs // [] | any(.[]; .job_name == "data-science-collector-prometheus")) | not`),
 			jq.Match(`.spec.config.processors | has("memory_limiter") and has("k8sattributes") and has("k8sattributes/otlp")`),
 			jq.Match(`.spec.config.processors | has("transform/sanitize_otlp_identity") and has("resourcedetection") and has("batch")`),
 			jq.Match(`.spec.config.exporters.prometheus.endpoint == "0.0.0.0:8889"`),
@@ -112,7 +112,7 @@ func (tc *MonitoringTestCtx) ValidateSignalSpecificCollectorContract(t *testing.
 			jq.Match(`.spec.config.service.pipelines."metrics/otlp".exporters | contains(["prometheus"])`),
 			jq.Match(`.spec.volumes[] | select(.name == "tls-certs") | .secret.secretName == "data-science-collector-tls"`),
 		)),
-		WithCustomErrorMsg("metrics collector contract must retain authenticated scrape, TLS export, and signal pipelines"),
+		WithCustomErrorMsg("metrics collector contract must retain Prometheus receiver, TLS export, and signal pipelines, without the unused generic pod scrape job"),
 	)
 
 	tc.EnsureResourceExists(

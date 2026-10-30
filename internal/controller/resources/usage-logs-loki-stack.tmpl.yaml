@@ -28,7 +28,7 @@ spec:
             - name: upstream_namespace_name
             - name: upstream_deployment_name
   managementState: Managed
-  size: 1x.extra-small
+  size: {{ .LokiStackSize }}
   storage:
     schemas:
     - effectiveDate: "2020-10-11"

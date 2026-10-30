@@ -574,18 +574,44 @@ func deployUsageLogsCollector(
 	cm *conditions.ConditionsManager,
 	sources *[]rendertemplate.TemplateSource,
 ) error {
-	if monitoring.Spec.UsageLogs == nil || monitoring.Spec.UsageLogs.Storage == nil {
+	usageLogs := monitoring.Spec.UsageLogs
+
+	// Storage drives the cluster-local write and exporters drive forwarding. Either
+	// alone is a working configuration, so the collector is unconfigured only when
+	// neither is asked for.
+	if usageLogs == nil || (usageLogs.Storage == nil && len(usageLogs.Exporters) == 0) {
 		cm.MarkNotConfigured(conditions.ConditionUsageLogsCollectorAvailable,
 			"UsageLogsNotConfigured", "Usage logs not configured in Monitoring CR")
 		return nil
 	}
 
-	// Wait for LokiStack endpoint to be available in status (set only when Loki is ready)
-	if monitoring.Status.UsageLogsEndpoint == "" {
+	// Wait for LokiStack endpoint to be available in status (set only when Loki is
+	// ready). Only the local write depends on it: a cluster that just forwards has no
+	// LokiStack being deployed, so waiting here would wait forever.
+	if usageLogs.Storage != nil && monitoring.Status.UsageLogsEndpoint == "" {
 		cm.MarkFalse(conditions.ConditionUsageLogsCollectorAvailable,
 			"LokiStackNotReady",
 			"Waiting for LokiStack to be ready")
 		return nil
+	}
+
+	// A named credential is a promise the Secret exists. Rendering the collector
+	// before it does leaves the pod in ContainerCreating on FailedMount, which says
+	// nothing about the cause — and with no local write to fall back on it takes the
+	// whole pipeline down. Gated on exporters to match the template, which mounts the
+	// Secret only when there is something to authenticate.
+	if usageLogs.CredentialSecret != "" && len(usageLogs.Exporters) > 0 {
+		credentialExists, err := usageLogsCredentialExists(ctx, c, monitoring)
+		if err != nil {
+			return err
+		}
+		if !credentialExists {
+			cm.MarkFalse(conditions.ConditionUsageLogsCollectorAvailable,
+				conditions.CredentialNotFoundReason,
+				fmt.Sprintf("Waiting for Secret %q, which carries the remote-write credential",
+					usageLogs.CredentialSecret))
+			return nil
+		}
 	}
 
 	otcExists, err := hasCRD(ctx, c, gvk.OpenTelemetryCollector)
@@ -599,7 +625,17 @@ func deployUsageLogsCollector(
 		return nil
 	}
 
-	cm.MarkTrue(conditions.ConditionUsageLogsCollectorAvailable)
+	// The two modes fail in entirely different ways, so a bare True that cannot tell
+	// them apart is not much of a status.
+	if usageLogs.Storage == nil {
+		cm.MarkTrueWithReason(conditions.ConditionUsageLogsCollectorAvailable,
+			"ForwardingOnly",
+			fmt.Sprintf("Forwarding usage logs to %d remote exporter(s); no cluster-local store",
+				len(usageLogs.Exporters)))
+	} else {
+		cm.MarkTrue(conditions.ConditionUsageLogsCollectorAvailable)
+	}
+
 	*sources = append(*sources,
 		src(UsageLogsOpenTelemetryCollectorTemplate),
 		src(UsageLogsOpenTelemetryCollectorRBACTemplate),
@@ -1424,6 +1460,25 @@ func hasReadyCondition(obj *unstructured.Unstructured) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// usageLogsCredentialExists reports whether the Secret named by
+// usageLogs.credentialSecret is present. Absent is the normal state on a fresh spoke,
+// where the chart names the Secret and ACM delivers it afterwards.
+func usageLogsCredentialExists(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) (bool, error) {
+	secret := &corev1.Secret{}
+	err := c.Get(ctx, types.NamespacedName{
+		Name:      monitoring.Spec.UsageLogs.CredentialSecret,
+		Namespace: monitoringNamespace(monitoring),
+	}, secret)
+	switch {
+	case k8serr.IsNotFound(err):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("getting usage logs credential Secret: %w", err)
+	}
+
+	return true, nil
 }
 
 // isLokiStackReady checks if the named LokiStack CR exists and is in a Ready state.
