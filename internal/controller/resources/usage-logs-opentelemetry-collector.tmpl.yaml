@@ -18,28 +18,27 @@ spec:
       memory: {{.CollectorMemoryRequest}}
   networkPolicy:
     enabled: false
-{{- if and .UsageLogsCredentialSecret .UsageLogsExporterNames }}
-
-  # Remote-write credential, mounted rather than inlined. Nothing secret reaches the
-  # collector object, and the extension below re-reads the file, so rotating the
-  # Secret reaches a running collector.
-  #
-  # Gated on there being an exporter to authenticate. A credential on its own has
-  # nothing to do, and mounting a Secret that may not exist yet would leave the
-  # collector in ContainerCreating on FailedMount — which takes the cluster-local
-  # write down with it, since both pipelines share one deployment.
+  volumeMounts:
+    - name: otlp-tls-certs
+      mountPath: /etc/otel-collector/otlp-tls
+      readOnly: true
+{{ if and .UsageLogsCredentialSecret .UsageLogsExporterNames }}
+    - name: usage-logs-remote-credential
+      mountPath: /var/run/secrets/usage-logs-remote
+      readOnly: true
+{{ end }}
   volumes:
+    - name: otlp-tls-certs
+      secret:
+        secretName: {{.UsageLogsCollectorName}}-collector-headless-tls
+{{ if and .UsageLogsCredentialSecret .UsageLogsExporterNames }}
     - name: usage-logs-remote-credential
       secret:
         secretName: {{ .UsageLogsCredentialSecret }}
         items:
           - key: token
             path: token
-  volumeMounts:
-    - name: usage-logs-remote-credential
-      mountPath: /var/run/secrets/usage-logs-remote
-      readOnly: true
-{{- end }}
+{{ end }}
 
   config:
     extensions:
@@ -59,8 +58,18 @@ spec:
         protocols:
           grpc:
             endpoint: '0.0.0.0:4317'
+            tls:
+              cert_file: "/etc/otel-collector/otlp-tls/tls.crt"
+              key_file: "/etc/otel-collector/otlp-tls/tls.key"
+              min_version: "1.2"
+              reload_interval: 5m
           http:
             endpoint: '0.0.0.0:4318'
+            tls:
+              cert_file: "/etc/otel-collector/otlp-tls/tls.crt"
+              key_file: "/etc/otel-collector/otlp-tls/tls.key"
+              min_version: "1.2"
+              reload_interval: 5m
 
     processors:
       # 1. Protect pod against OOM kills under heavy log spikes

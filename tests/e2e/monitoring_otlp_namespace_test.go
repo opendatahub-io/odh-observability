@@ -99,8 +99,8 @@ func (tc *MonitoringTestCtx) ValidateCollectorOTLPNamespaceBoundary(t *testing.T
 	require.Contains(t, string(output), "Changing monitoring.opendatahub.io/otlp requires")
 
 	endpoints := []string{
-		fmt.Sprintf("http://data-science-collector-collector.%s.svc.cluster.local:4317/", tc.MonitoringNamespace),
-		fmt.Sprintf("http://data-science-collector-collector.%s.svc.cluster.local:4318/v1/traces", tc.MonitoringNamespace),
+		fmt.Sprintf("https://data-science-collector-collector-headless.%s.svc.cluster.local:4317/", tc.MonitoringNamespace),
+		fmt.Sprintf("https://data-science-collector-collector-headless.%s.svc.cluster.local:4318/v1/traces", tc.MonitoringNamespace),
 	}
 	callerLabels := otlpCallerNetworkPolicyLabels("llminferenceservice-workload")
 	tc.runNetworkPolicyProbe(t, "unenrolled-spoof-denied", namespace.Name, callerLabels, endpoints, false)

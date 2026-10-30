@@ -178,12 +178,7 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	addResourceData(templateData)
-	addImageURLs(templateData)
-
-	if err := addTLSData(ctx, c, templateData); err != nil {
-		return nil, err
-	}
-	if err := addKorrel8rAPIServerData(ctx, c, monitoring, templateData); err != nil {
+	if err := addImageTLSAndKorrel8rData(ctx, c, monitoring, templateData); err != nil {
 		return nil, err
 	}
 
@@ -765,7 +760,7 @@ func addUsageLogsExportersData(usageLogs *v1alpha1.UsageLogs, templateData map[s
 }
 
 func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces, namespace string) error {
-	templateData["OtlpEndpoint"] = fmt.Sprintf("http://data-science-collector-collector.%s.svc.cluster.local:4317", namespace)
+	templateData["OtlpEndpoint"] = fmt.Sprintf("https://data-science-collector-collector-headless.%s.svc.cluster.local:4317", namespace)
 	templateData["SampleRatio"] = getStringValueOrDefault(traces.SampleRatio, defaultTracesSampleRatio)
 
 	validatedExporters := make(map[string]string)
@@ -832,7 +827,17 @@ func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces,
 	return nil
 }
 
-func addImageURLs(templateData map[string]any) {
+func addImageTLSAndKorrel8rData(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring, templateData map[string]any) error {
+	if err := addImageURLs(templateData); err != nil {
+		return err
+	}
+	if err := addTLSData(ctx, c, templateData); err != nil {
+		return err
+	}
+	return addKorrel8rAPIServerData(ctx, c, monitoring, templateData)
+}
+
+func addImageURLs(templateData map[string]any) error {
 	templateData["KubeRBACProxyImage"] = getEnvOrDefault(
 		"RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE",
 		"quay.io/opendatahub/odh-kube-rbac-proxy@sha256:69c4b767117b9dab040070ca3cd6a4d08f87c197f92c2e9d7637101a39018a7d",
@@ -841,6 +846,17 @@ func addImageURLs(templateData map[string]any) {
 		"RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE",
 		"quay.io/prometheuscommunity/prom-label-proxy@sha256:28f81efb6574556011e7914851faaccce4a64b1b72a338aaaf3cc9d45e66fd96",
 	)
+	// HTTPMethodGateImage runs the "method-gate" subcommand of this operator binary
+	// as a sidecar. There is no digest fallback: an image built before that
+	// subcommand treats "method-gate" as a non-flag and starts the manager,
+	// which never listens on :9092. OPERATOR_IMAGE is set on the operator
+	// Deployment to the operator's own image.
+	image := os.Getenv("OPERATOR_IMAGE")
+	if image == "" {
+		return errors.New("OPERATOR_IMAGE is empty: the method-gate sidecar must use this operator image")
+	}
+	templateData["HTTPMethodGateImage"] = image
+	return nil
 }
 
 // getKorrel8rImage returns the pinned Korrel8r image, allowing release

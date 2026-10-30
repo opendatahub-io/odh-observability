@@ -48,6 +48,7 @@ type prometheusQueryResponse struct {
 	Data   struct {
 		Result []struct {
 			Metric map[string]string `json:"metric"`
+			Value  []any             `json:"value"`
 		} `json:"result"`
 	} `json:"data"`
 }
@@ -205,9 +206,51 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 	assertThanosRouteNamespaceSeries(t, "crafted selector", crafted.Labels, tc.MonitoringNamespace)
 
 	// Perses sends the namespace in the URL and PromQL in the form body.
-	// Rejecting an additional form namespace is deferred until the proxy has
-	// query-only extraction; the current proxy accepts it (RHOAIENG-101998).
 	assertAuthorizedThanosPost(t, rootCAs, routeHost, authorizedToken, tc.MonitoringNamespace)
+	assertThanosRouteRejectsUnauthorizedNamespaces(t, rootCAs, routeHost, authorizedToken, tc.MonitoringNamespace)
+}
+
+func assertThanosRouteRejectsUnauthorizedNamespaces(t *testing.T, rootCAs *x509.CertPool, routeHost, token, namespace string) {
+	t.Helper()
+	// Repeated URL values are supported, but every namespace must pass the SAR.
+	const secondNamespace = "kube-system"
+	dualNamespace, err := probeThanosRouteWithNamespaces(
+		rootCAs,
+		routeHost,
+		token,
+		[]string{namespace, secondNamespace},
+		thanosRouteProbeQuery,
+	)
+	if err != nil {
+		t.Fatalf("dual-namespace GET probe failed: %v", err)
+	}
+	logThanosRouteEvidence(t, "authorized-dual-namespace-get", dualNamespace)
+	for _, labels := range dualNamespace.Labels {
+		if labels["namespace"] == secondNamespace {
+			t.Fatalf("GET with two namespace query values must not return series from %q", secondNamespace)
+		}
+	}
+	if dualNamespace.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("GET including an unauthorized namespace must be forbidden, got http_status=%d", dualNamespace.HTTPStatus)
+	}
+
+	// A form-body namespace is not authorized by kube-rbac-proxy and must be
+	// rejected before prom-label-proxy can merge it into the label matcher.
+	duplicateNamespace, err := probeThanosRoutePostWithError(
+		rootCAs,
+		routeHost,
+		token,
+		namespace,
+		secondNamespace,
+		thanosRouteProbeQuery,
+	)
+	if err != nil {
+		t.Fatalf("duplicate namespace POST probe failed: %v", err)
+	}
+	logThanosRouteEvidence(t, "authorized-duplicate-namespace-post", duplicateNamespace)
+	if duplicateNamespace.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("POST with a form namespace must be rejected with 403 by the method gate, got %d", duplicateNamespace.HTTPStatus)
+	}
 }
 
 func assertAuthorizedThanosPost(t *testing.T, rootCAs *x509.CertPool, routeHost, token, namespace string) {
@@ -218,16 +261,12 @@ func assertAuthorizedThanosPost(t *testing.T, rootCAs *x509.CertPool, routeHost,
 	}
 	logThanosRouteEvidence(t, "authorized-post", probe)
 	if probe.HTTPStatus != http.StatusOK || probe.PrometheusStatus != "success" {
-		t.Fatalf("authorized POST query should be a successful Prometheus request, got http_status=%d prometheus_status=%q", probe.HTTPStatus, probe.PrometheusStatus)
+		t.Fatalf("authorized POST query should succeed, got http_status=%d prometheus_status=%q", probe.HTTPStatus, probe.PrometheusStatus)
 	}
 	if len(probe.Labels) == 0 {
-		t.Fatalf("authorized POST query returned no metric series")
+		t.Fatal("authorized POST query returned no metric series")
 	}
-	for _, labels := range probe.Labels {
-		if labels["namespace"] != namespace {
-			t.Fatalf("authorized POST response escaped the namespace boundary: namespace=%q", labels["namespace"])
-		}
-	}
+	assertThanosRouteNamespaceSeries(t, "authorized POST", probe.Labels, namespace)
 }
 
 func assertThanosRouteNamespaceSeries(t *testing.T, persona string, series []map[string]string, namespace string) {
@@ -434,14 +473,20 @@ func probeThanosRoute(t *testing.T, rootCAs *x509.CertPool, routeHost, token, na
 }
 
 func probeThanosRouteWithError(rootCAs *x509.CertPool, routeHost, token, namespace, promQL string) (thanosRouteProbe, error) {
+	return probeThanosRouteWithNamespaces(rootCAs, routeHost, token, []string{namespace}, promQL)
+}
+
+func probeThanosRouteWithNamespaces(rootCAs *x509.CertPool, routeHost, token string, namespaces []string, promQL string) (thanosRouteProbe, error) {
 	endpoint := url.URL{
 		Scheme: "https",
 		Host:   routeHost,
 		Path:   "/api/v1/query",
 	}
 	query := endpoint.Query()
-	if namespace != "" {
-		query.Set("namespace", namespace)
+	for _, namespace := range namespaces {
+		if namespace != "" {
+			query.Add("namespace", namespace)
+		}
 	}
 	query.Set("query", promQL)
 	endpoint.RawQuery = query.Encode()

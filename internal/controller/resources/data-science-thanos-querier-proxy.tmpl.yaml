@@ -89,7 +89,7 @@ spec:
           image: {{.KubeRBACProxyImage}}
           args:
             - --secure-listen-address=0.0.0.0:8443
-            - --upstream=http://127.0.0.1:9091/
+            - --upstream=http://127.0.0.1:9092/
             - --config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml
             - --tls-cert-file=/etc/tls/private/tls.crt
             - --tls-private-key-file=/etc/tls/private/tls.key
@@ -128,18 +128,47 @@ spec:
                 - ALL
             readOnlyRootFilesystem: true
             runAsNonRoot: true
+        - name: method-gate
+          image: {{.HTTPMethodGateImage}}
+          command:
+            - /manager
+            - method-gate
+          args:
+            - --listen=127.0.0.1:9092
+            - --upstream=http://127.0.0.1:9091
+            # Perses sends PromQL as a form POST. The gate permits only read-only
+            # query endpoints and rejects namespace in the body before the proxy.
+            - --allow-form-post
+          ports:
+            - containerPort: 9092
+              name: method-gate
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 100m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          terminationMessagePolicy: FallbackToLogsOnError
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
         - name: prom-label-proxy
           image: {{.PromLabelProxyImage}}
           args:
             - --insecure-listen-address=127.0.0.1:9091
             - --upstream=http://thanos-querier-data-science-thanos-querier.{{.Namespace}}.svc.cluster.local:10902
             - --label=namespace
+            - --query-param=namespace
+            - --error-on-replace
             - --enable-label-apis
             # No --regex-match: Perses Project=All / multi-select sends
             # namespace=a&namespace=b; kube-rbac-proxy SAR-checks each value.
-            # Residual risk: POST form namespace= can widen enforcement beyond
-            # URL-only SAR (see ARCHITECTURE.md). Follow-up: use a proxy image
-            # that supports query-param-only.
           resources:
             limits:
               cpu: 100m

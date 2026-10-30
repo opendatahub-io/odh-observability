@@ -222,8 +222,8 @@ func (tc *MonitoringTestCtx) runCollectorNetworkPolicyProbes(t *testing.T, colle
 func (tc *MonitoringTestCtx) runOTLPSelectorNetworkPolicyProbes(t *testing.T, namespace string, enrolled bool) {
 	t.Helper()
 
-	otlpHTTPEndpoint := fmt.Sprintf("http://data-science-collector-collector.%s.svc.cluster.local:4318/v1/traces", tc.MonitoringNamespace)
-	otlpGRPCEndpoint := fmt.Sprintf("http://data-science-collector-collector.%s.svc.cluster.local:4317/", tc.MonitoringNamespace)
+	otlpHTTPEndpoint := fmt.Sprintf("https://data-science-collector-collector-headless.%s.svc.cluster.local:4318/v1/traces", tc.MonitoringNamespace)
+	otlpGRPCEndpoint := fmt.Sprintf("https://data-science-collector-collector-headless.%s.svc.cluster.local:4317/", tc.MonitoringNamespace)
 	endpoints := []string{otlpGRPCEndpoint, otlpHTTPEndpoint}
 	for _, caller := range []struct{ name, component string }{
 		{"workload", "llminferenceservice-workload"},
@@ -296,8 +296,8 @@ func otlpCallerContainer(pod corev1.Pod) string {
 func (tc *MonitoringTestCtx) runActualOTLPWorkloadNetworkPolicyProbe(t *testing.T, caller corev1.Pod, containerName string) {
 	t.Helper()
 
-	grpcEndpoint := fmt.Sprintf("http://data-science-collector-collector.%s.svc.cluster.local:4317/", tc.MonitoringNamespace)
-	httpEndpoint := fmt.Sprintf("http://data-science-collector-collector.%s.svc.cluster.local:4318/v1/traces", tc.MonitoringNamespace)
+	grpcEndpoint := fmt.Sprintf("https://data-science-collector-collector-headless.%s.svc.cluster.local:4317/", tc.MonitoringNamespace)
+	httpEndpoint := fmt.Sprintf("https://data-science-collector-collector-headless.%s.svc.cluster.local:4318/v1/traces", tc.MonitoringNamespace)
 	now := time.Now().UnixNano()
 	payload := fmt.Sprintf(`{"resourceSpans":[{"scopeSpans":[{"spans":[{`+
 		`"traceId":"%032x","spanId":"%016x","name":"network-policy-probe",`+

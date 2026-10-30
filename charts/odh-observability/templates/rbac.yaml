@@ -161,7 +161,8 @@ rules:
   - apiGroups: ["authorization.k8s.io"]
     resources: ["subjectaccessreviews"]
     verbs: ["create"]
-  # Metrics API read access for observability resources.
+  # Metrics API (read-only; POST/"create" is intentionally not granted so the
+  # namespace proxy rejects POST and cannot be bypassed via a POST-body namespace)
   - apiGroups: ["metrics.k8s.io"]
     resources: ["pods"]
     verbs: ["get", "list"]

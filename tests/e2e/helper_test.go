@@ -2,8 +2,12 @@ package e2e_test
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,7 +18,9 @@ import (
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/olm"
 	"github.com/stretchr/testify/require"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -171,8 +177,12 @@ const (
 	OtlpCustomExporter     = "otlp/custom"
 	OtlpHttpCustomExporter = "otlphttp/custom"
 	OtlpTempoExporter      = "otlp/tempo"
-	MetricsCPURequest      = "100m"
-	MetricsMemoryRequest   = "256Mi"
+	// Distinct Mode 2 exporter names so metrics+traces combined configs do not collide
+	// in the collector's shared exporters map.
+	OtlpHttpMetricsExternalExporter = "otlphttp/metrics-external"
+	OtlpHttpTracesExternalExporter  = "otlphttp/traces-external"
+	MetricsCPURequest               = "100m"
+	MetricsMemoryRequest            = "256Mi"
 
 	TracesStorageBackendPV  = "pv"
 	TracesStorageBackendS3  = "s3"
@@ -958,6 +968,34 @@ func withCustomTracesExporters() jq.TransformFn {
     }`, OtlpHttpCustomExporter)
 }
 
+// withMetricsExportersOnly configures metrics with custom exporters and no built-in storage (Mode 2).
+func withMetricsExportersOnly(exporterName string) jq.TransformFn {
+	return jq.Transform(`.spec.metrics = {
+		"exporters": {
+			"%s": {
+				"endpoint": "http://metrics-external.example.svc:4318",
+				"tls": {
+					"insecure": true
+				}
+			}
+		}
+	}`, exporterName)
+}
+
+// withTracesExportersOnly configures traces with custom exporters and no built-in storage (Mode 2).
+func withTracesExportersOnly(exporterName string) jq.TransformFn {
+	return jq.Transform(`.spec.traces = {
+		"exporters": {
+			"%s": {
+				"endpoint": "http://traces-external.example.svc:4318",
+				"tls": {
+					"insecure": true
+				}
+			}
+		}
+	}`, exporterName)
+}
+
 func withReservedTracesExporter() jq.TransformFn {
 	return jq.Transform(`.spec.traces.exporters = {
         "%s": {
@@ -1527,3 +1565,121 @@ var (
 	_ = withEmptyMetrics
 	_ = withNoCollectorReplicas
 )
+
+// mintScopedMetricsGetToken provisions a ServiceAccount authorized for "get" on
+// pods.metrics.k8s.io in the given namespace and returns a bearer token for it.
+// Namespace proxies authorize every request with a static SAR verb "get", so this
+// token is accepted by kube-rbac-proxy for both GET and POST; the method gate
+// still rejects POST. Created RBAC is removed via t.Cleanup.
+func (tc *MonitoringTestCtx) mintScopedMetricsGetToken(t *testing.T, namespace string) string {
+	t.Helper()
+	return tc.mintScopedMetricsToken(t, "ns-isolation-probe-get", namespace, "get")
+}
+
+// mintScopedMetricsToken provisions a ServiceAccount + namespaced Role/RoleBinding
+// granting the given verbs on pods.metrics.k8s.io and returns a bearer token for it.
+func (tc *MonitoringTestCtx) mintScopedMetricsToken(t *testing.T, name, namespace string, verbs ...string) string {
+	t.Helper()
+
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+	}
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{"metrics.k8s.io"},
+			Resources: []string{"pods"},
+			Verbs:     verbs,
+		}},
+	}
+	rb := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: name},
+		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: name, Namespace: namespace}},
+	}
+
+	for _, obj := range []client.Object{sa, role, rb} {
+		require.NoError(t, client.IgnoreAlreadyExists(tc.Client().Create(tc.Context(), obj)))
+	}
+	t.Cleanup(func() {
+		_ = tc.Client().Delete(tc.Context(), rb)
+		_ = tc.Client().Delete(tc.Context(), role)
+		_ = tc.Client().Delete(tc.Context(), sa)
+	})
+
+	tr := &authenticationv1.TokenRequest{}
+	require.NoError(t, tc.Client().SubResource("token").Create(tc.Context(), sa, tr))
+	require.NotEmpty(t, tr.Status.Token, "minted ServiceAccount token must not be empty")
+
+	return tr.Status.Token
+}
+
+// routeHost returns the external host of the named Route in the monitoring namespace.
+func (tc *MonitoringTestCtx) routeHost(t *testing.T, name string) string {
+	t.Helper()
+	g := NewWithT(t)
+
+	var host string
+	g.Eventually(func() (string, error) {
+		route := tc.FetchResource(
+			WithMinimalObject(gvk.Route, types.NamespacedName{Name: name, Namespace: tc.MonitoringNamespace}),
+		)
+		if route == nil {
+			return "", fmt.Errorf("Route %s not found", name)
+		}
+
+		var ingressHost string
+		if ingress, found, _ := unstructured.NestedSlice(route.Object, "status", "ingress"); found && len(ingress) > 0 {
+			if entry, ok := ingress[0].(map[string]any); ok {
+				ingressHost, _, _ = unstructured.NestedString(entry, "host")
+			}
+		}
+
+		if ingressHost == "" {
+			// Fall back to spec.host for clusters where the admission plugin writes it back.
+			ingressHost, _, _ = unstructured.NestedString(route.Object, "spec", "host")
+		}
+
+		host = ingressHost
+		return host, nil
+	}).ShouldNot(BeEmpty(), "Route %s has no ingress host", name)
+
+	return host
+}
+
+// postPromQLForm issues a POST to the namespace proxy with the namespace supplied
+// both as a URL query parameter and inside the form body. It returns the HTTP
+// status and a bounded prefix of the response body. rootCAs is the cluster
+// ingress CA pool from clusterIngressCAPool.
+func postPromQLForm(ctx context.Context, rootCAs *x509.CertPool, host, token, queryNamespace, bodyNamespace string) (int, string, error) {
+	form := url.Values{}
+	form.Set("query", "up")
+	form.Set("namespace", bodyNamespace)
+
+	reqURL := fmt.Sprintf("https://%s/api/v1/query?namespace=%s", host, url.QueryEscape(queryNamespace))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    rootCAs,
+		}},
+		Timeout: 30 * time.Second,
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
+	if err != nil {
+		return resp.StatusCode, "", err
+	}
+
+	return resp.StatusCode, string(body), nil
+}

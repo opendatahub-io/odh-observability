@@ -66,6 +66,8 @@ func monitoringTestSuite(t *testing.T) {
 		t.Run("Thanos Querier absent", phaseCtx.ValidateThanosQuerierNotDeployedWithoutMetrics)
 		t.Run("Perses absent", phaseCtx.ValidatePersesNotDeployedWithoutMetricsOrTraces)
 	})
+	// Modes before cloud Tempo/Loki so Mode 2 absence checks are not fighting leftover heavy operands.
+	t.Run("Observability Modes", monitoringServiceCtx.runObservabilityModesTests)
 	t.Run("Metrics ready", func(t *testing.T) {
 		phaseCtx := monitoringServiceCtx.WithT(t)
 		t.Cleanup(func() { phaseCtx.cleanupGroup(t, "") })
@@ -423,9 +425,102 @@ func (tc *MonitoringTestCtx) runCollectorTests(t *testing.T) {
 		tc.setupMetrics(t)
 		t.Run("Test signal-specific collector contract", tc.ValidateSignalSpecificCollectorContract)
 		t.Run("Test OpenTelemetry Collector replicas", tc.ValidateMonitoringCRCollectorReplicas)
+		t.Run("Test OTLP receiver TLS is always enabled", tc.ValidateOTLPTLSAlwaysEnabled)
 		t.Run("Test Metrics TLS is always enabled for Prometheus exporter", tc.ValidateMetricsTLSAlwaysEnabled)
 		t.Run("Test Monitoring TLS is always enabled for internal telemetry exporter", tc.ValidateMonitoringTLSAlwaysEnabled)
 	})
+}
+
+// ValidateOTLPTLSAlwaysEnabled validates the TLS contract for the main OTLP receiver.
+func (tc *MonitoringTestCtx) ValidateOTLPTLSAlwaysEnabled(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.updateMonitoringConfig(
+		withManagementState(common.Managed),
+		tc.withMetricsConfig(),
+	)
+
+	tc.ensureOpenTelemetryCollectorReady(t)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      OpenTelemetryCollectorServiceName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`[.spec.ports[] | select(.port == 4317 or .port == 4318)] | length == 2`),
+		)),
+		WithCustomErrorMsg("OTLP Service should expose gRPC and HTTP"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      OpenTelemetryCollectorServiceName + "-headless",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == "data-science-collector-collector-headless-tls"`)),
+		WithCustomErrorMsg("OTLP headless Service should own the service-ca serving certificate"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Secret, types.NamespacedName{
+			Name:      "data-science-collector-collector-headless-tls",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.type == "kubernetes.io/tls"`),
+			jq.Match(`.data."tls.crt" != null`),
+			jq.Match(`.data."tls.key" != null`),
+		)),
+		WithCustomErrorMsg("service-ca should issue the OTLP headless Service certificate and key"),
+	)
+	tc.assertServiceCACertificateOriginMatchesService(
+		t,
+		OpenTelemetryCollectorServiceName+"-headless",
+		"data-science-collector-collector-headless-tls",
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+			Name:      OpenTelemetryCollectorName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == null`),
+			jq.Match(`[.spec.volumeMounts[] | select(.name == "otlp-tls-certs" and .mountPath == "/etc/otel-collector/otlp-tls" and .readOnly == true)] | length > 0`),
+			jq.Match(`.spec.volumes[] | select(.name == "otlp-tls-certs") | .secret.secretName == "data-science-collector-collector-headless-tls"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.grpc.tls.cert_file == "/etc/otel-collector/otlp-tls/tls.crt"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.grpc.tls.key_file == "/etc/otel-collector/otlp-tls/tls.key"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.http.tls.cert_file == "/etc/otel-collector/otlp-tls/tls.crt"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.http.tls.key_file == "/etc/otel-collector/otlp-tls/tls.key"`),
+		)),
+		WithCustomErrorMsg("OpenTelemetryCollector should mount the service-ca certificate and enable TLS on both OTLP receivers"),
+	)
+}
+
+func (tc *MonitoringTestCtx) assertServiceCACertificateOriginMatchesService(t *testing.T, serviceName, secretName string) {
+	t.Helper()
+
+	service, err := tc.fetchResource(t, gvk.Service, types.NamespacedName{
+		Name: serviceName, Namespace: tc.MonitoringNamespace,
+	})
+	require.NoError(t, err, "failed to fetch serving-certificate Service %s", serviceName)
+
+	secret, err := tc.fetchResource(t, gvk.Secret, types.NamespacedName{
+		Name: secretName, Namespace: tc.MonitoringNamespace,
+	})
+	require.NoError(t, err, "failed to fetch serving-certificate Secret %s", secretName)
+
+	originServiceName, found, err := unstructured.NestedString(secret.Object, "metadata", "annotations", "service.beta.openshift.io/originating-service-name")
+	require.NoError(t, err)
+	require.True(t, found, "service-ca Secret must identify its originating Service")
+	require.Equal(t, serviceName, originServiceName)
+
+	originServiceUID, found, err := unstructured.NestedString(secret.Object, "metadata", "annotations", "service.beta.openshift.io/originating-service-uid")
+	require.NoError(t, err)
+	require.True(t, found, "service-ca Secret must identify its originating Service UID")
+	require.Equal(t, string(service.GetUID()), originServiceUID)
 }
 
 // ValidateOpenTelemetryCollectorConfigurations consolidates all OpenTelemetry Collector configuration tests.
@@ -1942,7 +2037,7 @@ func (tc *MonitoringTestCtx) ValidateInstrumentationCRTracesLifecycle(t *testing
 		WithCustomErrorMsg("Monitoring resource should be updated with traces configuration"),
 	)
 
-	expectedEndpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:4317", OpenTelemetryCollectorServiceName, tc.MonitoringNamespace)
+	expectedEndpoint := fmt.Sprintf("https://%s-headless.%s.svc.cluster.local:4317", OpenTelemetryCollectorServiceName, tc.MonitoringNamespace)
 
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Instrumentation, types.NamespacedName{Name: InstrumentationName, Namespace: tc.MonitoringNamespace}),
@@ -1951,6 +2046,7 @@ func (tc *MonitoringTestCtx) ValidateInstrumentationCRTracesLifecycle(t *testing
 			jq.Match(`.metadata.generation >= 1`),
 			jq.Match(`
 				(.spec.exporter.endpoint == "%s") and
+				(.spec.exporter.tls.ca_file == "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt") and
 				(.spec.sampler.type == "traceidratio") and
 				(.spec.sampler.argument == "0.1")
 			`, expectedEndpoint),
@@ -2640,6 +2736,7 @@ func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 		t.Run("OTLP metric identity cannot be spoofed", tc.ValidateOTLPMetricIdentityCannotBeSpoofed)
 		t.Run("Node metrics endpoint deployment", tc.ValidateNodeMetricsEndpointDeployment)
 		t.Run("Node metrics endpoint RBAC configuration", tc.ValidateNodeMetricsEndpointRBACConfiguration)
+		t.Run("Namespace isolation POST form bypass", tc.ValidateNamespaceIsolationPostFormBypass)
 		t.Run("Operator metrics authentication and authorization", tc.ValidateOperatorMetricsAuthenticationAndAuthorization)
 		t.Run("Operand NetworkPolicies and lifecycle", tc.ValidateOperandNetworkPolicies)
 		t.Run("Collector and TargetAllocator NetworkPolicy contract", tc.ValidateCollectorNetworkPolicyContract)
@@ -2676,7 +2773,8 @@ func (tc *MonitoringTestCtx) validatePrometheusNamespaceProxyResourcesCommon(t *
 		}),
 		WithCondition(And(
 			jq.Match(`.status.readyReplicas == 1`),
-			jq.Match(`.spec.template.spec.containers | length == 2`),
+			jq.Match(`.spec.template.spec.containers | length == 3`),
+			jq.Match(`[.spec.template.spec.containers[].name] | contains(["kube-rbac-proxy", "method-gate", "prom-label-proxy"])`),
 		)),
 		WithCustomErrorMsg("data-science-prometheus-namespace-proxy deployment should be created and ready"),
 	)
@@ -2794,7 +2892,8 @@ func (tc *MonitoringTestCtx) ValidatePrometheusSecureProxyAuthentication(t *test
 		}),
 		WithCondition(And(
 			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream="))) | length == 1`),
-			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream=http://127.0.0.1:9091/"))) | length == 1`),
+			// kube-rbac-proxy forwards to the method gate (:9092), not directly to prom-label-proxy (:9091).
+			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--upstream=http://127.0.0.1:9092/"))) | length == 1`),
 			jq.Match(`.spec.template.spec.containers[0].args | map(select(contains("--secure-listen-address=0.0.0.0:8443"))) | length == 1`),
 		)),
 		WithCustomErrorMsg("kube-rbac-proxy should be configured with correct upstream and secure listen address"),
@@ -3190,6 +3289,52 @@ func (tc *MonitoringTestCtx) ValidateNodeMetricsEndpointRBACConfiguration(t *tes
 		)),
 		WithCustomErrorMsg("deployment should have volumes and mounts for mTLS to Prometheus"),
 	)
+}
+
+func (tc *MonitoringTestCtx) ValidateNamespaceIsolationPostFormBypass(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+
+	tc.EnsureResourceDoesNotExist(
+		WithMinimalObject(gvk.ClusterRole, types.NamespacedName{Name: "data-science-metrics-view"}),
+		WithCustomErrorMsg("ClusterRole 'data-science-metrics-view' must not exist"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Deployment, types.NamespacedName{
+			Name:      "data-science-prometheus-namespace-proxy",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--query-param=namespace"])`),
+			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--error-on-replace"])`),
+			// Defense-in-depth: a method gate rejects non-GET/HEAD before prom-label-proxy,
+			// and kube-rbac-proxy forwards to it (:9092) rather than to prom-label-proxy (:9091).
+			jq.Match(`[.spec.template.spec.containers[].name] | contains(["method-gate"])`),
+			jq.Match(`.spec.template.spec.containers[] | select(.name == "kube-rbac-proxy") | .args | contains(["--upstream=http://127.0.0.1:9092/"])`),
+		)),
+		WithCustomErrorMsg("namespace proxy must have the method gate and route kube-rbac-proxy through it"),
+	)
+
+	t.Log("POST-body namespace bypass is closed: the method gate rejects non-GET/HEAD (403) before prom-label-proxy")
+
+	host := tc.routeHost(t, "data-science-prometheus-route")
+	rootCAs := clusterIngressCAPool(t, tc)
+
+	// Token authorized for "get" on pods.metrics.k8s.io. The proxy ConfigMap uses a
+	// static resourceAttributes.verb: get, so kube-rbac-proxy authorizes this POST;
+	// only the method gate can reject it. Asserting the gate body proves the 403 is
+	// not from kube-rbac-proxy.
+	getToken := tc.mintScopedMetricsGetToken(t, tc.MonitoringNamespace)
+
+	g := NewWithT(t)
+	g.Eventually(func(g Gomega) {
+		status, body, err := postPromQLForm(tc.Context(), rootCAs, host, getToken, tc.MonitoringNamespace, "openshift-monitoring")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(status).To(Equal(http.StatusForbidden),
+			"POST with a get-authorized token must be rejected with 403 by the method gate; got %d", status)
+		g.Expect(body).To(ContainSubstring("only GET and HEAD are allowed"))
+	}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
 }
 
 func (tc *MonitoringTestCtx) ValidateOperatorMetricsAuthenticationAndAuthorization(t *testing.T) {

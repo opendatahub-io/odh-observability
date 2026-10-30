@@ -39,6 +39,15 @@ import (
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 )
 
+func TestMain(m *testing.M) {
+	// Reconcile refuses to render the method-gate sidecar without OPERATOR_IMAGE.
+	// Production sets it on the operator Deployment; tests use a stand-in.
+	if os.Getenv("OPERATOR_IMAGE") == "" {
+		os.Setenv("OPERATOR_IMAGE", "example.invalid/odh-observability:test")
+	}
+	os.Exit(m.Run())
+}
+
 // --- checkMonitoringPreconditions ---
 
 func registerOperatorCondition(s *kruntime.Scheme) {
@@ -859,8 +868,8 @@ func TestAddTracesTemplateData_PVBackend(t *testing.T) {
 	if data["SampleRatio"] != "0.5" {
 		t.Errorf("SampleRatio: want '0.5', got %v", data["SampleRatio"])
 	}
-	if data["OtlpEndpoint"] != "http://data-science-collector-collector.test-ns.svc.cluster.local:4317" {
-		t.Errorf("OtlpEndpoint: want collector Service endpoint, got %v", data["OtlpEndpoint"])
+	if data["OtlpEndpoint"] != "https://data-science-collector-collector-headless.test-ns.svc.cluster.local:4317" {
+		t.Errorf("OtlpEndpoint: want collector headless Service endpoint, got %v", data["OtlpEndpoint"])
 	}
 
 	endpoint, ok := data["TempoEndpoint"].(string)
@@ -1086,11 +1095,15 @@ func TestAddResourceData(t *testing.T) {
 // --- addImageURLs ---
 
 func TestAddImageURLs_Defaults(t *testing.T) {
-	os.Unsetenv("RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE")
-	os.Unsetenv("RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE")
+	t.Setenv("RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE", "")
+	t.Setenv("RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE", "")
+	t.Setenv("OPERATOR_IMAGE", "")
 
 	data := make(map[string]any)
-	addImageURLs(data)
+	err := addImageURLs(data)
+	if err == nil || !strings.Contains(err.Error(), "OPERATOR_IMAGE is empty") {
+		t.Fatalf("empty OPERATOR_IMAGE must fail the reconcile, got %v", err)
+	}
 
 	if data["KubeRBACProxyImage"] == "" {
 		t.Error("KubeRBACProxyImage should have a default")
@@ -1103,15 +1116,21 @@ func TestAddImageURLs_Defaults(t *testing.T) {
 func TestAddImageURLs_OverriddenByEnv(t *testing.T) {
 	t.Setenv("RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE", "custom-proxy:latest")
 	t.Setenv("RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE", "custom-prom-proxy:latest")
+	t.Setenv("OPERATOR_IMAGE", "custom-method-gate:latest")
 
 	data := make(map[string]any)
-	addImageURLs(data)
+	if err := addImageURLs(data); err != nil {
+		t.Fatalf("addImageURLs: %v", err)
+	}
 
 	if data["KubeRBACProxyImage"] != "custom-proxy:latest" {
 		t.Errorf("KubeRBACProxyImage: want custom-proxy:latest, got %v", data["KubeRBACProxyImage"])
 	}
 	if data["PromLabelProxyImage"] != "custom-prom-proxy:latest" {
 		t.Errorf("PromLabelProxyImage: want custom-prom-proxy:latest, got %v", data["PromLabelProxyImage"])
+	}
+	if data["HTTPMethodGateImage"] != "custom-method-gate:latest" {
+		t.Errorf("HTTPMethodGateImage: want custom-method-gate:latest, got %v", data["HTTPMethodGateImage"])
 	}
 }
 

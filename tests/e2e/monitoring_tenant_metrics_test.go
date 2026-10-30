@@ -528,11 +528,19 @@ func (tc *MonitoringTestCtx) createOTLPIdentityProbe(t *testing.T, namespace str
 			RestartPolicy:                corev1.RestartPolicyNever,
 			AutomountServiceAccountToken: new(false),
 			SecurityContext:              fixturePodSecurityContext(),
+			Volumes: []corev1.Volume{{
+				Name: "service-ca",
+				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "openshift-service-ca.crt"},
+					Items:                []corev1.KeyToPath{{Key: "service-ca.crt", Path: "service-ca.crt"}},
+				}},
+			}},
 			Containers: []corev1.Container{{
 				Name:            otlpIdentityProbeContainerName,
 				Image:           fakeGCSClientImage,
 				Command:         []string{"/bin/sh", "-c"},
 				Args:            []string{"sleep 1800"},
+				VolumeMounts:    []corev1.VolumeMount{{Name: "service-ca", MountPath: "/var/run/secrets/service-ca", ReadOnly: true}},
 				SecurityContext: fixtureContainerSecurityContext(),
 			}},
 		},
@@ -730,11 +738,32 @@ func (tc *MonitoringTestCtx) warmCollectorReplicas(
 
 func (tc *MonitoringTestCtx) pushOTLPMetrics(t *testing.T, namespace, address string, payload []byte) otlpPushObservation {
 	t.Helper()
-	stdout, stderr, err := tc.execOTLPProbe(t, namespace, []string{
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return otlpPushObservation{err: fmt.Errorf("parse OTLP address %q: %w", address, err)}
+	}
+
+	// Keep the service DNS name in the HTTPS URL so curl validates the
+	// service-ca certificate's SAN while --connect-to pins each warm-up probe
+	// to the selected collector replica.
+	tlsHost := host
+	var connectTo []string
+	if net.ParseIP(host) != nil {
+		tlsHost = fmt.Sprintf("%s-headless.%s.svc.cluster.local", OpenTelemetryCollectorServiceName, tc.MonitoringNamespace)
+		connectTo = []string{"--connect-to", net.JoinHostPort(tlsHost, port) + ":" + net.JoinHostPort(host, port)}
+	}
+	command := make([]string, 0, 7+len(connectTo)+9)
+	command = append(command,
 		"curl", "--silent", "--show-error", "--max-time", "15",
+		"--cacert", "/var/run/secrets/service-ca/service-ca.crt",
+	)
+	command = append(command, connectTo...)
+	command = append(command,
 		"--request", "POST", "--header", "Content-Type: application/json",
-		"--data-binary", "@-", "--write-out", "\\n%{http_code}", "http://" + address + "/v1/metrics",
-	}, payload)
+		"--data-binary", "@-", "--write-out", "\\n%{http_code}",
+		"https://"+net.JoinHostPort(tlsHost, port)+"/v1/metrics",
+	)
+	stdout, stderr, err := tc.execOTLPProbe(t, namespace, command, payload)
 	status, body, responseErr := parseOTLPHTTPResponse(stdout)
 	if err != nil {
 		return otlpPushObservation{status: status, err: fmt.Errorf("exec OTLP curl: %w: %s", err, strings.TrimSpace(stderr))}
@@ -1091,6 +1120,10 @@ func (tc *MonitoringTestCtx) discoverCollectorOTLPHTTPHost(t *testing.T) string 
 	require.NoError(t, err, "failed to list collector services in namespace %s", tc.MonitoringNamespace)
 
 	for i := range serviceList.Items {
+		if serviceList.Items[i].Name != OpenTelemetryCollectorServiceName+"-headless" ||
+			serviceList.Items[i].Annotations["service.beta.openshift.io/serving-cert-secret-name"] != "data-science-collector-collector-headless-tls" {
+			continue
+		}
 		for _, port := range serviceList.Items[i].Spec.Ports {
 			if port.Port == 4318 {
 				return fmt.Sprintf("%s.%s.svc:4318", serviceList.Items[i].Name, tc.MonitoringNamespace)

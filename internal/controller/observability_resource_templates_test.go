@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -220,12 +221,12 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		t.Fatalf("Thanos proxy must use its service account: found=%t value=%q error=%v", found, serviceAccount, err)
 	}
 	containers := nestedSliceAt(t, deployment, "spec", "template", "spec", "containers")
-	if len(containers) != 2 {
-		t.Fatalf("Thanos proxy must have kube-rbac-proxy and prom-label-proxy containers, got %d", len(containers))
+	if len(containers) != 3 {
+		t.Fatalf("Thanos proxy must have kube-rbac-proxy, method-gate and prom-label-proxy containers, got %d", len(containers))
 	}
 	assertContainerArgs(t, findContainer(t, containers, "kube-rbac-proxy"),
 		"--secure-listen-address=0.0.0.0:8443",
-		"--upstream=http://127.0.0.1:9091/",
+		"--upstream=http://127.0.0.1:9092/",
 		"--config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml",
 		"--tls-cert-file=/etc/tls/private/tls.crt",
 		"--tls-private-key-file=/etc/tls/private/tls.key",
@@ -238,10 +239,16 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		"--insecure-listen-address=127.0.0.1:9091",
 		"--upstream=http://thanos-querier-data-science-thanos-querier."+testMonitoringNamespace+".svc.cluster.local:10902",
 		"--label=namespace",
+		"--query-param=namespace",
+		"--error-on-replace",
 		"--enable-label-apis",
 	)
 	assertContainerArgAbsent(t, promLabelProxy, "--regex-match")
-
+	assertContainerArgs(t, findContainer(t, containers, "method-gate"),
+		"--listen=127.0.0.1:9092",
+		"--upstream=http://127.0.0.1:9091",
+		"--allow-form-post",
+	)
 	service := findRenderedResource(t, resources, "Service", "data-science-thanos-querier-proxy")
 	ports := nestedSlice(t, service, "spec", "ports")
 	if len(ports) != 1 || asMap(t, ports[0])["port"] != int64(8443) || asMap(t, ports[0])["targetPort"] != "https" {
@@ -902,6 +909,7 @@ func TestThanosQuerierRouteUsesAuthorizedProxy(t *testing.T) {
 func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 	resources := renderObservabilityTemplate(t, PrometheusNamespaceProxyTemplate, proxyTemplateData())
 
+	// The template must not aggregate extra metrics permissions into view/edit/admin.
 	for _, resource := range resources {
 		if resource.GetKind() == "ClusterRole" && resource.GetName() == "data-science-metrics-view" {
 			t.Fatal("namespace proxy must not aggregate extra permissions into view/edit/admin")
@@ -949,12 +957,14 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		t.Fatalf("namespace proxy must use its service account: found=%t value=%q error=%v", found, serviceAccount, err)
 	}
 	containers := nestedSliceAt(t, deployment, "spec", "template", "spec", "containers")
-	if len(containers) != 2 {
-		t.Fatalf("namespace proxy must have kube-rbac-proxy and prom-label-proxy containers, got %d", len(containers))
+	if len(containers) != 3 {
+		t.Fatalf("namespace proxy must have kube-rbac-proxy, method-gate and prom-label-proxy containers, got %d", len(containers))
 	}
+	// kube-rbac-proxy must forward to the method gate (:9092), not directly to
+	// prom-label-proxy (:9091), so GET/HEAD enforcement runs before label proxying.
 	assertContainerArgs(t, asMap(t, containers[0]),
 		"--secure-listen-address=0.0.0.0:8443",
-		"--upstream=http://127.0.0.1:9091/",
+		"--upstream=http://127.0.0.1:9092/",
 		"--config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml",
 		"--tls-cert-file=/etc/tls/private/tls.crt",
 		"--tls-private-key-file=/etc/tls/private/tls.key",
@@ -969,6 +979,34 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		"--enable-label-apis",
 		"--regex-match",
 	)
+
+	// The method gate must be present (findContainer fails the test otherwise) and
+	// run the operator binary's "method-gate" subcommand, listening on :9092 and
+	// forwarding to prom-label-proxy on :9091. GET/HEAD enforcement is implemented
+	// in that subcommand, independent of RBAC.
+	gate := findContainer(t, containers, "method-gate")
+	gateCommand, ok := gate["command"].([]any)
+	if !ok {
+		t.Fatalf("method-gate command has unexpected type %T", gate["command"])
+	}
+	gateCommandStrs := make([]string, 0, len(gateCommand))
+	for _, c := range gateCommand {
+		s, ok := c.(string)
+		if !ok {
+			t.Fatalf("method-gate command element has unexpected type %T", c)
+		}
+		gateCommandStrs = append(gateCommandStrs, s)
+	}
+	for _, expected := range []string{
+		"/manager",
+		"method-gate",
+		"--listen=127.0.0.1:9092",
+		"--upstream=http://127.0.0.1:9091",
+	} {
+		if !slices.Contains(gateCommandStrs, expected) {
+			t.Errorf("method-gate command must contain %q, got %v", expected, gateCommandStrs)
+		}
+	}
 
 	service := findRenderedResource(t, resources, "Service", "data-science-prometheus-namespace-proxy")
 	ports := nestedSlice(t, service, "spec", "ports")
@@ -1286,6 +1324,7 @@ func proxyTemplateData() map[string]any {
 		"GatewayNamespace":    "",
 		"KubeRBACProxyImage":  "example.invalid/kube-rbac-proxy:test",
 		"PromLabelProxyImage": "example.invalid/prom-label-proxy:test",
+		"HTTPMethodGateImage": "example.invalid/method-gate:test",
 		"TLSMinVersion":       proxyTLSVersion12,
 		"TLSCipherSuites":     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
 		"TLSCurvePreferences": "29,25",

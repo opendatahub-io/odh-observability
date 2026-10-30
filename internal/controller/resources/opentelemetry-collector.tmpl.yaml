@@ -45,6 +45,9 @@ spec:
   - name: monitoring-tls-certs
     mountPath: /etc/otel-collector/monitoring-tls
     readOnly: true
+  - name: otlp-tls-certs
+    mountPath: /etc/otel-collector/otlp-tls
+    readOnly: true
   {{- if .MetricsStorage }}
   - name: tls-certs
     mountPath: /etc/otel-collector/tls
@@ -54,6 +57,9 @@ spec:
   - name: monitoring-tls-certs
     secret:
       secretName: data-science-collector-monitoring-tls
+  - name: otlp-tls-certs
+    secret:
+      secretName: data-science-collector-collector-headless-tls
   {{- if .MetricsStorage }}
   - name: tls-certs
     secret:
@@ -119,8 +125,18 @@ spec:
       {{- end }}
       otlp:
         protocols:
-          grpc: {}
-          http: {}
+          grpc:
+            tls:
+              cert_file: "/etc/otel-collector/otlp-tls/tls.crt"
+              key_file: "/etc/otel-collector/otlp-tls/tls.key"
+              min_version: "1.2"
+              reload_interval: 5m
+          http:
+            tls:
+              cert_file: "/etc/otel-collector/otlp-tls/tls.crt"
+              key_file: "/etc/otel-collector/otlp-tls/tls.key"
+              min_version: "1.2"
+              reload_interval: 5m
     processors:
       memory_limiter:
         check_interval: 1s

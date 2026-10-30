@@ -184,7 +184,10 @@ func (tc *MonitoringTestCtx) ValidateTempoGatewayTenantConfiguration(t *testing.
 	)
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Instrumentation, types.NamespacedName{Name: InstrumentationName, Namespace: tc.MonitoringNamespace}),
-		WithCondition(jq.Match(`.spec.exporter.endpoint == "http://%s.%s.svc.cluster.local:4317"`, OpenTelemetryCollectorServiceName, tc.MonitoringNamespace)),
+		WithCondition(And(
+			jq.Match(`.spec.exporter.endpoint == "https://%s-headless.%s.svc.cluster.local:4317"`, OpenTelemetryCollectorServiceName, tc.MonitoringNamespace),
+			jq.Match(`.spec.exporter.tls.ca_file == "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt"`),
+		)),
 	)
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{Name: OpenTelemetryCollectorName, Namespace: tc.MonitoringNamespace}),

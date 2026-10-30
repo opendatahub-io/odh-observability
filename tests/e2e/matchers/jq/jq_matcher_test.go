@@ -46,3 +46,60 @@ func TestBuiltinDCGMScrapeAbsenceMatcherHandlesEmptyConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestVolumeMountSelectionMatcherReturnsBoolean(t *testing.T) {
+	t.Parallel()
+
+	matcher := Match(`[.spec.volumeMounts[] | select(.name == "otlp-tls-certs" and .mountPath == "/etc/otel-collector/otlp-tls" and .readOnly == true)] | length > 0`)
+	tests := []struct {
+		name        string
+		volumeMount map[string]any
+		want        bool
+	}{
+		{
+			name: "matching mount",
+			volumeMount: map[string]any{
+				"name":      "otlp-tls-certs",
+				"mountPath": "/etc/otel-collector/otlp-tls",
+				"readOnly":  true,
+			},
+			want: true,
+		},
+		{
+			name: "wrong mount path",
+			volumeMount: map[string]any{
+				"name":      "otlp-tls-certs",
+				"mountPath": "/etc/otel-collector/other",
+				"readOnly":  true,
+			},
+			want: false,
+		},
+		{
+			name: "writable mount",
+			volumeMount: map[string]any{
+				"name":      "otlp-tls-certs",
+				"mountPath": "/etc/otel-collector/otlp-tls",
+				"readOnly":  false,
+			},
+			want: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			resource := map[string]any{
+				"spec": map[string]any{
+					"volumeMounts": []any{test.volumeMount},
+				},
+			}
+			matched, err := matcher.Match(resource)
+			if err != nil {
+				t.Fatalf("match OTLP TLS volume mount: %v", err)
+			}
+			if matched != test.want {
+				t.Errorf("match result: want %t, got %t", test.want, matched)
+			}
+		})
+	}
+}

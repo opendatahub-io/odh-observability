@@ -1,11 +1,29 @@
 package e2e_test
 
 import (
+	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strconv"
 	"testing"
+	"time"
 
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/portforward"
+	"k8s.io/client-go/transport/spdy"
+	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
@@ -67,8 +85,8 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 			return
 		}
 
-		// All validation tests run against the same resources (read-only)
-		// LokiStack tests run first since OTEL depends on LokiStack
+		// Shared-resource checks run before stateful certificate rotation and lifecycle tests.
+		// LokiStack tests run first since OTEL depends on LokiStack.
 		t.Run("Validate usage logs LokiStack deployment", tc.ValidateUsageLogsLokiStackDeployment)
 		t.Run("Validate usage logs LokiStack configuration", tc.ValidateUsageLogsLokiStackConfiguration)
 		t.Run("Validate Usage Logs Collector deployment", tc.ValidateUsageLogsCollectorDeployment)
@@ -85,8 +103,9 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 		t.Run("Validate log forwarding LokiStack configuration", tc.ValidateLogsLokiStackConfiguration)
 		t.Run("Validate optional ClusterLogForwarder and Vector contract", tc.ValidateClusterLogForwarderContract)
 		t.Run("Validate log forwarding LokiStack removal", tc.ValidateLogsLokiStackRemoved)
+		t.Run("Test Usage Logs Collector serving certificate rotation", tc.ValidateUsageLogsCollectorServingCertificateRotation)
 
-		// Lifecycle test modifies state, run last
+		// Lifecycle removes the collector and LokiStack, so it runs last.
 		t.Run("Test Usage Logs lifecycle (LokiStack + Collector)", tc.ValidateUsageLogsLifecycle)
 	})
 }
@@ -182,6 +201,321 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorDeployment(t *testing.T) 
 			Namespace: tc.MonitoringNamespace,
 		}),
 	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      UsageLogsCollectorName + "-collector",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`[.spec.ports[] | select(.port == 4317 or .port == 4318)] | length == 2`)),
+		WithCustomErrorMsg("Usage Logs OTLP Service should expose gRPC and HTTP"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, types.NamespacedName{
+			Name:      UsageLogsCollectorName + "-collector-headless",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == "%s-collector-headless-tls"`, UsageLogsCollectorName)),
+		WithCustomErrorMsg("Usage Logs OTLP headless Service should own an OpenShift serving certificate"),
+	)
+
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Secret, types.NamespacedName{
+			Name:      UsageLogsCollectorName + "-collector-headless-tls",
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(And(
+			jq.Match(`.type == "kubernetes.io/tls"`),
+			jq.Match(`.data."tls.crt" != null`),
+			jq.Match(`.data."tls.key" != null`),
+		)),
+		WithCustomErrorMsg("service-ca should issue the Usage Logs OTLP headless Service certificate and key"),
+	)
+	tc.assertServiceCACertificateOriginMatchesService(
+		t,
+		UsageLogsCollectorName+"-collector-headless",
+		UsageLogsCollectorName+"-collector-headless-tls",
+	)
+}
+
+// ValidateUsageLogsCollectorServingCertificateRotation deletes the service-ca
+// serving Secret and verifies the running collector starts serving its replacement.
+func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorServingCertificateRotation(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+	collectorDeploymentName := UsageLogsCollectorName + "-collector"
+	secretName := UsageLogsCollectorName + "-collector-headless-tls"
+	serviceDNS := fmt.Sprintf("%s.%s.svc", UsageLogsCollectorName+"-collector-headless", tc.MonitoringNamespace)
+
+	tc.EnsureDeploymentReady(WithMinimalObject(gvk.Deployment, types.NamespacedName{
+		Name: collectorDeploymentName, Namespace: tc.MonitoringNamespace,
+	}))
+
+	config, err := ctrlcfg.GetConfig()
+	if err != nil {
+		t.Fatalf("load Kubernetes config: %v", err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		t.Fatalf("create Kubernetes client: %v", err)
+	}
+
+	deployment, err := clientset.AppsV1().Deployments(tc.MonitoringNamespace).Get(
+		tc.Context(), collectorDeploymentName, metav1.GetOptions{},
+	)
+	if err != nil {
+		t.Fatalf("get Usage Logs collector Deployment: %v", err)
+	}
+	selector, err := metav1.LabelSelectorAsSelector(deployment.Spec.Selector)
+	if err != nil {
+		t.Fatalf("build Usage Logs collector pod selector: %v", err)
+	}
+
+	var collectorPod *corev1.Pod
+	tc.g.Eventually(func() error {
+		pods, err := clientset.CoreV1().Pods(tc.MonitoringNamespace).List(
+			tc.Context(), metav1.ListOptions{LabelSelector: selector.String()},
+		)
+		if err != nil {
+			return fmt.Errorf("list Usage Logs collector pods: %w", err)
+		}
+		for i := range pods.Items {
+			pod := &pods.Items[i]
+			if pod.DeletionTimestamp != nil || !usageLogsCollectorPodReady(pod) {
+				continue
+			}
+			collectorPod = pod.DeepCopy()
+			return nil
+		}
+		return errors.New("no ready Usage Logs collector pod found")
+	}, 2*time.Minute, 5*time.Second).Should(Succeed(), "a ready Usage Logs collector pod should exist")
+
+	portForwardAddress, stopPortForward, err := startUsageLogsCollectorPortForward(
+		t, config, clientset, tc.MonitoringNamespace, collectorPod.Name,
+	)
+	if err != nil {
+		t.Fatalf("port-forward to Usage Logs collector pod: %v", err)
+	}
+	defer stopPortForward()
+
+	caConfigMap, err := clientset.CoreV1().ConfigMaps(tc.MonitoringNamespace).Get(
+		tc.Context(), "openshift-service-ca.crt", metav1.GetOptions{},
+	)
+	if err != nil {
+		t.Fatalf("get injected service CA bundle: %v", err)
+	}
+	serviceCAPool := x509.NewCertPool()
+	if !serviceCAPool.AppendCertsFromPEM([]byte(caConfigMap.Data["service-ca.crt"])) {
+		t.Fatal("injected service CA bundle contains no certificates")
+	}
+
+	secret, err := clientset.CoreV1().Secrets(tc.MonitoringNamespace).Get(
+		tc.Context(), secretName, metav1.GetOptions{},
+	)
+	if err != nil {
+		t.Fatalf("get service-ca serving Secret: %v", err)
+	}
+	originalFingerprint, err := usageLogsCertificateFingerprint(secret.Data[corev1.TLSCertKey])
+	if err != nil {
+		t.Fatalf("parse current service-ca certificate: %v", err)
+	}
+
+	tc.g.Eventually(func() error {
+		fingerprint, err := usageLogsCollectorPresentedCertificateFingerprint(
+			tc.Context(), portForwardAddress, serviceDNS, serviceCAPool,
+		)
+		if err != nil {
+			return err
+		}
+		if fingerprint != originalFingerprint {
+			return fmt.Errorf("collector serves certificate %x, Secret contains %x", fingerprint, originalFingerprint)
+		}
+		return nil
+	}, 2*time.Minute, 5*time.Second).Should(Succeed(), "the collector should initially serve the certificate from its Secret")
+
+	if err := clientset.CoreV1().Secrets(tc.MonitoringNamespace).Delete(
+		tc.Context(), secretName, metav1.DeleteOptions{},
+	); err != nil {
+		t.Fatalf("delete service-ca serving Secret to trigger rotation: %v", err)
+	}
+	t.Cleanup(func() {
+		tc.g.Eventually(func() error {
+			_, err := clientset.CoreV1().Secrets(tc.MonitoringNamespace).Get(
+				tc.Context(), secretName, metav1.GetOptions{},
+			)
+			return err
+		}, 2*time.Minute, 5*time.Second).Should(Succeed(), "service-ca should restore the serving Secret after the rotation test")
+	})
+
+	var rotatedFingerprint [sha256.Size]byte
+	tc.g.Eventually(func() error {
+		rotatedSecret, err := clientset.CoreV1().Secrets(tc.MonitoringNamespace).Get(
+			tc.Context(), secretName, metav1.GetOptions{},
+		)
+		if err != nil {
+			return fmt.Errorf("wait for service-ca to recreate serving Secret: %w", err)
+		}
+		fingerprint, err := usageLogsCertificateFingerprint(rotatedSecret.Data[corev1.TLSCertKey])
+		if err != nil {
+			return fmt.Errorf("parse replacement service-ca certificate: %w", err)
+		}
+		if fingerprint == originalFingerprint {
+			return errors.New("service-ca has not replaced the original serving certificate yet")
+		}
+		rotatedFingerprint = fingerprint
+		return nil
+	}, 2*time.Minute, 5*time.Second).Should(Succeed(), "service-ca should issue a new serving certificate after its Secret is deleted")
+
+	tc.g.Eventually(func() error {
+		currentPod, err := clientset.CoreV1().Pods(tc.MonitoringNamespace).Get(
+			tc.Context(), collectorPod.Name, metav1.GetOptions{},
+		)
+		if err != nil {
+			return StopErr(err, "Usage Logs collector pod disappeared during certificate rotation")
+		}
+		if currentPod.UID != collectorPod.UID {
+			return StopErr(errors.New("pod UID changed"), "Usage Logs collector pod restarted during certificate rotation")
+		}
+		if usageLogsCollectorContainerRestartCount(currentPod) != usageLogsCollectorContainerRestartCount(collectorPod) {
+			return StopErr(errors.New("container restart count changed"), "Usage Logs collector restarted during certificate rotation")
+		}
+
+		fingerprint, err := usageLogsCollectorPresentedCertificateFingerprint(
+			tc.Context(), portForwardAddress, serviceDNS, serviceCAPool,
+		)
+		if err != nil {
+			return err
+		}
+		if fingerprint != rotatedFingerprint {
+			return fmt.Errorf("collector still serves certificate %x; waiting for rotated certificate %x", fingerprint, rotatedFingerprint)
+		}
+		return nil
+	}, 8*time.Minute, 10*time.Second).Should(Succeed(), "the running collector should serve the rotated certificate without restarting")
+}
+
+func usageLogsCollectorPodReady(pod *corev1.Pod) bool {
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func usageLogsCollectorContainerRestartCount(pod *corev1.Pod) int32 {
+	var restarts int32
+	for _, container := range pod.Status.ContainerStatuses {
+		restarts += container.RestartCount
+	}
+	return restarts
+}
+
+func startUsageLogsCollectorPortForward(
+	t *testing.T,
+	config *rest.Config,
+	clientset *kubernetes.Clientset,
+	namespace, podName string,
+) (string, func(), error) {
+	t.Helper()
+
+	requestURL := clientset.CoreV1().RESTClient().Post().
+		Resource("pods").Name(podName).Namespace(namespace).SubResource("portforward").URL()
+	transport, upgrader, err := spdy.RoundTripperFor(config)
+	if err != nil {
+		return "", nil, fmt.Errorf("create SPDY transport: %w", err)
+	}
+	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, http.MethodPost, requestURL)
+	stopChannel := make(chan struct{})
+	readyChannel := make(chan struct{})
+	forwarder, err := portforward.NewOnAddresses(
+		dialer, []string{"127.0.0.1"}, []string{"0:4318"}, stopChannel, readyChannel, io.Discard, io.Discard,
+	)
+	if err != nil {
+		return "", nil, fmt.Errorf("create port-forwarder: %w", err)
+	}
+	forwarderErrors := make(chan error, 1)
+	go func() {
+		forwarderErrors <- forwarder.ForwardPorts()
+	}()
+
+	select {
+	case <-readyChannel:
+	case err := <-forwarderErrors:
+		return "", nil, fmt.Errorf("start port-forward: %w", err)
+	case <-time.After(30 * time.Second):
+		close(stopChannel)
+		<-forwarderErrors
+		return "", nil, errors.New("timed out waiting for port-forward readiness")
+	}
+
+	ports, err := forwarder.GetPorts()
+	if err != nil {
+		close(stopChannel)
+		<-forwarderErrors
+		return "", nil, fmt.Errorf("get forwarded port: %w", err)
+	}
+	if len(ports) != 1 {
+		close(stopChannel)
+		<-forwarderErrors
+		return "", nil, fmt.Errorf("expected one forwarded port, got %d", len(ports))
+	}
+	stop := func() {
+		close(stopChannel)
+		select {
+		case err := <-forwarderErrors:
+			if err != nil {
+				t.Logf("port-forward stopped with error: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Log("timed out waiting for port-forward to stop")
+		}
+	}
+	return net.JoinHostPort("127.0.0.1", strconv.Itoa(int(ports[0].Local))), stop, nil
+}
+
+func usageLogsCertificateFingerprint(certificatePEM []byte) ([sha256.Size]byte, error) {
+	var zero [sha256.Size]byte
+	block, _ := pem.Decode(certificatePEM)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return zero, errors.New("PEM data does not contain a certificate")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return zero, fmt.Errorf("parse certificate: %w", err)
+	}
+	return sha256.Sum256(certificate.Raw), nil
+}
+
+func usageLogsCollectorPresentedCertificateFingerprint(
+	ctx context.Context,
+	address, serverName string,
+	rootCAs *x509.CertPool,
+) ([sha256.Size]byte, error) {
+	var zero [sha256.Size]byte
+	dialer := tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 10 * time.Second},
+		Config: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			RootCAs:    rootCAs,
+			ServerName: serverName,
+		},
+	}
+	connection, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return zero, fmt.Errorf("connect to collector TLS receiver: %w", err)
+	}
+	defer connection.Close()
+
+	tlsConnection, ok := connection.(*tls.Conn)
+	if !ok {
+		return zero, fmt.Errorf("expected TLS connection, got %T", connection)
+	}
+	peerCertificates := tlsConnection.ConnectionState().PeerCertificates
+	if len(peerCertificates) == 0 {
+		return zero, errors.New("collector sent no TLS certificate")
+	}
+	return sha256.Sum256(peerCertificates[0].Raw), nil
 }
 
 // ValidateUsageLogsCollectorConfiguration validates the logs collector configuration details.
@@ -198,10 +532,17 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorConfiguration(t *testing.
 			// The operator-managed NetworkPolicy is disabled; ingress is governed by
 			// the NetworkPolicies this operator renders (see ValidateUsageLogsCollectorNetworkPolicies).
 			jq.Match(`.spec.networkPolicy.enabled == false`),
+			jq.Match(`.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" == null`),
+			jq.Match(`[.spec.volumeMounts[] | select(.name == "otlp-tls-certs" and .mountPath == "/etc/otel-collector/otlp-tls" and .readOnly == true)] | length > 0`),
+			jq.Match(`.spec.volumes[] | select(.name == "otlp-tls-certs") | .secret.secretName == "%s-collector-headless-tls"`, UsageLogsCollectorName),
 
 			// Verify receivers
 			jq.Match(`.spec.config.receivers.otlp.protocols.grpc.endpoint == "0.0.0.0:4317"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.grpc.tls.cert_file == "/etc/otel-collector/otlp-tls/tls.crt"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.grpc.tls.key_file == "/etc/otel-collector/otlp-tls/tls.key"`),
 			jq.Match(`.spec.config.receivers.otlp.protocols.http.endpoint == "0.0.0.0:4318"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.http.tls.cert_file == "/etc/otel-collector/otlp-tls/tls.crt"`),
+			jq.Match(`.spec.config.receivers.otlp.protocols.http.tls.key_file == "/etc/otel-collector/otlp-tls/tls.key"`),
 
 			// Verify processors
 			jq.Match(`.spec.config.processors.k8sattributes != null`),

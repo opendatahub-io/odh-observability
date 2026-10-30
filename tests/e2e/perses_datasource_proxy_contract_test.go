@@ -77,7 +77,7 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceProxyNamespaceScoping(t *te
 		Rules: []rbacv1.PolicyRule{{
 			APIGroups: []string{"metrics.k8s.io"},
 			Resources: []string{"pods"},
-			Verbs:     []string{"get", "create"},
+			Verbs:     []string{"get"},
 		}},
 	}
 	if err := tc.Client().Create(tc.Context(), metricsRole); err != nil {
@@ -112,6 +112,7 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceProxyNamespaceScoping(t *te
 	if withNS.status != http.StatusOK {
 		t.Fatalf("Perses datasource proxy with caller token + namespace= must return 200, got %d body=%q", withNS.status, withNS.body)
 	}
+	assertPersesPostAllowed(t, tc, persesPod, authorizedToken, tc.MonitoringNamespace)
 
 	// Namespace isolation: Role is only in MonitoringNamespace — foreign NS must deny.
 	foreignNS := fmt.Sprintf("perses-proxy-ns-deny-%s", identitySuffix)
@@ -138,6 +139,7 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceProxyNamespaceScoping(t *te
 	if multiDeny.status != http.StatusForbidden && multiDeny.status != http.StatusUnauthorized {
 		t.Fatalf("Perses datasource proxy multi-ns deny must be 403 or 401, got %d", multiDeny.status)
 	}
+	assertPersesPostMultiNamespaceRejected(t, tc, persesPod, authorizedToken, foreignNS)
 
 	// Grant access to a second namespace; repeated authorized values must succeed.
 	secondNS := fmt.Sprintf("perses-proxy-ns-allow-%s", identitySuffix)
@@ -151,7 +153,7 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceProxyNamespaceScoping(t *te
 		Rules: []rbacv1.PolicyRule{{
 			APIGroups: []string{"metrics.k8s.io"},
 			Resources: []string{"pods"},
-			Verbs:     []string{"get", "create"},
+			Verbs:     []string{"get"},
 		}},
 	}
 	if err := tc.Client().Create(tc.Context(), secondRole); err != nil {
@@ -183,6 +185,8 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceProxyNamespaceScoping(t *te
 		t.Fatalf("Perses datasource proxy with both namespaces authorized must return 200, got %d body=%q",
 			multi.status, trimProbeBody(multi.body))
 	}
+	assertPersesPostAllowed(t, tc, persesPod, authorizedToken, tc.MonitoringNamespace, secondNS)
+	assertPersesPostBodyNamespaceRejected(t, tc, persesPod, authorizedToken, foreignNS)
 
 	missingNS := probePersesDatasourceProxy(t, tc, persesPod, authorizedToken)
 	t.Logf("perses→proxy authorized-missing-namespace http=%d body=%q", missingNS.status, trimProbeBody(missingNS.body))
@@ -220,6 +224,30 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceProxyNamespaceScoping(t *te
 type persesProxyProbe struct {
 	status int
 	body   string
+}
+
+func assertPersesPostAllowed(t *testing.T, tc *MonitoringTestCtx, pod, token string, namespaces ...string) {
+	t.Helper()
+	probe := probePersesDatasourceProxyPost(t, tc, pod, token, "", namespaces...)
+	if probe.status != http.StatusOK {
+		t.Fatalf("Perses form POST for %v must return 200, got %d body=%q", namespaces, probe.status, trimProbeBody(probe.body))
+	}
+}
+
+func assertPersesPostBodyNamespaceRejected(t *testing.T, tc *MonitoringTestCtx, pod, token, foreignNS string) {
+	t.Helper()
+	probe := probePersesDatasourceProxyPost(t, tc, pod, token, foreignNS, tc.MonitoringNamespace)
+	if probe.status != http.StatusForbidden {
+		t.Fatalf("Perses form POST with a body namespace must be forbidden, got %d body=%q", probe.status, trimProbeBody(probe.body))
+	}
+}
+
+func assertPersesPostMultiNamespaceRejected(t *testing.T, tc *MonitoringTestCtx, pod, token, foreignNS string) {
+	t.Helper()
+	probe := probePersesDatasourceProxyPost(t, tc, pod, token, "", tc.MonitoringNamespace, foreignNS)
+	if probe.status != http.StatusForbidden && probe.status != http.StatusUnauthorized {
+		t.Fatalf("Perses form POST including an unauthorized namespace must be denied, got %d body=%q", probe.status, trimProbeBody(probe.body))
+	}
 }
 
 func resolvePersesPodName(t *testing.T, tc *MonitoringTestCtx) string {
@@ -263,13 +291,25 @@ func resolvePersesPodName(t *testing.T, tc *MonitoringTestCtx) string {
 // Pass zero namespaces to omit namespace=; one or more for repeated namespace= params.
 func probePersesDatasourceProxy(t *testing.T, tc *MonitoringTestCtx, pod, token string, namespaces ...string) persesProxyProbe {
 	t.Helper()
+	return probePersesDatasourceProxyRequest(t, tc, pod, token, false, "", namespaces...)
+}
+
+func probePersesDatasourceProxyPost(t *testing.T, tc *MonitoringTestCtx, pod, token, formNamespace string, namespaces ...string) persesProxyProbe {
+	t.Helper()
+	return probePersesDatasourceProxyRequest(t, tc, pod, token, true, formNamespace, namespaces...)
+}
+
+func probePersesDatasourceProxyRequest(t *testing.T, tc *MonitoringTestCtx, pod, token string, post bool, formNamespace string, namespaces ...string) persesProxyProbe {
+	t.Helper()
 	var pathBuilder strings.Builder
 	fmt.Fprintf(&pathBuilder,
-		"/proxy/projects/%s/datasources/%s/api/v1/query?query=%s",
+		"/proxy/projects/%s/datasources/%s/api/v1/query?",
 		url.PathEscape(tc.MonitoringNamespace),
 		url.PathEscape(PersesDatasourceName),
-		url.QueryEscape(thanosRouteProbeQuery),
 	)
+	if !post {
+		pathBuilder.WriteString("query=" + url.QueryEscape(thanosRouteProbeQuery))
+	}
 	for _, namespace := range namespaces {
 		pathBuilder.WriteString("&namespace=")
 		pathBuilder.WriteString(url.QueryEscape(namespace))
@@ -279,6 +319,12 @@ func probePersesDatasourceProxy(t *testing.T, tc *MonitoringTestCtx, pod, token 
 	script := `curl -sS --connect-timeout 5 --max-time 30 -o /tmp/perses-ds-proxy-probe.body -w '%{http_code}'`
 	if token != "" {
 		script += ` -H 'Authorization: Bearer ` + strings.ReplaceAll(token, `'`, `'\''`) + `'`
+	}
+	if post {
+		script += ` --data-urlencode 'query=` + thanosRouteProbeQuery + `'`
+		if formNamespace != "" {
+			script += ` --data-urlencode 'namespace=` + strings.ReplaceAll(formNamespace, `'`, `'\''`) + `'`
+		}
 	}
 	script += ` '` + strings.ReplaceAll(curlURL, `'`, `'\''`) + `'`
 

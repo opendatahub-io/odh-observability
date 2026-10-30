@@ -4286,15 +4286,19 @@ func TestDeployUsageLogsCollector_RemoteExporters(t *testing.T) {
 		t.Errorf("bearertokenauth/remote not enabled in service.extensions: %v", enabled)
 	}
 	vols, _, _ := unstructured.NestedSlice(collector.Object, "spec", "volumes")
-	if len(vols) != 1 {
-		t.Fatalf("expected one volume for the credential, got %v", vols)
+	var credentialVolume map[string]any
+	for _, rawVolume := range vols {
+		volume, ok := rawVolume.(map[string]any)
+		if ok && volume["name"] == "usage-logs-remote-credential" {
+			credentialVolume = volume
+			break
+		}
 	}
-	vol, ok := vols[0].(map[string]any)
-	if !ok {
-		t.Fatalf("expected the volume to be an object, got %T", vols[0])
+	if credentialVolume == nil {
+		t.Fatalf("credential volume missing; got %v", vols)
 	}
-	if name, _, _ := unstructured.NestedString(vol, "secret", "secretName"); name != "hub-usage-logs-auth" {
-		t.Errorf("volume does not reference the credential Secret: %v", vols[0])
+	if name, _, _ := unstructured.NestedString(credentialVolume, "secret", "secretName"); name != "hub-usage-logs-auth" {
+		t.Errorf("volume does not reference the credential Secret: %v", credentialVolume)
 	}
 	// The authenticator is attached by the controller, not written by the user:
 	// exporter configs are validated against an allowlist that excludes auth.
@@ -4440,11 +4444,21 @@ func TestDeployUsageLogsCollector_CredentialWithoutExporters(t *testing.T) {
 		t.Fatal("no OpenTelemetryCollector rendered")
 	}
 
-	if vols, found, _ := unstructured.NestedSlice(collector.Object, "spec", "volumes"); found && len(vols) > 0 {
-		t.Errorf("credential mounted with no exporter to authenticate: %v", vols)
+	if vols, found, _ := unstructured.NestedSlice(collector.Object, "spec", "volumes"); found {
+		for _, rawVolume := range vols {
+			volume, ok := rawVolume.(map[string]any)
+			if ok && volume["name"] == "usage-logs-remote-credential" {
+				t.Errorf("credential mounted with no exporter to authenticate: %v", vols)
+			}
+		}
 	}
-	if mounts, found, _ := unstructured.NestedSlice(collector.Object, "spec", "volumeMounts"); found && len(mounts) > 0 {
-		t.Errorf("credential mount rendered with no exporter to authenticate: %v", mounts)
+	if mounts, found, _ := unstructured.NestedSlice(collector.Object, "spec", "volumeMounts"); found {
+		for _, rawMount := range mounts {
+			mount, ok := rawMount.(map[string]any)
+			if ok && mount["name"] == "usage-logs-remote-credential" {
+				t.Errorf("credential mount rendered with no exporter to authenticate: %v", mounts)
+			}
+		}
 	}
 
 	exts, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "extensions")

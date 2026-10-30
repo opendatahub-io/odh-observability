@@ -24,6 +24,9 @@ spec:
             - containerPort: 3000
               name: http
               protocol: TCP
+            - containerPort: 3200
+              name: tempo-query
+              protocol: TCP
             - containerPort: 4317
               name: otlp-grpc
               protocol: TCP
@@ -63,6 +66,10 @@ spec:
     - name: http
       port: 3000
       targetPort: 3000
+      protocol: TCP
+    - name: tempo-query
+      port: 3200
+      targetPort: 3200
       protocol: TCP
     - name: otlp-grpc
       port: 4317

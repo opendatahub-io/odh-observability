@@ -52,6 +52,10 @@ make deploy NAMESPACE=opendatahub IMG=quay.io/opendatahub/odh-observability:odh-
 make undeploy
 ```
 
+## Compatibility matrix
+
+Known-good and known-bad COO / Tempo / related dependency versions for RHOAI releases are documented in [docs/compatibility-matrix.md](docs/compatibility-matrix.md) (machine-readable: [docs/compatibility-matrix.yaml](docs/compatibility-matrix.yaml)). The automated golden-pair gate is `make e2e-test-coo-compatibility` — see [tests/e2e/README.md](tests/e2e/README.md).
+
 ## Custom Resource
 
 Create a `Monitoring` CR to configure the observability stack:
@@ -170,7 +174,8 @@ tests/e2e/                      End-to-end test suite
 - **Embedded templates** — resource templates are embedded via `//go:embed`
 - **Condition aggregation** — per-feature conditions are aggregated into top-level Ready/Degraded status
 - **TLS-only collector scraping** — the OTel Collector's internal telemetry is re-exported through a TLS-enabled pipeline exporter on `:8890` (service `data-science-collector-monitoring`, cert via OpenShift service-CA) because the Go SDK Prometheus pull exporter does not support TLS natively. Prometheus scrapes this endpoint over HTTPS.
-- **NetworkPolicy-guarded collector ingress** — `data-science-collector-monitoring-ingress` is the only policy selecting the collector pods, so it acts as the collector's sole ingress gate on clusters with NetworkPolicy enforcement. It allows the Prometheus pod selector to scrape the active TLS endpoints on `:8889`/`:8890`; the operator-created `:8888` Service is not an active pod-IP listener and is not admitted. OTLP `:4317`/`:4318` requires an administrator-enrolled namespace and the KServe inference or scheduler pod labels. The TargetAllocator has a separate policy allowing only collector pods on `:8080` and discovered Kubernetes API endpoint egress.
+- **TLS-protected OTLP receivers** — both the main collector and the optional Usage Logs collector serve OTLP gRPC (`:4317`) and HTTP (`:4318`) with OpenShift service-CA certificates. In-cluster clients should use each collector's generated headless Service DNS name over HTTPS/gRPC TLS and trust `/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt`.
+- **NetworkPolicy-guarded collector ingress** — `data-science-collector-monitoring-ingress` is the only policy selecting the collector pods, so it acts as the collector's sole ingress gate on clusters with NetworkPolicy enforcement. It allows the Prometheus pod selector to scrape the active TLS endpoints on `:8889`/`:8890`; the operator-created `:8888` Service is not an active pod-IP listener and is not admitted. OTLP `:4317`/`:4318` uses TLS with an OpenShift service-CA certificate and requires an administrator-enrolled namespace plus the KServe inference or scheduler pod labels. The TargetAllocator has a separate policy allowing only collector pods on `:8080` and discovered Kubernetes API endpoint egress.
 
 ### Enrolling inference namespaces for OTLP
 

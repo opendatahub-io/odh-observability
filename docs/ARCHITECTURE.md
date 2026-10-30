@@ -373,7 +373,7 @@ This handles scenarios like:
 
 ## Namespace-Scoped Metrics
 
-The operator deploys namespace-scoped proxy paths for both the Prometheus route and the data-science Thanos route. Each path uses the same two-stage architecture: `kube-rbac-proxy` authenticates and authorizes the namespace, while `prom-label-proxy` enforces the namespace label in PromQL.
+The operator deploys namespace-scoped proxy paths for both the Prometheus route and the data-science Thanos route. `kube-rbac-proxy` authenticates and authorizes the namespace, the method gate limits requests, and `prom-label-proxy` enforces the namespace label in PromQL.
 
 ```
 User Request
@@ -382,6 +382,9 @@ kube-rbac-proxy (port 8443)
     |-- Authenticates via bearer token (TokenReview)
     |-- Extracts 'namespace' query parameter
     |-- Performs SubjectAccessReview for metrics.k8s.io/pods
+    |
+method-gate (port 9092)
+    |-- Allows GET/HEAD; Thanos also allows safe read-only form POSTs
     |
 prom-label-proxy (port 9091)
     |-- Validates namespace parameter is present
@@ -393,11 +396,13 @@ Prometheus (port 9090)
 
 **Authentication**: kube-rbac-proxy validates bearer tokens via Kubernetes TokenReview API.
 
-**Authorization**: SubjectAccessReview checks that the user can `get` `metrics.k8s.io/pods` in the requested namespace. The proxy uses this read permission for both GET and read-only Prometheus POST queries. Repeated `namespace=` values produce one SAR per namespace; the request is allowed only if the caller is authorized for every listed namespace. The old aggregated `data-science-metrics-view` ClusterRole is no longer rendered and is eligible for removal by the monitoring resource garbage collector on upgrade.
+**Authorization**: kube-rbac-proxy performs a SubjectAccessReview with a static `resourceAttributes.verb: get` on `metrics.k8s.io/pods` for every requested URL-query namespace. The check applies to both GET and POST. The old aggregated `data-science-metrics-view` ClusterRole is no longer rendered and is eligible for removal during upgrades.
+
+**Method enforcement (independent of RBAC)**: the method-gate sidecar uses the operator's own image. The Prometheus proxy permits only GET/HEAD. The Thanos proxy also permits URL-encoded form POSTs to read-only query and label APIs, for Perses; it rejects unsupported methods and paths, malformed or encoded forms, and any form-body `namespace`. This prevents prom-label-proxy from merging an unauthorized body namespace into the URL-authorized label matcher. The namespace must always be in the URL.
 
 **Query isolation**: prom-label-proxy rewrites PromQL to inject the namespace matcher (`namespace="a"` or `namespace=~"a|b"` for multi-select / Project=All). Project=All must expand to concrete namespaces, not a wildcard. The Thanos proxy omits `--regex-match` to allow repeated `namespace=` values; kube-rbac-proxy checks every URL value. The Prometheus namespace proxy retains `--regex-match` and rejects duplicates.
 
-**Known limitation — POST form body namespace injection**: kube-rbac-proxy authorizes URL query values only, while prom-label-proxy merges URL and POST form values. A caller authorized for URL `namespace=A` can include form `namespace=B` and retrieve B's metrics without a SAR for B. This also affects direct requests to the external Thanos route. The default pinned prom-label-proxy image is v0.12.1 and does not support query-only extraction. Upstream [#444](https://github.com/prometheus-community/prom-label-proxy/pull/444) has merged but has not been released. Follow-up RHOAIENG-101998: consume a verified image containing the fix, enable `--query-param-only` without `--regex-match`, and verify mixed URL/form rejection alongside repeated authorized URL namespaces.
+**Follow-up**: once a verified prom-label-proxy image supports query-only extraction, RHOAIENG-101998 tracks enabling it as an additional safeguard and retaining mixed URL/form and multi-namespace tests.
 
 **TLS profile ownership**: The controller resolves the effective APIServer TLS profile and writes the resulting version, cipher-suite, and curve-preference flags into the PodTemplates of all generated kube-rbac-proxy workloads: the Prometheus namespace proxy, Prometheus cluster proxy, and Thanos Querier proxy. The proxy image does not watch OpenShift TLS resources. `RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE` only selects the image; it does not configure TLS. Under strict adherence, an unrepresentable profile fails reconciliation before any workload is applied. TLS 1.3 omits the cipher-suite restriction because Go does not make TLS 1.3 cipher suites configurable. Curve preferences are emitted as numeric Go CurveIDs, with non-FIPS-approved curves dropped when the cluster install configuration reports FIPS mode. If cluster FIPS status cannot be determined, reconciliation fails before any workload is applied.
 
