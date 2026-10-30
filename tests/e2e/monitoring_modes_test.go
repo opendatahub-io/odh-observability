@@ -84,9 +84,27 @@ func (tc *MonitoringTestCtx) ensureCollectorPipelineAbsent(t *testing.T, pipelin
 		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
 			Name: OpenTelemetryCollectorName, Namespace: tc.MonitoringNamespace,
 		}),
-		WithCondition(jq.Match(`.spec.config.service.pipelines | has("%s") | not`, pipeline)),
+		WithCondition(collectorPipelineAbsent(pipeline)),
 		WithCustomErrorMsg("Collector must not define the %s pipeline", pipeline),
 	)
+}
+
+func collectorPipelineAbsent(pipeline string) *jq.Matcher {
+	return jq.Match(`.spec.config.service.pipelines | has("%s") | not`, pipeline)
+}
+
+func collectorMetricsPipelinesInclude(exporter string) *jq.Matcher {
+	return jq.Match(`
+		(.spec.config.service.pipelines."metrics/scrape".exporters // [] | contains(["%s"])) and
+		(.spec.config.service.pipelines."metrics/otlp".exporters // [] | contains(["%s"]))
+	`, exporter, exporter)
+}
+
+func collectorMetricsPipelinesOnly(exporter string) *jq.Matcher {
+	return jq.Match(`
+		(.spec.config.service.pipelines."metrics/scrape".exporters == ["%s"]) and
+		(.spec.config.service.pipelines."metrics/otlp".exporters == ["%s"])
+	`, exporter, exporter)
 }
 
 // usageLogsMustBeAbsent fails if stale usageLogs config is present (Modes runs before the
@@ -156,11 +174,10 @@ func (tc *MonitoringTestCtx) ValidateMode1AllBuiltInReady(t *testing.T) {
 		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
 			Name: OpenTelemetryCollectorName, Namespace: tc.MonitoringNamespace,
 		}),
-		WithCondition(jq.Match(`
+		WithCondition(And(jq.Match(`
 			(.spec.config.exporters | has("prometheus") and has("otlp/tempo")) and
-			(.spec.config.service.pipelines.metrics.exporters | contains(["prometheus"])) and
 			(.spec.config.service.pipelines.traces.exporters | contains(["otlp/tempo"]))
-		`)),
+		`), collectorMetricsPipelinesInclude("prometheus"))),
 		WithCustomErrorMsg("Mode 1: collector metrics/traces pipelines must include built-in prometheus and otlp/tempo exporters"),
 	)
 
@@ -207,11 +224,10 @@ func (tc *MonitoringTestCtx) ValidateMode2MetricsExportersOnly(t *testing.T) {
 		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
 			Name: OpenTelemetryCollectorName, Namespace: tc.MonitoringNamespace,
 		}),
-		WithCondition(jq.Match(`
+		WithCondition(And(jq.Match(`
 			(.spec.config.exporters | has("%s")) and
-			(.spec.config.exporters | has("prometheus") | not) and
-			(.spec.config.service.pipelines.metrics.exporters | length == 1 and contains(["%s"]))
-		`, OtlpHttpMetricsExternalExporter, OtlpHttpMetricsExternalExporter)),
+			(.spec.config.exporters | has("prometheus") | not)
+		`, OtlpHttpMetricsExternalExporter), collectorMetricsPipelinesOnly(OtlpHttpMetricsExternalExporter))),
 		WithCustomErrorMsg("Mode 2 metrics: metrics pipeline exporters must be exactly [%s]", OtlpHttpMetricsExternalExporter),
 	)
 	tc.ensureCollectorPipelineAbsent(t, "traces")
@@ -275,7 +291,8 @@ func (tc *MonitoringTestCtx) ValidateMode2TracesExportersOnly(t *testing.T) {
 		`, OtlpHttpTracesExternalExporter, OtlpHttpTracesExternalExporter)),
 		WithCustomErrorMsg("Mode 2 traces: traces pipeline exporters must be exactly [%s]", OtlpHttpTracesExternalExporter),
 	)
-	tc.ensureCollectorPipelineAbsent(t, "metrics")
+	tc.ensureCollectorPipelineAbsent(t, "metrics/scrape")
+	tc.ensureCollectorPipelineAbsent(t, "metrics/otlp")
 
 	// Exporters-only traces never select a Tempo backend, so neither CR was ever created.
 	// Not using ensureBuiltInTracesOperandsGone here: it also asserts Instrumentation gone,
@@ -340,14 +357,13 @@ func (tc *MonitoringTestCtx) ValidateMode2CombinedExportersOnly(t *testing.T) {
 		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
 			Name: OpenTelemetryCollectorName, Namespace: tc.MonitoringNamespace,
 		}),
-		WithCondition(jq.Match(`
+		WithCondition(And(jq.Match(`
 			(.spec.config.exporters | has("%s") and has("%s")) and
 			(.spec.config.exporters | has("prometheus") | not) and
 			(.spec.config.exporters | has("otlp/tempo") | not) and
-			(.spec.config.service.pipelines.metrics.exporters | length == 1 and contains(["%s"])) and
 			(.spec.config.service.pipelines.traces.exporters | length == 1 and contains(["%s"]))
 		`, OtlpHttpMetricsExternalExporter, OtlpHttpTracesExternalExporter,
-			OtlpHttpMetricsExternalExporter, OtlpHttpTracesExternalExporter)),
+			OtlpHttpTracesExternalExporter), collectorMetricsPipelinesOnly(OtlpHttpMetricsExternalExporter))),
 		WithCustomErrorMsg("Mode 2 combined: metrics/traces pipelines must be exactly the distinct custom exporters"),
 	)
 
@@ -403,10 +419,10 @@ func (tc *MonitoringTestCtx) ValidateMode4MetricsOnlyWithStorage(t *testing.T) {
 		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
 			Name: OpenTelemetryCollectorName, Namespace: tc.MonitoringNamespace,
 		}),
-		WithCondition(jq.Match(`
-			(.spec.config.exporters | has("prometheus")) and
-			(.spec.config.service.pipelines.metrics.exporters | contains(["prometheus"]))
-		`)),
+		WithCondition(And(
+			jq.Match(`.spec.config.exporters | has("prometheus")`),
+			collectorMetricsPipelinesInclude("prometheus"),
+		)),
 		WithCustomErrorMsg("Mode 4 metrics-only: collector metrics pipeline must include built-in prometheus exporter"),
 	)
 	tc.ensureCollectorPipelineAbsent(t, "traces")
@@ -467,7 +483,8 @@ func (tc *MonitoringTestCtx) ValidateMode4TracesOnlyWithStorage(t *testing.T) {
 		`)),
 		WithCustomErrorMsg("Mode 4 traces-only: collector traces pipeline must include built-in otlp/tempo exporter"),
 	)
-	tc.ensureCollectorPipelineAbsent(t, "metrics")
+	tc.ensureCollectorPipelineAbsent(t, "metrics/scrape")
+	tc.ensureCollectorPipelineAbsent(t, "metrics/otlp")
 
 	tc.ensurePersesStatefulSetReady(t)
 	tc.ensureBuiltInMetricsOperandsGone(t)
