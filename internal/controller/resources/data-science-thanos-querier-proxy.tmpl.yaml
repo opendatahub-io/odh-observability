@@ -138,8 +138,8 @@ spec:
             # No --regex-match: Perses Project=All / multi-select sends
             # namespace=a&namespace=b; kube-rbac-proxy SAR-checks each value.
             # Residual risk: POST form namespace= can widen enforcement beyond
-            # URL-only SAR (see ARCHITECTURE.md). Perses uses URL queryParams
-            # only. Follow-up: upstream prom-label-proxy query-param-only.
+            # URL-only SAR (see ARCHITECTURE.md). Follow-up: use a proxy image
+            # that supports query-param-only.
           resources:
             limits:
               cpu: 100m

@@ -134,10 +134,14 @@ rules:
   - apiGroups: ["route.openshift.io"]
     resources: ["routes/custom-host"]
     verbs: ["create"]
-  # OLM operator conditions (read-only, for precondition checks)
+  # OLMv0 operator conditions (read-only, for precondition checks)
   - apiGroups: ["operators.coreos.com"]
     resources: ["operatorconditions"]
     verbs: ["get", "list", "watch"]
+  # OLMv0 installed CSV version lookup
+  - apiGroups: ["operators.coreos.com"]
+    resources: ["clusterserviceversions"]
+    verbs: ["list"]
   # OLMv1 operator installation status (read-only, for precondition checks)
   - apiGroups: ["olm.operatorframework.io"]
     resources: ["clusterextensions"]

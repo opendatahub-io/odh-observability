@@ -42,6 +42,13 @@ func TestCollectorNetworkPolicyTemplateRestrictsIngress(t *testing.T) {
 	}, scrapeRule.Ports)
 
 	otlpRule := collector.Spec.Ingress[1]
+	require.Len(t, otlpRule.From, 2)
+	require.Equal(t, []networkingv1.NetworkPolicyPort{
+		tcpNetworkPolicyPort(4317),
+		tcpNetworkPolicyPort(4318),
+	}, otlpRule.Ports)
+
+	llmRule := otlpRule.From[0]
 	require.Equal(t, []networkingv1.NetworkPolicyPeer{{
 		NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
 			"monitoring.opendatahub.io/otlp": "true",
@@ -61,12 +68,17 @@ func TestCollectorNetworkPolicyTemplateRestrictsIngress(t *testing.T) {
 				"llminferenceservice-router-scheduler",
 			},
 		}},
-		}}}, otlpRule.From)
-	require.Equal(t, []networkingv1.NetworkPolicyPort{
-		tcpNetworkPolicyPort(4317),
-		tcpNetworkPolicyPort(4318),
-	}, otlpRule.Ports)
-	namespaceSelector, err := metav1.LabelSelectorAsSelector(otlpRule.From[0].NamespaceSelector)
+		}}}, []networkingv1.NetworkPolicyPeer{llmRule})
+
+	isvcRule := otlpRule.From[1]
+	require.Equal(t, &metav1.LabelSelector{MatchLabels: map[string]string{
+		"monitoring.opendatahub.io/otlp": "true",
+	}}, isvcRule.NamespaceSelector)
+	require.Len(t, isvcRule.PodSelector.MatchExpressions, 1)
+	require.Equal(t, "serving.kserve.io/inferenceservice", isvcRule.PodSelector.MatchExpressions[0].Key)
+	require.Equal(t, metav1.LabelSelectorOpExists, isvcRule.PodSelector.MatchExpressions[0].Operator)
+
+	namespaceSelector, err := metav1.LabelSelectorAsSelector(llmRule.NamespaceSelector)
 	require.NoError(t, err)
 	for _, test := range []struct {
 		name   string
@@ -84,7 +96,7 @@ func TestCollectorNetworkPolicyTemplateRestrictsIngress(t *testing.T) {
 		})
 	}
 
-	selector, err := metav1.LabelSelectorAsSelector(otlpRule.From[0].PodSelector)
+	selector, err := metav1.LabelSelectorAsSelector(llmRule.PodSelector)
 	require.NoError(t, err)
 	for _, component := range []string{
 		"llminferenceservice-workload",
@@ -110,6 +122,9 @@ func TestCollectorNetworkPolicyTemplateRestrictsIngress(t *testing.T) {
 	require.False(t, selector.Matches(labels.Set{
 		"app.kubernetes.io/component": "llminferenceservice-workload",
 	}))
+	isvcSelector, err := metav1.LabelSelectorAsSelector(isvcRule.PodSelector)
+	require.NoError(t, err)
+	require.True(t, isvcSelector.Matches(labels.Set{"serving.kserve.io/inferenceservice": "demo"}))
 }
 
 func TestCollectorTargetAllocatorNetworkPolicyTemplateRestrictsIngressAndAPIConfig(t *testing.T) {

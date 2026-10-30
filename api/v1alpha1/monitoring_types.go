@@ -77,6 +77,10 @@ type Metrics struct {
 	// Storage configures the built-in MonitoringStack backend. Omit when using exporters only (external observability).
 	// +optional
 	Storage *MetricsStorage `json:"storage,omitempty"`
+	// BuiltinDCGMScrapeEnabled controls the built-in HTTP scrape for DCGM exporter metrics.
+	// It defaults to enabled; set false when collecting DCGM through a ServiceMonitor or PodMonitor instead.
+	// +optional
+	BuiltinDCGMScrapeEnabled *bool `json:"builtinDCGMScrapeEnabled,omitempty"`
 	// Replicas specifies the number of replicas in the MonitoringStack.
 	// +kubebuilder:validation:Minimum=0
 	Replicas int32 `json:"replicas,omitempty"`
@@ -130,9 +134,21 @@ type TracesTLS struct {
 // Logs defines the configuration for cluster log forwarding via the ClusterLogForwarder operator.
 type Logs struct {
 	// Storage configures the LokiStack storage backend for log forwarding.
-	// Required: the operator deploys a shared LokiStack used by both log forwarding and usage logs.
+	// Required: the operator deploys a LokiStack dedicated to log forwarding, separate from the
+	// one usageLogs.storage deploys.
+	// The two stacks must use different object storage buckets. Both serve the "application" tenant and
+	// Loki keys objects by tenant rather than by stack, so a shared bucket makes them overwrite each
+	// other's index and chunks. Separate secrets are not sufficient; the operator compares the resolved
+	// endpoint and bucketnames and refuses to reconcile when they overlap.
 	// +kubebuilder:validation:Required
 	Storage *LokiStorageConfig `json:"storage"`
+
+	// Size selects the log-forwarding LokiStack size. The default is 1x.extra-small;
+	// 1x.demo uses fewer resources but does not provide redundancy.
+	// +optional
+	// +kubebuilder:default="1x.extra-small"
+	// +kubebuilder:validation:Enum="1x.demo";"1x.pico";"1x.extra-small";"1x.small";"1x.medium"
+	Size string `json:"size,omitempty"`
 
 	// InferenceNamespaces lists the namespaces whose application logs should be forwarded to Loki.
 	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?$`
@@ -165,11 +181,68 @@ type TracesStorage struct {
 }
 
 // UsageLogs defines the configuration for usage log collection.
+// A cluster-local store requires storage; forwarding-only configs (a fleet hub) omit storage.
+// +kubebuilder:validation:XValidation:rule="has(self.storage) || (has(self.exporters) && size(self.exporters) > 0)",message="usageLogs requires storage and/or at least one exporter"
 type UsageLogs struct {
 	// Storage configures the LokiStack storage backend (S3).
 	// When configured, the operator deploys a LokiStack instance and auto-configures the collector endpoint.
-	// +kubebuilder:validation:Required
-	Storage *LokiStorageConfig `json:"storage"`
+	// This stack is separate from the one logs.storage deploys and must use a different object storage
+	// bucket; see logs.storage for why a shared bucket is rejected.
+	// Omit when forwarding only: no LokiStack is deployed and no object storage is needed.
+	// +optional
+	Storage *LokiStorageConfig `json:"storage,omitempty"`
+
+	// Size selects the LokiStack t-shirt size for the usage-log store. The default
+	// 1x.extra-small requests 1 CPU and 5.25Gi per ingester across three ingesters,
+	// which does not schedule on smaller clusters; the LokiStack then never reports
+	// Ready and the usage-logs collector is never deployed. 1x.demo carries identical
+	// ingestion limits with a single ingester and no resource requests at all, so it
+	// fits where the default cannot, but it has no redundancy. Ignored when storage is
+	// omitted, since no LokiStack is deployed.
+	// +optional
+	// +kubebuilder:default="1x.extra-small"
+	// +kubebuilder:validation:Enum="1x.demo";"1x.pico";"1x.extra-small";"1x.small";"1x.medium"
+	Size string `json:"size,omitempty"`
+
+	// Exporters defines additional usage-log exporters, for forwarding a copy of every
+	// usage record to an observability backend outside this cluster — typically a
+	// LokiStack on an ACM hub that aggregates a fleet. The configuration follows the
+	// OpenTelemetry Collector exporter format. They are added alongside the local
+	// write, which is left untouched, making it a dual-write rather than a redirect;
+	// with storage omitted they are the only destination and nothing is written locally.
+	// Reserved name 'otlphttp/loki' cannot be used.
+	// Maximum 10 exporters allowed.
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="!('otlphttp/loki' in self)",message="exporter name 'otlphttp/loki' is reserved and cannot be used"
+	// +kubebuilder:validation:XValidation:rule="size(self) <= 10",message="maximum 10 exporters allowed"
+	Exporters map[string]runtime.RawExtension `json:"exporters,omitempty"`
+
+	// CredentialSecret names a Secret in the monitoring namespace holding a bearer
+	// token under the key 'token', for authenticating to the Exporters' endpoint. It
+	// is mounted as a file and read through a bearertokenauth extension named
+	// 'bearertokenauth/remote', which an exporter selects with
+	// auth: {authenticator: bearertokenauth/remote}.
+	//
+	// The token is never written into the collector object, and because the extension
+	// re-reads the file, rotating the Secret reaches a running collector — projecting
+	// a credential as an environment variable would not, since env vars are read once
+	// at process start. A token also cannot be inlined into an exporter's headers:
+	// exporter values are capped at 1024 characters and a ServiceAccount token is
+	// longer than that.
+	// +optional
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	CredentialSecret string `json:"credentialSecret,omitempty"`
+
+	// Attributes are resource attributes stamped onto records sent to Exporters only.
+	// They never reach the local write, so a cluster identity added here cannot
+	// disturb the spoke-local pipeline or its dashboards. Set cluster_name and
+	// cluster_id here to attribute records to the cluster that produced them; the
+	// gateway already uses cluster_name for its own upstream cluster, so these are
+	// applied after the pipeline's cleanup stage rather than merged into it.
+	// +optional
+	// +kubebuilder:validation:MaxProperties=20
+	Attributes map[string]string `json:"attributes,omitempty"`
 }
 
 // LokiStorageConfig defines storage configuration for LokiStack.
@@ -214,9 +287,24 @@ type MonitoringStatus struct {
 	URL string `json:"url,omitempty"`
 
 	// UsageLogsEndpoint is the Loki OTLP endpoint for sending usage logs.
-	// Populated when usageLogs is configured.
+	// Populated when usage-log storage is configured and its LokiStack is ready.
 	// +optional
 	UsageLogsEndpoint string `json:"usageLogsEndpoint,omitempty"`
+
+	// LogsEndpoint is the Loki query endpoint for forwarded application logs.
+	// Populated when logs is configured and its LokiStack is ready. Unlike
+	// usageLogsEndpoint this is a read endpoint: the ClusterLogForwarder
+	// addresses the LokiStack by name rather than by URL, so there is no write
+	// endpoint to publish.
+	// +optional
+	LogsEndpoint string `json:"logsEndpoint,omitempty"`
+
+	// UsageLogsForwarding names the remote usage-log exporters carried by the deployed
+	// collector. It reports what passed validation and was rendered, so it is empty
+	// when no collector is deployed, which the UsageLogsCollectorAvailable condition
+	// explains.
+	// +optional
+	UsageLogsForwarding []string `json:"usageLogsForwarding,omitempty"`
 }
 
 //+kubebuilder:object:root=true

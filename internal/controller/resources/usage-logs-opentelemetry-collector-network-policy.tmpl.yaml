@@ -3,6 +3,8 @@ kind: NetworkPolicy
 metadata:
   name: {{.UsageLogsCollectorName}}-collector-allow
   namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/component: loki-usage-logs
 spec:
   podSelector:
     matchLabels:

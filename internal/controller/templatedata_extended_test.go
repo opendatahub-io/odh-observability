@@ -50,6 +50,36 @@ func registerOperatorCondition(s *kruntime.Scheme) {
 	}, &unstructured.UnstructuredList{})
 }
 
+func TestSplitLokiStacksUseIndependentSizes(t *testing.T) {
+	s := newActionsTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: "usage-secret"},
+		Size:    "1x.demo",
+	}
+	m.Spec.Logs = &v1alpha1.Logs{
+		Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: "logs-secret"},
+		Size:    "1x.small",
+	}
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct{ template, name, size string }{
+		{UsageLogsLokiStackTemplate, usageLogsLokiStackResourceName, "1x.demo"},
+		{LokiStackTemplate, lokiStackResourceName, "1x.small"},
+	} {
+		stack := findRenderedResource(t, renderObservabilityTemplate(t, tt.template, data), "LokiStack", tt.name)
+		if size, _, _ := unstructured.NestedString(stack.Object, "spec", "size"); size != tt.size {
+			t.Errorf("%s size = %q, want %q", tt.name, size, tt.size)
+		}
+	}
+	if endpoint, _ := data["UsageLogsEndpoint"].(string); !strings.Contains(endpoint, usageLogsLokiStackResourceName+"-gateway-http.") {
+		t.Errorf("usage collector endpoint points at the wrong stack: %q", endpoint)
+	}
+}
+
 func registerClusterExtension(s *kruntime.Scheme) {
 	s.AddKnownTypeWithName(schema.GroupVersionKind{
 		Group: "olm.operatorframework.io", Version: "v1", Kind: "ClusterExtension",
@@ -369,6 +399,35 @@ func TestCheckPreconditions_UsageLogsRequiresOTelAndLoki(t *testing.T) {
 	}
 }
 
+// Forwarding alone still runs a collector, so the OpenTelemetry operator is still
+// required — but nothing is stored locally, so the Loki operator is not. Reporting Loki
+// here would send an operator installing one for no reason.
+func TestCheckPreconditions_ForwardingOnlyRequiresOTelNotLoki(t *testing.T) {
+	s := newTestScheme(t)
+	registerOperatorCondition(s)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Exporters: map[string]kruntime.RawExtension{
+			"otlphttp/hub": {Raw: []byte(`{"endpoint":"https://hub.example.com/api/logs/v1/infrastructure/otlp"}`)},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	err := checkMonitoringPreconditions(context.Background(), cli, m)
+	if err == nil {
+		t.Fatal("expected error when the OpenTelemetry operator is missing")
+	}
+
+	errStr := err.Error()
+	if !strings.Contains(errStr, "Red Hat build of OpenTelemetry") {
+		t.Errorf("forwarding still needs the OpenTelemetry operator, got: %s", errStr)
+	}
+	if strings.Contains(errStr, "Loki Operator") {
+		t.Errorf("forwarding alone must not require the Loki Operator, got: %s", errStr)
+	}
+}
+
 func TestCheckPreconditions_LogsRequiresLokiAndOpenShiftLogging(t *testing.T) {
 	s := newTestScheme(t)
 	registerOperatorCondition(s)
@@ -627,6 +686,102 @@ func TestAddStorageData_EmptyRetention(t *testing.T) {
 
 	if data["StorageRetention"] != defaultRetention {
 		t.Errorf("StorageRetention: want default %q, got %v", defaultRetention, data["StorageRetention"])
+	}
+}
+
+// --- addLokiStorageData ---
+
+// TestAddLokiStorageData covers the prefix keeping the two LokiStacks' storage
+// apart. The usage logs stack and the log forwarding stack are separate CRs
+// rendered from the same shaped template, so a key written under the wrong
+// prefix would silently point one stack at the other's storage.
+func TestAddLokiStorageData(t *testing.T) {
+	tests := []struct {
+		name    string
+		prefix  string
+		storage *v1alpha1.LokiStorageConfig
+		want    map[string]any
+	}{
+		{
+			name:   "log forwarding storage lands under the Loki prefix",
+			prefix: "Loki",
+			storage: &v1alpha1.LokiStorageConfig{
+				Type:             "s3",
+				SecretName:       "logs-secret",
+				CredentialMode:   "static",
+				StorageClassName: "logs-sc",
+			},
+			want: map[string]any{
+				"LokiStorageType":           "s3",
+				"LokiStorageSecretName":     "logs-secret",
+				"LokiStorageCredentialMode": "static",
+				"LokiStorageClassName":      "logs-sc",
+			},
+		},
+		{
+			name:   "usage logs storage lands under the UsageLogsLoki prefix",
+			prefix: "UsageLogsLoki",
+			storage: &v1alpha1.LokiStorageConfig{
+				Type:             "s3",
+				SecretName:       "usage-logs-secret",
+				CredentialMode:   "token",
+				StorageClassName: "usage-logs-sc",
+			},
+			want: map[string]any{
+				"UsageLogsLokiStorageType":           "s3",
+				"UsageLogsLokiStorageSecretName":     "usage-logs-secret",
+				"UsageLogsLokiStorageCredentialMode": "token",
+				"UsageLogsLokiStorageClassName":      "usage-logs-sc",
+			},
+		},
+		{
+			name:   "an unset storage class falls back to the default",
+			prefix: "Loki",
+			storage: &v1alpha1.LokiStorageConfig{
+				Type:       "s3",
+				SecretName: "logs-secret",
+			},
+			want: map[string]any{"LokiStorageClassName": defaultLokiStorageClassName},
+		},
+		{
+			// Templates render with missingkey=error, so the keys must exist even
+			// when the stack is not configured — and must be blank rather than
+			// carrying over whatever the other stack set.
+			name:    "an unconfigured stack gets blank keys, not the other stack's",
+			prefix:  "Loki",
+			storage: nil,
+			want: map[string]any{
+				"LokiStorageType":           "",
+				"LokiStorageSecretName":     "",
+				"LokiStorageCredentialMode": "",
+				"LokiStorageClassName":      "",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := make(map[string]any)
+			addLokiStorageData(tt.prefix, tt.storage, data)
+
+			for key, want := range tt.want {
+				got, found := data[key]
+				if !found {
+					t.Errorf("%s was not set", key)
+					continue
+				}
+				if got != want {
+					t.Errorf("%s: want %q, got %v", key, want, got)
+				}
+			}
+
+			// Nothing may be written outside this stack's own prefix.
+			for key := range data {
+				if !strings.HasPrefix(key, tt.prefix+"Storage") {
+					t.Errorf("prefix %q must not write %q", tt.prefix, key)
+				}
+			}
+		})
 	}
 }
 
@@ -1021,6 +1176,9 @@ func TestBuildTemplateData_BasicNoFeatures(t *testing.T) {
 	if data["Metrics"] != false {
 		t.Errorf("Metrics: want false, got %v", data["Metrics"])
 	}
+	if data["BuiltinDCGMScrapeEnabled"] != false {
+		t.Errorf("BuiltinDCGMScrapeEnabled: want false without metrics, got %v", data["BuiltinDCGMScrapeEnabled"])
+	}
 	if data["Traces"] != false {
 		t.Errorf("Traces: want false, got %v", data["Traces"])
 	}
@@ -1081,7 +1239,7 @@ func TestBuildTemplateData_UsesEffectiveMonitoringNamespace(t *testing.T) {
 	if data["Namespace"] != defaultMonitoringNamespace {
 		t.Errorf("Namespace: want %q, got %v", defaultMonitoringNamespace, data["Namespace"])
 	}
-	if data["UsageLogsEndpoint"] != "https://data-science-lokistack-gateway-http.opendatahub.svc.cluster.local:8080/api/logs/v1/application/otlp" {
+	if data["UsageLogsEndpoint"] != "https://data-science-usage-logs-lokistack-gateway-http.opendatahub.svc.cluster.local:8080/api/logs/v1/application/otlp" {
 		t.Errorf("UsageLogsEndpoint: unexpected effective namespace endpoint %v", data["UsageLogsEndpoint"])
 	}
 }
@@ -1170,6 +1328,9 @@ func TestBuildTemplateData_WithMetrics(t *testing.T) {
 	if data["Metrics"] != true {
 		t.Error("Metrics: want true")
 	}
+	if data["BuiltinDCGMScrapeEnabled"] != true {
+		t.Error("BuiltinDCGMScrapeEnabled: omitted setting must default to enabled")
+	}
 	if data["MetricsStorage"] != true {
 		t.Error("MetricsStorage: want true")
 	}
@@ -1185,6 +1346,47 @@ func TestBuildTemplateData_WithMetrics(t *testing.T) {
 		FS: resourcesFS, Path: Korrel8rConfigTemplate,
 	}}, data); err != nil {
 		t.Fatalf("Korrel8r config must render for metrics-only Monitoring: %v", err)
+	}
+}
+
+func TestBuildTemplateData_BuiltinDCGMScrapeOverride(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		enabled bool
+	}{
+		{name: "explicitly enabled", enabled: true},
+		{name: "explicitly disabled", enabled: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := newTestScheme(t)
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			enabled := test.enabled
+			m.Spec.Metrics = &v1alpha1.Metrics{
+				Storage:                  &v1alpha1.MetricsStorage{},
+				BuiltinDCGMScrapeEnabled: &enabled,
+			}
+
+			cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
+			data, err := buildTemplateData(context.Background(), cli, m, "")
+			if err != nil {
+				t.Fatalf("build template data: %v", err)
+			}
+			if data["BuiltinDCGMScrapeEnabled"] != test.enabled {
+				t.Errorf("BuiltinDCGMScrapeEnabled: want %t, got %v", test.enabled, data["BuiltinDCGMScrapeEnabled"])
+			}
+			if data["AcceleratorMetrics"] != true {
+				t.Errorf("AcceleratorMetrics must remain enabled when only the built-in scrape is disabled, got %v", data["AcceleratorMetrics"])
+			}
+			rules, err := rendertemplate.Render(context.Background(), nil, []rendertemplate.TemplateSource{{
+				FS: resourcesFS, Path: AcceleratorRecordingRulesTemplate,
+			}}, data)
+			if err != nil {
+				t.Fatalf("render accelerator recording rules with built-in DCGM scrape %t: %v", test.enabled, err)
+			}
+			if len(rules) != 1 {
+				t.Errorf("accelerator recording rules must remain rendered with built-in DCGM scrape %t, got %d resources", test.enabled, len(rules))
+			}
+		})
 	}
 }
 

@@ -144,23 +144,6 @@ func TestValidatePersesProjectsResponse(t *testing.T) {
 	}
 }
 
-func TestKubernetesServiceProxyURLWithQuery(t *testing.T) {
-	got, err := kubernetesServiceProxyURL(
-		"https://api.example.com:6443",
-		"redhat-ods-monitoring",
-		"data-science-prometheus-namespace-proxy",
-		8443,
-		"/api/v1/query?query=up",
-		true,
-	)
-	if err != nil {
-		t.Fatalf("kubernetesServiceProxyURL: %v", err)
-	}
-	if !strings.Contains(got, "query=up") {
-		t.Fatalf("expected query string in proxy URL, got %q", got)
-	}
-}
-
 func TestValidatePrometheusBuildInfoResponse(t *testing.T) {
 	if err := validatePrometheusBuildInfoResponse(`{"status":"success","data":{"version":"2.45.0"}}`); err != nil {
 		t.Fatalf("expected valid response: %v", err)
@@ -327,5 +310,18 @@ func TestValidateClusterVersionReady(t *testing.T) {
 	}}
 	if err := validateClusterVersionReady(progressing); err == nil {
 		t.Fatal("expected progressing cluster to fail")
+	}
+}
+
+func TestParseHTTPProbeLog(t *testing.T) {
+	body, status, err := parseHTTPProbeLog("HTTP_STATUS=200\n{\"database\":true}\n")
+	if err != nil {
+		t.Fatalf("parseHTTPProbeLog: %v", err)
+	}
+	if status != 200 || body != "{\"database\":true}\n" {
+		t.Fatalf("unexpected probe result: status=%d body=%q", status, body)
+	}
+	if _, _, err := parseHTTPProbeLog("missing status"); err == nil {
+		t.Fatal("expected malformed probe output to fail")
 	}
 }

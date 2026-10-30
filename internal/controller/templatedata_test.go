@@ -33,6 +33,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 )
 
 func rawExt(yaml string) runtime.RawExtension {
@@ -477,6 +479,28 @@ func TestValidateExporters_MissingRequiredField(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "endpoint") {
 		t.Errorf("expected 'endpoint' in error, got: %v", err)
+	}
+}
+
+// A rejected usage-log exporter has to be attributable. The failure aborts the whole
+// reconcile, and the reconciler tells the usage-log condition apart from any other
+// configuration error by this sentinel alone.
+func TestAddUsageLogsExportersData_InvalidExporterWrapsSentinel(t *testing.T) {
+	usageLogs := &v1alpha1.UsageLogs{
+		Exporters: map[string]runtime.RawExtension{
+			"otlphttp/hub": rawExt("endpoint: http://hub.example.com/v1/logs"),
+		},
+	}
+
+	err := addUsageLogsExportersData(usageLogs, map[string]any{})
+	if err == nil {
+		t.Fatal("expected an error for an insecure external endpoint")
+	}
+	if !errors.Is(err, errUsageLogsExporterInvalid) {
+		t.Errorf("error must wrap errUsageLogsExporterInvalid, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "insecure HTTP") {
+		t.Errorf("the underlying cause must survive wrapping, got: %v", err)
 	}
 }
 

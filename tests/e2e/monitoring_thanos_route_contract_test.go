@@ -37,12 +37,6 @@ import (
 
 const thanosRouteProbeQuery = "up"
 
-const (
-	clusterIngressCANamespace = "openshift-config-managed"
-	clusterIngressCAConfigMap = "default-ingress-cert"
-	clusterIngressCAKey       = "ca-bundle.crt"
-)
-
 type thanosRouteProbe struct {
 	HTTPStatus       int
 	PrometheusStatus string
@@ -210,10 +204,9 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 	}
 	assertThanosRouteNamespaceSeries(t, "crafted selector", crafted.Labels, tc.MonitoringNamespace)
 
-	// POST with namespace in the URL and PromQL in the form body — the Perses
-	// product shape. Conflicting form-body namespace= is a known residual risk
-	// without --regex-match (ARCHITECTURE.md); do not assert 400 here until
-	// that gap is validated on-cluster and fixed upstream.
+	// Perses sends the namespace in the URL and PromQL in the form body.
+	// Rejecting an additional form namespace is deferred until the proxy has
+	// query-only extraction; the current proxy accepts it (RHOAIENG-101998).
 	assertAuthorizedThanosPost(t, rootCAs, routeHost, authorizedToken, tc.MonitoringNamespace)
 }
 
@@ -365,27 +358,7 @@ func namespaceLabels(series []map[string]string) []string {
 
 func clusterIngressCAPool(t *testing.T, tc *MonitoringTestCtx) *x509.CertPool {
 	t.Helper()
-
-	rootCAs, err := x509.SystemCertPool()
-	if err != nil {
-		rootCAs = x509.NewCertPool()
-	}
-
-	configMap := &corev1.ConfigMap{}
-	if err := tc.Client().Get(tc.Context(), types.NamespacedName{
-		Name:      clusterIngressCAConfigMap,
-		Namespace: clusterIngressCANamespace,
-	}, configMap); err != nil {
-		t.Fatalf("failed to read the cluster ingress CA ConfigMap: %v", err)
-	}
-	caBundle := configMap.Data[clusterIngressCAKey]
-	if caBundle == "" {
-		t.Fatalf("cluster ingress CA ConfigMap %q is missing %q", clusterIngressCAConfigMap, clusterIngressCAKey)
-	}
-	if !rootCAs.AppendCertsFromPEM([]byte(caBundle)) {
-		t.Fatalf("cluster ingress CA ConfigMap %q does not contain a valid PEM certificate bundle", clusterIngressCAConfigMap)
-	}
-	return rootCAs
+	return ingressCAPool(t, tc.Context(), tc.Client())
 }
 
 // authorizedThanosProbeToken creates a namespace-scoped identity for Route

@@ -3,6 +3,8 @@ kind: LokiStack
 metadata:
   name: {{.LokiStackName}}
   namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/component: loki-logs
 spec:
   limits:
     global:
@@ -26,7 +28,7 @@ spec:
             - name: upstream_namespace_name
             - name: upstream_deployment_name
   managementState: Managed
-  size: 1x.extra-small
+  size: {{ .LogsLokiStackSize }}
   storage:
     schemas:
     - effectiveDate: "2020-10-11"

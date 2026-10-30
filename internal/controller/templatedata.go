@@ -32,6 +32,7 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-multierror"
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/olm"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/openshift"
 	"gopkg.in/yaml.v3"
@@ -60,6 +61,8 @@ const (
 	defaultStorageSize = "5Gi"
 	defaultRetention   = "90d"
 
+	defaultLokiStorageClassName = "gp3-csi"
+
 	defaultTracesSampleRatio = "0.1"
 	defaultTracesBackend     = "pv"
 	defaultTracesRetention   = "2160h"
@@ -87,6 +90,10 @@ const (
 	targetAllocatorServiceAccountName = "data-science-collector-targetallocator"
 
 	persesV1Alpha2 = "v1alpha2"
+
+	// defaultLokiStackSize is the size used when usageLogs.size is unset. It matches
+	// what shipped before the field existed, so an unset spec is unchanged.
+	defaultLokiStackSize = "1x.extra-small"
 
 	// Security limits for exporter configurations.
 	maxConfigFields      = 50    // Maximum number of fields in an exporter config.
@@ -138,11 +145,12 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	templateData := map[string]any{
-		"Namespace":        monitoringNamespace,
-		"GatewayNamespace": gatewayNamespace,
-		"Traces":           monitoring.Spec.Traces != nil,
-		"Metrics":          monitoring.Spec.Metrics != nil,
-		"MetricsStorage":   monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil,
+		"Namespace":                monitoringNamespace,
+		"GatewayNamespace":         gatewayNamespace,
+		"Traces":                   monitoring.Spec.Traces != nil,
+		"Metrics":                  monitoring.Spec.Metrics != nil,
+		"MetricsStorage":           monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil,
+		"BuiltinDCGMScrapeEnabled": builtinDCGMScrapeEnabled(monitoring.Spec.Metrics),
 		// Always set: templates use missingkey=error; metrics-only never calls addTracesTemplateData.
 		"TempoStorage":                    false,
 		"Logs":                            monitoring.Spec.Logs != nil,
@@ -154,6 +162,11 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		"MetricsExporterNames":            []string{},
 		"TracesExporters":                 make(map[string]string),
 		"TracesExporterNames":             []string{},
+		"UsageLogsExporters":              make(map[string]string),
+		"UsageLogsExporterNames":          []string{},
+		"UsageLogsCredentialSecret":       "",
+		"UsageLogsAttributes":             make(map[string]string),
+		"UsageLogsAttributeNames":         []string{},
 		"PersesImage":                     getPersesImage(),
 		"PersesAPIVersion":                persesAPIVersion,
 		"Korrel8rImage":                   getKorrel8rImage(),
@@ -192,48 +205,11 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		}
 	}
 
-	// LokiStack configuration
-	lokiStackName := lokiStackResourceName
-	templateData["LokiStackName"] = lokiStackName
-	// The RHOAI LokiStack is configured in OpenShift logging mode. Its
-	// application tenant is the pinned tenant for inference logs.
-	templateData["LokiTenant"] = "application"
 	templateData["ThanosQuerierEndpoint"] = fmt.Sprintf("http://thanos-querier-data-science-thanos-querier.%s.svc.cluster.local:10902", monitoringNamespace)
-	templateData["LokiQueryEndpoint"] = fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application", lokiStackName, monitoringNamespace)
-	// Resolve Loki storage: logs.Storage takes precedence, then usageLogs.Storage
-	var lokiStorage *v1alpha1.LokiStorageConfig
-	if logs := monitoring.Spec.Logs; logs != nil && logs.Storage != nil {
-		lokiStorage = logs.Storage
-	} else if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
-		lokiStorage = usageLogs.Storage
-	}
 
-	if lokiStorage != nil {
-		templateData["LokiStorageCredentialMode"] = lokiStorage.CredentialMode
-		templateData["LokiStorageSecretName"] = lokiStorage.SecretName
-		templateData["LokiStorageType"] = lokiStorage.Type
-
-		storageClassName := lokiStorage.StorageClassName
-		if storageClassName == "" {
-			storageClassName = "gp3-csi"
-		}
-		templateData["LokiStorageClassName"] = storageClassName
-	} else {
-		templateData["LokiStorageCredentialMode"] = ""
-		templateData["LokiStorageSecretName"] = ""
-		templateData["LokiStorageType"] = ""
-		templateData["LokiStorageClassName"] = ""
-	}
-
-	// Usage logs collector configuration (independent of Loki storage resolution)
-	templateData["UsageLogsCollectorName"] = "data-science-usage-logs"
-	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil && usageLogs.Storage != nil {
-		gatewayURL := fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application/otlp", lokiStackName, monitoringNamespace)
-		templateData["UsageLogs"] = true
-		templateData["UsageLogsEndpoint"] = gatewayURL
-	} else {
-		templateData["UsageLogs"] = false
-		templateData["UsageLogsEndpoint"] = ""
+	addLokiTemplateData(monitoring, monitoringNamespace, templateData)
+	if err := addUsageLogsData(monitoring, usageLogsLokiStackResourceName, monitoringNamespace, templateData); err != nil {
+		return nil, err
 	}
 
 	// Cluster log forwarding configuration
@@ -282,6 +258,56 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 	}
 
 	return templateData, nil
+}
+
+// addLokiTemplateData fills in the names, query endpoints, and storage settings
+// for both LokiStacks: the usage logs stack backed by usageLogs.Storage and the
+// log forwarding stack backed by logs.Storage. They are separate CRs, so
+// neither feature's storage configuration leaks into the other's stack.
+func addLokiTemplateData(monitoring *v1alpha1.Monitoring, monitoringNamespace string, templateData map[string]any) {
+	templateData["UsageLogsLokiStackName"] = usageLogsLokiStackResourceName
+	templateData["LokiStackName"] = lokiStackResourceName
+	// Both LokiStacks are configured in OpenShift logging mode. Their
+	// application tenant is the pinned tenant for inference logs.
+	templateData["LokiTenant"] = "application"
+	templateData["LokiQueryEndpoint"] = lokiGatewayURL(lokiStackResourceName, monitoringNamespace)
+
+	var usageLogsLokiStorage, lokiStorage *v1alpha1.LokiStorageConfig
+	logsLokiStackSize := defaultLokiStackSize
+	if usageLogs := monitoring.Spec.UsageLogs; usageLogs != nil {
+		usageLogsLokiStorage = usageLogs.Storage
+	}
+	if logs := monitoring.Spec.Logs; logs != nil {
+		lokiStorage = logs.Storage
+		logsLokiStackSize = getStringValueOrDefault(logs.Size, defaultLokiStackSize)
+	}
+	templateData["LogsLokiStackSize"] = logsLokiStackSize
+	addLokiStorageData("UsageLogsLoki", usageLogsLokiStorage, templateData)
+	addLokiStorageData("Loki", lokiStorage, templateData)
+}
+
+// lokiGatewayURL returns the in-cluster gateway URL for the application tenant
+// of the named LokiStack.
+func lokiGatewayURL(lokiStackName, namespace string) string {
+	return fmt.Sprintf("https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application", lokiStackName, namespace)
+}
+
+// addLokiStorageData writes the <prefix>Storage* keys for one LokiStack.
+// Templates render with missingkey=error, so the keys are always set, blank
+// when that stack has no storage configured.
+func addLokiStorageData(prefix string, storage *v1alpha1.LokiStorageConfig, templateData map[string]any) {
+	if storage == nil {
+		templateData[prefix+"StorageCredentialMode"] = ""
+		templateData[prefix+"StorageSecretName"] = ""
+		templateData[prefix+"StorageType"] = ""
+		templateData[prefix+"StorageClassName"] = ""
+		return
+	}
+
+	templateData[prefix+"StorageCredentialMode"] = storage.CredentialMode
+	templateData[prefix+"StorageSecretName"] = storage.SecretName
+	templateData[prefix+"StorageType"] = storage.Type
+	templateData[prefix+"StorageClassName"] = getStringValueOrDefault(storage.StorageClassName, defaultLokiStorageClassName)
 }
 
 // addKorrel8rConfigChecksum derives the Pod-template value that restarts
@@ -375,16 +401,39 @@ func kubernetesAPIServerCIDRs(endpointSlices []discoveryv1.EndpointSlice) ([]str
 // Returns a missingOperatorsError listing all confirmed missing operators, or
 // the operational error encountered while checking for them.
 func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) error {
-	var allErrors *multierror.Error
+	_, err := checkMonitoringPreconditionsWithCOOVersion(ctx, c, monitoring)
+	return err
+}
 
-	usageLogsConfigured := monitoring.Spec.UsageLogs != nil && monitoring.Spec.UsageLogs.Storage != nil
-	needsLoki := monitoring.Spec.Logs != nil || usageLogsConfigured
+// checkMonitoringPreconditionsWithCOOVersion returns the installed COO version
+// when built-in metrics storage requires COO, along with any precondition error.
+func checkMonitoringPreconditionsWithCOOVersion(
+	ctx context.Context,
+	c client.Client,
+	monitoring *v1alpha1.Monitoring,
+) (*cluster.OperatorInfo, error) {
+	var allErrors *multierror.Error
+	var cooInfo *cluster.OperatorInfo
+
+	// Two different questions. Loki is needed only for a cluster-local store, so a
+	// cluster that just forwards needs no Loki operator at all. The collector is needed
+	// for either write, so forwarding alone still requires the OpenTelemetry operator.
+	usageLogs := monitoring.Spec.UsageLogs
+	usageLogsStorage := usageLogs != nil && usageLogs.Storage != nil
+	usageLogsCollector := usageLogs != nil && (usageLogs.Storage != nil || len(usageLogs.Exporters) > 0)
+	needsLoki := monitoring.Spec.Logs != nil || usageLogsStorage
 
 	checkOperatorNames := func(names []string, missingMessage string) error {
 		for _, name := range names {
-			_, err := olm.OperatorExists(ctx, c, name)
+			info, err := olm.OperatorExists(ctx, c, name)
 			switch {
 			case err == nil:
+				if name == clusterObservabilityOperator {
+					cooInfo, err = cooInstalledCSVVersion(ctx, c, info)
+					if err != nil {
+						return fmt.Errorf("checking installed Cluster Observability Operator CSV: %w", err)
+					}
+				}
 				return nil
 			case errors.Is(err, olm.ErrOperatorNotInstalled):
 				continue
@@ -399,9 +448,9 @@ func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitori
 		return checkOperatorNames([]string{name}, missingMessage)
 	}
 
-	if monitoring.Spec.Metrics != nil || monitoring.Spec.Traces != nil || usageLogsConfigured {
+	if monitoring.Spec.Metrics != nil || monitoring.Spec.Traces != nil || usageLogsCollector {
 		if err := checkOperator(opentelemetryOperator, conditions.OpenTelemetryCollectorOperatorMissingMessage); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
@@ -413,40 +462,142 @@ func checkMonitoringPreconditions(ctx context.Context, c client.Client, monitori
 			[]string{certManagerOperator, "openshift-cert-manager-operator"},
 			conditions.CertManagerOperatorMissingMessage,
 		); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
 	// COO owns MonitoringStack/Thanos/Perses; only required for built-in metrics storage.
 	if monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil {
 		if err := checkOperator(clusterObservabilityOperator, conditions.COOMissingMessage); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
 	// Tempo is only required for built-in storage; exporters-only traces use the collector.
 	if monitoring.Spec.Traces != nil && monitoring.Spec.Traces.Storage != nil {
 		if err := checkOperator(tempoOperator, conditions.TempoOperatorMissingMessage); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
 	if needsLoki {
 		if err := checkOperator(lokiOperator, conditions.LokiOperatorMissingMessage); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
 	if monitoring.Spec.Logs != nil {
 		if err := checkOperator(clusterLoggingOperator, conditions.ClusterLoggingOperatorMissingMessage); err != nil {
-			return err
+			return cooInfo, err
 		}
 	}
 
 	if err := allErrors.ErrorOrNil(); err != nil {
-		return &missingOperatorsError{err: err}
+		return cooInfo, &missingOperatorsError{err: err}
 	}
-	return nil
+	return cooInfo, nil
+}
+
+// cooInstalledCSVVersion uses the current successful OLMv0 CSV as the
+// authoritative COO version. OperatorCondition names can include an old
+// version while an upgrade is in progress. If the CSV API is unavailable,
+// retain the version supplied by OperatorExists for OLMv1 installations.
+func cooInstalledCSVVersion(
+	ctx context.Context,
+	c client.Reader,
+	fallback *cluster.OperatorInfo,
+) (*cluster.OperatorInfo, error) {
+	csvList := &unstructured.UnstructuredList{}
+	csvList.SetGroupVersionKind(gvk.ClusterServiceVersion.GroupVersion().WithKind("ClusterServiceVersionList"))
+	if err := c.List(ctx, csvList); err != nil {
+		if meta.IsNoMatchError(err) {
+			return fallback, nil
+		}
+		return nil, err
+	}
+
+	type installedCSV struct {
+		name      string
+		namespace string
+		version   string
+	}
+
+	const namePrefix = clusterObservabilityOperator + "."
+	var installed []installedCSV
+	replaced := make(map[string]struct{})
+	for i := range csvList.Items {
+		csv := &csvList.Items[i]
+		name := csv.GetName()
+		if !strings.HasPrefix(name, namePrefix) {
+			continue
+		}
+
+		phase, found, err := unstructured.NestedString(csv.Object, "status", "phase")
+		if err != nil {
+			return nil, fmt.Errorf("reading CSV %q status.phase: %w", name, err)
+		}
+		if !found || phase != "Succeeded" {
+			continue
+		}
+
+		installed = append(installed, installedCSV{
+			name:      name,
+			namespace: csv.GetNamespace(),
+			version:   strings.TrimPrefix(name, namePrefix),
+		})
+		replaces, hasReplaces, err := unstructured.NestedString(csv.Object, "spec", "replaces")
+		if err != nil {
+			return nil, fmt.Errorf("reading CSV %q spec.replaces: %w", name, err)
+		}
+		if hasReplaces {
+			replaced[csv.GetNamespace()+"/"+replaces] = struct{}{}
+		}
+	}
+
+	// During an upgrade, the new succeeded CSV replaces the previous one. If
+	// multiple versions are still succeeded, select the terminal CSV in that
+	// replacement chain rather than relying on API list order.
+	var current []installedCSV
+	for _, csv := range installed {
+		if _, wasReplaced := replaced[csv.namespace+"/"+csv.name]; !wasReplaced {
+			current = append(current, csv)
+		}
+	}
+	if len(current) != 1 {
+		extensionInfo, err := cluster.OperatorInstalledViaClusterExtension(ctx, c, clusterObservabilityOperator)
+		if err != nil && !meta.IsNoMatchError(err) {
+			return nil, fmt.Errorf("checking installed Cluster Observability Operator ClusterExtension: %w", err)
+		}
+		if extensionInfo != nil {
+			return extensionInfo, nil
+		}
+		return cluster.NewOperatorInfo(""), nil
+	}
+	return cluster.NewOperatorInfo(current[0].version), nil
+}
+
+func markCOOVersionCompatibility(cm *conditions.ConditionsManager, info *cluster.OperatorInfo) {
+	supportedPrefix := conditions.COOSupportedVersionLine + "."
+	if info == nil || info.Version == "" {
+		cm.MarkWarning(conditions.ConditionCOOVersionCompatible, "VersionUnavailable",
+			fmt.Sprintf("Unable to determine the installed Cluster Observability Operator version; the supported version line is %s.x", conditions.COOSupportedVersionLine))
+		return
+	}
+	if strings.HasPrefix(info.Version, supportedPrefix) {
+		cm.MarkTrue(conditions.ConditionCOOVersionCompatible)
+		return
+	}
+
+	message := fmt.Sprintf(
+		"Detected Cluster Observability Operator version %s outside the supported version line %s.x; this combination is untested",
+		info.Version,
+		conditions.COOSupportedVersionLine,
+	)
+	cm.MarkWarning(conditions.ConditionCOOVersionCompatible, "UnsupportedVersion", message)
+}
+
+func builtinDCGMScrapeEnabled(metrics *v1alpha1.Metrics) bool {
+	return metrics != nil && (metrics.BuiltinDCGMScrapeEnabled == nil || *metrics.BuiltinDCGMScrapeEnabled)
 }
 
 func addMetricsData(metrics *v1alpha1.Metrics, isSNO bool, templateData map[string]any) error {
@@ -530,6 +681,85 @@ func addExportersData(metrics *v1alpha1.Metrics, templateData map[string]any) er
 
 	templateData["MetricsExporters"] = validatedExporters
 	templateData["MetricsExporterNames"] = exporterNames
+
+	return nil
+}
+
+// addUsageLogsData resolves everything the usage-log collector renders from: the LokiStack
+// size of the usage stack, whether the cluster-local write is configured and the
+// endpoint it uses, and the remote exporters alongside it. Kept out of buildTemplateData so
+// that function stays under the cyclomatic complexity limit.
+func addUsageLogsData(monitoring *v1alpha1.Monitoring, lokiStackName, monitoringNamespace string, templateData map[string]any) error {
+	usageLogs := monitoring.Spec.UsageLogs
+
+	// The usage-log size applies only to the usage stack.
+	lokiStackSize := defaultLokiStackSize
+	if usageLogs != nil && usageLogs.Size != "" {
+		lokiStackSize = usageLogs.Size
+	}
+	templateData["LokiStackSize"] = lokiStackSize
+
+	// Independent of the Loki storage resolution above: the collector is named whether or
+	// not it is configured, because the reconciler looks it up either way.
+	templateData["UsageLogsCollectorName"] = "data-science-usage-logs"
+
+	if usageLogs == nil {
+		templateData["UsageLogs"] = false
+		templateData["UsageLogsEndpoint"] = ""
+		return nil
+	}
+
+	// The two writes are configured independently: storage drives the cluster-local
+	// pipeline, exporters drive the forwarding one, and a cluster may have either or
+	// both. So UsageLogs says only whether a local store exists, and the exporters are
+	// resolved below either way — a cluster that only forwards still has to render them.
+	if usageLogs.Storage != nil {
+		templateData["UsageLogs"] = true
+		templateData["UsageLogsEndpoint"] = fmt.Sprintf(
+			"https://%s-gateway-http.%s.svc.cluster.local:8080/api/logs/v1/application/otlp",
+			lokiStackName, monitoringNamespace,
+		)
+	} else {
+		templateData["UsageLogs"] = false
+		templateData["UsageLogsEndpoint"] = ""
+	}
+
+	return addUsageLogsExportersData(usageLogs, templateData)
+}
+
+// addUsageLogsExportersData validates the usage-log exporters and the resource
+// attributes stamped alongside them. Both feed the remote pipeline only, so the
+// spoke-local write keeps the record shape its dashboards and tenancy proxy expect.
+func addUsageLogsExportersData(usageLogs *v1alpha1.UsageLogs, templateData map[string]any) error {
+	validatedExporters := make(map[string]string)
+	exporterNames := make([]string, 0)
+
+	if len(usageLogs.Exporters) > 0 {
+		var err error
+		validatedExporters, err = validateExporters(usageLogs.Exporters)
+		if err != nil {
+			return fmt.Errorf("%w: %w", errUsageLogsExporterInvalid, err)
+		}
+
+		for name := range validatedExporters {
+			exporterNames = append(exporterNames, name)
+		}
+		sort.Strings(exporterNames)
+	}
+
+	templateData["UsageLogsExporters"] = validatedExporters
+	templateData["UsageLogsExporterNames"] = exporterNames
+	templateData["UsageLogsCredentialSecret"] = usageLogs.CredentialSecret
+
+	// Sorted so the rendered processor is byte-stable across reconciles; an
+	// unordered map would churn the collector on every pass.
+	attributeNames := make([]string, 0, len(usageLogs.Attributes))
+	for name := range usageLogs.Attributes {
+		attributeNames = append(attributeNames, name)
+	}
+	sort.Strings(attributeNames)
+	templateData["UsageLogsAttributes"] = usageLogs.Attributes
+	templateData["UsageLogsAttributeNames"] = attributeNames
 
 	return nil
 }
@@ -714,6 +944,11 @@ func getStringValueOrDefault(value, defaultValue string) string {
 }
 
 // --- Exporter validation ---
+
+// errUsageLogsExporterInvalid marks a template-data failure that came from the
+// usage-log exporter allowlist, so the reconciler can point the usage-log condition at
+// it instead of reporting only a generic configuration error for the whole service.
+var errUsageLogsExporterInvalid = errors.New("invalid usage logs exporter configuration")
 
 func validateExporters(exporters map[string]runtime.RawExtension) (map[string]string, error) {
 	validatedExporters := make(map[string]string)

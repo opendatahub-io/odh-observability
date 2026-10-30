@@ -1,0 +1,42 @@
+apiVersion: loki.grafana.com/v1
+kind: LokiStack
+metadata:
+  name: {{.UsageLogsLokiStackName}}
+  namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/component: loki-usage-logs
+spec:
+  limits:
+    global:
+      queries:
+        queryTimeout: 3m
+      otlp:
+        streamLabels:
+          resourceAttributes:
+            - name: service.name
+    tenants:
+      application:
+        otlp:
+          streamLabels:
+            resourceAttributes:
+            - name: kubernetes_namespace_name
+            - name: model
+            - name: subscription
+            - name: response_type
+            - name: gateway_namespace_name
+            - name: gateway_deployment_name
+            - name: upstream_namespace_name
+            - name: upstream_deployment_name
+  managementState: Managed
+  size: {{ .LokiStackSize }}
+  storage:
+    schemas:
+    - effectiveDate: "2020-10-11"
+      version: v13
+    secret:
+      credentialMode: {{.UsageLogsLokiStorageCredentialMode}}
+      name: {{.UsageLogsLokiStorageSecretName}}
+      type: {{.UsageLogsLokiStorageType}}
+  storageClassName: {{.UsageLogsLokiStorageClassName}}
+  tenants:
+    mode: openshift-logging

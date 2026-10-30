@@ -113,11 +113,9 @@ func (tc *MonitoringTestCtx) ValidateCollectorNetworkPolicyContract(t *testing.T
 
 	collectorPolicy := policyByName(t, collectorPolicies, "data-science-collector-monitoring-ingress")
 	require.Len(t, collectorPolicy.Spec.Ingress, 2)
-	for _, rule := range collectorPolicy.Spec.Ingress {
-		require.Len(t, rule.From, 1, "an additional peer can widen the policy union")
-		require.NotNil(t, rule.From[0].PodSelector)
-		require.Nil(t, rule.From[0].IPBlock)
-	}
+	require.Len(t, collectorPolicy.Spec.Ingress[0].From, 1, "prometheus scrape rule uses a single peer")
+	require.NotNil(t, collectorPolicy.Spec.Ingress[0].From[0].PodSelector)
+	require.Nil(t, collectorPolicy.Spec.Ingress[0].From[0].IPBlock)
 	require.Equal(t, collectorLabels, collectorPolicy.Spec.PodSelector.MatchLabels)
 	require.Nil(t, collectorPolicy.Spec.Ingress[0].From[0].NamespaceSelector)
 	require.Equal(t, map[string]string{
@@ -126,6 +124,7 @@ func (tc *MonitoringTestCtx) ValidateCollectorNetworkPolicyContract(t *testing.T
 	}, collectorPolicy.Spec.Ingress[0].From[0].PodSelector.MatchLabels)
 	require.Equal(t, []int32{8889, 8890}, networkPolicyPorts(collectorPolicy.Spec.Ingress[0]))
 	require.NotContains(t, networkPolicyPorts(collectorPolicy.Spec.Ingress[0]), int32(8888))
+	require.Len(t, collectorPolicy.Spec.Ingress[1].From, 2)
 	require.Equal(t, map[string]string{"app.kubernetes.io/part-of": "llminferenceservice"},
 		collectorPolicy.Spec.Ingress[1].From[0].PodSelector.MatchLabels)
 	require.Equal(t, []metav1.LabelSelectorRequirement{{
@@ -144,6 +143,12 @@ func (tc *MonitoringTestCtx) ValidateCollectorNetworkPolicyContract(t *testing.T
 	require.Equal(t, &metav1.LabelSelector{MatchLabels: map[string]string{
 		otlpNamespaceLabel: "true",
 	}}, collectorPolicy.Spec.Ingress[1].From[0].NamespaceSelector)
+	require.Equal(t, &metav1.LabelSelector{MatchLabels: map[string]string{
+		otlpNamespaceLabel: "true",
+	}}, collectorPolicy.Spec.Ingress[1].From[1].NamespaceSelector)
+	require.Len(t, collectorPolicy.Spec.Ingress[1].From[1].PodSelector.MatchExpressions, 1)
+	require.Equal(t, inferenceServicePodLabelKey, collectorPolicy.Spec.Ingress[1].From[1].PodSelector.MatchExpressions[0].Key)
+	require.Equal(t, metav1.LabelSelectorOpExists, collectorPolicy.Spec.Ingress[1].From[1].PodSelector.MatchExpressions[0].Operator)
 	require.Equal(t, []int32{4317, 4318}, networkPolicyPorts(collectorPolicy.Spec.Ingress[1]))
 
 	targetAllocatorPolicy := policyByName(t, targetAllocatorPolicies, "data-science-collector-targetallocator-ingress")
@@ -232,6 +237,8 @@ func (tc *MonitoringTestCtx) runOTLPSelectorNetworkPolicyProbes(t *testing.T, na
 		tc.runNetworkPolicyProbe(t, "collector-otlp-"+caller.name+"-allowed", namespace,
 			otlpCallerNetworkPolicyLabels(caller.component), endpoints, enrolled)
 	}
+	tc.runNetworkPolicyProbe(t, "collector-otlp-inferenceservice-allowed", namespace,
+		map[string]string{inferenceServicePodLabelKey: "demo"}, endpoints, enrolled)
 	for _, caller := range []struct {
 		name   string
 		labels map[string]string

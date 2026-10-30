@@ -1,14 +1,17 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{.LokiStackName}}-allow
+  name: {{.UsageLogsLokiStackName}}-allow
   namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+    platform.opendatahub.io/component: loki-usage-logs
 spec:
   # Protects the loki gateway pods (the ones RECEIVING the connection).
   podSelector:
     matchLabels:
       app.kubernetes.io/component: lokistack-gateway
-      app.kubernetes.io/instance: {{.LokiStackName}}
+      app.kubernetes.io/instance: {{.UsageLogsLokiStackName}}
   policyTypes:
   - Ingress
   ingress:

@@ -1,8 +1,9 @@
 # This is the only NetworkPolicy that selects the collector pods, so it acts as
 # the collector's sole ingress gate: on clusters with NetworkPolicy enforcement,
 # any ingress not listed below is denied. Prometheus is the only caller of the
-# collector's monitoring endpoints, while OTLP is limited to the stable labels
-# used by instrumented KServe inference and scheduler pods across namespaces.
+# collector's monitoring endpoints, while OTLP is limited to enrolled namespaces
+# and the stable labels used by instrumented KServe InferenceService and
+# LLMInferenceService workloads.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -48,6 +49,13 @@ spec:
                   - llminferenceservice-workload-worker-prefill
                   - llminferenceservice-workload-leader-prefill
                   - llminferenceservice-router-scheduler
+        - namespaceSelector:
+            matchLabels:
+              monitoring.opendatahub.io/otlp: "true"
+          podSelector:
+            matchExpressions:
+              - key: serving.kserve.io/inferenceservice
+                operator: Exists
       ports:
         - protocol: TCP
           port: 4317

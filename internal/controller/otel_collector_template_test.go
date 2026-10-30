@@ -75,8 +75,119 @@ func TestDCGMMetricsAreRetainedWithOriginalNames(t *testing.T) {
 	}
 }
 
-//nolint:gocyclo // The test validates the complete rendered scrape configuration.
-func TestPrometheusScrapeConfigAndTargetAllocatorSecurity(t *testing.T) {
+func TestPrometheusScrapeConfigContainsOnlyDCGMJob(t *testing.T) {
+	jobs := renderedPrometheusScrapeJobs(t, renderCollectorTemplate(t))
+	if _, found := jobs["data-science-collector-prometheus"]; found {
+		t.Error("unused generic pod scrape job must not be rendered")
+	}
+	if len(jobs) != 1 || jobs["dcgm-exporter-accelerator-metrics"] == nil {
+		t.Fatalf("expected one DCGM scrape job; job count=%d, DCGM job present=%t", len(jobs), jobs["dcgm-exporter-accelerator-metrics"] != nil)
+	}
+}
+
+func TestPrometheusReceiverUsesTargetAllocatorWithoutStaticScrapes(t *testing.T) {
+	collector := renderCollectorTemplateWithAcceleratorMetrics(t, false)
+	prometheusReceiver, found, err := unstructured.NestedMap(collector.Object, "spec", "config", "receivers", "prometheus")
+	if err != nil || !found {
+		t.Fatalf("Prometheus receiver must remain present: found=%t, error=%v", found, err)
+	}
+	if _, found := prometheusReceiver["config"]; found {
+		t.Fatal("Prometheus receiver must omit config when no static scrape jobs are configured")
+	}
+	if _, found, err := unstructured.NestedMap(prometheusReceiver, "target_allocator"); err != nil || !found {
+		t.Fatalf("Prometheus receiver must seed TargetAllocator config: found=%t, error=%v", found, err)
+	}
+}
+
+func TestBuiltinDCGMScrapeCanBeDisabledWithoutDisablingMonitorCollection(t *testing.T) {
+	collector := renderCollectorTemplateWithDCGMScrapeEnabled(t, false)
+
+	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
+	if err != nil || !found {
+		t.Fatalf("collector config must be present: found=%t, error=%v", found, err)
+	}
+	receivers, found, err := unstructured.NestedMap(config, "receivers")
+	if err != nil || !found {
+		t.Fatalf("collector receivers must be present: found=%t, error=%v", found, err)
+	}
+	prometheusReceiver, ok := receivers["prometheus"].(map[string]any)
+	if !ok {
+		t.Fatalf("Prometheus receiver must remain configured, got %T", receivers["prometheus"])
+	}
+	if _, found := prometheusReceiver["config"]; found {
+		t.Fatal("built-in DCGM opt-out must omit Prometheus config so TargetAllocator can provide monitor scrapes")
+	}
+	if _, found, err := unstructured.NestedMap(prometheusReceiver, "target_allocator"); err != nil || !found {
+		t.Fatalf("built-in DCGM opt-out must retain TargetAllocator receiver config: found=%t, error=%v", found, err)
+	}
+
+	if !containsString(metricsPipelines(t, collector)["metrics/scrape"]["receivers"], "prometheus") {
+		t.Fatal("metrics/scrape pipeline must keep Prometheus receiver for TargetAllocator-discovered monitors")
+	}
+	if !containsString(metricsPipelines(t, collector)["metrics/scrape"]["processors"], "transform/gpu_metrics") {
+		t.Fatal("metrics/scrape pipeline must retain accelerator metric processing")
+	}
+
+	targetAllocator, found, err := unstructured.NestedMap(collector.Object, "spec", "targetAllocator")
+	if err != nil || !found || targetAllocator["enabled"] != true {
+		t.Fatalf("TargetAllocator must remain enabled for monitor discovery: found=%t enabled=%t error=%v", found, targetAllocator["enabled"] == true, err)
+	}
+	prometheusCR, found, err := unstructured.NestedMap(targetAllocator, "prometheusCR")
+	if err != nil || !found {
+		t.Fatalf("TargetAllocator Prometheus CR discovery must remain configured: found=%t error=%v", found, err)
+	}
+	for _, selector := range []string{"podMonitorSelector", "serviceMonitorSelector"} {
+		matchLabels, found, err := unstructured.NestedStringMap(prometheusCR, selector, "matchLabels")
+		if err != nil || !found || matchLabels["monitoring.opendatahub.io/scrape"] != "true" {
+			t.Errorf("TargetAllocator %s must remain selected: found=%t labels=%v error=%v", selector, found, matchLabels, err)
+		}
+	}
+}
+
+func TestBuiltinDCGMScrapeRequiresAcceleratorAndScrapeFlags(t *testing.T) {
+	tests := []struct {
+		name               string
+		acceleratorMetrics bool
+		scrapeEnabled      bool
+		wantJob            bool
+	}{
+		{name: "both disabled", acceleratorMetrics: false, scrapeEnabled: false},
+		{name: "only scrape enabled", acceleratorMetrics: false, scrapeEnabled: true},
+		{name: "only accelerator metrics enabled", acceleratorMetrics: true, scrapeEnabled: false},
+		{name: "both enabled", acceleratorMetrics: true, scrapeEnabled: true, wantJob: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			collector := renderCollectorTemplateWithOptions(t, test.acceleratorMetrics, test.scrapeEnabled)
+			config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
+			if err != nil || !found {
+				t.Fatalf("collector config must be present: found=%t, error=%v", found, err)
+			}
+			scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus", "config", "scrape_configs")
+			if err != nil {
+				t.Fatalf("read Prometheus scrape configs: %v", err)
+			}
+			if test.wantJob {
+				if !found || len(scrapeConfigs) != 1 {
+					t.Fatalf("both flags enabled must render exactly one DCGM job: found=%t count=%d", found, len(scrapeConfigs))
+				}
+				job, ok := scrapeConfigs[0].(map[string]any)
+				if !ok {
+					t.Fatalf("built-in DCGM scrape config has unexpected type %T", scrapeConfigs[0])
+				}
+				if job["job_name"] != "dcgm-exporter-accelerator-metrics" {
+					t.Fatalf("unexpected built-in DCGM job name %q", job["job_name"])
+				}
+				return
+			}
+			if found && len(scrapeConfigs) != 0 {
+				t.Fatalf("DCGM job must be absent unless both flags are enabled; scrape config count=%d", len(scrapeConfigs))
+			}
+		})
+	}
+}
+
+func TestTargetAllocatorSecurity(t *testing.T) {
 	collector := renderCollectorTemplate(t)
 	targetAllocator, found, err := unstructured.NestedMap(collector.Object, "spec", "targetAllocator")
 	if err != nil || !found {
@@ -88,63 +199,6 @@ func TestPrometheusScrapeConfigAndTargetAllocatorSecurity(t *testing.T) {
 	}
 	if targetAllocator["allowInsecureAuthSecrets"] != false {
 		t.Errorf("target allocator must disable auth secrets over plaintext HTTP, got %v", targetAllocator["allowInsecureAuthSecrets"])
-	}
-
-	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
-	if err != nil || !found {
-		t.Fatalf("collector config must be present in rendered resource: found=%t, error=%v", found, err)
-	}
-	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus", "config", "scrape_configs")
-	if err != nil || !found {
-		t.Fatalf("prometheus scrape configs must be present: found=%t, error=%v", found, err)
-	}
-
-	var podScrapeJob map[string]any
-	for _, rawScrapeConfig := range scrapeConfigs {
-		scrapeConfig, ok := rawScrapeConfig.(map[string]any)
-		if ok && scrapeConfig["job_name"] == "data-science-collector-prometheus" {
-			podScrapeJob = scrapeConfig
-			break
-		}
-	}
-	if podScrapeJob == nil {
-		t.Fatal("data-science-collector-prometheus scrape config must be present")
-	}
-
-	relabelConfigs, found, err := unstructured.NestedSlice(podScrapeJob, "relabel_configs")
-	if err != nil || !found {
-		t.Fatalf("pod scrape relabel configs must be present: found=%t, error=%v", found, err)
-	}
-
-	var hasDefaultPort, hasEPPSchedulerDrop, hasEPPPort bool
-	for _, rawRule := range relabelConfigs {
-		rule, ok := rawRule.(map[string]any)
-		if !ok {
-			t.Fatal("pod scrape relabel rule has unexpected type")
-		}
-		if rule["action"] == "drop" && rule["regex"] == "llminferenceservice-router-scheduler" {
-			sourceLabels, ok := rule["source_labels"].([]any)
-			if !ok || !containsString(sourceLabels, "__meta_kubernetes_pod_label_app_kubernetes_io_component") {
-				t.Errorf("EPP exclusion must inspect the scheduler component label: %v", rule)
-			}
-			hasEPPSchedulerDrop = true
-		}
-		switch rule["replacement"] {
-		case "$1:8080":
-			hasDefaultPort = true
-		case "$1:9090":
-			hasEPPPort = true
-		}
-	}
-
-	if !hasDefaultPort {
-		t.Error("pod scrape config must retain the default 8080 port")
-	}
-	if !hasEPPSchedulerDrop {
-		t.Error("pod scrape config must exclude scheduler pods handled by KServe's ServiceMonitor")
-	}
-	if hasEPPPort {
-		t.Error("pod scrape config must not add a second EPP metrics port")
 	}
 
 	prometheusCR, found, err := unstructured.NestedMap(targetAllocator, "prometheusCR")
@@ -293,15 +347,13 @@ func TestCollectorStripsWorkloadSuppliedK8sLabelAttributes(t *testing.T) {
 }
 
 // TestSanitizeTransformExcludesDCGMExporterK8sLabels guards the DCGM
-// scope-out of the namespace/pod promotion: the dcgm-exporter scrape job's
-// k8s.namespace.name/k8s.pod.name resource attributes identify the exporter
-// pod in nvidia-gpu-operator, not the workload consuming the GPU, so they
-// must not be promoted to namespace/pod by the collector ServiceMonitor.
-// The resource-context statements delete them for that job, making the
-// promotion a no-op for accelerator series, while node/component are
-// preserved (Korrel8r correlates DCGM series by node). The processor runs
-// in the scrape pipeline only: an OTLP pusher controls service.name and
-// must not be able to use the DCGM job name to opt out of pod attribution.
+// scope-out of namespace/pod promotion. Monitor relabelings can spoof the
+// service.name derived from job, so the exclusion must also require the
+// collector-enriched target namespace to be nvidia-gpu-operator. The ordered
+// resource-context statements remove exporter pod identity without allowing
+// tenant monitors to opt out of namespace/pod attribution. Node/component
+// remain for Korrel8r. The processor stays in the scrape pipeline; OTLP
+// pushers use a separate identity sanitizer.
 func TestSanitizeTransformExcludesDCGMExporterK8sLabels(t *testing.T) {
 	collector := renderCollectorTemplate(t)
 
@@ -333,13 +385,14 @@ func TestSanitizeTransformExcludesDCGMExporterK8sLabels(t *testing.T) {
 		t.Fatalf("resource-context statements have unexpected type: %T", resourceBlock["statements"])
 	}
 
-	// The DCGM job name scoping the statements must match the job target
-	// label assigned by the dcgm scrape job's relabeling, so renaming one
-	// without the other fails here.
+	// Both the DCGM job identity and trusted target namespace must scope these
+	// statements. Their order is significant: the first guard needs the namespace
+	// attribute that the second statement removes.
 	dcgmJobName := dcgmScrapeJobName(t, collector)
+	dcgmTargetNamespace := "nvidia-gpu-operator"
 	expectedStatements := []string{
-		fmt.Sprintf(`delete_key(attributes, "k8s.namespace.name") where attributes["service.name"] == %q`, dcgmJobName),
-		fmt.Sprintf(`delete_key(attributes, "k8s.pod.name") where attributes["service.name"] == %q`, dcgmJobName),
+		fmt.Sprintf(`delete_key(attributes, "k8s.pod.name") where attributes["service.name"] == %q and attributes["k8s.namespace.name"] == %q`, dcgmJobName, dcgmTargetNamespace),
+		fmt.Sprintf(`delete_key(attributes, "k8s.namespace.name") where attributes["service.name"] == %q and attributes["k8s.namespace.name"] == %q`, dcgmJobName, dcgmTargetNamespace),
 	}
 	if len(statements) != len(expectedStatements) {
 		t.Fatalf("expected %d resource-context statements, got %d", len(expectedStatements), len(statements))
@@ -627,7 +680,7 @@ func TestDCGMMetricRelabelingPreservesDRAAttributionLabels(t *testing.T) {
 		t.Fatalf("collector config must be present in rendered resource: found=%t, error=%v", found, err)
 	}
 	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus", "config", "scrape_configs")
-	if err != nil || !found || len(scrapeConfigs) < 2 {
+	if err != nil || !found || len(scrapeConfigs) == 0 {
 		t.Fatalf("expected DCGM scrape config in rendered resource: found=%t, error=%v", found, err)
 	}
 	var dcgmJob map[string]any
@@ -674,6 +727,21 @@ func TestDCGMMetricRelabelingPreservesDRAAttributionLabels(t *testing.T) {
 
 func renderCollectorTemplate(t *testing.T) unstructured.Unstructured {
 	t.Helper()
+	return renderCollectorTemplateWithAcceleratorMetrics(t, true)
+}
+
+func renderCollectorTemplateWithAcceleratorMetrics(t *testing.T, acceleratorMetrics bool) unstructured.Unstructured {
+	t.Helper()
+	return renderCollectorTemplateWithOptions(t, acceleratorMetrics, acceleratorMetrics)
+}
+
+func renderCollectorTemplateWithDCGMScrapeEnabled(t *testing.T, enabled bool) unstructured.Unstructured {
+	t.Helper()
+	return renderCollectorTemplateWithOptions(t, true, enabled)
+}
+
+func renderCollectorTemplateWithOptions(t *testing.T, acceleratorMetrics, builtinDCGMScrapeEnabled bool) unstructured.Unstructured {
+	t.Helper()
 	resources, err := rendertemplate.Render(context.Background(), nil, []rendertemplate.TemplateSource{{
 		FS:   resourcesFS,
 		Path: OpenTelemetryCollectorTemplate,
@@ -681,7 +749,8 @@ func renderCollectorTemplate(t *testing.T) unstructured.Unstructured {
 		"Namespace":                       "redhat-ods-monitoring",
 		"Metrics":                         true,
 		"MetricsStorage":                  true,
-		"AcceleratorMetrics":              true,
+		"AcceleratorMetrics":              acceleratorMetrics,
+		"BuiltinDCGMScrapeEnabled":        builtinDCGMScrapeEnabled,
 		"Traces":                          false,
 		"CollectorReplicas":               1,
 		"CollectorCPULimit":               "1",
@@ -727,4 +796,114 @@ func extractSection(content, startMarker, endMarker string) string {
 		return content[startIdx:]
 	}
 	return content[startIdx : startIdx+endIdx]
+}
+
+func TestDCGMScrapeJobUsesHTTPWithoutCredentialsAndKeepsDefaultRedirects(t *testing.T) {
+	jobs := renderedPrometheusScrapeJobs(t, renderCollectorTemplate(t))
+	job := jobs["dcgm-exporter-accelerator-metrics"]
+	if job == nil {
+		t.Fatal("DCGM scrape job must be present")
+	}
+	if job["scheme"] != "http" {
+		t.Errorf("DCGM scrape job must explicitly use HTTP, got %v", job["scheme"])
+	}
+	for _, credentialField := range []string{"bearer_token_file", "bearer_token", "authorization", "basic_auth"} {
+		if _, found := job[credentialField]; found {
+			t.Errorf("DCGM scrape job must not configure credential field %s", credentialField)
+		}
+	}
+	if _, found := job["follow_redirects"]; found {
+		t.Errorf("DCGM scrape job must preserve Prometheus default redirect behavior, got %v", job["follow_redirects"])
+	}
+	if tlsConfig, found, err := unstructured.NestedMap(job, "tls_config"); err != nil {
+		t.Errorf("failed to read TLS config: %v", err)
+	} else if found && tlsConfig["insecure_skip_verify"] == true {
+		t.Error("DCGM scrape job must not skip TLS certificate verification")
+	}
+}
+
+func TestDCGMScrapeJobRetainsDiscoveryAndRelabeling(t *testing.T) {
+	jobs := renderedPrometheusScrapeJobs(t, renderCollectorTemplate(t))
+	job := jobs["dcgm-exporter-accelerator-metrics"]
+	if job == nil {
+		t.Fatal("DCGM scrape job must be present")
+	}
+	sdConfigs, found, err := unstructured.NestedSlice(job, "kubernetes_sd_configs")
+	if err != nil || !found || len(sdConfigs) != 1 {
+		t.Fatalf("DCGM job must retain one Kubernetes discovery config: found=%t configs=%v error=%v", found, sdConfigs, err)
+	}
+	sdConfig, ok := sdConfigs[0].(map[string]any)
+	if !ok || sdConfig["role"] != "pod" {
+		t.Fatalf("DCGM job must discover Pod targets, got %v", sdConfigs[0])
+	}
+	namespaces, found, err := unstructured.NestedStringSlice(sdConfig, "namespaces", "names")
+	if err != nil || !found || len(namespaces) != 1 || namespaces[0] != "nvidia-gpu-operator" {
+		t.Fatalf("DCGM discovery must remain limited to nvidia-gpu-operator, got %v (found=%t error=%v)", namespaces, found, err)
+	}
+
+	relabelRules := renderedPrometheusRelabelRules(t, job)
+	expectedRules := map[string]string{
+		"__address__": "$1:9400",
+		"node":        "__meta_kubernetes_pod_node_name",
+		"component":   "__meta_kubernetes_pod_label_app",
+		"job":         "rhoai-accelerator-metrics",
+	}
+	for targetLabel, expected := range expectedRules {
+		if !hasPrometheusRelabelRule(relabelRules, targetLabel, expected) {
+			t.Errorf("DCGM scrape job must retain relabeling for %q=%q", targetLabel, expected)
+		}
+	}
+}
+
+func renderedPrometheusScrapeJobs(t *testing.T, collector unstructured.Unstructured) map[string]map[string]any {
+	t.Helper()
+	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
+	if err != nil || !found {
+		t.Fatalf("collector config must be present: found=%t error=%v", found, err)
+	}
+	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus", "config", "scrape_configs")
+	if err != nil || !found {
+		t.Fatalf("Prometheus scrape configs must be present: found=%t error=%v", found, err)
+	}
+	jobs := make(map[string]map[string]any, len(scrapeConfigs))
+	for _, rawConfig := range scrapeConfigs {
+		job, ok := rawConfig.(map[string]any)
+		if !ok {
+			t.Fatalf("Prometheus scrape config has unexpected type: %T", rawConfig)
+		}
+		if name, ok := job["job_name"].(string); ok {
+			jobs[name] = job
+		}
+	}
+	return jobs
+}
+
+func renderedPrometheusRelabelRules(t *testing.T, job map[string]any) []map[string]any {
+	t.Helper()
+	rawRules, found, err := unstructured.NestedSlice(job, "relabel_configs")
+	if err != nil || !found {
+		t.Fatalf("Prometheus relabel configs must be present: found=%t error=%v", found, err)
+	}
+	rules := make([]map[string]any, 0, len(rawRules))
+	for _, rawRule := range rawRules {
+		rule, ok := rawRule.(map[string]any)
+		if !ok {
+			t.Fatalf("Prometheus relabel rule has unexpected type: %T", rawRule)
+		}
+		rules = append(rules, rule)
+	}
+	return rules
+}
+
+func hasPrometheusRelabelRule(rules []map[string]any, targetLabel, expected string) bool {
+	for _, rule := range rules {
+		if rule["target_label"] != targetLabel {
+			continue
+		}
+		if targetLabel == "__address__" || targetLabel == "job" {
+			return rule["replacement"] == expected
+		}
+		return containsString(rule["source_labels"], expected)
+	}
+	return false
 }

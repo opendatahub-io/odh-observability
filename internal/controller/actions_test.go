@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"slices"
 	"strings"
@@ -37,6 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -841,30 +843,32 @@ func TestCleanupLegacyPersesDatasourceSATokenSecrets_DeletesSATokens(t *testing.
 	t.Parallel()
 
 	s := newActionsTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.UID = "monitoring-uid"
+	m.Spec.Namespace = "opendatahub"
+	controller := true
+	legacyMeta := func(name string) metav1.ObjectMeta {
+		return metav1.ObjectMeta{
+			Name: name, Namespace: m.Spec.Namespace, UID: types.UID(name),
+			Annotations:     map[string]string{corev1.ServiceAccountNameKey: legacyPersesDatasourceServiceAccount},
+			OwnerReferences: []metav1.OwnerReference{{UID: m.UID, Controller: &controller}},
+		}
+	}
 	dsLegacy := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      legacyDataSciencePrometheusDatasourceSecret,
-			Namespace: "opendatahub",
-		},
-		Type: corev1.SecretTypeServiceAccountToken,
+		ObjectMeta: legacyMeta(legacyDataSciencePrometheusDatasourceSecret),
+		Type:       corev1.SecretTypeServiceAccountToken,
 	}
 	clusterLegacy := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      legacyClusterPrometheusDatasourceSecret,
-			Namespace: "opendatahub",
-		},
-		Type: corev1.SecretTypeServiceAccountToken,
+		ObjectMeta: legacyMeta(legacyClusterPrometheusDatasourceSecret),
+		Type:       corev1.SecretTypeServiceAccountToken,
 	}
 	tenancyLegacy := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      legacyClusterPrometheusTenancyDatasourceSecret,
-			Namespace: "opendatahub",
-		},
-		Type: corev1.SecretTypeServiceAccountToken,
+		ObjectMeta: legacyMeta(legacyClusterPrometheusTenancyDatasourceSecret),
+		Type:       corev1.SecretTypeServiceAccountToken,
 	}
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(dsLegacy, clusterLegacy, tenancyLegacy).Build()
 
-	if err := cleanupLegacyPersesDatasourceSATokenSecrets(context.Background(), cli, "opendatahub"); err != nil {
+	if err := cleanupLegacyPersesDatasourceSATokenSecrets(context.Background(), cli, m); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	for _, obj := range []client.Object{dsLegacy, clusterLegacy, tenancyLegacy} {
@@ -879,6 +883,8 @@ func TestCleanupLegacyPersesDatasourceSATokenSecrets_KeepsTLSSecret(t *testing.T
 	t.Parallel()
 
 	s := newActionsTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = "opendatahub"
 	tlsSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      legacyClusterPrometheusDatasourceSecret,
@@ -893,11 +899,102 @@ func TestCleanupLegacyPersesDatasourceSATokenSecrets_KeepsTLSSecret(t *testing.T
 	}
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(tlsSecret).Build()
 
-	if err := cleanupLegacyPersesDatasourceSATokenSecrets(context.Background(), cli, "opendatahub"); err != nil {
+	if err := cleanupLegacyPersesDatasourceSATokenSecrets(context.Background(), cli, m); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if err := cli.Get(context.Background(), client.ObjectKeyFromObject(tlsSecret), &corev1.Secret{}); err != nil {
 		t.Fatalf("TLS CA secret must be kept: %v", err)
+	}
+}
+
+func TestCleanupLegacyPersesDatasourceSATokenSecrets_LeavesUnrelatedTokens(t *testing.T) {
+	t.Parallel()
+
+	s := newActionsTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.UID = "monitoring-uid"
+	m.Spec.Namespace = "opendatahub"
+	controller := true
+	secrets := []*corev1.Secret{
+		{ObjectMeta: metav1.ObjectMeta{
+			Name: legacyClusterPrometheusDatasourceSecret, Namespace: m.Spec.Namespace,
+			Annotations: map[string]string{corev1.ServiceAccountNameKey: legacyPersesDatasourceServiceAccount},
+		}, Type: corev1.SecretTypeServiceAccountToken},
+		{ObjectMeta: metav1.ObjectMeta{
+			Name: legacyClusterPrometheusTenancyDatasourceSecret, Namespace: m.Spec.Namespace,
+			Annotations:     map[string]string{corev1.ServiceAccountNameKey: "another-service-account"},
+			OwnerReferences: []metav1.OwnerReference{{UID: m.UID, Controller: &controller}},
+		}, Type: corev1.SecretTypeServiceAccountToken},
+	}
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(secrets[0], secrets[1]).Build()
+	if err := cleanupLegacyPersesDatasourceSATokenSecrets(context.Background(), cli, m); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, secret := range secrets {
+		if err := cli.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); err != nil {
+			t.Fatalf("unrelated secret %s must be kept: %v", secret.Name, err)
+		}
+	}
+}
+
+func TestDeployPersesPrometheusIntegrationCleansSecretsInEffectiveNamespace(t *testing.T) {
+	t.Setenv("MONITORING_NAMESPACE", "custom-monitoring")
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.PersesDatasourceV1Alpha2)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.UID = "monitoring-uid"
+	m.Spec.Namespace = ""
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+	controller := true
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: legacyClusterPrometheusDatasourceSecret, Namespace: "custom-monitoring", UID: "secret-uid",
+		Annotations:     map[string]string{corev1.ServiceAccountNameKey: legacyPersesDatasourceServiceAccount},
+		OwnerReferences: []metav1.OwnerReference{{UID: m.UID, Controller: &controller}},
+	}, Type: corev1.SecretTypeServiceAccountToken}
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(secret).Build()
+	var sources []rendertemplate.TemplateSource
+	err := deployPersesPrometheusIntegration(context.Background(), cli, m,
+		conditions.NewConditionsManager(m, m.Generation), &sources, "v1alpha2", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := cli.Get(context.Background(), client.ObjectKeyFromObject(secret), &corev1.Secret{}); !k8serr.IsNotFound(err) {
+		t.Fatalf("legacy secret in effective namespace must be deleted, got %v", err)
+	}
+}
+
+func TestCleanupLegacyPersesDatasourceSATokenSecretsUsesDeletePreconditions(t *testing.T) {
+	t.Parallel()
+	s := newActionsTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.UID = "monitoring-uid"
+	m.Spec.Namespace = "opendatahub"
+	controller := true
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: legacyClusterPrometheusDatasourceSecret, Namespace: m.Spec.Namespace, UID: "secret-uid",
+		Annotations:     map[string]string{corev1.ServiceAccountNameKey: legacyPersesDatasourceServiceAccount},
+		OwnerReferences: []metav1.OwnerReference{{UID: m.UID, Controller: &controller}},
+	}, Type: corev1.SecretTypeServiceAccountToken}
+	called := false
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(secret).WithInterceptorFuncs(interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			called = true
+			options := &client.DeleteOptions{}
+			for _, opt := range opts {
+				opt.ApplyToDelete(options)
+			}
+			if options.Preconditions == nil || options.Preconditions.UID == nil || *options.Preconditions.UID != secret.UID ||
+				options.Preconditions.ResourceVersion == nil || *options.Preconditions.ResourceVersion != obj.GetResourceVersion() {
+				t.Fatalf("delete must use the observed UID and resource version: %#v", options.Preconditions)
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	}).Build()
+	if err := cleanupLegacyPersesDatasourceSATokenSecrets(context.Background(), cli, m); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !called {
+		t.Fatal("expected the legacy token to be deleted")
 	}
 }
 
@@ -1373,42 +1470,1916 @@ func TestDeployLokiStack_LogsOnlyNoUsageLogs(t *testing.T) {
 	var sources []rendertemplate.TemplateSource
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
-	err := deployLokiStack(context.Background(), cli, m, cm, &sources)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if usageLogsErr, logsErr := deployBothLokiStacks(context.Background(), cli, m, cm, &sources); usageLogsErr != nil || logsErr != nil {
+		t.Fatalf("unexpected errors: usage logs %v, logs %v", usageLogsErr, logsErr)
 	}
 
-	if len(sources) != 3 {
-		t.Fatalf("expected 3 sources (LokiStackTemplate + NetworkPolicies), got %d", len(sources))
+	// Log forwarding brings its whole pipeline: its stack, the network
+	// policies guarding it, and the forwarder that feeds it. The forwarder's
+	// templates stay in the desired set while the stack is starting — that is
+	// the rule that keeps the sweep from taking them down during a transient
+	// Loki outage — so they are here even though no stack exists yet.
+	assertTemplatePaths(t, sources, []string{
+		LokiStackTemplate,
+		LokiStackNetworkPolicyTemplate,
+		LokiStackGatewayNetworkPolicyTemplate,
+		ClusterLogForwarderTemplate,
+		ClusterLogForwarderRBACTemplate,
+		ClusterLogForwarderNetworkPolicyTemplate,
+	})
+
+	c := mustFindCondition(t, m, conditions.ConditionUsageLogsLokiStackAvailable)
+	if c.Status != metav1.ConditionFalse || c.Reason != "LokiNotRequired" {
+		t.Errorf("UsageLogsLokiStackAvailable: expected False/LokiNotRequired, got %s/%s", c.Status, c.Reason)
 	}
 
+	// The folded collector reports its own not-configured verdict: the
+	// pipeline is one action now, but each part still writes its own
+	// condition.
+	if c := mustFindCondition(t, m, conditions.ConditionUsageLogsCollectorAvailable); c.Status != metav1.ConditionFalse ||
+		c.Reason != "UsageLogsNotConfigured" {
+		t.Errorf("UsageLogsCollectorAvailable: expected False/UsageLogsNotConfigured, got %s/%s", c.Status, c.Reason)
+	}
+
+	// The forwarder waits for the stack it ships into, which does not exist
+	// yet in this cluster.
+	if c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable); c.Status != metav1.ConditionFalse ||
+		c.Reason != "LokiStackNotReady" {
+		t.Errorf("ClusterLogForwarderAvailable: expected False/LokiStackNotReady, got %s/%s", c.Status, c.Reason)
+	}
+}
+
+func TestDeployLokiStack_UsageLogsOnlyNoLogs(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Logs = nil
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{
+			Type:             "s3",
+			SecretName:       "usage-logs-only-secret",
+			CredentialMode:   "static",
+			StorageClassName: "gp3-csi",
+		},
+	}
+
+	// The endpoint of a ready stack, published by an earlier round: the
+	// collector gates its rendering on it, so setting it is what makes this
+	// test see the whole folded pipeline rather than the stack alone.
+	m.Status.UsageLogsEndpoint = usageLogsEndpoint
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
+	if usageLogsErr, logsErr := deployBothLokiStacks(context.Background(), cli, m, cm, &sources); usageLogsErr != nil || logsErr != nil {
+		t.Fatalf("unexpected errors: usage logs %v, logs %v", usageLogsErr, logsErr)
+	}
+
+	// Usage logs brings its whole pipeline: the stack, the policy guarding
+	// that stack's gateway, and the collector that dials it. The gateway
+	// policy belongs to the stack rather than to the collector, so it is in
+	// place for the whole startup window — before any collector exists.
+	assertTemplatePaths(t, sources, []string{
+		UsageLogsLokiStackTemplate, UsageLogsLokiStackNPTemplate,
+		UsageLogsOpenTelemetryCollectorTemplate,
+		UsageLogsOpenTelemetryCollectorRBACTemplate,
+		UsageLogsOpenTelemetryCollectorNPTemplate,
+	})
+
+	// One action, two verdicts: the stack reports from its readiness, the
+	// collector from the endpoint that readiness published.
+	if c := mustFindCondition(t, m, conditions.ConditionUsageLogsCollectorAvailable); c.Status != metav1.ConditionTrue {
+		t.Errorf("UsageLogsCollectorAvailable: expected True with the endpoint published, got %s/%s", c.Status, c.Reason)
+	}
+
+	// Log forwarding is not configured, so its stack must stay out of the way
+	// and its forwarder must say so.
+	c := mustFindCondition(t, m, conditions.ConditionLokiStackAvailable)
+	if c.Status != metav1.ConditionFalse || c.Reason != "LokiNotRequired" {
+		t.Errorf("LokiStackAvailable: expected False/LokiNotRequired, got %s/%s", c.Status, c.Reason)
+	}
+	if c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable); c.Status != metav1.ConditionFalse ||
+		c.Reason != "LogsNotConfigured" {
+		t.Errorf("ClusterLogForwarderAvailable: expected False/LogsNotConfigured, got %s/%s", c.Status, c.Reason)
+	}
+}
+
+// TestDeployLokiStack_BothConfigured covers the two stacks being independent:
+// each contributes its own templates and is reported on by its own condition.
+// The storage keys that feed those templates are covered by
+// TestAddLokiStorageData and TestLokiStackTemplatesRenderIndependentStorage.
+func TestDeployLokiStack_BothConfigured(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{
+			Type:             "s3",
+			SecretName:       "usage-logs-secret",
+			CredentialMode:   "static",
+			StorageClassName: "usage-logs-sc",
+		},
+	}
+	m.Spec.Logs = &v1alpha1.Logs{
+		Storage: &v1alpha1.LokiStorageConfig{
+			Type:           "s3",
+			SecretName:     "logs-secret",
+			CredentialMode: "token",
+		},
+	}
+
+	// The endpoints of two ready stacks, published by earlier rounds: with
+	// them set, both folded pipelines render whole.
+	m.Status.UsageLogsEndpoint = usageLogsEndpoint
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	// Both storage Secrets have to exist and resolve to different buckets:
+	// with both stacks configured the isolation check fails closed, so an
+	// unresolvable Secret withholds them before any of this is reached.
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(kubernetesAPIServerEndpointSlice(),
+			lokiStorageSecret("usage-logs-secret", m.Spec.Namespace, "https://s3.example.com", "usage-logs-bucket"),
+			lokiStorageSecret("logs-secret", m.Spec.Namespace, "https://s3.example.com", "logs-bucket"),
+			readyLokiStack(usageLogsLokiStackResourceName, m.Spec.Namespace),
+			readyLokiStack(lokiStackResourceName, m.Spec.Namespace)).
+		Build()
+
+	if withheld, err := validateStorageIsolation(context.Background(), cli, m, cm); err != nil || withheld != nil {
+		t.Fatalf("two distinct buckets must pass the gate withholding nothing: withheld %v, err %v", withheld, err)
+	}
+	if usageLogsErr, logsErr := deployBothLokiStacks(context.Background(), cli, m, cm, &sources); usageLogsErr != nil || logsErr != nil {
+		t.Fatalf("two ready stacks is the healthy case: usage logs %v, logs %v", usageLogsErr, logsErr)
+	}
+
+	assertTemplatePaths(t, sources, []string{
+		UsageLogsLokiStackTemplate,
+		UsageLogsLokiStackNPTemplate,
+		UsageLogsOpenTelemetryCollectorTemplate,
+		UsageLogsOpenTelemetryCollectorRBACTemplate,
+		UsageLogsOpenTelemetryCollectorNPTemplate,
+		LokiStackTemplate,
+		LokiStackNetworkPolicyTemplate,
+		LokiStackGatewayNetworkPolicyTemplate,
+		ClusterLogForwarderTemplate,
+		ClusterLogForwarderRBACTemplate,
+		ClusterLogForwarderNetworkPolicyTemplate,
+	})
+
+	for _, conditionType := range []string{
+		conditions.ConditionUsageLogsLokiStackAvailable,
+		conditions.ConditionUsageLogsCollectorAvailable,
+		conditions.ConditionLokiStackAvailable,
+	} {
+		if c := mustFindCondition(t, m, conditionType); c.Status != metav1.ConditionTrue {
+			t.Errorf("%s: expected True once the stack is ready, got %s/%s", conditionType, c.Status, c.Reason)
+		}
+	}
+
+	// The forwarder's stack is ready, but the forwarder itself has not been
+	// applied yet in this cluster, so it reports its own startup state.
+	if c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable); c.Status != metav1.ConditionFalse ||
+		c.Reason != "ClusterLogForwarderNotReady" {
+		t.Errorf("ClusterLogForwarderAvailable: expected False/ClusterLogForwarderNotReady, got %s/%s", c.Status, c.Reason)
+	}
+}
+
+func TestDeployLokiStack_NeitherConfigured(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = nil
+	m.Spec.Logs = nil
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	if usageLogsErr, logsErr := deployBothLokiStacks(context.Background(), cli, m, cm, &sources); usageLogsErr != nil || logsErr != nil {
+		t.Fatalf("unexpected errors: usage logs %v, logs %v", usageLogsErr, logsErr)
+	}
+
+	if len(sources) != 0 {
+		t.Fatalf("expected no sources when neither feature is configured, got %d", len(sources))
+	}
+
+	// Both pipelines report NotConfigured down to their dependents: the fold
+	// must not leave the collector's or the forwarder's condition unwritten.
+	for conditionType, wantReason := range map[string]string{
+		conditions.ConditionUsageLogsLokiStackAvailable:  "LokiNotRequired",
+		conditions.ConditionUsageLogsCollectorAvailable:  "UsageLogsNotConfigured",
+		conditions.ConditionLokiStackAvailable:           "LokiNotRequired",
+		conditions.ConditionClusterLogForwarderAvailable: "LogsNotConfigured",
+	} {
+		c := mustFindCondition(t, m, conditionType)
+		if c.Status != metav1.ConditionFalse || c.Severity != platformcommon.ConditionSeverityInfo {
+			t.Errorf("%s: expected False+Info when not configured, got %s/%s", conditionType, c.Status, c.Severity)
+		}
+		if c.Reason != wantReason {
+			t.Errorf("%s: expected reason %s, got %s", conditionType, wantReason, c.Reason)
+		}
+	}
+}
+
+func TestDeployLokiStack_CRDMissing(t *testing.T) {
+	s := newActionsTestScheme(t)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: "usage-logs-secret"}}
+	m.Spec.Logs = &v1alpha1.Logs{Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: "logs-secret"}}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	// Each action asks for itself, so the absence has to come from the client:
+	// the fake one answers an unstructured List for an unregistered kind with
+	// an empty list rather than a NoKindMatchError, which hasCRD would read as
+	// "installed, none created yet".
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithInterceptorFuncs(missingCRDs(gvk.LokiStack)).Build()
+	if usageLogsErr, logsErr := deployBothLokiStacks(context.Background(), cli, m, cm, &sources); usageLogsErr != nil || logsErr != nil {
+		t.Fatalf("a missing operator is a reported condition, not an error: usage logs %v, logs %v", usageLogsErr, logsErr)
+	}
+
+	if len(sources) != 0 {
+		t.Fatalf("expected no sources when the LokiStack CRD is missing, got %d", len(sources))
+	}
+
+	// Both features are configured, so both must report the missing operator.
+	for _, conditionType := range []string{
+		conditions.ConditionUsageLogsLokiStackAvailable,
+		conditions.ConditionLokiStackAvailable,
+	} {
+		c := mustFindCondition(t, m, conditionType)
+		if c.Status != metav1.ConditionFalse || c.Reason != conditions.MissingOperatorReason {
+			t.Errorf("%s: expected False/%s, got %s/%s", conditionType, conditions.MissingOperatorReason, c.Status, c.Reason)
+		}
+	}
+
+	// The folded dependents still write their own verdicts. The collector
+	// waits for an endpoint no stack can publish while the operator is
+	// missing; the forwarder names the missing CRD for itself.
+	if c := mustFindCondition(t, m, conditions.ConditionUsageLogsCollectorAvailable); c.Status != metav1.ConditionFalse ||
+		c.Reason != "LokiStackNotReady" {
+		t.Errorf("UsageLogsCollectorAvailable: expected False/LokiStackNotReady, got %s/%s", c.Status, c.Reason)
+	}
+	if c := mustFindCondition(t, m, conditions.ConditionClusterLogForwarderAvailable); c.Status != metav1.ConditionFalse ||
+		c.Reason != "LokiStackCRDNotFound" {
+		t.Errorf("ClusterLogForwarderAvailable: expected False/LokiStackCRDNotFound, got %s/%s", c.Status, c.Reason)
+	}
+}
+
+// deployBothLokiStacks runs the two stack actions and returns both errors.
+//
+// The reconciler does not do this: there, the first action to fail aborts the
+// round before the second runs, the same as for every other action. Running
+// both unconditionally is a test affordance for cases about one action's own
+// behaviour, where both outcomes need asserting in one pass. How the
+// reconciler composes the gate with these two — and the fact that it stops at
+// the first error — is covered at reconcile level, where that composition
+// actually lives.
+func deployBothLokiStacks(
+	ctx context.Context,
+	c client.Client,
+	m *v1alpha1.Monitoring,
+	cm *conditions.ConditionsManager,
+	sources *[]rendertemplate.TemplateSource,
+) (error, error) {
+	usageLogsErr := deployUsageLogsLokiStack(ctx, c, m, cm, sources)
+	logsErr := deployRHOAILogsLokiStack(ctx, c, m, cm, sources)
+	return usageLogsErr, logsErr
+}
+
+// assertWithheldComponents pins the garbage collection shield the storage gate
+// hands back. It is the gate's only output besides the conditions, and the
+// set has to be exact in both directions: a missing component is a resource
+// the collector deletes out from under a configuration the operator refused to
+// render, and an extra one is a deletion the user asked for that never happens.
+func assertWithheldComponents(t *testing.T, got map[string]struct{}, want ...string) {
+	t.Helper()
+
+	wantSet := make(map[string]struct{}, len(want))
+	for _, component := range want {
+		wantSet[component] = struct{}{}
+	}
+	if !maps.Equal(got, wantSet) {
+		t.Errorf("withheld components: want %v, got %v", wantSet, got)
+	}
+}
+
+// lokiStorageSecret builds a LokiStack S3 storage Secret pointing at a bucket
+// on an endpoint.
+func lokiStorageSecret(name, namespace, endpoint, bucketnames string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Data: map[string][]byte{
+			"endpoint":    []byte(endpoint),
+			"bucketnames": []byte(bucketnames),
+		},
+	}
+}
+
+// monitoringWithBothLokiStorage configures both features against the named
+// storage Secrets.
+func monitoringWithBothLokiStorage(usageLogsSecret, logsSecret string) *v1alpha1.Monitoring {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: usageLogsSecret},
+	}
+	m.Spec.Logs = &v1alpha1.Logs{
+		Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: logsSecret},
+	}
+	return m
+}
+
+// TestCanonicalStorageLocation pins the canonicalization rules directly, as
+// an endpoint and bucket in and a key or an error out.
+//
+// They are the subtlest code in the gate and decide every verdict it reaches:
+// a rule that normalizes too little misses a conflict and lets two writers
+// share a bucket, and one that normalizes too much invents a conflict and
+// withholds a configuration that was fine. TestCheckStorageIsolation reaches
+// them through two Secrets and a fake client, which states the rule under test
+// only implicitly and reports a failure as "expected no conflict" several
+// layers from the comparison that produced it.
+//
+// Only equality between outputs is meaningful — the strings are map keys, not
+// an API — so the expectations here are written to make the rules legible
+// rather than because any caller depends on the exact spelling.
+func TestCanonicalStorageLocation(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		bucket   string
+		want     string
+		// wantErr asserts the pair is rejected rather than keyed: an address
+		// that cannot name a location must not become one that compares as
+		// isolated from the locations that do.
+		wantErr bool
+	}{
+		{
+			name:     "path-style endpoint",
+			endpoint: "https://s3.example.com",
+			bucket:   "logs",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			// http and https are transports to one gateway, not separate
+			// backends: every S3-compatible store serves the same buckets over
+			// both. Keeping the scheme in the key would let two claimants reach
+			// one bucket under two spellings and pass the comparison.
+			name:     "the scheme is not part of the location",
+			endpoint: "http://s3.example.com",
+			bucket:   "logs",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			// Hosts are case-insensitive (RFC 4343).
+			name:     "the host is lowercased",
+			endpoint: "HTTPS://S3.Example.COM",
+			bucket:   "logs",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			name:     "an explicitly written default https port is dropped",
+			endpoint: "https://s3.example.com:443",
+			bucket:   "logs",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			name:     "an explicitly written default http port is dropped",
+			endpoint: "http://s3.example.com:80",
+			bucket:   "logs",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			// The port rule cannot key off the scheme when the scheme is not in
+			// the key: were :80 kept here and dropped under http, the two
+			// spellings of one gateway would still land on different locations
+			// and the scheme would go on separating them by proxy.
+			name:     "a default web port is dropped whichever scheme carried it",
+			endpoint: "https://s3.example.com:80",
+			bucket:   "logs",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			name:     "a non-default port is kept",
+			endpoint: "https://s3.example.com:9000",
+			bucket:   "logs",
+			want:     "//s3.example.com:9000/logs",
+		},
+		{
+			// The fold and the port have to agree on one spelling of the host:
+			// the bucket label comes off the bare hostname, and the port goes
+			// back on after it. This row pins that the two spellings of one
+			// ported endpoint still meet in a single key, whichever order those
+			// two steps run in.
+			name:     "a virtual-host bucket on a non-default port is still folded out",
+			endpoint: "https://logs.s3.example.com:9000",
+			bucket:   "logs",
+			want:     "//s3.example.com:9000/logs",
+		},
+		{
+			name:     "a trailing slash is not a path prefix",
+			endpoint: "https://s3.example.com/",
+			bucket:   "logs",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			name:     "repeated slashes collapse",
+			endpoint: "https://s3.example.com//",
+			bucket:   "logs",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			name:     "dot segments resolve",
+			endpoint: "https://gateway.internal/s3/../s3/",
+			bucket:   "logs",
+			want:     "//gateway.internal/s3/logs",
+		},
+		{
+			// Self-hosted gateways route on the prefix and are free to treat
+			// its case as significant, so it is left alone.
+			name:     "path prefix case is preserved",
+			endpoint: "https://gateway.internal/S3",
+			bucket:   "logs",
+			want:     "//gateway.internal/S3/logs",
+		},
+		{
+			// Virtual-host-style addressing folds the bucket into the
+			// hostname; stripping it is what makes that spelling comparable
+			// to the path-style one above.
+			name:     "a virtual-host bucket is folded out of the hostname",
+			endpoint: "https://logs.s3.example.com",
+			bucket:   "logs",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			name:     "the virtual-host fold ignores bucket case",
+			endpoint: "https://LOGS.s3.example.com",
+			bucket:   "logs",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			// The fold and the key read the same lowercased bucket, so an
+			// uppercase bucketnames entry has to survive both. One lowercasing
+			// site serves them; this is the row that notices if it stops.
+			name:     "the virtual-host fold ignores bucket case written the other way",
+			endpoint: "https://logs.s3.example.com",
+			bucket:   "LOGS",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			// The fold reads the hostname only; a gateway path prefix is not
+			// part of what it strips, so it survives the virtual-host spelling
+			// and keeps that form comparable to the path-style one under the
+			// same prefix.
+			name:     "the virtual-host fold leaves a gateway path prefix alone",
+			endpoint: "https://logs.s3.example.com/custom/prefix",
+			bucket:   "logs",
+			want:     "//s3.example.com/custom/prefix/logs",
+		},
+		{
+			// The fold matches on a whole leading label, so a host that merely
+			// starts with the bucket name keeps its hostname intact. Stripping
+			// here would collapse two distinct endpoints into one location and
+			// report a conflict that does not exist.
+			name:     "a hostname that only starts with the bucket name is untouched",
+			endpoint: "https://logs-archive.s3.example.com",
+			bucket:   "logs",
+			want:     "//logs-archive.s3.example.com/logs",
+		},
+		{
+			// An S3 bucket name is a DNS label, so a store that distinguishes
+			// these two is out of spec. Folding the case costs a conflict that
+			// could only be invented by an out-of-spec backend and buys one
+			// that would otherwise be silent.
+			name:     "bucket case is folded",
+			endpoint: "https://s3.example.com",
+			bucket:   "LOGS",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			// url.Parse keeps the DNS root dot, and the fully qualified
+			// spelling is the ordinary one for an in-cluster Service.
+			name:     "the DNS root dot is stripped",
+			endpoint: "https://minio.odh.svc.cluster.local.",
+			bucket:   "logs",
+			want:     "//minio.odh.svc.cluster.local/logs",
+		},
+		{
+			// url.Parse strips the brackets from an IPv6 literal and
+			// JoinHostPort only restores them when a port survives, so the two
+			// spellings below differ in more than the port. Nothing reparses a
+			// key, so a bracketless literal is only ever compared, and the two
+			// forms of one address still agree with themselves.
+			name:     "an IPv6 literal keeps its brackets only alongside a port",
+			endpoint: "http://[::1]:9000",
+			bucket:   "logs",
+			want:     "//[::1]:9000/logs",
+		},
+		{
+			name:     "an IPv6 literal on a default port loses its brackets",
+			endpoint: "http://[::1]:80",
+			bucket:   "logs",
+			want:     "//::1/logs",
+		},
+		{
+			name:     "surrounding whitespace is ignored",
+			endpoint: "  https://s3.example.com  ",
+			bucket:   "  logs  ",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			// An endpoint url.Parse rejects cannot be normalized, and a key
+			// built from the raw string cannot be checked against anything.
+			// Rejecting it is the fail-closed answer: two identically
+			// misspelled endpoints used to conflict through the fallback key;
+			// now the Secret is reported as invalid instead, which names the
+			// thing the user actually has to fix.
+			name:     "an unparseable endpoint is rejected",
+			endpoint: "https://exa\x7fmple.com",
+			bucket:   "logs",
+			wantErr:  true,
+		},
+		{
+			// The regression this row guards: an empty endpoint once parsed as
+			// an empty authority and keyed to "///logs", which no valid
+			// endpoint produces, so it compared as isolated from every real
+			// one beside it.
+			name:     "an empty endpoint is rejected",
+			endpoint: "",
+			bucket:   "logs",
+			wantErr:  true,
+		},
+		{
+			name:     "a whitespace-only endpoint is rejected",
+			endpoint: "   ",
+			bucket:   "logs",
+			wantErr:  true,
+		},
+		{
+			// Parses, and to a path — but a location without a host is the
+			// same "///" key an empty endpoint produced, reached by another
+			// spelling.
+			name:     "a hostless endpoint is rejected",
+			endpoint: "/just-a-path",
+			bucket:   "logs",
+			wantErr:  true,
+		},
+		{
+			// The spelling the Loki operator takes for an in-cluster gateway.
+			// With no scheme in the key it needs no special handling: it is
+			// already the same location as either spelling that names it, which
+			// is what the first two rows above assert from the other side.
+			name:     "a scheme-less endpoint is the same location as either spelling of it",
+			endpoint: "s3.example.com",
+			bucket:   "logs",
+			want:     "//s3.example.com/logs",
+		},
+		{
+			// A bare host with a standard port, which is only equal to the
+			// scheme-ful spellings because the port rule ignores the scheme.
+			name:     "a scheme-less endpoint on a default web port drops it",
+			endpoint: "s3.example.com:443",
+			bucket:   "logs",
+			want:     "//s3.example.com/logs",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := canonicalStorageLocation(tt.endpoint, tt.bucket)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("canonicalStorageLocation(%q, %q): expected an error, got key %q",
+						tt.endpoint, tt.bucket, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("canonicalStorageLocation(%q, %q): unexpected error: %v",
+					tt.endpoint, tt.bucket, err)
+			}
+			if got != tt.want {
+				t.Errorf("canonicalStorageLocation(%q, %q):\n want %q\n  got %q",
+					tt.endpoint, tt.bucket, tt.want, got)
+			}
+		})
+	}
+}
+
+// TestCanonicalStorageLocationDoesNotEchoCredentials pins the security property
+// of the two error returns above. The endpoint is Secret data and may carry
+// credentials in its userinfo, and these errors surface in status conditions
+// and operator logs that far more principals can read than the Secret itself —
+// echoing them there would hand out the credentials to anyone who can `kubectl
+// get monitoring`. The wrapper in lokiStorageLocations is what keeps the
+// message diagnosable instead: it names the Secret, never its contents.
+func TestCanonicalStorageLocationDoesNotEchoCredentials(t *testing.T) {
+	t.Parallel()
+
+	const (
+		accessKey = "AKIAIOSFODNN7EXAMPLE"
+		password  = "wJalrXUtnFEMI7K7MDENGsecret"
+	)
+	credentialed := "https://" + accessKey + ":" + password + "@"
+	for name, endpoint := range map[string]string{
+		// url.Parse rejects the control character. Its own error message
+		// quotes the raw URL it failed on, which is why that cause is not
+		// wrapped into ours.
+		"unparseable": credentialed + "exa\x7fmple.com:9000",
+		// Parses, but to a path: the hostless branch.
+		"hostless": credentialed + "/just-a-path",
+	} {
+		_, err := canonicalStorageLocation(endpoint, "logs")
+		if err == nil {
+			t.Fatalf("%s endpoint: expected an error", name)
+		}
+		for _, credential := range []string{accessKey, password} {
+			if strings.Contains(err.Error(), credential) {
+				t.Errorf("%s endpoint: error must not echo the endpoint's credentials, got %q", name, err)
+			}
+		}
+	}
+}
+
+// TestLokiStorageLocationsDoesNotEchoCredentials is the same property one
+// layer up, at the boundary the condition message actually renders: the
+// message must name the Secret so its owner can fix it, while the credentials
+// embedded in that Secret's endpoint stay in the Secret.
+func TestLokiStorageLocationsDoesNotEchoCredentials(t *testing.T) {
+	t.Parallel()
+
+	const (
+		ns         = "test-ns"
+		accessKey  = "AKIAIOSFODNN7EXAMPLE"
+		password   = "wJalrXUtnFEMI7K7MDENGsecret"
+		secretName = "usage-logs-secret"
+	)
+	s := newActionsTestScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		lokiStorageSecret(secretName, ns,
+			"https://"+accessKey+":"+password+"@exa\x7fmple.com:9000", "logs"),
+	).Build()
+
+	_, err := lokiStorageLocations(context.Background(), cli, ns, secretName)
+	if err == nil {
+		t.Fatal("expected the unparseable endpoint to fail the resolution")
+	}
+	if !strings.Contains(err.Error(), secretName) {
+		t.Errorf("error must name the Secret so its owner can fix it, got %q", err)
+	}
+	for _, credential := range []string{accessKey, password} {
+		if strings.Contains(err.Error(), credential) {
+			t.Errorf("error must not echo the endpoint's credentials, got %q", err)
+		}
+	}
+}
+
+// storageIsolationTest is one checkStorageIsolation case: the Secrets that
+// exist, the spec that claims them, and the verdict expected of the two.
+type storageIsolationTest struct {
+	name         string
+	secrets      []client.Object
+	monitoring   *v1alpha1.Monitoring
+	wantConflict bool
+	wantBuckets  string
+	// wantCheckReason names the reason a *storageCheckError must
+	// carry. Set it for the cases where the question could not be
+	// answered, as opposed to answered with a conflict.
+	wantCheckReason string
+}
+
+// TestCheckStorageIsolation covers what the comparison does with the claims it
+// is given: which overlaps are conflicts, which are not, and which questions it
+// refuses to answer. How an endpoint is spelled is the companion test's.
+func TestCheckStorageIsolation(t *testing.T) {
+	const ns = "test-ns"
+
+	runStorageIsolationTests(t, ns, []storageIsolationTest{
+		{
+			// Distinct Secret names are not evidence of separation.
+			name: "same bucket through different secrets conflicts",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			name: "the same secret for both stacks conflicts",
+			secrets: []client.Object{
+				lokiStorageSecret("one-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("one-secret", "one-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			// bucketnames is a list, so an overlap anywhere in it conflicts.
+			name: "overlap inside a bucket list conflicts",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "usage-bucket, shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket,logs-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			name: "separate buckets are accepted",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "usage-logs-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "logs-bucket"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			// The same bucket name on two backends is two different buckets.
+			name: "same bucket name on different endpoints is accepted",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "logs"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.other.example.com", "logs"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			// Fails closed. A Secret that does not exist yet resolves to no
+			// locations, and "no locations" compares as isolated against
+			// anything — so treating it as "cannot be shown to conflict"
+			// would let both stacks be created now and collide later, once
+			// the Secret lands pointing at the other stack's bucket.
+			name: "one missing secret withholds both stacks",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:      monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantCheckReason: storageSecretMissingReason,
+		},
+		{
+			// The GitOps ordering case, and the one the fail-open bug was
+			// actually reachable through: the CR is applied before either
+			// Secret exists, so neither resolves and nothing can be compared.
+			name:            "both secrets missing withholds both stacks",
+			monitoring:      monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantCheckReason: storageSecretMissingReason,
+		},
+		{
+			// Present but useless: same zero-locations result as an absent
+			// Secret, so it has to fail closed the same way.
+			name: "secret without a bucketnames key withholds both stacks",
+			secrets: []client.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: "usage-logs-secret", Namespace: ns},
+					Data:       map[string][]byte{"endpoint": []byte("https://s3.example.com")},
+				},
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "logs-bucket"),
+			},
+			monitoring:      monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantCheckReason: storageSecretInvalidReason,
+		},
+		{
+			// Every entry trims away to nothing, so the list parses to zero
+			// buckets rather than to a bucket named "" or " ".
+			name: "secret with a whitespace-only bucketnames withholds both stacks",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "  ,  "),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "logs-bucket"),
+			},
+			monitoring:      monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantCheckReason: storageSecretInvalidReason,
+		},
+		{
+			// The regression this row guards: an endpoint that is empty — here
+			// because the Secret never carried the key — once keyed to
+			// "///bucket", which no valid endpoint produces, so it compared as
+			// isolated from the real endpoint beside it and both stacks passed
+			// the gate on one bucket. It fails closed now, under the reason
+			// that names the Secret as the thing to fix.
+			name: "secret without an endpoint key withholds both stacks",
+			secrets: []client.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: "usage-logs-secret", Namespace: ns},
+					Data:       map[string][]byte{"bucketnames": []byte("shared-bucket")},
+				},
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:      monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantCheckReason: storageSecretInvalidReason,
+		},
+		{
+			name: "secret with a whitespace-only endpoint withholds both stacks",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "   ", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:      monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantCheckReason: storageSecretInvalidReason,
+		},
+		{
+			// An endpoint url.Parse rejects is the same question unanswered: it
+			// can be shown to be neither conflicting nor isolated, so it
+			// withholds rather than vouches. The reason says the Secret, not
+			// the cluster, is what to fix.
+			name: "secret with an unparseable endpoint withholds both stacks",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://exa\x7fmple.com", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:      monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantCheckReason: storageSecretInvalidReason,
+		},
+		{
+			// Failing closed is scoped to the comparison. With one stack
+			// there is no second writer, so a missing Secret is the Loki
+			// operator's to report and this check stays out of the way.
+			name: "a single stack with a missing secret is not withheld",
+			monitoring: func() *v1alpha1.Monitoring {
+				m := monitoringWithBothLokiStorage("usage-logs-secret", "usage-logs-secret")
+				m.Spec.Logs = nil
+				return m
+			}(),
+		},
+		{
+			// With one stack there is no second writer to collide with, so the
+			// check must stay out of the way however the storage is configured.
+			name: "only usage logs configured is never a conflict",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring: func() *v1alpha1.Monitoring {
+				m := monitoringWithBothLokiStorage("usage-logs-secret", "usage-logs-secret")
+				m.Spec.Logs = nil
+				return m
+			}(),
+		},
+		{
+			name: "only log forwarding configured is never a conflict",
+			secrets: []client.Object{
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring: func() *v1alpha1.Monitoring {
+				m := monitoringWithBothLokiStorage("logs-secret", "logs-secret")
+				m.Spec.UsageLogs = nil
+				return m
+			}(),
+		},
+	})
+}
+
+// TestCheckStorageIsolation_EndpointSpellings covers the same comparison over
+// endpoints that are written differently and mean the same thing, or written
+// alike and mean different things.
+//
+// TestCanonicalStorageLocation pins these rules directly, as string in and
+// string out. They are driven through the Secret here as well because that is
+// the path the gate actually takes: these rows are what says a rule survives
+// two Secrets, a bucket list and a fake client, and they are written as pairs
+// of real spellings rather than as keys.
+func TestCheckStorageIsolation_EndpointSpellings(t *testing.T) {
+	const ns = "test-ns"
+
+	runStorageIsolationTests(t, ns, []storageIsolationTest{
+		{
+			// Equivalent spellings of one endpoint must not look like two
+			// backends: a trailing slash, hostname case, an explicitly written
+			// default port and a doubled slash all name the same place.
+			name: "equivalent endpoint spellings still conflict",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://S3.Example.com:443//", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			// Virtual-host-style addressing folds the bucket into the hostname;
+			// it still reaches the bucket the path-style spelling reaches.
+			name: "virtual-host and path-style addressing of one bucket conflict",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://shared-bucket.s3.example.com", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			// The same fold with a port in play. The bucket label comes off the
+			// bare hostname and the port goes back on after it; this row pins
+			// that the ported spellings of one endpoint still meet in a single
+			// key, so the fold cannot come to depend on how the ported host is
+			// written.
+			name: "virtual-host and path-style addressing on a non-default port conflict",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://shared-bucket.s3.example.com:9000", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com:9000", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com:9000/shared-bucket",
+		},
+		{
+			// A non-default port is a different backend, not a spelling variant.
+			name: "same bucket on a non-default port is accepted",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com:9000", "logs"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "logs"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			// The case this gate was reopened for. http and https are transports
+			// to one gateway, not separate backends — MinIO, Ceph RGW, ODF and
+			// S3 all serve the same buckets over both — so two claimants written
+			// this way are two writers on one bucket.
+			name: "same bucket over http and https conflicts",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "http://s3.example.com", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			// The same thing on a port the scheme does not imply, where no
+			// default-port rule can be doing the work: only ignoring the scheme
+			// brings these together.
+			name: "same bucket over http and https on one non-default port conflicts",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "http://minio.odh.svc:9000", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://minio.odh.svc:9000", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//minio.odh.svc:9000/shared-bucket",
+		},
+		{
+			// Gateway path prefixes are case-sensitive, so they separate buckets.
+			name: "same bucket under different gateway path prefixes is accepted",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://gateway.internal/s3", "logs"),
+				lokiStorageSecret("logs-secret", ns, "https://gateway.internal/S3", "logs"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			// Writing the scheme is optional, so one claimant can name the
+			// endpoint bare and the other name it in full. Both reach the same
+			// gateway, and with no scheme in the key they say so without the
+			// gate having to decide which scheme the bare one meant.
+			name: "a scheme-less endpoint conflicts with the https spelling of it",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "s3.example.com", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			// The other half of it: http is as likely as https for a bare
+			// in-cluster endpoint, and neither spelling is privileged.
+			name: "a scheme-less endpoint conflicts with the http spelling of it",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "s3.example.com", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "http://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			name: "two scheme-less spellings of one endpoint conflict",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "s3.example.com", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "S3.Example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			// A bare host with a standard port is only equal to the scheme-ful
+			// spelling because the port rule stopped keying off the scheme.
+			name: "a scheme-less endpoint on a default web port conflicts with the https spelling",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "s3.example.com:443", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			// The row that bounds all of the above. Folding spellings together
+			// must not make claimants overlap that never did: a collision needs
+			// the bucket to match too, and a bucket is named the same way
+			// whichever scheme reaches it.
+			name: "a scheme-less endpoint on a different bucket is accepted",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "s3.example.com", "usage-logs-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "logs-bucket"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			name: "a padded scheme-less endpoint conflicts with the spelling of it",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "  s3.example.com  ", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			// The spelling this is actually about: an in-cluster gateway
+			// addressed by Service name and port, with no scheme in sight.
+			name: "a scheme-less in-cluster endpoint conflicts across the port",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "minio.odh.svc:9000", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "http://minio.odh.svc:9000", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//minio.odh.svc:9000/shared-bucket",
+		},
+		{
+			// The fully qualified spelling of an in-cluster Service carries a
+			// DNS root dot that url.Parse keeps and the two forms are one host.
+			name: "an FQDN with a root dot conflicts with the spelling without one",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "http://minio.odh.svc.cluster.local.:9000", "shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "http://minio.odh.svc.cluster.local:9000", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//minio.odh.svc.cluster.local:9000/shared-bucket",
+		},
+		{
+			// An S3 bucket name is a DNS label, so these name one bucket on any
+			// backend that accepts both at all.
+			name: "the same bucket spelled in different cases conflicts",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "SHARED-BUCKET"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+	})
+}
+
+// TestCheckStorageIsolation_BucketLists covers bucketnames being a list rather
+// than a name: entries that resolve to nothing, and entries that resolve to
+// each other.
+//
+// A conflict is two claimants on one location, and the comparison reads that
+// off how many claimants a location collected. A claimant that names one
+// bucket twice puts two entries under one key by itself, so without a dedupe
+// the count stops meaning "writers" and a stack is reported as conflicting
+// with itself — a withhold of both LokiStacks, under a message that can only
+// name one party, for a repeated word in a Secret.
+//
+// The repetition does not have to be visible to whoever wrote the list.
+// Canonicalization folds bucket case and trims whitespace, so entries that
+// read as two buckets in the YAML can arrive as one.
+func TestCheckStorageIsolation_BucketLists(t *testing.T) {
+	const ns = "test-ns"
+
+	runStorageIsolationTests(t, ns, []storageIsolationTest{
+		{
+			// Empty entries in a bucket list are skipped rather than claimed as
+			// a location with no bucket, which every other list would overlap.
+			name: "empty entries in a bucket list are ignored",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "logs-a, , shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", ",,shared-bucket,"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+		{
+			// The plain form: a list repeating a bucket is one claim on it.
+			name: "a bucket repeated in one list is not a conflict with itself",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "bucket-a,bucket-a"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "bucket-b"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			// A repetition only the canonicalizer can see: these are two
+			// distinct strings in the Secret and one bucket after folding.
+			name: "a bucket repeated in one list in another case is not a conflict with itself",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "Bucket-A,bucket-a"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "bucket-b"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			// The same, folded by the trim that makes a list readable.
+			name: "a bucket repeated in one list around whitespace is not a conflict with itself",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "bucket-a, bucket-a "),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "bucket-b"),
+			},
+			monitoring: monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+		},
+		{
+			// The row that bounds the three above. Ignoring a claimant's own
+			// repetition must not cost the bucket its claim: the second
+			// claimant reaching the repeated bucket is still two writers on
+			// it, which is the conflict the gate exists for.
+			name: "a bucket repeated in one list still conflicts with another claimant on it",
+			secrets: []client.Object{
+				lokiStorageSecret("usage-logs-secret", ns, "https://s3.example.com", "shared-bucket,shared-bucket"),
+				lokiStorageSecret("logs-secret", ns, "https://s3.example.com", "shared-bucket"),
+			},
+			monitoring:   monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret"),
+			wantConflict: true,
+			wantBuckets:  "//s3.example.com/shared-bucket",
+		},
+	})
+}
+
+// TestCheckStorageIsolation_ThreeClaimants covers the comparison being
+// all-against-all rather than neighbour-against-neighbour.
+//
+// checkStorageIsolation keeps a claimedBy map so a third claimant is detected
+// against both of the first two, and nothing else reaches that: storageClaims
+// yields at most two claims today, so the tables above cannot produce a third
+// however their Secrets are written. This calls the comparison directly with
+// claims a future component would supply, which is also what says the map is
+// keyed on the location rather than on the claimant.
+//
+// The claimants that do not overlap have to stay out of the error as well as
+// out of the verdict. validateStorageIsolation withholds every claim it was
+// given once any of them conflict — that is deliberate, since the gate cannot
+// tell which writer to prefer — but the message is what the user reads to find
+// the two buckets to separate, and naming an innocent third sends them to the
+// wrong Secret.
+func TestCheckStorageIsolation_ThreeClaimants(t *testing.T) {
+	const ns = "test-ns"
+
+	s := newActionsTestScheme(t)
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		lokiStorageSecret("first-secret", ns, "https://s3.example.com", "shared-bucket"),
+		lokiStorageSecret("second-secret", ns, "https://s3.example.com", "its-own-bucket"),
+		// Spelled differently from the first on purpose: the third claimant
+		// has to be compared against the first through canonicalization, not
+		// by matching the Secret or the literal endpoint.
+		lokiStorageSecret("third-secret", ns, "shared-bucket.s3.example.com:443", "shared-bucket"),
+	).Build()
+
+	claims := []storageClaim{
+		{description: "first", secretName: "first-secret"},
+		{description: "second", secretName: "second-secret"},
+		{description: "third", secretName: "third-secret"},
+	}
+
+	err := checkStorageIsolation(context.Background(), cli, ns, claims)
+
+	var conflict *storageConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("expected a *storageConflictError, got %T (%v)", err, err)
+	}
+
+	// The first and third overlap across the second, which is the ordering the
+	// claimedBy map exists for: a comparison that only looked at the preceding
+	// claimant would find nothing here.
+	if want := []string{"first", "third"}; !slices.Equal(conflict.claimants, want) {
+		t.Errorf("claimants: want %v, got %v", want, conflict.claimants)
+	}
+	if want := []string{"//s3.example.com/shared-bucket"}; !slices.Equal(conflict.shared, want) {
+		t.Errorf("shared locations: want %v, got %v", want, conflict.shared)
+	}
+	if strings.Contains(err.Error(), "second") {
+		t.Errorf("the isolated claimant should not be named in the conflict, got %v", err)
+	}
+}
+
+// runStorageIsolationTests drives the cases of both tables above. The three
+// outcomes it distinguishes are the whole point of the check: isolated,
+// conflicting, and unanswerable.
+func runStorageIsolationTests(t *testing.T, ns string, tests []storageIsolationTest) {
+	t.Helper()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newActionsTestScheme(t)
+			cli := fake.NewClientBuilder().WithScheme(s).WithObjects(tt.secrets...).Build()
+
+			err := checkStorageIsolation(context.Background(), cli, ns, storageClaims(tt.monitoring))
+
+			// Unresolvable storage is a third outcome, distinct from both
+			// "isolated" and "conflicting": nothing was compared, so the
+			// stacks are withheld under a reason that says what to fix
+			// rather than one that reads as an operator malfunction.
+			if tt.wantCheckReason != "" {
+				var checkErr *storageCheckError
+				if !errors.As(err, &checkErr) {
+					t.Fatalf("expected a *storageCheckError, got %T (%v)", err, err)
+				}
+				if got := checkErr.conditionReason(); got != tt.wantCheckReason {
+					t.Errorf("reason: want %s, got %s", tt.wantCheckReason, got)
+				}
+				if checkErr.conditionStatus() != metav1.ConditionUnknown {
+					t.Errorf("status: an unanswered question is Unknown, got %s", checkErr.conditionStatus())
+				}
+				return
+			}
+
+			if !tt.wantConflict {
+				if err != nil {
+					t.Fatalf("expected no conflict, got %v", err)
+				}
+				return
+			}
+
+			// A rejected configuration, not a check that could not run: the
+			// two are reported under different reasons and only one of them
+			// is the user's to fix.
+			var conflict *storageConflictError
+			if !errors.As(err, &conflict) {
+				t.Fatalf("expected a *storageConflictError, got %T (%v)", err, err)
+			}
+			if !slices.Contains(conflict.shared, tt.wantBuckets) {
+				t.Errorf("conflict should include the shared location %q, got %v", tt.wantBuckets, conflict.shared)
+			}
+		})
+	}
+}
+
+func TestStorageConflictDoesNotExposeSecretLocation(t *testing.T) {
+	const namespace = "test-ns"
+	s := newActionsTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = namespace
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{Storage: &v1alpha1.LokiStorageConfig{SecretName: "usage-secret"}}
+	m.Spec.Logs = &v1alpha1.Logs{Storage: &v1alpha1.LokiStorageConfig{SecretName: "logs-secret"}}
+	endpoint := "https://user:password@s3.example.com/private-token"
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		lokiStorageSecret("usage-secret", namespace, endpoint, "shared-bucket"),
+		lokiStorageSecret("logs-secret", namespace, endpoint, "shared-bucket"),
+	).Build()
+	_, err := validateStorageIsolation(context.Background(), cli, m, conditions.NewConditionsManager(m, m.Generation))
+	if err == nil {
+		t.Fatal("expected storage conflict")
+	}
+	for _, message := range []string{err.Error(),
+		findCondition(m, conditions.ConditionLokiStackAvailable).Message,
+		findCondition(m, conditions.ConditionUsageLogsLokiStackAvailable).Message} {
+		for _, secret := range []string{"password", "private-token", "s3.example.com", "shared-bucket"} {
+			if strings.Contains(message, secret) {
+				t.Errorf("conflict message exposes secret location: %q", message)
+			}
+		}
+	}
+}
+
+// TestValidateStorageIsolation_SharedBucketRejected covers the conflict being
+// refused, reported on both claimants, and handed back as a shield over both
+// of their components.
+//
+// That the stack actions do not run past this is the reconciler's part, in
+// TestReconcile_StorageConflictWithholdsBothStacks; keeping the already
+// running stacks alive is garbage collection's, in
+// TestStorageConflictShieldsLokiFromGarbageCollection.
+func TestValidateStorageIsolation_SharedBucketRejected(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret")
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		lokiStorageSecret("usage-logs-secret", m.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+		lokiStorageSecret("logs-secret", m.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+	).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	withheld, err := validateStorageIsolation(context.Background(), cli, m, cm)
+	if err == nil {
+		t.Fatal("expected validateStorageIsolation to reject the shared bucket")
+	}
+
+	// The typed error survives the caller boundary, so the reconciler can tell
+	// a rejected configuration from a check that could not run.
+	var conflict *storageConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("expected a *storageConflictError, got %T (%v)", err, err)
+	}
+
+	assertWithheldComponents(t, withheld, componentLokiUsageLogs, componentLokiLogs)
+
+	for _, conditionType := range []string{
+		conditions.ConditionUsageLogsLokiStackAvailable,
+		conditions.ConditionLokiStackAvailable,
+	} {
+		// False, unlike the unreadable-Secret case below: the buckets were
+		// compared and found to overlap. That is a determinate answer and the
+		// user's to fix, so it degrades rather than reporting Unknown.
+		c := mustFindCondition(t, m, conditionType)
+		if c.Status != metav1.ConditionFalse || c.Reason != storageConflictReason {
+			t.Errorf("%s: expected False/%s, got %s/%s", conditionType, storageConflictReason, c.Status, c.Reason)
+		}
+	}
+}
+
+// TestValidateStorageIsolation_StorageSecretUnreadableWithholdsBothStacks covers
+// the isolation check failing closed. An unreadable Secret leaves the overlap
+// question unanswered, and answering "no conflict" would let two stacks share a
+// bucket and overwrite each other's index and chunks.
+func TestValidateStorageIsolation_StorageSecretUnreadableWithholdsBothStacks(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret")
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		lokiStorageSecret("usage-logs-secret", m.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+		lokiStorageSecret("logs-secret", m.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+	).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, isSecret := obj.(*corev1.Secret); isSecret {
+				return k8serr.NewForbidden(
+					schema.GroupResource{Resource: "secrets"}, key.Name, errors.New("no permission"))
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	withheld, err := validateStorageIsolation(context.Background(), cli, m, cm)
+	if err == nil {
+		t.Fatal("expected validateStorageIsolation to fail closed when the storage secret cannot be read")
+	}
+
+	var checkErr *storageCheckError
+	if !errors.As(err, &checkErr) {
+		t.Fatalf("expected a *storageCheckError, got %T (%v)", err, err)
+	}
+	// The API error stays reachable through the wrapper, so callers can still
+	// tell a permission problem from any other reason the check did not run.
+	if !k8serr.IsForbidden(err) {
+		t.Errorf("expected the Forbidden cause to remain unwrappable, got %v", err)
+	}
+
+	// Both stacks are withheld, so both are shielded — an unanswerable question
+	// withholds exactly as much as a rejected answer does.
+	assertWithheldComponents(t, withheld, componentLokiUsageLogs, componentLokiLogs)
+
+	for _, conditionType := range []string{
+		conditions.ConditionUsageLogsLokiStackAvailable,
+		conditions.ConditionLokiStackAvailable,
+	} {
+		// Unknown, not False: the Secret could not be read, so nothing was
+		// established about either stack. False would clear the published
+		// endpoint and take the collector down with it, which is a heavy
+		// response to a permission blip. The stacks are withheld either way.
+		c := mustFindCondition(t, m, conditionType)
+		if c.Status != metav1.ConditionUnknown || c.Reason != storageCheckFailedReason {
+			t.Errorf("%s: expected Unknown/%s, got %s/%s", conditionType, storageCheckFailedReason, c.Status, c.Reason)
+		}
+	}
+}
+
+// TestValidateStorageIsolation_MissingStorageSecretsWithholdBothStacks is the CWE-636
+// regression: the Monitoring CR is applied before its storage Secrets, which
+// is the ordinary GitOps case because apply order is not guaranteed.
+//
+// Neither Secret resolves, so neither stack has a comparable location. Reading
+// that as "cannot be shown to conflict" created both stacks immediately; the
+// Secrets then landed pointing at one bucket, the Loki operator — which does
+// watch Secrets — started both, and they overwrote each other's index and
+// chunks. By the time the next reconcile noticed, withholding the render could
+// not undo it, because the GC shield deliberately keeps the live stacks.
+// Nothing may be created until both Secrets resolve.
+func TestValidateStorageIsolation_MissingStorageSecretsWithholdBothStacks(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret")
+
+	// No Secrets, and both LokiStacks already ready: readiness is not the
+	// reason anything is withheld here, and leaving them out would let the
+	// test pass for the wrong reason.
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		kubernetesAPIServerEndpointSlice(),
+		readyLokiStack(usageLogsLokiStackResourceName, m.Spec.Namespace),
+		readyLokiStack(lokiStackResourceName, m.Spec.Namespace),
+	).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	withheld, err := validateStorageIsolation(context.Background(), cli, m, cm)
+	if err == nil {
+		t.Fatal("expected validateStorageIsolation to fail closed while the storage secrets do not exist")
+	}
+
+	var checkErr *storageCheckError
+	if !errors.As(err, &checkErr) {
+		t.Fatalf("expected a *storageCheckError, got %T (%v)", err, err)
+	}
+	if !k8serr.IsNotFound(err) {
+		t.Errorf("the NotFound cause must stay unwrappable, got %v", err)
+	}
+
+	// The decisive assertion is that the error reaches the reconciler at all:
+	// a stack that is never rendered is never created, which is the only point
+	// at which this is preventable. That the reconciler respects it is
+	// TestReconcile_StorageConflictWithholdsBothStacks.
+	assertWithheldComponents(t, withheld, componentLokiUsageLogs, componentLokiLogs)
+
+	for _, conditionType := range []string{
+		conditions.ConditionUsageLogsLokiStackAvailable,
+		conditions.ConditionLokiStackAvailable,
+	} {
+		// Unknown with a reason that names the actual problem. False would
+		// clear the published endpoint and take the collector down over a
+		// Secret that is simply still on its way.
+		c := mustFindCondition(t, m, conditionType)
+		if c.Status != metav1.ConditionUnknown || c.Reason != storageSecretMissingReason {
+			t.Errorf("%s: expected Unknown/%s, got %s/%s",
+				conditionType, storageSecretMissingReason, c.Status, c.Reason)
+		}
+	}
+}
+
+// TestValidateStorageIsolation_EmptyEndpointWithholdsBothStacks is the
+// endpoint half of the fail-closed rule the test above covers for missing
+// Secrets: a Secret that exists but carries no endpoint.
+//
+// The empty endpoint once canonicalized to "///bucket" — a key no valid
+// endpoint produces — so it compared as isolated from the real endpoint beside
+// it and both stacks were created on one bucket. The reason the conditions
+// carry is the point of the assertions: StorageSecretInvalid, not
+// StorageCheckFailed, because the user fixes this by editing the Secret, not
+// by fixing cluster access.
+func TestValidateStorageIsolation_EmptyEndpointWithholdsBothStacks(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret")
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "usage-logs-secret", Namespace: m.Spec.Namespace},
+			Data:       map[string][]byte{"bucketnames": []byte("shared-bucket")},
+		},
+		lokiStorageSecret("logs-secret", m.Spec.Namespace, "https://s3.example.com", "shared-bucket"),
+	).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	withheld, err := validateStorageIsolation(context.Background(), cli, m, cm)
+	if err == nil {
+		t.Fatal("expected validateStorageIsolation to fail closed on a Secret with no endpoint")
+	}
+
+	var checkErr *storageCheckError
+	if !errors.As(err, &checkErr) {
+		t.Fatalf("expected a *storageCheckError, got %T (%v)", err, err)
+	}
+	if got := checkErr.conditionReason(); got != storageSecretInvalidReason {
+		t.Errorf("reason: want %s, got %s", storageSecretInvalidReason, got)
+	}
+
+	assertWithheldComponents(t, withheld, componentLokiUsageLogs, componentLokiLogs)
+
+	for _, conditionType := range []string{
+		conditions.ConditionUsageLogsLokiStackAvailable,
+		conditions.ConditionLokiStackAvailable,
+	} {
+		// Unknown, not False: nothing was established about either stack, and
+		// False would clear the published endpoint over a Secret whose
+		// contents the user has to complete.
+		c := mustFindCondition(t, m, conditionType)
+		if c.Status != metav1.ConditionUnknown || c.Reason != storageSecretInvalidReason {
+			t.Errorf("%s: expected Unknown/%s, got %s/%s",
+				conditionType, storageSecretInvalidReason, c.Status, c.Reason)
+		}
+	}
+}
+
+// TestDeployLokiStack_UnobservableStateReportsUnknown covers the API calls in
+// the stack actions that can fail without telling us anything about the stacks.
+//
+// The caller holds these errors instead of returning them, so the reconcile
+// runs on to publish endpoints and aggregate Ready from whatever the conditions
+// say. Returning without marking would leave the previous round's True standing
+// and report a healthy stack on the strength of a check that never ran. Unknown
+// rather than False, because the condition decides whether the published
+// endpoint is kept, and False would clear it — taking the usage logs collector
+// and its policies down with it over one failed call.
+//
+// The templates are rendered anyway, and that is the point. A readiness check
+// is an observation of a desired state the storage gate already accepted, so
+// withholding on it would keep the stack from ever being created — the failure
+// would make itself permanent. It is also what makes this error safe to hold
+// without a garbage collection shield: the resources stay in the desired set,
+// so the sweep is a no-op on them.
+//
+// The other error a stack action can return is a failed CRD discovery, which
+// is covered below. That one renders nothing, which is safe only because the
+// reconciler aborts on it before anything is applied or swept.
+func TestDeployLokiStack_UnobservableStateReportsUnknown(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret")
+
+	// Not a missing stack: isLokiStackReady maps NotFound to (false, nil), so
+	// an error here is only ever "could not look".
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		lokiStorageSecret("usage-logs-secret", m.Spec.Namespace, "https://s3.example.com", "usage-logs-bucket"),
+		lokiStorageSecret("logs-secret", m.Spec.Namespace, "https://s3.example.com", "logs-bucket"),
+	).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if obj.GetObjectKind().GroupVersionKind().Kind == gvk.LokiStack.Kind {
+				return k8serr.NewForbidden(
+					schema.GroupResource{Resource: "lokistacks"}, key.Name, errors.New("no permission"))
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	// Both stacks were up as of the previous round. The manager preserves
+	// conditions across reconciles, so without this the assertions below pass
+	// on absence rather than on invalidation.
+	cm.MarkTrue(conditions.ConditionUsageLogsLokiStackAvailable)
+	cm.MarkTrue(conditions.ConditionLokiStackAvailable)
+
+	var sources []rendertemplate.TemplateSource
+
+	usageLogsErr, logsErr := deployBothLokiStacks(context.Background(), cli, m, cm, &sources)
+	for name, err := range map[string]error{
+		"usage logs":     usageLogsErr,
+		"log forwarding": logsErr,
+	} {
+		if err == nil {
+			t.Fatalf("expected the %s stack action to return the failure", name)
+		}
+		if !strings.Contains(err.Error(), "LokiStack readiness") {
+			t.Errorf("%s error should mention the readiness check, got %v", name, err)
+		}
+	}
+
+	// The decisive assertion. Withholding a template because its readiness Get
+	// failed is what made a transient failure permanent: a stack that is never
+	// applied is a stack that never becomes ready.
+	assertTemplatePaths(t, sources, []string{
+		UsageLogsLokiStackTemplate, UsageLogsLokiStackNPTemplate,
+		LokiStackTemplate, LokiStackNetworkPolicyTemplate, LokiStackGatewayNetworkPolicyTemplate,
+	})
+
+	// Both stacks are configured and both hit the same failure, so both
+	// conditions must be invalidated. A condition that keeps its stale True
+	// lets publishLokiEndpoints republish an endpoint nothing verified this
+	// round.
+	for _, condType := range []string{
+		conditions.ConditionUsageLogsLokiStackAvailable,
+		conditions.ConditionLokiStackAvailable,
+	} {
+		c := mustFindCondition(t, m, condType)
+		if c.Status != metav1.ConditionUnknown || c.Reason != lokiReadinessCheckFailedReason {
+			t.Errorf("%s: expected Unknown/%s, got %s/%s",
+				condType, lokiReadinessCheckFailedReason, c.Status, c.Reason)
+		}
+	}
+}
+
+// TestDeployLokiStack_UnconfiguredStackStaysOutOfTheAggregation bounds what an
+// unobservable stack costs.
+//
+// A stack whose readiness cannot be observed reports Unknown, but a stack the
+// user never configured has nothing to observe and must keep its Info-severity
+// not-configured condition. Info severity is what keeps a feature nobody asked
+// for out of the Degraded and Unknown aggregation; losing it would report the
+// whole operand as degraded over a stack that was never requested.
+func TestDeployLokiStack_UnconfiguredStackStaysOutOfTheAggregation(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	// Usage logs only, and its readiness Get times out. Log forwarding is off.
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: "usage-logs-secret"},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if obj.GetObjectKind().GroupVersionKind().Kind == gvk.LokiStack.Kind {
+				return k8serr.NewTimeoutError("request timed out", 1)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	usageLogsErr, logsErr := deployBothLokiStacks(context.Background(), cli, m, cm, &sources)
+	if usageLogsErr == nil {
+		t.Fatal("expected the timed-out readiness check to be returned")
+	}
+	if logsErr != nil {
+		t.Errorf("an unconfigured stack has nothing to fail at, got %v", logsErr)
+	}
+
+	c := mustFindCondition(t, m, conditions.ConditionLokiStackAvailable)
+	if c.Status != metav1.ConditionFalse || c.Reason != "LokiNotRequired" {
+		t.Errorf("LokiStackAvailable: expected the not-configured condition, got %s/%s", c.Status, c.Reason)
+	}
+	if c.Severity != platformcommon.ConditionSeverityInfo {
+		t.Errorf("LokiStackAvailable: expected Info severity, got %q", c.Severity)
+	}
+
+	cm.MarkTrue(conditions.ConditionMonitoringDependenciesReady)
+	cm.AggregateReady()
+	if got := mustFindCondition(t, m, string(platformcommon.ConditionTypeDegraded)); got.Status != metav1.ConditionFalse {
+		t.Errorf("Degraded: an unobservable stack is not a degradation, got %s", got.Status)
+	}
+}
+
+// TestDeployLokiStack_ReadinessNotFoundMarksFalse guards the other side of the
+// line TestDeployLokiStack_UnobservableStateReportsUnknown draws.
+//
+// isLokiStackReady maps NotFound to (false, nil), so a stack that does not
+// exist yet is a determinate answer: it is not ready. That must stay False and
+// must keep rendering, because the stack only comes into existence by being
+// applied — withholding it the way a failed check does would mean a stack that
+// is absent can never be created. Only a non-nil error is "could not observe".
+func TestDeployLokiStack_ReadinessNotFoundMarksFalse(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		configure     func(*v1alpha1.Monitoring)
+		condition     string
+		wantTemplates []string
+	}{
+		{
+			name: "usage logs stack not yet created",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+					Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: "usage-logs-secret"},
+				}
+			},
+			condition:     conditions.ConditionUsageLogsLokiStackAvailable,
+			wantTemplates: []string{UsageLogsLokiStackTemplate, UsageLogsLokiStackNPTemplate},
+		},
+		{
+			name: "log forwarding stack not yet created",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Logs = &v1alpha1.Logs{
+					Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: "logs-secret"},
+				}
+			},
+			condition: conditions.ConditionLokiStackAvailable,
+			// The forwarder's templates render alongside the stack's: they
+			// stay in the desired set while Loki starts, so the sweep cannot
+			// read a starting stack as a deletion of the forwarder.
+			wantTemplates: []string{
+				LokiStackTemplate,
+				LokiStackNetworkPolicyTemplate,
+				LokiStackGatewayNetworkPolicyTemplate,
+				ClusterLogForwarderTemplate,
+				ClusterLogForwarderRBACTemplate,
+				ClusterLogForwarderNetworkPolicyTemplate,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := newActionsTestScheme(t)
+			registerCRDs(s, gvk.LokiStack)
+
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			test.configure(m)
+
+			// No LokiStack objects: every Get is a genuine NotFound.
+			cli := fake.NewClientBuilder().WithScheme(s).
+				WithObjects(kubernetesAPIServerEndpointSlice()).Build()
+
+			cm := conditions.NewConditionsManager(m, m.Generation)
+			var sources []rendertemplate.TemplateSource
+
+			usageLogsErr, logsErr := deployBothLokiStacks(context.Background(), cli, m, cm, &sources)
+			if usageLogsErr != nil || logsErr != nil {
+				t.Fatalf("an absent stack is not an error, it is the state before the first apply: %v, %v",
+					usageLogsErr, logsErr)
+			}
+
+			c := mustFindCondition(t, m, test.condition)
+			if c.Status != metav1.ConditionFalse || c.Reason != "LokiStackNotReady" {
+				t.Errorf("%s: expected False/LokiStackNotReady for an absent stack, got %s/%s",
+					test.condition, c.Status, c.Reason)
+			}
+			// The decisive part: the templates still render. A stack reported
+			// Unknown renders nothing, and one that renders nothing is never
+			// created.
+			assertTemplatePaths(t, sources, test.wantTemplates)
+		})
+	}
+}
+
+// TestDeployLokiStack_StaleTrueIsOverwrittenOnFailedCheck is the regression
+// this round exists for: a previous reconcile marked the stack ready, then the
+// readiness check fails. The stale True must not survive into AggregateReady.
+func TestDeployLokiStack_StaleTrueIsOverwrittenOnFailedCheck(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Logs = &v1alpha1.Logs{
+		Storage: &v1alpha1.LokiStorageConfig{Type: "s3", SecretName: "logs-secret"},
+	}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	// The stack was up as of the last round.
+	cm.MarkTrue(conditions.ConditionLokiStackAvailable)
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if obj.GetObjectKind().GroupVersionKind().Kind == gvk.LokiStack.Kind {
+				return k8serr.NewTimeoutError("request timed out", 1)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}).Build()
+
+	var sources []rendertemplate.TemplateSource
+	if _, logsErr := deployBothLokiStacks(context.Background(), cli, m, cm, &sources); logsErr == nil {
+		t.Fatal("expected the log forwarding stack to return the timeout")
+	}
+
+	c := mustFindCondition(t, m, conditions.ConditionLokiStackAvailable)
+	if c.Status != metav1.ConditionUnknown {
+		t.Fatalf("LokiStackAvailable: a timed-out check must replace the stale True, got %s/%s", c.Status, c.Reason)
+	}
+
+	// And Ready must follow it down rather than reporting a working stack.
+	cm.MarkTrue(conditions.ConditionMonitoringDependenciesReady)
+	cm.AggregateReady()
+	ready := mustFindCondition(t, m, string(platformcommon.ConditionTypeReady))
+	if ready.Status != metav1.ConditionUnknown {
+		t.Errorf("Ready: want Unknown while the stack's state is unobserved, got %s", ready.Status)
+	}
+}
+
+// TestDeployLokiStack_OneStackFailingDoesNotPoisonTheOther is the regression
+// this split exists for.
+//
+// The two stacks shared one action and one condition. A failed readiness Get on
+// the usage logs stack left ConditionLokiStackAvailable Unknown as well — one
+// because it could not be observed, the other because it had not been — and
+// publishLokiEndpoints, reading those conditions, withheld status.logsEndpoint
+// from a stack that was up the whole time. One apiserver blip on usage logs
+// took log forwarding's address off the status.
+//
+// This drives the two actions directly, which is not what the reconciler does:
+// there, the usage logs failure aborts the round before the log forwarding
+// action runs, the same as for any other action. What is pinned here is that
+// the actions are independent — each reports from its own observation and
+// neither reads the other's state — and that publishLokiEndpoints turns that
+// independence into the right endpoints. The storage gate has already passed,
+// which is what licenses the independence: the buckets are provably disjoint.
+func TestDeployLokiStack_OneStackFailingDoesNotPoisonTheOther(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.LokiStack)
+
+	m := monitoringWithBothLokiStorage("usage-logs-secret", "logs-secret")
+
+	// The log forwarding stack is up; only the usage logs Get fails. Separate
+	// buckets, so the gate below passes and the failure is purely an
+	// observation failure.
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		kubernetesAPIServerEndpointSlice(),
+		lokiStorageSecret("usage-logs-secret", m.Spec.Namespace, "https://s3.example.com", "usage-logs-bucket"),
+		lokiStorageSecret("logs-secret", m.Spec.Namespace, "https://s3.example.com", "logs-bucket"),
+		readyLokiStack(lokiStackResourceName, m.Spec.Namespace),
+	).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if obj.GetObjectKind().GroupVersionKind().Kind == gvk.LokiStack.Kind &&
+				key.Name == usageLogsLokiStackResourceName {
+				return k8serr.NewTimeoutError("request timed out", 1)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	// Both stacks were up as of the previous round, and their endpoints were
+	// published from that. The conditions and the endpoints below are what the
+	// stacks report now, not leftovers.
+	cm.MarkTrue(conditions.ConditionUsageLogsLokiStackAvailable)
+	cm.MarkTrue(conditions.ConditionLokiStackAvailable)
+	const staleUsageLogsEndpoint = "https://usage-logs.example.com/otlp"
+	m.Status.UsageLogsEndpoint = staleUsageLogsEndpoint
+	m.Status.LogsEndpoint = "https://logs.example.com"
+
+	// Both outcomes are asserted, not just the first error: the defect was the
+	// healthy stack inheriting a verdict it never earned, so a nil from it is
+	// the thing worth pinning.
+	err, logsErr := deployBothLokiStacks(context.Background(), cli, m, cm, &sources)
+	if err == nil {
+		t.Fatal("expected the timed-out usage logs readiness check to be returned")
+	}
+	if !strings.Contains(err.Error(), "checking usage logs LokiStack readiness") {
+		t.Errorf("the usage logs error should name its own failure, got %v", err)
+	}
+	if logsErr != nil {
+		t.Errorf("the log forwarding stack was healthy and must not inherit its sibling's failure: %v", logsErr)
+	}
+
+	// Both stacks render: the failed one because withholding its template
+	// would keep it from ever being created, the healthy one because nothing
+	// about it failed. The usage logs collector does not render — its action
+	// aborted at the readiness check before reaching it — while the log
+	// forwarding pipeline renders whole, forwarder included.
+	assertTemplatePaths(t, sources, []string{
+		UsageLogsLokiStackTemplate, UsageLogsLokiStackNPTemplate,
+		LokiStackTemplate, LokiStackNetworkPolicyTemplate, LokiStackGatewayNetworkPolicyTemplate,
+		ClusterLogForwarderTemplate, ClusterLogForwarderRBACTemplate, ClusterLogForwarderNetworkPolicyTemplate,
+	})
+
+	if c := mustFindCondition(t, m, conditions.ConditionUsageLogsLokiStackAvailable); c.Status != metav1.ConditionUnknown ||
+		c.Reason != lokiReadinessCheckFailedReason {
+		t.Errorf("UsageLogsLokiStackAvailable: want Unknown/%s, got %s/%s",
+			lokiReadinessCheckFailedReason, c.Status, c.Reason)
+	}
+	// The decisive assertion. Before the split both stacks shared this
+	// condition, so the usage logs failure wrote Unknown over a stack it had
+	// not looked at.
+	if c := mustFindCondition(t, m, conditions.ConditionLokiStackAvailable); c.Status != metav1.ConditionTrue {
+		t.Errorf("LokiStackAvailable: a stack that was observed ready must report True, got %s/%s", c.Status, c.Reason)
+	}
+
+	// The user-visible payoff, and the only place it is covered: the healthy
+	// stack's endpoint is published from its own observation, while the
+	// unobservable one holds its last known value rather than being cleared —
+	// clearing it would drop the usage logs collector from the desired set and
+	// have garbage collection delete it.
 	data, err := buildTemplateData(context.Background(), cli, m, "")
 	if err != nil {
 		t.Fatalf("buildTemplateData error: %v", err)
 	}
+	if requeue := publishLokiEndpoints(m, data); !requeue {
+		t.Error("an unobservable stack must be polled again, expected a requeue")
+	}
+	wantLogsEndpoint, _ := data["LokiQueryEndpoint"].(string)
+	if wantLogsEndpoint == "" {
+		t.Fatal("LokiQueryEndpoint should be a non-empty string")
+	}
+	if got := m.Status.LogsEndpoint; got != wantLogsEndpoint {
+		t.Errorf("LogsEndpoint: a ready stack's address must be published, want %q, got %q", wantLogsEndpoint, got)
+	}
+	if got := m.Status.UsageLogsEndpoint; got != staleUsageLogsEndpoint {
+		t.Errorf("UsageLogsEndpoint: an unobservable stack holds its endpoint, want %q, got %q",
+			staleUsageLogsEndpoint, got)
+	}
+}
 
-	if data["LokiStorageSecretName"] != "logs-only-secret" {
-		t.Errorf("expected LokiStorageSecretName=logs-only-secret, got %v", data["LokiStorageSecretName"])
-	}
-	if data["LokiStorageType"] != "s3" {
-		t.Errorf("expected LokiStorageType=s3, got %v", data["LokiStorageType"])
-	}
-	if data["LokiStorageCredentialMode"] != "static" {
-		t.Errorf("expected LokiStorageCredentialMode=static, got %v", data["LokiStorageCredentialMode"])
-	}
-	if data["LokiStorageClassName"] != "gp3-csi" {
-		t.Errorf("expected LokiStorageClassName=gp3-csi, got %v", data["LokiStorageClassName"])
-	}
-	if data["UsageLogs"] != false {
-		t.Errorf("expected UsageLogs=false when usageLogs is nil, got %v", data["UsageLogs"])
-	}
+// readyLokiStack builds a LokiStack CR reporting Ready=True, the state the
+// per-stack readiness check looks for.
+func readyLokiStack(name, namespace string) *unstructured.Unstructured {
+	lokiStack := &unstructured.Unstructured{}
+	lokiStack.SetGroupVersionKind(gvk.LokiStack)
+	lokiStack.SetName(name)
+	lokiStack.SetNamespace(namespace)
+	_ = unstructured.SetNestedSlice(lokiStack.Object, []any{
+		map[string]any{
+			"type":   "Ready",
+			"status": "True",
+		},
+	}, "status", "conditions")
+	return lokiStack
 }
 
 // --- deployUsageLogsCollector ---
 
-// usageLogsEndpoint is the LokiStack OTLP endpoint the reconciler publishes to
-// status once LokiStack is ready; the collector deploys only after it is set.
-const usageLogsEndpoint = "https://data-science-lokistack-gateway-http.test-ns.svc.cluster.local:8080/api/logs/v1/application/otlp"
+// usageLogsEndpoint is the usage logs LokiStack OTLP endpoint the reconciler
+// publishes to status once that stack is ready; the collector deploys only
+// after it is set.
+const usageLogsEndpoint = "https://data-science-usage-logs-lokistack-gateway-http.test-ns.svc.cluster.local:8080/api/logs/v1/application/otlp"
 
 func TestDeployUsageLogsCollector_NoUsageLogs(t *testing.T) {
 	s := newActionsTestScheme(t)
@@ -1434,7 +3405,7 @@ func TestDeployUsageLogsCollector_NoUsageLogs(t *testing.T) {
 	}
 }
 
-func TestDeployUsageLogsCollector_NoStorage(t *testing.T) {
+func TestDeployUsageLogsCollector_NoStorageNoExporters(t *testing.T) {
 	s := newActionsTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.UsageLogs = &v1alpha1.UsageLogs{}
@@ -1449,7 +3420,7 @@ func TestDeployUsageLogsCollector_NoStorage(t *testing.T) {
 	}
 
 	if len(sources) != 0 {
-		t.Errorf("expected no sources when usageLogs has no storage, got %d", len(sources))
+		t.Errorf("expected no sources when usageLogs asks for neither a store nor forwarding, got %d", len(sources))
 	}
 
 	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
@@ -1539,9 +3510,20 @@ func TestDeployUsageLogsCollector_CRDMissing(t *testing.T) {
 	}
 }
 
-func TestDeployUsageLogsCollector_RendersCollectorRBACAndNetworkPolicies(t *testing.T) {
+// TestUsageLogsNetworkPoliciesAgreeAcrossActions renders the usage logs
+// pipeline end to end and checks that the two NetworkPolicies name the pods
+// that the collector and LokiStack templates actually create.
+//
+// The two policies are contributed by different halves of the usage logs
+// pipeline action — the collector policy by the folded deployUsageLogsCollector
+// half, the gateway policy by the LokiStack half, which owns it because the
+// gateway has to be guarded before any collector exists to dial it. Splitting
+// this test along that seam would lose the only check that the gateway
+// policy's "from" peer and the collector policy's podSelector still refer to
+// the same workload.
+func TestUsageLogsNetworkPoliciesAgreeAcrossActions(t *testing.T) {
 	s := newActionsTestScheme(t)
-	registerCRDs(s, gvk.OpenTelemetryCollector)
+	registerCRDs(s, gvk.OpenTelemetryCollector, gvk.LokiStack)
 
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
@@ -1557,17 +3539,29 @@ func TestDeployUsageLogsCollector_RendersCollectorRBACAndNetworkPolicies(t *test
 	var sources []rendertemplate.TemplateSource
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
-	if err := deployUsageLogsCollector(context.Background(), cli, m, cm, &sources); err != nil {
-		t.Fatalf("deployUsageLogsCollector error: %v", err)
+
+	// Spec.Logs is unset, so only the usage logs pipeline renders here — the
+	// stack pair and, folded behind them, the collector trio.
+	if usageLogsErr, _ := deployBothLokiStacks(context.Background(), cli, m, cm, &sources); usageLogsErr != nil {
+		t.Fatalf("usage logs LokiStack error: %v", usageLogsErr)
 	}
 
 	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
 	if c == nil || c.Status != metav1.ConditionTrue {
 		t.Errorf("UsageLogsCollectorAvailable: expected True, got %v", c)
 	}
-	if len(sources) != 4 {
-		t.Fatalf("expected 4 sources (collector, RBAC, collector NetworkPolicy, LokiStack NetworkPolicy), got %d", len(sources))
-	}
+	// By path, not by count: the gateway policy leaving this action and the
+	// collector policy arriving in its place would keep the count at five.
+	// The gateway policy must arrive ahead of the collector's own templates —
+	// it has to outlive the collector's readiness gate, which is the whole
+	// reason it belongs to the LokiStack half of the action.
+	assertTemplatePaths(t, sources, []string{
+		UsageLogsLokiStackTemplate,
+		UsageLogsLokiStackNPTemplate,
+		UsageLogsOpenTelemetryCollectorTemplate,
+		UsageLogsOpenTelemetryCollectorRBACTemplate,
+		UsageLogsOpenTelemetryCollectorNPTemplate,
+	})
 
 	data, err := buildTemplateData(context.Background(), cli, m, "")
 	if err != nil {
@@ -1587,7 +3581,8 @@ func TestDeployUsageLogsCollector_RendersCollectorRBACAndNetworkPolicies(t *test
 		"ClusterRole/data-science-usage-logs-processor",
 		"ClusterRoleBinding/data-science-usage-logs-processor",
 		"NetworkPolicy/data-science-usage-logs-collector-allow",
-		"NetworkPolicy/data-science-lokistack-allow",
+		"NetworkPolicy/data-science-usage-logs-lokistack-allow",
+		"LokiStack/data-science-usage-logs-lokistack",
 	} {
 		if rendered[key] == nil {
 			t.Errorf("missing rendered resource %s (got %v)", key, slices.Sorted(maps.Keys(rendered)))
@@ -1603,15 +3598,15 @@ func TestDeployUsageLogsCollector_RendersCollectorRBACAndNetworkPolicies(t *test
 	if !ok {
 		t.Fatal("UsageLogsCollectorName should be a string")
 	}
-	lokiStackName, ok := data["LokiStackName"].(string)
+	lokiStackName, ok := data["UsageLogsLokiStackName"].(string)
 	if !ok {
-		t.Fatal("LokiStackName should be a string")
+		t.Fatal("UsageLogsLokiStackName should be a string")
 	}
 
 	assertUsageLogsCollectorConfig(t, rendered["OpenTelemetryCollector/data-science-usage-logs"])
 	assertUsageLogsNetworkPolicies(t, usageLogsNetworkPolicyPeers{
 		collectorPolicy:  rendered["NetworkPolicy/data-science-usage-logs-collector-allow"],
-		lokiStackPolicy:  rendered["NetworkPolicy/data-science-lokistack-allow"],
+		lokiStackPolicy:  rendered["NetworkPolicy/data-science-usage-logs-lokistack-allow"],
 		collectorPodName: collectorName + "-collector",
 		lokiStackName:    lokiStackName,
 		namespace:        m.Spec.Namespace,
@@ -2126,5 +4121,346 @@ func TestHasReadyConditionAcceptsNamespacedConditionType(t *testing.T) {
 	}
 	if !ready {
 		t.Fatal("hasReadyCondition returned false for a namespaced Ready condition")
+	}
+}
+
+// TestDeployUsageLogsCollector_RemoteExporters covers the dual-write: custom
+// exporters get their own pipeline off the shared receiver, cluster identity is
+// stamped after the cleanup stage that deletes cluster_name, and the local write
+// keeps the record shape its dashboards and tenancy proxy expect.
+func usageLogsCredentialSecret() *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "hub-usage-logs-auth",
+			Namespace: "test-ns",
+		},
+		Data: map[string][]byte{"token": []byte("not-a-real-token")},
+	}
+}
+
+// A named credential the cluster does not have yet withholds the collector instead of
+// letting it fail to mount, and names the Secret it is waiting for. On a fresh spoke
+// this is the window between the chart naming the Secret and ACM delivering it.
+func TestDeployUsageLogsCollector_CredentialSecretMissing(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Exporters: map[string]runtime.RawExtension{
+			"otlphttp/hub": {Raw: []byte(`{"endpoint":"https://hub.example.com/api/logs/v1/infrastructure/otlp"}`)},
+		},
+		CredentialSecret: "hub-usage-logs-auth",
+	}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployUsageLogsCollector(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(sources) != 0 {
+		t.Errorf("expected no sources while the credential Secret is absent, got %d", len(sources))
+	}
+
+	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
+	if c == nil {
+		t.Fatal("expected UsageLogsCollectorAvailable condition to be set")
+		return
+	}
+	if c.Status != metav1.ConditionFalse {
+		t.Errorf("expected status False, got %s", c.Status)
+	}
+	if c.Reason != conditions.CredentialNotFoundReason {
+		t.Errorf("expected reason %s, got %s", conditions.CredentialNotFoundReason, c.Reason)
+	}
+	if !strings.Contains(c.Message, "hub-usage-logs-auth") {
+		t.Errorf("message must name the Secret being waited for, got %q", c.Message)
+	}
+}
+
+func TestDeployUsageLogsCollector_RemoteExporters(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{
+			Type:           "s3",
+			SecretName:     "usage-logs-secret",
+			CredentialMode: "static",
+		},
+		Size: "1x.demo",
+		Exporters: map[string]runtime.RawExtension{
+			"otlphttp/hub": {Raw: []byte(`{"endpoint":"https://hub.example.com/api/logs/v1/infrastructure/otlp"}`)},
+		},
+		Attributes: map[string]string{
+			"cluster_name": "jeyoungspoke1",
+			"cluster_id":   "eea5f0b3-5982-4eb1-b256-8e2443f7b3a0",
+		},
+		CredentialSecret: "hub-usage-logs-auth",
+	}
+	m.Status.UsageLogsEndpoint = usageLogsEndpoint
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(kubernetesAPIServerEndpointSlice(), usageLogsCredentialSecret()).Build()
+	if err := deployUsageLogsCollector(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("deployUsageLogsCollector error: %v", err)
+	}
+
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("buildTemplateData error: %v", err)
+	}
+	if got := data["LokiStackSize"]; got != "1x.demo" {
+		t.Errorf("LokiStackSize: want 1x.demo, got %v", got)
+	}
+	objects, err := rendertemplate.Render(context.Background(), s, sources, data)
+	if err != nil {
+		t.Fatalf("rendering usage logs templates: %v", err)
+	}
+
+	var collector *unstructured.Unstructured
+	for i := range objects {
+		if objects[i].GetKind() == "OpenTelemetryCollector" {
+			collector = objects[i].DeepCopy()
+		}
+	}
+	if collector == nil {
+		t.Fatal("no OpenTelemetryCollector rendered")
+	}
+
+	exporters, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "exporters")
+	if _, ok := exporters["otlphttp/hub"]; !ok {
+		t.Errorf("custom exporter missing; got %v", slices.Sorted(maps.Keys(exporters)))
+	}
+	if _, ok := exporters["otlphttp/loki"]; !ok {
+		t.Error("local exporter must survive alongside the remote one")
+	}
+
+	pipelines, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "service", "pipelines")
+	remote, ok := pipelines["logs/remote"].(map[string]any)
+	if !ok {
+		t.Fatalf("logs/remote pipeline missing; got %v", slices.Sorted(maps.Keys(pipelines)))
+	}
+	if recv, _, _ := unstructured.NestedStringSlice(remote, "receivers"); !slices.Equal(recv, []string{"otlp"}) {
+		t.Errorf("logs/remote must share the otlp receiver, got %v", recv)
+	}
+	if exp, _, _ := unstructured.NestedStringSlice(remote, "exporters"); !slices.Equal(exp, []string{"otlphttp/hub"}) {
+		t.Errorf("logs/remote exporters: want [otlphttp/hub], got %v", exp)
+	}
+
+	// Identity must come after transform/cleanup, which deletes cluster_name.
+	procs, _, _ := unstructured.NestedStringSlice(remote, "processors")
+	cleanup := slices.Index(procs, "transform/cleanup")
+	identity := slices.Index(procs, "resource/usage_logs_remote")
+	if cleanup < 0 || identity < 0 || identity < cleanup {
+		t.Errorf("resource/usage_logs_remote must run after transform/cleanup, got %v", procs)
+	}
+
+	// And it must not touch the local pipeline.
+	local, _ := pipelines["logs"].(map[string]any)
+	localProcs, _, _ := unstructured.NestedStringSlice(local, "processors")
+	if slices.Contains(localProcs, "resource/usage_logs_remote") {
+		t.Errorf("cluster identity leaked into the local write: %v", localProcs)
+	}
+	if exp, _, _ := unstructured.NestedStringSlice(local, "exporters"); !slices.Equal(exp, []string{"otlphttp/loki"}) {
+		t.Errorf("local pipeline exporters changed: %v", exp)
+	}
+
+	// The credential is mounted, not inlined: a bearertokenauth instance reading a
+	// file, so a rotated Secret reaches the running collector.
+	exts, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "extensions")
+	if _, ok := exts["bearertokenauth/remote"]; !ok {
+		t.Errorf("bearertokenauth/remote extension missing; got %v", slices.Sorted(maps.Keys(exts)))
+	}
+	if fn, _, _ := unstructured.NestedString(exts, "bearertokenauth/remote", "filename"); fn != "/var/run/secrets/usage-logs-remote/token" {
+		t.Errorf("unexpected credential path %q", fn)
+	}
+	if enabled, _, _ := unstructured.NestedStringSlice(collector.Object, "spec", "config", "service", "extensions"); !slices.Contains(enabled, "bearertokenauth/remote") {
+		t.Errorf("bearertokenauth/remote not enabled in service.extensions: %v", enabled)
+	}
+	vols, _, _ := unstructured.NestedSlice(collector.Object, "spec", "volumes")
+	if len(vols) != 1 {
+		t.Fatalf("expected one volume for the credential, got %v", vols)
+	}
+	vol, ok := vols[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected the volume to be an object, got %T", vols[0])
+	}
+	if name, _, _ := unstructured.NestedString(vol, "secret", "secretName"); name != "hub-usage-logs-auth" {
+		t.Errorf("volume does not reference the credential Secret: %v", vols[0])
+	}
+	// The authenticator is attached by the controller, not written by the user:
+	// exporter configs are validated against an allowlist that excludes auth.
+	if a, _, _ := unstructured.NestedString(exporters, "otlphttp/hub", "auth", "authenticator"); a != "bearertokenauth/remote" {
+		t.Errorf("controller did not attach the authenticator to the exporter, got %q", a)
+	}
+
+	// The local write must keep using the collector's own ServiceAccount token.
+	if fn, _, _ := unstructured.NestedString(exts, "bearertokenauth", "filename"); fn != "/var/run/secrets/kubernetes.io/serviceaccount/token" {
+		t.Errorf("local write credential changed: %q", fn)
+	}
+}
+
+// TestDeployUsageLogsCollector_CredentialWithoutExporters covers a credential set
+// with nothing to authenticate. The mount must not be rendered: there is no remote
+// write to carry it, and a Secret that does not exist yet would leave the collector
+// in ContainerCreating on FailedMount, taking the cluster-local write down with it.
+// Forwarding only, with no cluster-local store at all. The collector must deploy
+// without waiting for a LokiStack endpoint nothing will ever publish, render only the
+// remote pipeline, and say which mode it is in.
+func TestDeployUsageLogsCollector_ForwardingOnly(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Exporters: map[string]runtime.RawExtension{
+			"otlphttp/hub": {Raw: []byte(`{"endpoint":"https://hub.example.com/api/logs/v1/infrastructure/otlp"}`)},
+		},
+		Attributes:       map[string]string{"cluster_name": "jeyoungspoke1"},
+		CredentialSecret: "hub-usage-logs-auth",
+	}
+	// Deliberately empty: no LokiStack is deployed here, so nothing ever sets it.
+	m.Status.UsageLogsEndpoint = ""
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(kubernetesAPIServerEndpointSlice(), usageLogsCredentialSecret()).Build()
+	if err := deployUsageLogsCollector(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("deployUsageLogsCollector error: %v", err)
+	}
+
+	c := findCondition(m, conditions.ConditionUsageLogsCollectorAvailable)
+	if c == nil || c.Status != metav1.ConditionTrue || c.Reason != "ForwardingOnly" {
+		t.Fatalf("UsageLogsCollectorAvailable: want True/ForwardingOnly, got %v", c)
+	}
+
+	var pipelineSources []rendertemplate.TemplateSource
+	if err := deployUsageLogsLokiStack(context.Background(), cli, m,
+		conditions.NewConditionsManager(m, m.Generation), &pipelineSources); err != nil {
+		t.Fatalf("deployUsageLogsLokiStack error: %v", err)
+	}
+	if len(pipelineSources) != len(sources) {
+		t.Errorf("forwarding alone must render only collector resources, got %d sources, want %d", len(pipelineSources), len(sources))
+	}
+
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("buildTemplateData error: %v", err)
+	}
+	if got := data["UsageLogs"]; got != false {
+		t.Errorf("UsageLogs: want false without storage, got %v", got)
+	}
+	if got := data["UsageLogsEndpoint"]; got != "" {
+		t.Errorf("UsageLogsEndpoint: want empty without storage, got %v", got)
+	}
+
+	objects, err := rendertemplate.Render(context.Background(), s, sources, data)
+	if err != nil {
+		t.Fatalf("rendering usage logs templates: %v", err)
+	}
+
+	var collector *unstructured.Unstructured
+	for i := range objects {
+		if objects[i].GetKind() == "OpenTelemetryCollector" {
+			collector = objects[i].DeepCopy()
+		}
+	}
+	if collector == nil {
+		t.Fatal("no OpenTelemetryCollector rendered")
+	}
+
+	exporters, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "exporters")
+	if _, ok := exporters["otlphttp/loki"]; ok {
+		t.Error("the local exporter must not render without storage")
+	}
+	if _, ok := exporters["otlphttp/hub"]; !ok {
+		t.Errorf("remote exporter missing; got %v", slices.Sorted(maps.Keys(exporters)))
+	}
+
+	pipelines, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "service", "pipelines")
+	if _, ok := pipelines["logs"]; ok {
+		t.Error("the local pipeline must not render without storage: an empty exporter list is invalid collector config")
+	}
+	remote, ok := pipelines["logs/remote"].(map[string]any)
+	if !ok {
+		t.Fatalf("logs/remote pipeline missing; got %v", slices.Sorted(maps.Keys(pipelines)))
+	}
+	if exp, _, _ := unstructured.NestedStringSlice(remote, "exporters"); !slices.Equal(exp, []string{"otlphttp/hub"}) {
+		t.Errorf("logs/remote exporters: want [otlphttp/hub], got %v", exp)
+	}
+}
+
+func TestDeployUsageLogsCollector_CredentialWithoutExporters(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.UsageLogs = &v1alpha1.UsageLogs{
+		Storage: &v1alpha1.LokiStorageConfig{
+			Type:           "s3",
+			SecretName:     "usage-logs-secret",
+			CredentialMode: "static",
+		},
+		CredentialSecret: "hub-usage-logs-auth",
+	}
+	m.Status.UsageLogsEndpoint = usageLogsEndpoint
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(kubernetesAPIServerEndpointSlice()).Build()
+	if err := deployUsageLogsCollector(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("deployUsageLogsCollector error: %v", err)
+	}
+
+	data, err := buildTemplateData(context.Background(), cli, m, "")
+	if err != nil {
+		t.Fatalf("buildTemplateData error: %v", err)
+	}
+	objects, err := rendertemplate.Render(context.Background(), s, sources, data)
+	if err != nil {
+		t.Fatalf("rendering usage logs templates: %v", err)
+	}
+
+	var collector *unstructured.Unstructured
+	for i := range objects {
+		if objects[i].GetKind() == "OpenTelemetryCollector" {
+			collector = objects[i].DeepCopy()
+		}
+	}
+	if collector == nil {
+		t.Fatal("no OpenTelemetryCollector rendered")
+	}
+
+	if vols, found, _ := unstructured.NestedSlice(collector.Object, "spec", "volumes"); found && len(vols) > 0 {
+		t.Errorf("credential mounted with no exporter to authenticate: %v", vols)
+	}
+	if mounts, found, _ := unstructured.NestedSlice(collector.Object, "spec", "volumeMounts"); found && len(mounts) > 0 {
+		t.Errorf("credential mount rendered with no exporter to authenticate: %v", mounts)
+	}
+
+	exts, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "extensions")
+	if _, present := exts["bearertokenauth/remote"]; present {
+		t.Error("bearertokenauth/remote declared with no exporter to authenticate")
+	}
+	if enabled, _, _ := unstructured.NestedStringSlice(collector.Object, "spec", "config", "service", "extensions"); slices.Contains(enabled, "bearertokenauth/remote") {
+		t.Errorf("bearertokenauth/remote enabled with no exporter to authenticate: %v", enabled)
+	}
+
+	// The local write is untouched: still one pipeline, still the SA token.
+	pipelines, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "service", "pipelines")
+	if _, present := pipelines["logs/remote"]; present {
+		t.Error("logs/remote pipeline rendered with no exporters")
+	}
+	if fn, _, _ := unstructured.NestedString(exts, "bearertokenauth", "filename"); fn != "/var/run/secrets/kubernetes.io/serviceaccount/token" {
+		t.Errorf("local write credential changed: %q", fn)
 	}
 }

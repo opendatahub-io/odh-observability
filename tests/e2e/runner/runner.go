@@ -48,6 +48,11 @@ const (
 	envTestOLMTimeout               = "E2E_TEST_OLM_TIMEOUT"
 	envTestCOOChannel               = "E2E_TEST_COO_CHANNEL"
 	envTestCompatibilityReport      = "E2E_TEST_COMPATIBILITY_REPORT"
+	envTestUpgradeEnabled           = "E2E_TEST_UPGRADE_ENABLED"
+	envTestUpgradeOperators         = "E2E_TEST_UPGRADE_OPERATORS"
+	envTestUpgradeCOOChannel        = "E2E_TEST_UPGRADE_COO_CHANNEL"
+	envTestUpgradeTempoChannel      = "E2E_TEST_UPGRADE_TEMPO_CHANNEL"
+	envTestUpgradeReport            = "E2E_TEST_UPGRADE_REPORT"
 )
 
 // TestPackages is set at build time via -ldflags.
@@ -243,9 +248,9 @@ func (r *Runner) execPackages(args []string) int {
 	return worstCode
 }
 
-// envToFlags translates E2E_TEST_* environment variables into test binary flags.
-// The flag names here correspond to those registered in tests/e2e/config_test.go.
-func (r *Runner) envToFlags() []string {
+// EnvTestFlags translates E2E_TEST_* environment variables into test binary flags.
+// The flag names correspond to those registered in tests/e2e/config_test.go.
+func EnvTestFlags() []string {
 	envMap := map[string]string{
 		envTestMonitoringNamespace:      "-monitoring-namespace",
 		envTestApplicationsNamespace:    "-applications-namespace",
@@ -262,6 +267,11 @@ func (r *Runner) envToFlags() []string {
 		envTestOLMTimeout:               "-olm-timeout",
 		envTestCOOChannel:               "-coo-channel",
 		envTestCompatibilityReport:      "-compatibility-report",
+		envTestUpgradeEnabled:           "-upgrade-enabled",
+		envTestUpgradeOperators:         "-upgrade-operators",
+		envTestUpgradeCOOChannel:        "-upgrade-coo-channel",
+		envTestUpgradeTempoChannel:      "-upgrade-tempo-channel",
+		envTestUpgradeReport:            "-upgrade-report",
 	}
 
 	var flags []string
@@ -271,6 +281,10 @@ func (r *Runner) envToFlags() []string {
 		}
 	}
 	return flags
+}
+
+func (r *Runner) envToFlags() []string {
+	return EnvTestFlags()
 }
 
 func (r *Runner) logf(format string, args ...any) {

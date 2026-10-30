@@ -139,11 +139,11 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceProxyNamespaceScoping(t *te
 		t.Fatalf("Perses datasource proxy multi-ns deny must be 403 or 401, got %d", multiDeny.status)
 	}
 
-	// Multi-ns allow: grant metrics.k8s.io in a second NS, then both params must succeed.
+	// Grant access to a second namespace; repeated authorized values must succeed.
 	secondNS := fmt.Sprintf("perses-proxy-ns-allow-%s", identitySuffix)
 	secondNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: secondNS}}
 	if err := tc.Client().Create(tc.Context(), secondNamespace); err != nil {
-		t.Fatalf("failed to create second namespace for multi-ns allow: %v", err)
+		t.Fatalf("failed to create second namespace for multi-ns test: %v", err)
 	}
 	registerCleanup(secondNamespace)
 	secondRole := &rbacv1.Role{
@@ -173,11 +173,15 @@ func (tc *MonitoringTestCtx) ValidatePersesDatasourceProxyNamespaceScoping(t *te
 		t.Fatalf("failed to create second-NS metrics RoleBinding: %v", err)
 	}
 	registerCleanup(secondBinding)
-	multiAllow := probePersesDatasourceProxy(t, tc, persesPod, authorizedToken, tc.MonitoringNamespace, secondNS)
-	t.Logf("perses→proxy multi-ns allow http=%d body=%q", multiAllow.status, trimProbeBody(multiAllow.body))
-	if multiAllow.status != http.StatusOK {
-		t.Fatalf("Perses datasource proxy with namespace=%s&namespace=%s (SAR on both) must return 200, got %d body=%q",
-			tc.MonitoringNamespace, secondNS, multiAllow.status, trimProbeBody(multiAllow.body))
+	// Wait for the second grant to take effect before checking both namespaces.
+	tc.g.Eventually(func() int {
+		return probePersesDatasourceProxy(t, tc, persesPod, authorizedToken, secondNS).status
+	}).WithTimeout(2 * time.Minute).WithPolling(5 * time.Second).Should(Equal(http.StatusOK))
+	multi := probePersesDatasourceProxy(t, tc, persesPod, authorizedToken, tc.MonitoringNamespace, secondNS)
+	t.Logf("perses→proxy multi-ns allow http=%d body=%q", multi.status, trimProbeBody(multi.body))
+	if multi.status != http.StatusOK {
+		t.Fatalf("Perses datasource proxy with both namespaces authorized must return 200, got %d body=%q",
+			multi.status, trimProbeBody(multi.body))
 	}
 
 	missingNS := probePersesDatasourceProxy(t, tc, persesPod, authorizedToken)
