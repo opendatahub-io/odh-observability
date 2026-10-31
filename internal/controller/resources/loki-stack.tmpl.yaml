@@ -40,3 +40,21 @@ spec:
   storageClassName: {{.LokiStorageClassName}}
   tenants:
     mode: openshift-logging
+---
+# The LokiStack gateway checks this stream permission before authorizing the
+# namespace selected by the query. Aggregate it into project roles so their
+# namespace RoleBindings can pass the stream check.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: data-science-application-logs-view
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+    platform.opendatahub.io/part-of: monitoring
+rules:
+  - apiGroups: ["loki.grafana.com"]
+    resources: ["application"]
+    resourceNames: ["logs"]
+    verbs: ["get"]

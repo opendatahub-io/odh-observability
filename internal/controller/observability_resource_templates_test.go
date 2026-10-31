@@ -1015,6 +1015,40 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 	}
 }
 
+func TestLokiStackApplicationLogsProjectRoleContract(t *testing.T) {
+	resources := renderObservabilityTemplate(t, LokiStackTemplate, map[string]any{
+		"LokiStackName":             "test-lokistack",
+		"Namespace":                 testMonitoringNamespace,
+		"LokiStorageCredentialMode": "static",
+		"LokiStorageSecretName":     "loki-storage",
+		"LokiStorageType":           "s3",
+		"LokiStorageClassName":      "gp3-csi",
+	})
+	if len(resources) != 2 {
+		t.Fatalf("expected LokiStack and application logs ClusterRole, got %d resources", len(resources))
+	}
+
+	clusterRole := findRenderedResource(t, resources, "ClusterRole", "data-science-application-logs-view")
+	if labels := clusterRole.GetLabels(); len(labels) != 4 || labels["rbac.authorization.k8s.io/aggregate-to-view"] != "true" ||
+		labels["rbac.authorization.k8s.io/aggregate-to-edit"] != "true" ||
+		labels["rbac.authorization.k8s.io/aggregate-to-admin"] != "true" ||
+		labels["platform.opendatahub.io/part-of"] != "monitoring" {
+		t.Fatalf("application logs ClusterRole must aggregate to view/edit/admin: %#v", labels)
+	}
+	rules := nestedSlice(t, clusterRole, "rules")
+	if len(rules) != 1 {
+		t.Fatalf("expected one application logs ClusterRole rule, got %d", len(rules))
+	}
+	rule := asMap(t, rules[0])
+	if len(rule) != 4 {
+		t.Fatalf("application logs ClusterRole rule must not contain extra permissions: %#v", rule)
+	}
+	assertStringSet(t, rule, "apiGroups", []string{"loki.grafana.com"})
+	assertStringSet(t, rule, "resources", []string{"application"})
+	assertStringSet(t, rule, "resourceNames", []string{"logs"})
+	assertStringSet(t, rule, "verbs", []string{"get"})
+}
+
 func TestPrometheusClusterProxyTemplateContract(t *testing.T) {
 	resources := renderObservabilityTemplate(t, PrometheusClusterProxyTemplate, proxyTemplateData())
 
