@@ -46,7 +46,7 @@ helm uninstall odh-observability --namespace odh-observability-system
 | `gatewayNamespace` | string | `""` | Namespace containing the external router or gateway; empty uses the OpenShift ingress policy-group selector |
 | `replicaCount` | int | `1` | Number of operator replicas |
 | `resources.limits.cpu` | string | `"500m"` | CPU limit |
-| `resources.limits.memory` | string | `"256Mi"` | Memory limit |
+| `resources.limits.memory` | string | `"1Gi"` | Memory limit |
 | `resources.requests.cpu` | string | `"100m"` | CPU request |
 | `resources.requests.memory` | string | `"128Mi"` | Memory request |
 | `leaderElect` | bool | `false` | Enable leader election (required when running multiple replicas) |
