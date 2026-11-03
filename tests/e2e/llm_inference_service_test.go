@@ -262,9 +262,11 @@ fixture:
 
 expected:
   traces:
-    - traceql: '{ trace:id = "%s" && name = "llm_request" && resource.k8s.pod.name =~ "%s.*" && span:parentID = "%s" }'
+    - traceql: '{ trace:id = "%s" && name = "request" && span:parentID = "%s" }'
       count: ">= 1"
-`, tag, tag, traceHex, podNamePrefix, parentSpanID)
+    - traceql: '{ trace:id = "%s" && name = "llm_request" && resource.k8s.pod.name =~ "%s.*" && span:parentID != "0000000000000000" }'
+      count: ">= 1"
+`, tag, tag, traceHex, parentSpanID, traceHex, podNamePrefix)
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 	return path
 }
@@ -1131,8 +1133,8 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 			return assertTraceIDInTempo(tc.Context(), t, tracedRequestTraceID, oatsEnv)
 		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "injected trace ID should be retrievable from Tempo via gcx")
 		g.Eventually(func() error {
-			return assertVLLMSpanHasInjectedParent(tc.Context(), tracedRequestTraceID, tracedRequestParentSpanID, oatsEnv)
-		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "vLLM llm_request span should retain the injected parent span ID")
+			return assertAdapterSpanHasInjectedParent(tc.Context(), tracedRequestTraceID, tracedRequestParentSpanID, oatsEnv)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "EPP request span should retain the injected parent span ID")
 		g.Eventually(func() error {
 			return assertAdapterVLLMSpanRelationship(tc.Context(), tracedRequestTraceID, oatsEnv)
 		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(),

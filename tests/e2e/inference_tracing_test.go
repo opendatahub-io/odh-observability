@@ -194,6 +194,24 @@ func assertVLLMSpanHasInjectedParent(ctx context.Context, traceID, parentSpanID 
 	return fmt.Errorf("trace %s has no %q span with injected parent ID %s", traceID, vLLMRequestSpanName, wantParent)
 }
 
+func assertAdapterSpanHasInjectedParent(ctx context.Context, traceID, parentSpanID string, oatsEnv []string) error {
+	raw, err := fetchTraceJSON(ctx, traceID, oatsEnv)
+	if err != nil {
+		return err
+	}
+	spans, err := parseTraceSpansFromGCXJSON(raw)
+	if err != nil {
+		return err
+	}
+	wantParent := normalizeSpanID(parentSpanID)
+	for _, span := range spans {
+		if span.Name == "request" && span.ParentSpanID == wantParent {
+			return nil
+		}
+	}
+	return fmt.Errorf("trace %s has no EPP %q span with injected parent ID %s", traceID, "request", wantParent)
+}
+
 func assertAdapterVLLMSpanRelationship(ctx context.Context, traceID string, oatsEnv []string) error {
 	raw, err := fetchTraceJSON(ctx, traceID, oatsEnv)
 	if err != nil {
