@@ -4233,6 +4233,7 @@ func TestDeployUsageLogsCollector_RemoteExporters(t *testing.T) {
 	}
 	if collector == nil {
 		t.Fatal("no OpenTelemetryCollector rendered")
+		return
 	}
 
 	exporters, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "exporters")
@@ -4380,6 +4381,7 @@ func TestDeployUsageLogsCollector_ForwardingOnly(t *testing.T) {
 	}
 	if collector == nil {
 		t.Fatal("no OpenTelemetryCollector rendered")
+		return
 	}
 
 	exporters, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "exporters")
@@ -4442,6 +4444,7 @@ func TestDeployUsageLogsCollector_CredentialWithoutExporters(t *testing.T) {
 	}
 	if collector == nil {
 		t.Fatal("no OpenTelemetryCollector rendered")
+		return
 	}
 
 	if vols, found, _ := unstructured.NestedSlice(collector.Object, "spec", "volumes"); found {
