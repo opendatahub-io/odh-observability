@@ -546,6 +546,7 @@ func TestReconcile_COOVersionCompatibilityCondition(t *testing.T) {
 			}
 			if compatibility == nil {
 				t.Fatal("COOVersionCompatible condition was not reported")
+				return
 			}
 			if compatibility.Status != tt.wantStatus {
 				t.Errorf("COOVersionCompatible status: want %q, got %q", tt.wantStatus, compatibility.Status)
@@ -585,6 +586,8 @@ func TestReconcile_COOVersionCompatibilityCondition(t *testing.T) {
 }
 
 func TestReconcile_COOVersionCompatibilityUsesInstalledCSV(t *testing.T) {
+	t.Parallel()
+
 	s := newTestScheme(t)
 	registerOperatorConditionTypes(s)
 	registerClusterServiceVersionTypes(s)
@@ -593,6 +596,9 @@ func TestReconcile_COOVersionCompatibilityUsesInstalledCSV(t *testing.T) {
 	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
 	oldCSV := newClusterServiceVersion("cluster-observability-operator.v1.4.0", "Succeeded")
 	currentCSV := newClusterServiceVersion("cluster-observability-operator.v1.5.2", "Succeeded")
+	copiedCSV := newClusterServiceVersion("cluster-observability-operator.v1.5.2", "Succeeded")
+	copiedCSV.SetNamespace("default")
+	copiedCSV.SetLabels(map[string]string{"olm.copiedFrom": "openshift-cluster-observability-operator"})
 	_ = unstructured.SetNestedField(currentCSV.Object, oldCSV.GetName(), "spec", "replaces")
 
 	// OLM can leave an older OperatorCondition behind while the current CSV
@@ -602,6 +608,7 @@ func TestReconcile_COOVersionCompatibilityUsesInstalledCSV(t *testing.T) {
 		newOperatorCondition("cluster-observability-operator.v1.4.0"),
 		oldCSV,
 		currentCSV,
+		copiedCSV,
 	).WithStatusSubresource(m).Build()
 	r := newTestReconciler(t, s, cli)
 

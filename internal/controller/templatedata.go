@@ -526,6 +526,9 @@ func cooInstalledCSVVersion(
 		if !strings.HasPrefix(name, namePrefix) {
 			continue
 		}
+		if csv.GetLabels()["olm.copiedFrom"] != "" {
+			continue
+		}
 
 		phase, found, err := unstructured.NestedString(csv.Object, "status", "phase")
 		if err != nil {
