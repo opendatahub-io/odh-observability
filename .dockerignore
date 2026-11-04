@@ -1,0 +1,5 @@
+# Exclude unit-test sources from the manager image context only.
+# Do not use a repo-wide **/*_test.go — e2e-image-build COPY tests/ needs those files.
+cmd/**/*_test.go
+api/**/*_test.go
+internal/**/*_test.go

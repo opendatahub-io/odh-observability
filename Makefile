@@ -185,14 +185,14 @@ CLEANFILES += $(PROMETHEUS_ALERT_RULES)
 
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/main.go
+	go build -o bin/manager ./cmd
 
 .PHONY: run
 run: manifests generate fmt vet ## Run controller locally (requires POD_NAMESPACE, e.g. POD_NAMESPACE=opendatahub make run).
 ifndef POD_NAMESPACE
 	$(error POD_NAMESPACE is not set. Usage: POD_NAMESPACE=opendatahub make run)
 endif
-	go run ./cmd/main.go
+	go run ./cmd
 
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
