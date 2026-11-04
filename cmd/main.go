@@ -30,9 +30,12 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/go-logr/logr"
+	pkgtls "github.com/opendatahub-io/odh-platform-utilities/framework/tls"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
 	configv1 "github.com/openshift/api/config/v1"
 	routev1 "github.com/openshift/api/route/v1"
@@ -119,6 +122,7 @@ func main() {
 	setupLog.Info("odh-observability", "version", os.Getenv("OPERATOR_VERSION"))
 
 	cfg := ctrl.GetConfigOrDie()
+	ctx := ctrl.SetupSignalHandler()
 
 	mgrOpts := ctrl.Options{
 		Scheme: scheme,
@@ -135,11 +139,15 @@ func main() {
 		LeaderElectionID:       "odh-observability-leader",
 	}
 
+	var webhookTLS webhookTLSResult
 	if enableWebhook {
-		mgrOpts.WebhookServer = webhook.NewServer(webhook.Options{
-			Port:    9443,
-			CertDir: webhookCertDir,
-		})
+		var err error
+		webhookTLS, err = resolveWebhookTLS(ctx, scheme, cfg)
+		if err != nil {
+			setupLog.Error(err, "Unable to establish webhook TLS configuration")
+			os.Exit(1)
+		}
+		mgrOpts.WebhookServer = webhook.NewServer(webhookServerOptions(webhookTLS, webhookCertDir, setupLog))
 	}
 
 	mgr, err := ctrl.NewManager(cfg, mgrOpts)
@@ -201,11 +209,104 @@ func main() {
 		os.Exit(1)
 	}
 
+	mgrCtx := ctx
+	var webhookTLSReloadRequested atomic.Bool
+	if enableWebhook {
+		var err error
+		mgrCtx, err = registerWebhookTLSReload(ctx, mgr, webhookTLS, &webhookTLSReloadRequested, setupLog)
+		if err != nil {
+			setupLog.Error(err, "Unable to configure webhook TLS reload")
+			os.Exit(1)
+		}
+	}
+
 	setupLog.Info("Starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(mgrCtx); err != nil {
 		setupLog.Error(err, "Problem running manager")
 		os.Exit(1)
 	}
+	if webhookTLSReloadRequested.Load() {
+		setupLog.Info("exiting so kube restarts the process and reloads webhook TLS")
+		os.Exit(0)
+	}
+}
+
+func webhookServerOptions(webhookTLS webhookTLSResult, certDir string, logger logr.Logger) webhook.Options {
+	opts := webhook.Options{
+		Port:    9443,
+		CertDir: certDir,
+	}
+	if len(webhookTLS.TLSOpts) == 0 {
+		logger.Info("webhook TLS keeps Go defaults",
+			"adherence", webhookTLS.AdherencePolicy,
+			"watchable", webhookTLS.Watchable,
+		)
+		return opts
+	}
+
+	opts.TLSOpts = webhookTLS.TLSOpts
+	if webhookTLS.Degraded {
+		logger.Info("webhook TLS using Strict Intermediate stand-in until APIServer adherence is readable",
+			"adherence", webhookTLS.AdherencePolicy,
+			"minTLSVersion", webhookTLS.Profile.MinTLSVersion,
+			"caveat", webhookTLSStandInCaveat,
+		)
+		return opts
+	}
+	logger.Info("webhook TLS honors cluster profile",
+		"adherence", webhookTLS.AdherencePolicy,
+		"minTLSVersion", webhookTLS.Profile.MinTLSVersion,
+	)
+	return opts
+}
+
+func registerWebhookTLSReload(
+	ctx context.Context,
+	mgr ctrl.Manager,
+	webhookTLS webhookTLSResult,
+	reloadRequested *atomic.Bool,
+	logger logr.Logger,
+) (context.Context, error) {
+	if !needsWebhookTLSReload(webhookTLS) {
+		return ctx, nil
+	}
+
+	mgrCtx, cancel := context.WithCancel(ctx)
+	mgrCancel := func() {
+		markWebhookTLSReloadRequested(reloadRequested, cancel)
+	}
+
+	if webhookTLS.Degraded {
+		logger.Info("polling for APIServer TLS recovery (watcher skipped while degraded)",
+			"caveat", webhookTLSStandInCaveat)
+	}
+	if err := configureWebhookTLSReload(webhookTLS,
+		func() error {
+			watcher := &pkgtls.SecurityProfileWatcher{
+				Client:                    mgr.GetClient(),
+				InitialTLSProfileSpec:     webhookTLS.Profile,
+				InitialTLSAdherencePolicy: webhookTLS.AdherencePolicy,
+				OnAdherencePolicyChange: func(_ context.Context, _, _ configv1.TLSAdherencePolicy) {
+					logger.Info("TLS adherence policy changed, initiating graceful shutdown to reload webhook TLS")
+					mgrCancel()
+				},
+			}
+			if pkgtls.ShouldHonorClusterTLSProfile(webhookTLS.AdherencePolicy) {
+				watcher.OnProfileChange = func(_ context.Context, _, _ configv1.TLSProfileSpec) {
+					logger.Info("TLS profile changed, initiating graceful shutdown to reload webhook TLS")
+					mgrCancel()
+				}
+			}
+			return watcher.SetupWithManager(mgr)
+		},
+		func() error {
+			return mgr.Add(newWebhookTLSReadRecovery(mgr, mgrCancel, logger))
+		},
+	); err != nil {
+		cancel()
+		return ctx, err
+	}
+	return mgrCtx, nil
 }
 
 // methodGateHandler restricts methods independently of upstream authorization.
