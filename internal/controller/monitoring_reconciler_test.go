@@ -357,6 +357,35 @@ func TestValidateMonitoringNamespace(t *testing.T) {
 	})
 }
 
+func TestOpenTelemetryCollectorRequestsUsesEffectiveNamespace(t *testing.T) {
+	t.Setenv("MONITORING_NAMESPACE", "")
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = "custom-monitoring"
+
+	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).Build())
+	collector := &unstructured.Unstructured{}
+	collector.SetGroupVersionKind(controllergvk.OpenTelemetryCollector)
+	collector.SetName(openTelemetryCollectorName)
+	collector.SetNamespace(m.Spec.Namespace)
+
+	requests := r.openTelemetryCollectorRequests(context.Background(), collector)
+	if len(requests) != 1 || requests[0].Name != v1alpha1.MonitoringInstanceName {
+		t.Fatalf("expected one request for %s, got %v", v1alpha1.MonitoringInstanceName, requests)
+	}
+
+	collector.SetNamespace(defaultMonitoringNamespace)
+	if requests := r.openTelemetryCollectorRequests(context.Background(), collector); len(requests) != 0 {
+		t.Fatalf("expected no request for collector in %s, got %v", defaultMonitoringNamespace, requests)
+	}
+
+	collector.SetNamespace(m.Spec.Namespace)
+	collector.SetName("another-collector")
+	if requests := r.openTelemetryCollectorRequests(context.Background(), collector); len(requests) != 0 {
+		t.Fatalf("expected no request for unrelated collector, got %v", requests)
+	}
+}
+
 // TestReconcile_Removed: Monitoring with Removed state should short-circuit, set
 // Ready=False and ProvisioningSucceeded=False, and not return an error.
 func TestReconcile_Removed(t *testing.T) {

@@ -56,7 +56,8 @@ const (
 	// ConditionInstrumentationAvailable indicates the Instrumentation CR is deployed.
 	ConditionInstrumentationAvailable = "InstrumentationAvailable"
 
-	// ConditionOpenTelemetryCollectorAvailable indicates the OTel collector is deployed.
+	// ConditionOpenTelemetryCollectorAvailable indicates the OTel collector has
+	// been admitted and reports Ready for the current generation.
 	ConditionOpenTelemetryCollectorAvailable = "OpenTelemetryCollectorAvailable"
 
 	// ConditionAlertingAvailable indicates Prometheus alerting rules are deployed.

@@ -123,6 +123,7 @@ const (
 	ClusterLogForwarderNetworkPolicyName = "data-science-cluster-log-forwarder-allow"
 	conditionTypeReady                   = "Ready"
 	conditionStatusTrue                  = "True"
+	openTelemetryCollectorName           = "data-science-collector"
 )
 
 //go:embed resources monitoring
@@ -299,7 +300,17 @@ func deployOpenTelemetryCollector(
 		return nil
 	}
 
-	cm.MarkTrue(conditions.ConditionOpenTelemetryCollectorAvailable)
+	collectorReady, err := isOpenTelemetryCollectorReady(ctx, c, monitoringNamespace(monitoring))
+	if err != nil {
+		return fmt.Errorf("checking OpenTelemetryCollector readiness: %w", err)
+	}
+	if !collectorReady {
+		cm.MarkFalse(conditions.ConditionOpenTelemetryCollectorAvailable,
+			"OpenTelemetryCollectorNotReadyReason",
+			"OpenTelemetryCollector has not been admitted and reported Ready yet")
+	} else {
+		cm.MarkTrue(conditions.ConditionOpenTelemetryCollectorAvailable)
+	}
 
 	*sources = append(*sources,
 		src(CollectorRBACTemplate),
@@ -328,6 +339,26 @@ func deployOpenTelemetryCollector(
 	}
 
 	return nil
+}
+
+// isOpenTelemetryCollectorReady deliberately checks the collector instance, not
+// just the CRD. CRD discovery only proves that the OpenTelemetry Operator is
+// installed; it does not prove that the collector was admitted and reconciled.
+// The OpenTelemetry Operator's Ready condition represents that admission and
+// reconciliation state; pod replica health is reported separately by the
+// collector status. In particular, the validating webhook can reject a
+// collector before it is persisted when the operator cannot use cert-manager.
+func isOpenTelemetryCollectorReady(ctx context.Context, c client.Client, namespace string) (bool, error) {
+	collector := &unstructured.Unstructured{}
+	collector.SetGroupVersionKind(gvk.OpenTelemetryCollector)
+	if err := c.Get(ctx, types.NamespacedName{Name: openTelemetryCollectorName, Namespace: namespace}, collector); err != nil {
+		if k8serr.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return hasCurrentReadyCondition(collector)
 }
 
 // deployOperatorMonitoring deploys PrometheusRules for operator self-monitoring
@@ -1513,6 +1544,45 @@ func hasReadyCondition(obj *unstructured.Unstructured) (bool, error) {
 		if (condType == conditionTypeReady || strings.HasSuffix(condType, "/"+conditionTypeReady)) && condStatus == conditionStatusTrue {
 			return true, nil
 		}
+	}
+
+	return false, nil
+}
+
+// hasCurrentReadyCondition is the stricter form used for operands whose
+// readiness must describe the current spec. A stale Ready=True condition from
+// an older generation is not evidence that the current collector was admitted
+// or is running.
+func hasCurrentReadyCondition(obj *unstructured.Unstructured) (bool, error) {
+	conds, found, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
+	}
+
+	for _, cond := range conds {
+		condMap, ok := cond.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		condType, _, _ := unstructured.NestedString(condMap, "type")
+		condStatus, _, _ := unstructured.NestedString(condMap, "status")
+		if (condType != conditionTypeReady && !strings.HasSuffix(condType, "/"+conditionTypeReady)) ||
+			condStatus != conditionStatusTrue {
+			continue
+		}
+
+		observedGeneration, found, err := unstructured.NestedInt64(condMap, "observedGeneration")
+		if err != nil {
+			return false, err
+		}
+		if !found || observedGeneration != obj.GetGeneration() {
+			return false, nil
+		}
+		return true, nil
 	}
 
 	return false, nil

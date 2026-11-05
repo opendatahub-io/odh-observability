@@ -67,6 +67,73 @@ func registerCRDs(s *runtime.Scheme, gvks ...schema.GroupVersionKind) {
 	}
 }
 
+func openTelemetryCollectorWithReadyStatus(namespace string, ready bool) *unstructured.Unstructured {
+	collector := &unstructured.Unstructured{}
+	collector.SetGroupVersionKind(gvk.OpenTelemetryCollector)
+	collector.SetName(openTelemetryCollectorName)
+	collector.SetNamespace(namespace)
+	collector.SetGeneration(1)
+	status := "False"
+	if ready {
+		status = conditionStatusTrue
+	}
+	collector.Object["status"] = map[string]any{
+		"conditions": []any{
+			map[string]any{
+				"type":               conditionTypeReady,
+				"status":             status,
+				"observedGeneration": int64(1),
+			},
+		},
+	}
+	return collector
+}
+
+func TestHasCurrentReadyConditionRequiresCurrentGeneration(t *testing.T) {
+	tests := []struct {
+		name               string
+		generation         int64
+		observedGeneration any
+		wantReady          bool
+	}{
+		{name: "current", generation: 1, observedGeneration: int64(1), wantReady: true},
+		{name: "stale", generation: 2, observedGeneration: int64(1), wantReady: false},
+		{name: "missing observed generation", generation: 1, wantReady: false},
+		{name: "future", generation: 1, observedGeneration: int64(2), wantReady: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			collector := openTelemetryCollectorWithReadyStatus("test-ns", true)
+			collector.SetGeneration(tt.generation)
+			conditions, found, err := unstructured.NestedSlice(collector.Object, "status", "conditions")
+			if err != nil || !found || len(conditions) != 1 {
+				t.Fatalf("failed to get test condition: found=%v error=%v", found, err)
+			}
+			condition, ok := conditions[0].(map[string]any)
+			if !ok {
+				t.Fatalf("test condition has unexpected type %T", conditions[0])
+			}
+			if tt.observedGeneration == nil {
+				delete(condition, "observedGeneration")
+			} else {
+				condition["observedGeneration"] = tt.observedGeneration
+			}
+			if err := unstructured.SetNestedSlice(collector.Object, conditions, "status", "conditions"); err != nil {
+				t.Fatalf("failed to update test condition: %v", err)
+			}
+
+			got, err := hasCurrentReadyCondition(collector)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.wantReady {
+				t.Fatalf("hasCurrentReadyCondition() = %v, want %v", got, tt.wantReady)
+			}
+		})
+	}
+}
+
 func kubernetesAPIServerEndpointSlice() *discoveryv1.EndpointSlice {
 	ready := true
 	return &discoveryv1.EndpointSlice{
@@ -355,7 +422,8 @@ func TestDeployOpenTelemetryCollector_MetricsOnly_CRDPresent(t *testing.T) {
 	var sources []rendertemplate.TemplateSource
 
 	err := deployOpenTelemetryCollector(context.Background(),
-		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+		fake.NewClientBuilder().WithScheme(s).
+			WithObjects(openTelemetryCollectorWithReadyStatus(m.Spec.Namespace, true)).Build(), m, cm, &sources)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -371,6 +439,73 @@ func TestDeployOpenTelemetryCollector_MetricsOnly_CRDPresent(t *testing.T) {
 	}
 }
 
+func TestDeployOpenTelemetryCollector_MetricsOnly_CRDPresentButCollectorNotReady(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(openTelemetryCollectorWithReadyStatus(m.Spec.Namespace, false)).Build()
+
+	if err := deployOpenTelemetryCollector(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	collectorCondition := findCondition(m, conditions.ConditionOpenTelemetryCollectorAvailable)
+	if collectorCondition == nil || collectorCondition.Status != metav1.ConditionFalse ||
+		collectorCondition.Reason != "OpenTelemetryCollectorNotReadyReason" {
+		t.Fatalf("expected OpenTelemetryCollectorAvailable False/NotReady, got %v", collectorCondition)
+	}
+}
+
+func TestDeployOpenTelemetryCollector_MetricsOnly_StaleReadyCondition(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	collector := openTelemetryCollectorWithReadyStatus(m.Spec.Namespace, true)
+	collector.SetGeneration(2)
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(collector).Build()
+
+	if err := deployOpenTelemetryCollector(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	collectorCondition := findCondition(m, conditions.ConditionOpenTelemetryCollectorAvailable)
+	if collectorCondition == nil || collectorCondition.Status != metav1.ConditionFalse {
+		t.Fatalf("expected stale Ready condition to be unavailable, got %v", collectorCondition)
+	}
+}
+
+func TestDeployOpenTelemetryCollector_MetricsOnly_CRDPresentButCollectorMissing(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+
+	if err := deployOpenTelemetryCollector(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	collectorCondition := findCondition(m, conditions.ConditionOpenTelemetryCollectorAvailable)
+	if collectorCondition == nil || collectorCondition.Status != metav1.ConditionFalse {
+		t.Fatalf("expected OpenTelemetryCollectorAvailable False, got %v", collectorCondition)
+	}
+}
+
 func TestDeployOpenTelemetryCollector_MetricsOnly_WithoutCertManagerCRD(t *testing.T) {
 	s := newActionsTestScheme(t)
 	registerCRDs(s, gvk.OpenTelemetryCollector)
@@ -381,7 +516,8 @@ func TestDeployOpenTelemetryCollector_MetricsOnly_WithoutCertManagerCRD(t *testi
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
 
-	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(openTelemetryCollectorWithReadyStatus(m.Spec.Namespace, true)).Build()
 	err := deployOpenTelemetryCollector(context.Background(), cli, m, cm, &sources)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -409,7 +545,8 @@ func TestDeployOpenTelemetryCollector_TracesOnly_CRDPresent(t *testing.T) {
 	var sources []rendertemplate.TemplateSource
 
 	err := deployOpenTelemetryCollector(context.Background(),
-		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+		fake.NewClientBuilder().WithScheme(s).
+			WithObjects(openTelemetryCollectorWithReadyStatus(m.Spec.Namespace, true)).Build(), m, cm, &sources)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -435,7 +572,8 @@ func TestDeployOpenTelemetryCollector_ExportersOnlyMetrics_NoServiceMonitors(t *
 	var sources []rendertemplate.TemplateSource
 
 	err := deployOpenTelemetryCollector(context.Background(),
-		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+		fake.NewClientBuilder().WithScheme(s).
+			WithObjects(openTelemetryCollectorWithReadyStatus(m.Spec.Namespace, true)).Build(), m, cm, &sources)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -472,7 +610,8 @@ func TestDeployOpenTelemetryCollector_MetricsAndTraces_CRDPresent(t *testing.T) 
 	var sources []rendertemplate.TemplateSource
 
 	err := deployOpenTelemetryCollector(context.Background(),
-		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+		fake.NewClientBuilder().WithScheme(s).
+			WithObjects(openTelemetryCollectorWithReadyStatus(m.Spec.Namespace, true)).Build(), m, cm, &sources)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -480,6 +619,11 @@ func TestDeployOpenTelemetryCollector_MetricsAndTraces_CRDPresent(t *testing.T) 
 	// 5 base + ServiceMonitors + prometheus service + 2 traces RBAC (MLflow + Tempo)
 	if len(sources) != 9 {
 		t.Errorf("expected 9 sources for metrics+traces+OTel, got %d", len(sources))
+	}
+
+	otcC := findCondition(m, conditions.ConditionOpenTelemetryCollectorAvailable)
+	if otcC == nil || otcC.Status != metav1.ConditionTrue {
+		t.Error("OTelCollectorAvailable should be True")
 	}
 }
 
