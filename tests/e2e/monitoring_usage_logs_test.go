@@ -683,14 +683,31 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorNetworkPolicies(t *testin
 			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/component" == "lokistack-gateway"`),
 			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, UsageLogsLokiStackName),
 			jq.Match(`.spec.policyTypes == ["Ingress"]`),
+			// Exactly four peers may reach the gateway: the usage logs collector
+			// (writes), Perses and the usage tenancy proxy (read the dashboards),
+			// and the OpenShift console backend (logging view).
+			jq.Match(`.spec.ingress | length == 4`),
 			jq.Match(`
-				[.spec.ingress[].from[] | .podSelector.matchLabels."app.kubernetes.io/name"] == ["%s"]
+				[.spec.ingress[] | select(.from[0].podSelector.matchLabels."app.kubernetes.io/name" == "%s")] | length == 1
 			`, UsageLogsCollectorName+"-collector"),
 			jq.Match(`
-				[.spec.ingress[].ports[] | select(.protocol == "TCP") | .port] == [8080]
+				[.spec.ingress[] | select(.from[0].podSelector.matchLabels."app.kubernetes.io/name" == "data-science-perses")] | length == 1
+			`),
+			jq.Match(`
+				[.spec.ingress[] | select(.from[0].podSelector.matchLabels.app == "usage-tenancy-proxy")] | length == 1
+			`),
+			jq.Match(`
+				[.spec.ingress[] | select(
+					.from[0].namespaceSelector.matchLabels."kubernetes.io/metadata.name" == "openshift-console" and
+					.from[0].podSelector.matchLabels.app == "console" and
+					.from[0].podSelector.matchLabels.component == "ui"
+				)] | length == 1
+			`),
+			jq.Match(`
+				[.spec.ingress[].ports[] | select(.protocol == "TCP") | .port] | unique == [8080]
 			`),
 		)),
-		WithCustomErrorMsg("LokiStack gateway NetworkPolicy should only admit the usage logs collector on 8080"),
+		WithCustomErrorMsg("LokiStack gateway NetworkPolicy should admit exactly the usage logs collector, Perses, the usage tenancy proxy, and the OpenShift console on 8080"),
 	)
 }
 
