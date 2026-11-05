@@ -15,10 +15,43 @@ spec:
   policyTypes:
   - Ingress
   ingress:
+  # The usage logs collector writes OTLP through the gateway.
   - from:
     - podSelector:
         matchLabels:
           app.kubernetes.io/name: {{.UsageLogsCollectorName}}-collector
+    ports:
+    - protocol: TCP
+      port: 8080
+  # Perses reads usage logs through the gateway for its Loki datasource.
+  - from:
+    - podSelector:
+        matchLabels:
+          instance: data-science-perses
+          app.kubernetes.io/name: data-science-perses
+    ports:
+    - protocol: TCP
+      port: 8080
+  # The usage tenancy proxy reads usage logs through the gateway.
+  - from:
+    - podSelector:
+        matchLabels:
+          app: usage-tenancy-proxy
+    ports:
+    - protocol: TCP
+      port: 8080
+  # The OpenShift console's logging view. For a UIPlugin of type Logging, COO
+  # points the ConsolePlugin proxy at this gateway, and the console backend
+  # forwards the browser's queries there with the user's token, so the console
+  # pods - not the plugin pods - are the peer across the namespace boundary.
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-console
+      podSelector:
+        matchLabels:
+          app: console
+          component: ui
     ports:
     - protocol: TCP
       port: 8080
