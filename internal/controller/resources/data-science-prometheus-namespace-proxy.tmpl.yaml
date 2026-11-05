@@ -191,12 +191,17 @@ spec:
             readOnlyRootFilesystem: true
             runAsNonRoot: true
         - name: prom-label-proxy
+          # PromLabelProxyImage is resolvePromLabelProxyImage(): digest or tag >= v0.16.2 only.
           image: {{.PromLabelProxyImage}}
           args:
             - --insecure-listen-address=127.0.0.1:9091
             - --upstream=https://prometheus-operated.{{.Namespace}}.svc:9090
             - --label=namespace
             - --query-param=namespace
+            # Defense-in-depth with the method gate: reject form-body namespace= if a
+            # request ever reaches prom-label-proxy (URL query remains authoritative).
+            # Requires prom-label-proxy v0.16.2+ (enforced in resolvePromLabelProxyImage).
+            - --query-param-only
             - --error-on-replace
             - --enable-label-apis
             # Single-value tenancy (not the Perses Observe lane). Perses multi-ns All
