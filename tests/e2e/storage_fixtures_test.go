@@ -205,7 +205,12 @@ func (tc *TestContext) startSeaweedFS(t *testing.T, buckets ...string) {
 	var script strings.Builder
 	for _, bucket := range buckets {
 		endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/%s", seaweedFSServiceName, tc.MonitoringNamespace, seaweedFSS3Port, bucket)
-		fmt.Fprintf(&script, `i=0; while :; do code=$(curl --max-time 30 -sS -o /tmp/response -w '%%{http_code}' --aws-sigv4 'aws:amz:us-east-1:s3' --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" -X PUT %q) || code=000; case "$code" in 200|201|204|409) echo "bucket %s ready (HTTP $code)"; break;; esac; i=$((i+1)); [ "$i" -lt 60 ] || exit 1; sleep 2; done`+"\n", endpoint, bucket)
+		fmt.Fprintf(&script,
+			`i=0; while :; do code=$(curl --max-time 30 -sS -o /tmp/response -w '%%{http_code}' `+
+				`--aws-sigv4 'aws:amz:us-east-1:s3' --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" `+
+				`-X PUT %q) || code=000; case "$code" in 200|201|204|409) `+
+				`echo "bucket %s ready (HTTP $code)"; break;; esac; i=$((i+1)); `+
+				`[ "$i" -lt 60 ] || exit 1; sleep 2; done`+"\n", endpoint, bucket)
 	}
 	tc.createBucketPod(t, seaweedFSBucketPod, fakeGCSClientImage, script.String(), []corev1.EnvVar{
 		{

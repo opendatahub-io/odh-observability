@@ -121,7 +121,7 @@ Action functions run sequentially in a fixed order. Each function checks whether
 | 3 | `deployMonitoringAdmissionPolicies` | Always | None | None | monitoring-admission-policies |
 | 4 | `deployMonitoringStackWithQuerierAndRestrictions` | `spec.metrics` | `MonitoringStack`, `ThanosQuerier` | `MonitoringStackAvailable`, `ThanosQuerierAvailable` | 14 templates (see inventory) |
 | 5 | `deployTracingStack` | `spec.traces` | `TempoMonolithic`/`TempoStack`, `Instrumentation` | `TempoAvailable`, `InstrumentationAvailable` | Tempo template + instrumentation |
-| 6 | `deployOpenTelemetryCollector` | `spec.metrics` or `spec.traces` | `OpenTelemetryCollector` | `OpenTelemetryCollectorAvailable` (admitted and Ready) | collector, RBAC, ServiceMonitors, Prometheus service |
+| 6 | `deployOpenTelemetryCollector` | `spec.metrics` or `spec.traces` | `OpenTelemetryCollector` | `OpenTelemetryCollectorAvailable` (current-generation `Ready=True`) | collector, RBAC, ServiceMonitors, Prometheus service |
 | 7 | `deployAlerting` | `spec.alerting` | `PrometheusRule` | `AlertingAvailable` | None -- condition-only check |
 | 8 | `deployNodeMetricsEndpoint` | `spec.metrics` | None | `NodeMetricsEndpointAvailable` | prometheus-cluster-proxy |
 | 9 | `deployKorrel8r` | `spec.metrics` or `spec.traces` or `spec.logs` | None | `Korrel8rAvailable` | ConfigMap, Deployment, Service, RBAC, NetworkPolicy |
@@ -259,7 +259,7 @@ Each action function manages one or more conditions:
 | `ThanosQuerierAvailable` | `deployMonitoringStackWithQuerierAndRestrictions` |
 | `TempoAvailable` | `deployTracingStack` |
 | `InstrumentationAvailable` | `deployTracingStack` |
-| `OpenTelemetryCollectorAvailable` | `deployOpenTelemetryCollector` (CR status Ready) |
+| `OpenTelemetryCollectorAvailable` | `deployOpenTelemetryCollector` (CR status `Ready=True` with current `observedGeneration`) |
 | `AlertingAvailable` | `deployAlerting` |
 | `PersesAvailable` | `deployPerses` |
 | `PersesTempoDataSourceAvailable` | `deployPersesTempoIntegration` |

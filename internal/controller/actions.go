@@ -1552,7 +1552,7 @@ func hasReadyCondition(obj *unstructured.Unstructured) (bool, error) {
 // hasCurrentReadyCondition is the stricter form used for operands whose
 // readiness must describe the current spec. A stale Ready=True condition from
 // an older generation is not evidence that the current collector was admitted
-// or is running.
+// or reconciled.
 func hasCurrentReadyCondition(obj *unstructured.Unstructured) (bool, error) {
 	conds, found, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
 	if err != nil {

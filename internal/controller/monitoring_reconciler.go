@@ -258,6 +258,7 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 
 	defer func() {
 		result = requeueForCOOVersionRefresh(result, cooCompatibilityConfigured, reconcileErr)
+		result = requeueForCollectorReadiness(result, monitoring, reconcileErr)
 		if reconcileErr != nil {
 			message := reconcileErr.Error()
 			cm.MarkFalse(string(platformcommon.ConditionTypeReady), "ReconcileFailed", message)
@@ -465,6 +466,41 @@ func requeueForCOOVersionRefresh(result ctrl.Result, configured bool, reconcileE
 		result.RequeueAfter = 5 * time.Minute
 	}
 	return result
+}
+
+// requeueForCollectorReadiness covers configurations without another periodic
+// reconcile source. Built-in metrics already refresh for COO compatibility and
+// log forwarding already refreshes for namespace discovery; exporters-only and
+// traces-only configurations still need to observe a collector that appears or
+// becomes Ready after the desired resource is applied.
+func requeueForCollectorReadiness(result ctrl.Result, monitoring *v1alpha1.Monitoring, reconcileErr error) ctrl.Result {
+	if reconcileErr != nil || result != (ctrl.Result{}) || monitoring.Spec.ManagementState == platformcommon.Removed {
+		return result
+	}
+	if monitoring.Spec.Logs != nil || (monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil) {
+		return result
+	}
+	if !openTelemetryCollectorAwaitingReadiness(monitoring) {
+		return result
+	}
+
+	result.RequeueAfter = 30 * time.Second
+	return result
+}
+
+func openTelemetryCollectorAwaitingReadiness(monitoring *v1alpha1.Monitoring) bool {
+	if monitoring.Spec.Metrics == nil && monitoring.Spec.Traces == nil {
+		return false
+	}
+
+	for i := range monitoring.Status.Conditions {
+		condition := &monitoring.Status.Conditions[i]
+		if condition.Type == conditions.ConditionOpenTelemetryCollectorAvailable {
+			return condition.Status != metav1.ConditionTrue
+		}
+	}
+
+	return true
 }
 
 // cleanupOpenTelemetryOperatorNetworkPolicies removes policies left behind by
@@ -1114,26 +1150,6 @@ func (r *MonitoringReconciler) storageSecretRequests(ctx context.Context, obj cl
 	return singletonRequests(ctx, obj)
 }
 
-// openTelemetryCollectorRequests enqueues Monitoring only for its effective
-// collector namespace. The namespace may come from Monitoring.spec.namespace
-// in standalone deployments, so this cannot be reduced to the controller's
-// MONITORING_NAMESPACE environment variable.
-func (r *MonitoringReconciler) openTelemetryCollectorRequests(ctx context.Context, obj client.Object) []reconcile.Request {
-	if obj.GetName() != openTelemetryCollectorName {
-		return nil
-	}
-
-	monitoring := &v1alpha1.Monitoring{}
-	if err := r.Get(ctx, types.NamespacedName{Name: v1alpha1.MonitoringInstanceName}, monitoring); err != nil {
-		return nil
-	}
-	if obj.GetNamespace() != monitoringNamespace(monitoring) {
-		return nil
-	}
-
-	return singletonRequests(ctx, obj)
-}
-
 // isPlatformConfigMap matches the platform-written handshake ConfigMap by name
 // and operator namespace. That ConfigMap is labeled part-of=platform (or
 // unlabeled), so it is not covered by the managed-resource predicate. The
@@ -1281,16 +1297,6 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// Namespace creation or deletion changes the TargetAllocator Secret Role allowlist.
 		Watches(&corev1.Namespace{}, toSingleton, builder.WithPredicates(namespaceWatchPredicate())).
 		Watches(&routev1.Route{}, toSingleton, builder.WithPredicates(managedPredicate)).
-		// The OpenTelemetry Operator writes admission/reconciliation readiness to
-		// an unstructured CR. Resolve the effective Monitoring namespace in the
-		// handler so standalone spec.namespace deployments are covered too.
-		Watches(func() *unstructured.Unstructured {
-			collector := &unstructured.Unstructured{}
-			collector.SetGroupVersionKind(controllergvk.OpenTelemetryCollector)
-			return collector
-		}(), handler.EnqueueRequestsFromMapFunc(r.openTelemetryCollectorRequests), builder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
-			return obj.GetName() == openTelemetryCollectorName
-		}))).
 		// Watch CRDs to react when optional operators are installed / removed.
 		Watches(&extv1.CustomResourceDefinition{}, toSingleton).
 		// Reconcile when cluster APIServer TLS profile changes.

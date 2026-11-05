@@ -357,32 +357,73 @@ func TestValidateMonitoringNamespace(t *testing.T) {
 	})
 }
 
-func TestOpenTelemetryCollectorRequestsUsesEffectiveNamespace(t *testing.T) {
-	t.Setenv("MONITORING_NAMESPACE", "")
-	s := newTestScheme(t)
-	m := newMonitoring(v1alpha1.MonitoringInstanceName)
-	m.Spec.Namespace = "custom-monitoring"
-
-	r := newTestReconciler(t, s, fake.NewClientBuilder().WithScheme(s).WithObjects(m).Build())
-	collector := &unstructured.Unstructured{}
-	collector.SetGroupVersionKind(controllergvk.OpenTelemetryCollector)
-	collector.SetName(openTelemetryCollectorName)
-	collector.SetNamespace(m.Spec.Namespace)
-
-	requests := r.openTelemetryCollectorRequests(context.Background(), collector)
-	if len(requests) != 1 || requests[0].Name != v1alpha1.MonitoringInstanceName {
-		t.Fatalf("expected one request for %s, got %v", v1alpha1.MonitoringInstanceName, requests)
+func TestRequeueForCollectorReadiness(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*v1alpha1.Monitoring)
+		want      time.Duration
+	}{
+		{
+			name: "exporters-only metrics wait for collector",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Metrics = &v1alpha1.Metrics{}
+			},
+			want: 30 * time.Second,
+		},
+		{
+			name: "traces-only waits for collector",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Traces = &v1alpha1.Traces{}
+			},
+			want: 30 * time.Second,
+		},
+		{
+			name: "missing collector condition waits for collector",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Traces = &v1alpha1.Traces{}
+				m.Status.Conditions = nil
+			},
+			want: 30 * time.Second,
+		},
+		{
+			name: "built-in metrics already has periodic refresh",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+			},
+			want: 0,
+		},
+		{
+			name: "logs already has periodic refresh",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Metrics = &v1alpha1.Metrics{}
+				m.Spec.Logs = &v1alpha1.Logs{}
+			},
+			want: 0,
+		},
+		{
+			name: "ready collector does not requeue",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Traces = &v1alpha1.Traces{}
+				m.Status.Conditions[0].Status = metav1.ConditionTrue
+			},
+			want: 0,
+		},
 	}
 
-	collector.SetNamespace(defaultMonitoringNamespace)
-	if requests := r.openTelemetryCollectorRequests(context.Background(), collector); len(requests) != 0 {
-		t.Fatalf("expected no request for collector in %s, got %v", defaultMonitoringNamespace, requests)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			m.Status.Conditions = []platformcommon.Condition{{
+				Type:   conditions.ConditionOpenTelemetryCollectorAvailable,
+				Status: metav1.ConditionFalse,
+			}}
+			tt.configure(m)
 
-	collector.SetNamespace(m.Spec.Namespace)
-	collector.SetName("another-collector")
-	if requests := r.openTelemetryCollectorRequests(context.Background(), collector); len(requests) != 0 {
-		t.Fatalf("expected no request for unrelated collector, got %v", requests)
+			result := requeueForCollectorReadiness(reconcile.Result{}, m, nil)
+			if result.RequeueAfter != tt.want {
+				t.Fatalf("RequeueAfter = %s, want %s", result.RequeueAfter, tt.want)
+			}
+		})
 	}
 }
 
