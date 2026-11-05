@@ -159,12 +159,17 @@ spec:
             readOnlyRootFilesystem: true
             runAsNonRoot: true
         - name: prom-label-proxy
+          # PromLabelProxyImage is resolvePromLabelProxyImage(): digest or tag >= v0.16.2 only.
           image: {{.PromLabelProxyImage}}
           args:
             - --insecure-listen-address=127.0.0.1:9091
             - --upstream=http://thanos-querier-data-science-thanos-querier.{{.Namespace}}.svc.cluster.local:10902
             - --label=namespace
             - --query-param=namespace
+            # Reject POST form namespace= so URL-only SAR (kube-rbac-proxy) cannot
+            # be widened by prom-label-proxy merging URL + form into r.Form.
+            # Requires prom-label-proxy v0.16.2+ (enforced in resolvePromLabelProxyImage).
+            - --query-param-only
             - --error-on-replace
             - --enable-label-apis
             # No --regex-match: Perses Project=All / multi-select sends
