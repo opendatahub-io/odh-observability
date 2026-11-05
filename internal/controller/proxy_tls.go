@@ -73,6 +73,9 @@ func addTLSData(ctx context.Context, c client.Client, templateData map[string]an
 	if minVersion == proxyTLSVersion13 {
 		cipherSuites = ""
 	}
+	if err := validateProxyHTTP2CipherSuites(minVersion, cipherSuites); err != nil {
+		return err
+	}
 
 	fipsEnabled, err := platformcluster.IsFipsEnabled(ctx, c)
 	if err != nil {
@@ -88,6 +91,25 @@ func addTLSData(ctx context.Context, c client.Client, templateData map[string]an
 	templateData["TLSCipherSuites"] = cipherSuites
 	templateData["TLSCurvePreferences"] = curvePreferences
 	return nil
+}
+
+func validateProxyHTTP2CipherSuites(minVersion, cipherSuites string) error {
+	if minVersion == proxyTLSVersion13 || cipherSuites == "" {
+		return nil
+	}
+
+	for cipherSuite := range strings.SplitSeq(cipherSuites, ",") {
+		if cipherSuite == "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" ||
+			cipherSuite == "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" {
+			return nil
+		}
+	}
+
+	return fmt.Errorf(
+		"%w: monitoring proxies cannot serve HTTP/2 with TLS cipher suites %q",
+		errInvalidProxyTLSProfile,
+		cipherSuites,
+	)
 }
 
 func filterProxyCurvePreferences(curvePreferences string, fipsEnabled bool) (string, error) {
