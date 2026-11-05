@@ -316,10 +316,16 @@ func probeOutputHasHTTPStatus(out string, status int) bool {
 
 func thanosQuerierProxyPodName(t *testing.T, tc *MonitoringTestCtx) string {
 	t.Helper()
-	g := NewWithT(t)
 	var name string
-	g.Eventually(func() (string, error) {
-		hash, err := thanosQuerierProxyPodTemplateHash(tc)
+	// Wait for the Deployment's current generation to be fully rolled out, then pick a
+	// ready pod from that ReplicaSet (pod-template-hash). Use tc.g with an explicit
+	// timeout — NewWithT defaults to ~1s and is too short for proxy rollouts.
+	tc.g.Eventually(func() (string, error) {
+		deploy, err := thanosQuerierProxyDeploymentRolledOut(tc)
+		if err != nil {
+			return "", err
+		}
+		hash, err := thanosQuerierProxyPodTemplateHash(tc, deploy)
 		if err != nil {
 			return "", err
 		}
@@ -346,20 +352,44 @@ func thanosQuerierProxyPodName(t *testing.T, tc *MonitoringTestCtx) string {
 			}
 		}
 		return "", fmt.Errorf("no ready thanos proxy pod with prom-label-proxy for pod-template-hash=%s", hash)
-	}).ShouldNot(BeEmpty())
+	}).WithTimeout(5*time.Minute).WithPolling(2*time.Second).ShouldNot(BeEmpty(),
+		"thanos querier proxy must expose a ready prom-label-proxy pod on the current ReplicaSet")
 	return name
 }
 
-// thanosQuerierProxyPodTemplateHash returns the pod-template-hash of the Deployment's
-// current ReplicaSet so probes hit the rolled-out template (not a stale ready pod).
-func thanosQuerierProxyPodTemplateHash(tc *MonitoringTestCtx) (string, error) {
+// thanosQuerierProxyDeploymentRolledOut returns the Deployment once observedGeneration
+// matches and UpdatedReplicas/AvailableReplicas cover the desired count — so subsequent
+// ReplicaSet selection cannot pick a stale pre-rollout template.
+func thanosQuerierProxyDeploymentRolledOut(tc *MonitoringTestCtx) (*appsv1.Deployment, error) {
 	var deploy appsv1.Deployment
 	if err := tc.Client().Get(tc.Context(), types.NamespacedName{
 		Name:      ThanosQuerierProxyName,
 		Namespace: tc.MonitoringNamespace,
 	}, &deploy); err != nil {
-		return "", err
+		return nil, err
 	}
+	replicas := int32(1)
+	if deploy.Spec.Replicas != nil {
+		replicas = *deploy.Spec.Replicas
+	}
+	if replicas == 0 ||
+		deploy.Status.ObservedGeneration < deploy.Generation ||
+		deploy.Status.UpdatedReplicas != replicas ||
+		deploy.Status.AvailableReplicas < replicas {
+		return nil, fmt.Errorf(
+			"thanos proxy Deployment %s/%s not rolled out (generation=%d observed=%d updated=%d available=%d want=%d)",
+			deploy.Namespace, deploy.Name,
+			deploy.Generation, deploy.Status.ObservedGeneration,
+			deploy.Status.UpdatedReplicas, deploy.Status.AvailableReplicas, replicas,
+		)
+	}
+	return &deploy, nil
+}
+
+// thanosQuerierProxyPodTemplateHash returns the pod-template-hash of the Deployment's
+// current (matching revision) ReplicaSet so probes hit the rolled-out template.
+func thanosQuerierProxyPodTemplateHash(tc *MonitoringTestCtx, deploy *appsv1.Deployment) (string, error) {
+	wantRev := deploy.Annotations["deployment.kubernetes.io/revision"]
 	var rss appsv1.ReplicaSetList
 	if err := tc.Client().List(tc.Context(), &rss,
 		client.InNamespace(tc.MonitoringNamespace),
@@ -367,23 +397,26 @@ func thanosQuerierProxyPodTemplateHash(tc *MonitoringTestCtx) (string, error) {
 	); err != nil {
 		return "", err
 	}
-	var best *appsv1.ReplicaSet
+	var current *appsv1.ReplicaSet
 	for i := range rss.Items {
 		rs := &rss.Items[i]
-		if !metav1.IsControlledBy(rs, &deploy) {
+		if !metav1.IsControlledBy(rs, deploy) {
 			continue
 		}
 		if rs.Spec.Replicas == nil || *rs.Spec.Replicas == 0 {
 			continue
 		}
-		if best == nil || replicaSetRevision(rs) > replicaSetRevision(best) {
-			best = rs
+		if wantRev != "" && rs.Annotations["deployment.kubernetes.io/revision"] != wantRev {
+			continue
+		}
+		if current == nil || replicaSetRevision(rs) > replicaSetRevision(current) {
+			current = rs
 		}
 	}
-	if best == nil {
-		return "", errors.New("no active ReplicaSet for thanos querier proxy")
+	if current == nil {
+		return "", fmt.Errorf("no active ReplicaSet for thanos querier proxy (want revision %q)", wantRev)
 	}
-	hash := best.Labels["pod-template-hash"]
+	hash := current.Labels["pod-template-hash"]
 	if hash == "" {
 		return "", errors.New("active ReplicaSet missing pod-template-hash label")
 	}
