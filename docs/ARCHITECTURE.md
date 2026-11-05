@@ -212,6 +212,10 @@ The [MaaS legacy usage dashboard](https://github.com/opendatahub-io/models-as-a-
 - Upgrade: the reconciler removes legacy Kubernetes SA-token Secrets with these datasource names only when they are owned by the current Monitoring resource and reference the old cluster-proxy service account. Perses operator manages separate Perses API secrets for the datasource TLS configuration.
 - Observe UI / gateway → Perses ingress is owned by Dashboard (`dashboard-perses-access`), not this operator.
 
+### Application log query RBAC
+
+`loki-application-logs-rbac.tmpl.yaml` renders `data-science-application-logs-view`: `get` on `loki.grafana.com/application` named `logs`, aggregated into OpenShift project `admin`/`edit`/`view` so namespace RoleBindings pass LokiStack Stage-1. No ClusterRoleBinding (no cluster-wide grant). Cluster-wide Stage-1 stays on platform `data-science-admingroupcluster-role`. The rule carries no LokiStack identity, so any `openshift-logging` tenant-mode gateway that Stage-1-checks this resource for a namespace can accept the grant; Stage-2 (OPA) still limits returned data to the caller's namespaces.
+
 ### Korrel8r (Signal Correlation)
 
 | Template | Resources Created |

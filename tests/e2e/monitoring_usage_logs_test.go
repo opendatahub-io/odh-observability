@@ -101,8 +101,9 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 		}
 		t.Run("Validate log forwarding LokiStack deployment", tc.ValidateLogsLokiStackDeployment)
 		t.Run("Validate log forwarding LokiStack configuration", tc.ValidateLogsLokiStackConfiguration)
+		t.Run("Validate application logs project RBAC", tc.ValidateApplicationLogsProjectRBAC)
 		t.Run("Validate optional ClusterLogForwarder and Vector contract", tc.ValidateClusterLogForwarderContract)
-		t.Run("Validate log forwarding LokiStack removal", tc.ValidateLogsLokiStackRemoved)
+		t.Run("Validate log forwarding LokiStack lifecycle", tc.ValidateLogsLokiStackLifecycle)
 		t.Run("Test Usage Logs Collector serving certificate rotation", tc.ValidateUsageLogsCollectorServingCertificateRotation)
 
 		// Lifecycle removes the collector and LokiStack, so it runs last.

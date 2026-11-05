@@ -1,0 +1,25 @@
+# Aggregates LokiStack Stage-1 (get application.loki.grafana.com/logs) into
+# OpenShift project admin/edit/view. No ClusterRoleBinding — namespaced SAR
+# only; cluster-wide Stage-1 remains data-science-admingroupcluster-role.
+# NOTE: The rule carries no LokiStack identity. Any gateway in openshift-logging
+# tenant mode that Stage-1-checks this resource for a namespace can accept the
+# grant. Stage-2 (OPA) still limits returned data to the caller's namespaces.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: data-science-application-logs-view
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+    platform.opendatahub.io/component: loki-logs
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+  - apiGroups:
+      - loki.grafana.com
+    resources:
+      - application
+    resourceNames:
+      - logs
+    verbs:
+      - get
