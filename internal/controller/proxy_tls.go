@@ -31,6 +31,8 @@ import (
 const (
 	proxyTLSVersion12     = "VersionTLS12"
 	proxyTLSVersion13     = "VersionTLS13"
+	proxyHTTP2CipherRSA   = "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+	proxyHTTP2CipherECDSA = "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
 	curveIDSecP256r1      = 23
 	curveIDSecP384r1      = 24
 	curveIDSecP521r1      = 25
@@ -99,8 +101,7 @@ func validateProxyHTTP2CipherSuites(minVersion, cipherSuites string) error {
 	}
 
 	for cipherSuite := range strings.SplitSeq(cipherSuites, ",") {
-		if cipherSuite == "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256" ||
-			cipherSuite == "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256" {
+		if cipherSuite == proxyHTTP2CipherRSA || cipherSuite == proxyHTTP2CipherECDSA {
 			return nil
 		}
 	}
