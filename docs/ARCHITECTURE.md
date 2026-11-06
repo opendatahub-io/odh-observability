@@ -191,17 +191,17 @@ All templates are embedded via `//go:embed` and rendered with Go's `text/templat
 | `perses-datasource-cluster-prometheus.tmpl.yaml` | PersesDatasource for OpenShift Monitoring cluster-wide (:9091, **caller token / RBAC**, not shared SA, not default) |
 | `perses-datasource-cluster-prometheus-tenancy.tmpl.yaml` | PersesDatasource for OpenShift Monitoring tenancy (:9092, requires `namespace=`) |
 | `perses-datasource-data-science-cluster.tmpl.yaml` | PersesDatasource for the Data Science stack cluster-wide (:8444, no `namespace=`, **caller token**, not default) |
-| `perses-gpu-health-dashboard-v1alpha1.tmpl.yaml` | PersesDashboard (v1alpha1 API) -- GPU health, every query pinned to `data-science-cluster-prometheus-datasource` |
-| `perses-gpu-health-dashboard-v1alpha2.tmpl.yaml` | PersesDashboard (v1alpha2 API) -- GPU health, every query pinned to `data-science-cluster-prometheus-datasource` |
+| `perses-gpu-health-dashboard-v1alpha1.tmpl.yaml` | PersesDashboard (v1alpha1 API) -- GPU health, `accelerator_*` panels pinned to `data-science-cluster-prometheus-datasource`, the capacity panel to `cluster-prometheus-datasource` |
+| `perses-gpu-health-dashboard-v1alpha2.tmpl.yaml` | PersesDashboard (v1alpha2 API) -- GPU health, `accelerator_*` panels pinned to `data-science-cluster-prometheus-datasource`, the capacity panel to `cluster-prometheus-datasource` |
 
-Perses metrics access model (three lanes — pick by **where the series live**, not by dashboard title):
+Perses metrics access model (four lanes — pick by **where the series live**, not by dashboard title):
 
 | Lane | Datasource | Backend | Gate | Owns |
 |------|------------|---------|------|------|
 | **DS namespace-scoped** | `data-science-prometheus-datasource` (default) | DS Thanos proxy `:8443` | `namespace=` + caller token + `metrics.k8s.io` SAR | Series in the Data Science MonitoringStack (e.g. raw `vllm:*`, DS `accelerator_*` recording rules from OTC/DCGM) |
 | **OCP tenancy** | `cluster-prometheus-tenancy-datasource` | OpenShift Thanos `:9092` | `namespace=` + caller token | Namespaced OpenShift Monitoring series (`node_namespace_pod_container:*`, `kube_*`, OCP accelerator with `exported_namespace` / `exported_pod`) |
 | **DS cluster-wide** | `data-science-cluster-prometheus-datasource` | DS Thanos proxy `:8444` | caller RBAC only (`metrics.k8s.io/nodes`) | Cluster-wide Data Science series with **no** `namespace` label — `accelerator_*` |
-| **OCP admin** | `cluster-prometheus-datasource` | OpenShift Thanos `:9091` | caller RBAC only (e.g. `cluster-monitoring-view`) | Cluster-wide admin views — **not** namespace tenancy |
+| **OCP admin** | `cluster-prometheus-datasource` | OpenShift Thanos `:9091` | caller RBAC only (e.g. `cluster-monitoring-view`) | Cluster-wide admin views and `kube_*` capacity (`kube_node_status_capacity`) — **not** namespace tenancy |
 
 **Do not conflate the gates.** `:8443` is DS namespace scoping. `:8444` is DS cluster-wide RBAC. `:9091` is OCP RBAC. `:9092` is OpenShift tenancy.
 
@@ -212,7 +212,7 @@ The [MaaS legacy usage dashboard](https://github.com/opendatahub-io/models-as-a-
 **Metric ownership / dashboard pins (hard rule):** one PromQL query runs against **one** datasource. You cannot join DS Thanos series with OpenShift series in a single query. Observe dashboards (Dashboard repo) must pin explicitly after the DS default flip:
 - **Models:** raw `vllm:*` panels → `data-science-prometheus-datasource` (`:8443`). OCP GPU/CPU panels → `cluster-prometheus-tenancy-datasource` (`:9092`).
 - **Cluster:** → `cluster-prometheus-datasource` (`:9091`).
-- **GPU health (shipped):** the `data-science-gpu-health` dashboard pins `data-science-cluster-prometheus-datasource` (`:8444`) on every panel. Neither older lane can serve it: the `:8443` proxy injects `namespace=<selected>` and `transform/exclude_dcgm_k8s_labels` strips Kubernetes identity from DCGM scrapes, so `accelerator_*` carries no `namespace` label; and OCP Thanos `:9091` never sees the Data Science recording rules at all, because the DS `ThanosQuerier` federates only DS Prometheus and nothing remote-writes across. The dashboard gate stays "Perses deployed", and its by-project panel stays empty until per-workload GPU attribution lands.
+- **GPU health (shipped):** the `data-science-gpu-health` dashboard pins `data-science-cluster-prometheus-datasource` (`:8444`) on every `accelerator_*` panel, and `cluster-prometheus-datasource` (`:9091`) on the GPUs-advertised panel alone: capacity is `kube_node_status_capacity`, which kube-state-metrics publishes to OpenShift Monitoring, and one query cannot span two datasources. Neither older lane can serve the accelerator panels: the `:8443` proxy injects `namespace=<selected>` and `transform/exclude_dcgm_k8s_labels` strips Kubernetes identity from DCGM scrapes, so `accelerator_*` carries no `namespace` label; and OCP Thanos `:9091` never sees the Data Science recording rules at all, because the DS `ThanosQuerier` federates only DS Prometheus and nothing remote-writes across. The dashboard gate stays "Perses deployed", and its by-project panel stays empty until per-workload GPU attribution lands.
 - **Datasource boundary:** GPU/CPU PromQL remains on the OpenShift tenancy datasource; raw `vllm:*` is used for model identity and serving metrics. Cross-stack joins must not move either datasource's resource queries into the other lane.
 
 - Upgrade: the reconciler removes legacy Kubernetes SA-token Secrets with these datasource names only when they are owned by the current Monitoring resource and reference the old cluster-proxy service account. Perses operator manages separate Perses API secrets for the datasource TLS configuration.

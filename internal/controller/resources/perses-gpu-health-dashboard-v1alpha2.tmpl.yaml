@@ -9,7 +9,7 @@ spec:
   config:
     display:
       name: "RHOAI GPU Health"
-      description: "NVIDIA DCGM device health for the cluster. Every query reads the accelerator recording rules through the cluster-wide Data Science Prometheus datasource, because those series carry no namespace label and the namespace-scoped datasource cannot serve them. The panels describe node-level GPU health. Per-workload attribution needs the DCGM pod-level join and is not available yet."
+      description: "NVIDIA DCGM device health for the cluster. Every query reads the accelerator recording rules through the cluster-wide Data Science Prometheus datasource, because those series carry no namespace label and the namespace-scoped datasource cannot serve them; the capacity panel reads kube-state-metrics from OpenShift Monitoring instead, because the Data Science stack does not scrape it. The panels describe node-level GPU health. Per-workload attribution needs the DCGM pod-level join and is not available yet."
     duration: "1h"
     layouts:
       - kind: Grid
@@ -117,7 +117,7 @@ spec:
         spec:
           display:
             name: "GPUs advertised"
-            description: "Capacity the cluster advertises (sum of the nvidia.com/gpu extended resource). A gap against GPUs reporting means part of the fleet is not exporting metrics, for example a node whose GPU Operator pod is not Ready."
+            description: "Capacity the cluster advertises (sum of the nvidia.com/gpu extended resource, from kube-state-metrics in OpenShift Monitoring). A gap against GPUs reporting means part of the fleet is not exporting metrics, for example a node whose GPU Operator pod is not Ready."
           plugin:
             kind: StatChart
             spec:
@@ -131,9 +131,11 @@ spec:
                 plugin:
                   kind: PrometheusTimeSeriesQuery
                   spec:
+                    # Capacity comes from kube-state-metrics, which OpenShift
+                    # Monitoring scrapes and the Data Science stack does not.
                     datasource:
                       kind: PrometheusDatasource
-                      name: data-science-cluster-prometheus-datasource
+                      name: cluster-prometheus-datasource
                     query: sum(kube_node_status_capacity{resource="nvidia_com_gpu"})
                     seriesNameFormat: Advertised
       meanUtilization:

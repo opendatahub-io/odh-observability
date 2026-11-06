@@ -24,6 +24,12 @@ import (
 // them, and OpenShift Thanos never sees the Data Science recording rules.
 const clusterPrometheusDatasourceName = "data-science-cluster-prometheus-datasource"
 
+// The capacity panel is the one query the Data Science stack cannot answer:
+// kube-state-metrics is scraped by OpenShift Monitoring, so that panel pins the
+// OCP admin lane instead. Both lanes are caller-token and cluster-wide, so the
+// dashboard never needs a namespace-scoped datasource.
+const ocpPrometheusDatasourceName = "cluster-prometheus-datasource"
+
 // noMatchForPerses models a cluster whose API server does not serve the Perses
 // group at all, the shape hasCRD treats as "CRD absent" rather than an error.
 func noMatchForPerses() interceptor.Funcs {
@@ -104,10 +110,11 @@ func TestPersesGPUHealthDashboardTemplateContract(t *testing.T) {
 		},
 	}
 
-	// Every panel reads the accelerator recording rules, which this dashboard
-	// can only reach through the cluster-scoped OpenShift datasource: the
+	// Panel queries read the accelerator recording rules, which this dashboard
+	// can only reach through the Data Science cluster-wide datasource: the
 	// namespace proxy injects namespace= and the collector strips Kubernetes
 	// identity from accelerator series, so a scoped datasource never matches.
+	ocpLaneQueries := []string{`sum(kube_node_status_capacity{resource="nvidia_com_gpu"})`}
 	wantQueries := []string{
 		"count(count by (Hostname, gpu) (accelerator_gpu_utilization))",
 		`sum(kube_node_status_capacity{resource="nvidia_com_gpu"})`,
@@ -168,8 +175,12 @@ func TestPersesGPUHealthDashboardTemplateContract(t *testing.T) {
 			queries := gpuDashboardQueries(t, dashboard, tt.configPath...)
 			gotQueries := make([]string, 0, len(queries))
 			for _, q := range queries {
-				if q.datasource != clusterPrometheusDatasourceName {
-					t.Errorf("panel %q must pin %s, got %q", q.panel, clusterPrometheusDatasourceName, q.datasource)
+				wantDatasource := clusterPrometheusDatasourceName
+				if slices.Contains(ocpLaneQueries, q.query) {
+					wantDatasource = ocpPrometheusDatasourceName
+				}
+				if q.datasource != wantDatasource {
+					t.Errorf("panel %q must pin %s, got %q", q.panel, wantDatasource, q.datasource)
 				}
 				if q.kind != "PrometheusDatasource" {
 					t.Errorf("panel %q must use PrometheusDatasource, got %q", q.panel, q.kind)
