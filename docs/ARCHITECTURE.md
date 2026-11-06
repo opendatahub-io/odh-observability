@@ -46,7 +46,7 @@ Before any feature deployment, the reconciler verifies prerequisite operators th
 | `tempo-operator` | Traces configured |
 | `opentelemetry-operator` | Metrics, traces, or usage logs configured |
 | `cert-manager` | Operator webhook and metrics TargetAllocator mTLS certificates |
-| `loki-operator` | Usage logs or cluster log forwarding configured |
+| `loki-operator` | Usage-log storage or cluster log forwarding configured |
 | `cluster-logging` | Cluster log forwarding configured |
 
 If any required operator is missing, `MonitoringDependenciesReady` is set to False with the missing operator names and OperatorHub installation guidance. Reconciliation then stops without error (no retry -- the CRD watch will trigger re-reconciliation when operators are installed). The legacy `MonitoringAvailable` condition is updated in parallel for compatibility.
@@ -174,6 +174,36 @@ All templates are embedded via `//go:embed` and rendered with Go's `text/templat
 | `collector-servicemonitors.tmpl.yaml` | ServiceMonitors for collector metrics |
 | `collector-prometheus-service.tmpl.yaml` | Prometheus receiver service |
 
+### MaaS Usage Logs
+
+`deployLokiStacks` reconciles usage logs through `deployUsageLogsLokiStack` and
+`deployUsageLogsCollector`. `spec.usageLogs.storage` enables the local LokiStack;
+`spec.usageLogs.exporters` enables remote delivery. Either is sufficient to
+configure the collector, and setting both produces local and remote writes.
+
+| Template | Resources Created |
+|----------|-------------------|
+| `usage-logs-opentelemetry-collector.tmpl.yaml` | `OpenTelemetryCollector/data-science-usage-logs` with local and/or remote logs pipelines |
+| `usage-logs-opentelemetry-collector-rbac.tmpl.yaml` | Collector ServiceAccount and enrichment/export RBAC |
+| `usage-logs-opentelemetry-collector-network-policy.tmpl.yaml` | Usage-log collector ingress policy |
+| `usage-logs-loki-stack.tmpl.yaml` | Optional `LokiStack/data-science-usage-logs-lokistack` |
+| `usage-logs-lokistack-network-policy.tmpl.yaml` | Local usage-log LokiStack ingress policy |
+
+MaaS owns the gateway access logger and identity capture. The collector's
+`groupbyattrs/maas` processor promotes `organization_id` and `user_id`, when
+present, from log attributes to resource attributes. Both logs pipelines run it
+before batching. The local LokiStack indexes these resource attributes for its
+`application` tenant, alongside the existing usage-log attributes and the global
+`service.name` attribute. This supports the identity matchers injected by the
+MaaS API Loki read proxy. Records missing the IDs continue through the collector.
+
+Source-cluster attributes configured under `usageLogs.attributes` are added only
+to the remote pipeline. The receiving hub owns its Loki indexing configuration;
+the local template does not configure that remote store. The independent
+`spec.logs` capability uses ClusterLogForwarder and `data-science-lokistack`.
+See [Operator-managed MaaS usage logs](usage-logs.md) for setup, identity capture,
+read endpoints, and verification.
+
 ### Alerting
 
 | Template | Resources Created |
@@ -263,6 +293,8 @@ Each action function manages one or more conditions:
 | `TempoAvailable` | `deployTracingStack` |
 | `InstrumentationAvailable` | `deployTracingStack` |
 | `OpenTelemetryCollectorAvailable` | `deployOpenTelemetryCollector` (CR status `Ready=True` with current `observedGeneration`) |
+| `UsageLogsLokiStackAvailable` | `deployUsageLogsLokiStack` and storage validation |
+| `UsageLogsCollectorAvailable` | `deployUsageLogsCollector` and storage validation |
 | `AlertingAvailable` | `deployAlerting` |
 | `PersesAvailable` | `deployPerses` |
 | `PersesTempoDataSourceAvailable` | `deployPersesTempoIntegration` |
