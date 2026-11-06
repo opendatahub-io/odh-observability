@@ -667,6 +667,68 @@ func TestLokiStackTemplatesRenderIndependentStorage(t *testing.T) {
 	}
 }
 
+func TestUsageLogsLokiStackIndexesMaaSIdentity(t *testing.T) {
+	t.Parallel()
+
+	resources := renderObservabilityTemplate(t, UsageLogsLokiStackTemplate, map[string]any{
+		"Namespace":                          testMonitoringNamespace,
+		"UsageLogsLokiStackName":             usageLogsLokiStackResourceName,
+		"UsageLogsLokiStorageSecretName":     "usage-logs-secret",
+		"UsageLogsLokiStorageType":           "s3",
+		"UsageLogsLokiStorageCredentialMode": "static",
+		"UsageLogsLokiStorageClassName":      "usage-logs-sc",
+		"LokiStackSize":                      "1x.demo",
+	})
+	stack := findRenderedResource(t, resources, "LokiStack", usageLogsLokiStackResourceName)
+
+	for _, tc := range []struct {
+		name string
+		path []string
+		want []string
+	}{
+		{
+			name: "global service identity",
+			path: []string{"spec", "limits", "global", "otlp", "streamLabels", "resourceAttributes"},
+			want: []string{"service.name"},
+		},
+		{
+			name: "application identity and existing usage labels",
+			path: []string{"spec", "limits", "tenants", "application", "otlp", "streamLabels", "resourceAttributes"},
+			want: []string{
+				"kubernetes_namespace_name", "model", "subscription", "response_type",
+				"gateway_namespace_name", "gateway_deployment_name", "upstream_namespace_name", "upstream_deployment_name",
+				"organization_id", "user_id",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			attributes, found, err := unstructured.NestedSlice(stack.Object, tc.path...)
+			if err != nil || !found {
+				t.Fatalf("reading indexed resource attributes: found=%t error=%v", found, err)
+			}
+			names := make([]string, 0, len(attributes))
+			for _, raw := range attributes {
+				attribute, ok := raw.(map[string]any)
+				if !ok {
+					t.Fatalf("indexed resource attribute has unexpected type %T", raw)
+				}
+				name, found, err := unstructured.NestedString(attribute, "name")
+				if err != nil || !found {
+					t.Fatalf("reading indexed resource attribute name: found=%t error=%v", found, err)
+				}
+				names = append(names, name)
+			}
+			slices.Sort(names)
+			slices.Sort(tc.want)
+			if !slices.Equal(names, tc.want) {
+				t.Errorf("indexed resource attributes: want %v, got %v", tc.want, names)
+			}
+		})
+	}
+}
+
 // TestLokiStackTemplatesCarryComponentLabel is the drift guard for the garbage
 // collection shield. A rejected storage configuration renders none of these
 // templates, so the only thing keeping the live resources out of the

@@ -3772,6 +3772,7 @@ type usageLogsNetworkPolicyPeers struct {
 
 func assertUsageLogsCollectorConfig(t *testing.T, collector *unstructured.Unstructured) {
 	t.Helper()
+	assertUsageLogsGroupingConfig(t, collector)
 
 	// Ingress is governed by the NetworkPolicies this operator renders, so the
 	// operator-managed one must stay off.
@@ -4417,6 +4418,7 @@ func TestDeployUsageLogsCollector_RemoteExporters(t *testing.T) {
 		t.Fatal("no OpenTelemetryCollector rendered")
 		return
 	}
+	assertUsageLogsGroupingConfig(t, collector)
 
 	exporters, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "exporters")
 	if _, ok := exporters["otlphttp/hub"]; !ok {
@@ -4565,6 +4567,7 @@ func TestDeployUsageLogsCollector_ForwardingOnly(t *testing.T) {
 		t.Fatal("no OpenTelemetryCollector rendered")
 		return
 	}
+	assertUsageLogsGroupingConfig(t, collector)
 
 	exporters, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "exporters")
 	if _, ok := exporters["otlphttp/loki"]; ok {

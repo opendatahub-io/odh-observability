@@ -186,6 +186,8 @@ spec:
           - model
           - subscription
           - response_type
+          - organization_id
+          - user_id
 
       # 6. Clean up temporary and redundant fields before export
       transform/cleanup:
