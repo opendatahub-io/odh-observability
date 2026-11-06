@@ -598,6 +598,10 @@ func (r *MonitoringReconciler) renderMonitoringResources(
 			cm *conditions.ConditionsManager, sources *[]rendertemplate.TemplateSource) error {
 			return deployPersesPrometheusIntegration(ctx, c, m, cm, sources, persesVersion, persesFound)
 		},
+		func(ctx context.Context, c client.Client, m *v1alpha1.Monitoring,
+			cm *conditions.ConditionsManager, sources *[]rendertemplate.TemplateSource) error {
+			return deployPersesGPUHealthDashboard(ctx, c, m, cm, sources, persesVersion, persesFound)
+		},
 	} {
 		if err := action(ctx, r.Client, monitoring, cm, &sources); err != nil {
 			return nil, nil, nil, err

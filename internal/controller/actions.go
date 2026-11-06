@@ -83,6 +83,8 @@ const (
 	PersesDatasourcePrometheusTemplate               = "resources/perses-datasource-prometheus.tmpl.yaml"
 	PersesDatasourceClusterPrometheusTemplate        = "resources/perses-datasource-cluster-prometheus.tmpl.yaml"
 	PersesDatasourceClusterPrometheusTenancyTemplate = "resources/perses-datasource-cluster-prometheus-tenancy.tmpl.yaml"
+	PersesGPUHealthDashboardV1Alpha1Template         = "resources/perses-gpu-health-dashboard-v1alpha1.tmpl.yaml"
+	PersesGPUHealthDashboardV1Alpha2Template         = "resources/perses-gpu-health-dashboard-v1alpha2.tmpl.yaml"
 	PrometheusClusterProxyTemplate                   = "resources/data-science-prometheus-cluster-proxy.tmpl.yaml"
 	TempoServiceCAConfigMapTemplate                  = "resources/tempo-service-ca-configmap.tmpl.yaml"
 	PersesOperatorAccessNetworkPolicyTemplate        = "resources/perses-operator-access-network-policy.tmpl.yaml"
@@ -592,6 +594,47 @@ func deployPersesPrometheusIntegration(
 		src(PersesDatasourceClusterPrometheusTenancyTemplate),
 		src(PersesDatasourcePrometheusTemplate),
 	)
+	return nil
+}
+
+// deployPersesGPUHealthDashboard deploys the GPU health dashboard when built-in
+// metrics storage is configured and Perses is installed. Every query reads the
+// accelerator recording rules, which exist exactly where metrics.storage does,
+// through the cluster-scoped Prometheus datasource: the namespace-enforcing
+// datasource cannot serve them because the proxy injects namespace= and the
+// collector strips Kubernetes identity from accelerator series.
+//
+// The dashboard is best-effort and reports no condition of its own: the rules
+// it reads are covered by MonitoringStackAvailable and the datasource it pins
+// by PersesPrometheusDataSourceAvailable. It carries the part-of label so the
+// garbage collector removes it when storage or Perses goes away.
+func deployPersesGPUHealthDashboard(
+	ctx context.Context,
+	c client.Client,
+	monitoring *v1alpha1.Monitoring,
+	_ *conditions.ConditionsManager,
+	sources *[]rendertemplate.TemplateSource,
+	persesVersion string,
+	persesFound bool,
+) error {
+	if monitoring.Spec.Metrics == nil || monitoring.Spec.Metrics.Storage == nil || !persesFound {
+		return nil
+	}
+
+	_, _, dashboardGVK := persesGVKs(persesVersion)
+	exists, err := hasCRD(ctx, c, dashboardGVK)
+	if err != nil {
+		return fmt.Errorf("checking PersesDashboard CRD: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+
+	dashboardTemplate := PersesGPUHealthDashboardV1Alpha1Template
+	if persesVersion == persesV1Alpha2 {
+		dashboardTemplate = PersesGPUHealthDashboardV1Alpha2Template
+	}
+	*sources = append(*sources, src(dashboardTemplate))
 	return nil
 }
 

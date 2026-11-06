@@ -128,6 +128,7 @@ Action functions run sequentially in a fixed order. Each function checks whether
 | 10 | `deployPerses` | `spec.metrics` or `spec.traces` | `Perses` | `PersesAvailable` | perses, network-policy |
 | 11 | `deployPersesTempoIntegration` | `spec.traces` | `PersesDatasource`, `PersesDashboard` | `PersesTempoDataSourceAvailable` | datasource, CA ConfigMap, dashboard |
 | 12 | `deployPersesPrometheusIntegration` | `spec.metrics` | `PersesDatasource` | `PersesPrometheusDataSourceAvailable` | 2 datasource templates |
+| 13 | `deployPersesGPUHealthDashboard` | `spec.metrics` with storage, when Perses is installed | `PersesDashboard` | None -- best-effort dashboard, covered by `MonitoringStackAvailable` + `PersesPrometheusDataSourceAvailable` | GPU health dashboard (v1alpha1/v1alpha2) |
 
 When a feature is not configured, the action calls `MarkNotConfigured` (Info severity) which prevents it from contributing to Degraded status. When a required CRD is missing, `MarkFalse` is used, which does contribute to Degraded.
 
@@ -189,6 +190,8 @@ All templates are embedded via `//go:embed` and rendered with Go's `text/templat
 | `perses-datasource-prometheus.tmpl.yaml` | PersesDatasource for Data Science metrics via Thanos proxy (:8443, requires `namespace=`, default) |
 | `perses-datasource-cluster-prometheus.tmpl.yaml` | PersesDatasource for OpenShift Monitoring cluster-wide (:9091, **caller token / RBAC**, not shared SA, not default) |
 | `perses-datasource-cluster-prometheus-tenancy.tmpl.yaml` | PersesDatasource for OpenShift Monitoring tenancy (:9092, requires `namespace=`) |
+| `perses-gpu-health-dashboard-v1alpha1.tmpl.yaml` | PersesDashboard (v1alpha1 API) -- GPU health, every query pinned to `cluster-prometheus-datasource` |
+| `perses-gpu-health-dashboard-v1alpha2.tmpl.yaml` | PersesDashboard (v1alpha2 API) -- GPU health, every query pinned to `cluster-prometheus-datasource` |
 
 Perses metrics access model (three lanes — pick by **where the series live**, not by dashboard title):
 
@@ -207,6 +210,7 @@ The [MaaS legacy usage dashboard](https://github.com/opendatahub-io/models-as-a-
 **Metric ownership / dashboard pins (hard rule):** one PromQL query runs against **one** datasource. You cannot join DS Thanos series with OpenShift series in a single query. Observe dashboards (Dashboard repo) must pin explicitly after the DS default flip:
 - **Models:** raw `vllm:*` panels → `data-science-prometheus-datasource` (`:8443`). OCP GPU/CPU panels → `cluster-prometheus-tenancy-datasource` (`:9092`).
 - **Cluster:** → `cluster-prometheus-datasource` (`:9091`).
+- **GPU health (shipped):** the `data-science-gpu-health` dashboard pins `cluster-prometheus-datasource` on every panel. It cannot use the default DS datasource: the `:8443` proxy injects `namespace=<selected>` and `transform/exclude_dcgm_k8s_labels` strips Kubernetes identity from DCGM scrapes, so `accelerator_*` series carry no `namespace` label and never match. The cost is that the dashboard gate is "Perses deployed", not "metrics reachable from the scoped lane", and its by-project panel stays empty until per-workload GPU attribution lands.
 - **Datasource boundary:** GPU/CPU PromQL remains on the OpenShift tenancy datasource; raw `vllm:*` is used for model identity and serving metrics. Cross-stack joins must not move either datasource's resource queries into the other lane.
 
 - Upgrade: the reconciler removes legacy Kubernetes SA-token Secrets with these datasource names only when they are owned by the current Monitoring resource and reference the old cluster-proxy service account. Perses operator manages separate Perses API secrets for the datasource TLS configuration.
