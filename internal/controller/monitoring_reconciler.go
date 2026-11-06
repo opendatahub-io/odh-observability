@@ -258,6 +258,7 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 
 	defer func() {
 		result = requeueForCOOVersionRefresh(result, cooCompatibilityConfigured, reconcileErr)
+		result = requeueForDCGMExporterRefresh(result, monitoring, reconcileErr)
 		result = requeueForCollectorReadiness(result, monitoring, reconcileErr)
 		if reconcileErr != nil {
 			message := reconcileErr.Error()
@@ -424,10 +425,11 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	// The GPU Operator is not watched (only core kinds are), and the periodic
-	// COO refresh below runs only with built-in metrics storage. An Unknown
+	// The GPU Operator itself is not watched (only core kinds are). An Unknown
 	// exporter verdict rides this requeue so a transient lookup failure is
-	// retried instead of standing until some unrelated event arrives.
+	// retried instead of standing until some unrelated event arrives; a settled
+	// non-True verdict gets the slower bounded refresh added in the defer, since
+	// installing the operator without an exporter Service produces no event.
 	if requeueNeeded || usageLogsAwaitingCredential(monitoring) || dcgmExporterCheckPending(monitoring) {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
@@ -479,6 +481,32 @@ func requeueForCOOVersionRefresh(result ctrl.Result, configured bool, reconcileE
 func dcgmExporterCheckPending(monitoring *v1alpha1.Monitoring) bool {
 	return libconditions.IsStatusConditionPresentAndEqual(monitoring,
 		conditions.ConditionDCGMExporterAvailable, metav1.ConditionUnknown)
+}
+
+// requeueForDCGMExporterRefresh schedules a bounded refresh while the exporter
+// verdict is not True. Installing the GPU Operator with the exporter disabled
+// creates no exporter Service, so no watched object changes and an
+// exporters-only configuration would report the operator as missing forever;
+// removing the operator has the mirror problem when the Service is already gone.
+// A True verdict needs no refresh: the Service watch already covers the exporter
+// being disabled or removed afterwards.
+func requeueForDCGMExporterRefresh(
+	result ctrl.Result,
+	monitoring *v1alpha1.Monitoring,
+	reconcileErr error,
+) ctrl.Result {
+	if reconcileErr != nil || result != (ctrl.Result{}) || monitoring.Spec.ManagementState == platformcommon.Removed {
+		return result
+	}
+	if !builtinDCGMScrapeEnabled(monitoring.Spec.Metrics) {
+		return result
+	}
+	if libconditions.IsStatusConditionTrue(monitoring, conditions.ConditionDCGMExporterAvailable) {
+		return result
+	}
+
+	result.RequeueAfter = 5 * time.Minute
+	return result
 }
 
 // requeueForCollectorReadiness covers configurations without another periodic
