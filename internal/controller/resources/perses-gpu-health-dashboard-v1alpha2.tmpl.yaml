@@ -9,7 +9,7 @@ spec:
   config:
     display:
       name: "RHOAI GPU Health"
-      description: "NVIDIA DCGM device health for the cluster. Every query reads the accelerator recording rules through the cluster-scoped Prometheus datasource (OpenShift administrator lane), so the panels describe node-level GPU health. Per-workload attribution needs the DCGM pod-level join and is not available yet."
+      description: "NVIDIA DCGM device health for the cluster. Every query reads the accelerator recording rules through the cluster-wide Data Science Prometheus datasource, because those series carry no namespace label and the namespace-scoped datasource cannot serve them. The panels describe node-level GPU health. Per-workload attribution needs the DCGM pod-level join and is not available yet."
     duration: "1h"
     layouts:
       - kind: Grid
@@ -109,7 +109,7 @@ spec:
                   spec:
                     datasource:
                       kind: PrometheusDatasource
-                      name: cluster-prometheus-datasource
+                      name: data-science-cluster-prometheus-datasource
                     query: count(count by (Hostname, gpu) (accelerator_gpu_utilization))
                     seriesNameFormat: Reporting
       gpusAdvertised:
@@ -133,7 +133,7 @@ spec:
                   spec:
                     datasource:
                       kind: PrometheusDatasource
-                      name: cluster-prometheus-datasource
+                      name: data-science-cluster-prometheus-datasource
                     query: sum(kube_node_status_capacity{resource="nvidia_com_gpu"})
                     seriesNameFormat: Advertised
       meanUtilization:
@@ -157,7 +157,7 @@ spec:
                   spec:
                     datasource:
                       kind: PrometheusDatasource
-                      name: cluster-prometheus-datasource
+                      name: data-science-cluster-prometheus-datasource
                     query: avg(accelerator_gpu_utilization)
                     seriesNameFormat: Utilization
       hotGpus:
@@ -181,7 +181,7 @@ spec:
                   spec:
                     datasource:
                       kind: PrometheusDatasource
-                      name: cluster-prometheus-datasource
+                      name: data-science-cluster-prometheus-datasource
                     query: count(accelerator_temperature_celsius > 80)
                     seriesNameFormat: Hot
       gpuUtilization:
@@ -214,7 +214,7 @@ spec:
                   spec:
                     datasource:
                       kind: PrometheusDatasource
-                      name: cluster-prometheus-datasource
+                      name: data-science-cluster-prometheus-datasource
                     query: accelerator_gpu_utilization
                     seriesNameFormat: 'GPU {{ "{{" }}gpu{{ "}}" }}'
       gpuFramebuffer:
@@ -247,7 +247,7 @@ spec:
                   spec:
                     datasource:
                       kind: PrometheusDatasource
-                      name: cluster-prometheus-datasource
+                      name: data-science-cluster-prometheus-datasource
                     query: accelerator_memory_used_bytes
                     seriesNameFormat: 'GPU {{ "{{" }}gpu{{ "}}" }}'
       gpuTemperature:
@@ -280,7 +280,7 @@ spec:
                   spec:
                     datasource:
                       kind: PrometheusDatasource
-                      name: cluster-prometheus-datasource
+                      name: data-science-cluster-prometheus-datasource
                     query: accelerator_temperature_celsius
                     seriesNameFormat: 'GPU {{ "{{" }}gpu{{ "}}" }}'
             - kind: TimeSeriesQuery
@@ -290,7 +290,7 @@ spec:
                   spec:
                     datasource:
                       kind: PrometheusDatasource
-                      name: cluster-prometheus-datasource
+                      name: data-science-cluster-prometheus-datasource
                     query: vector(83)
                     seriesNameFormat: Throttle threshold
       gpuPower:
@@ -323,7 +323,7 @@ spec:
                   spec:
                     datasource:
                       kind: PrometheusDatasource
-                      name: cluster-prometheus-datasource
+                      name: data-science-cluster-prometheus-datasource
                     query: accelerator_power_usage_watts
                     seriesNameFormat: 'GPU {{ "{{" }}gpu{{ "}}" }}'
       gpuByProject:
@@ -357,6 +357,6 @@ spec:
                   spec:
                     datasource:
                       kind: PrometheusDatasource
-                      name: cluster-prometheus-datasource
+                      name: data-science-cluster-prometheus-datasource
                     query: sum by (exported_namespace) (accelerator_gpu_utilization{exported_namespace!="nvidia-gpu-operator"})
                     seriesNameFormat: '{{ "{{" }}exported_namespace{{ "}}" }}'

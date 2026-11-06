@@ -81,6 +81,7 @@ const (
 	PersesTempoDashboardV1Alpha1Template             = "resources/perses-tempo-dashboard-v1alpha1.tmpl.yaml"
 	PersesTempoDashboardV1Alpha2Template             = "resources/perses-tempo-dashboard-v1alpha2.tmpl.yaml"
 	PersesDatasourcePrometheusTemplate               = "resources/perses-datasource-prometheus.tmpl.yaml"
+	PersesDatasourceDataScienceClusterTemplate       = "resources/perses-datasource-data-science-cluster.tmpl.yaml"
 	PersesDatasourceClusterPrometheusTemplate        = "resources/perses-datasource-cluster-prometheus.tmpl.yaml"
 	PersesDatasourceClusterPrometheusTenancyTemplate = "resources/perses-datasource-cluster-prometheus-tenancy.tmpl.yaml"
 	PersesGPUHealthDashboardV1Alpha1Template         = "resources/perses-gpu-health-dashboard-v1alpha1.tmpl.yaml"
@@ -592,6 +593,7 @@ func deployPersesPrometheusIntegration(
 	*sources = append(*sources,
 		src(PersesDatasourceClusterPrometheusTemplate),
 		src(PersesDatasourceClusterPrometheusTenancyTemplate),
+		src(PersesDatasourceDataScienceClusterTemplate),
 		src(PersesDatasourcePrometheusTemplate),
 	)
 	return nil

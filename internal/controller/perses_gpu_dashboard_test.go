@@ -19,7 +19,10 @@ import (
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 )
 
-const clusterPrometheusDatasourceName = "cluster-prometheus-datasource"
+// The GPU panels read accelerator_* through the cluster-wide Data Science lane:
+// those series carry no namespace label, so the scoped datasource cannot serve
+// them, and OpenShift Thanos never sees the Data Science recording rules.
+const clusterPrometheusDatasourceName = "data-science-cluster-prometheus-datasource"
 
 // noMatchForPerses models a cluster whose API server does not serve the Perses
 // group at all, the shape hasCRD treats as "CRD absent" rather than an error.
