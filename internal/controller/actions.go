@@ -125,6 +125,7 @@ const (
 	ClusterLogForwarderNetworkPolicyName = "data-science-cluster-log-forwarder-allow"
 	conditionTypeReady                   = "Ready"
 	conditionStatusTrue                  = "True"
+	openTelemetryCollectorName           = "data-science-collector"
 )
 
 //go:embed resources monitoring
@@ -301,7 +302,17 @@ func deployOpenTelemetryCollector(
 		return nil
 	}
 
-	cm.MarkTrue(conditions.ConditionOpenTelemetryCollectorAvailable)
+	collectorReady, err := isOpenTelemetryCollectorReady(ctx, c, monitoringNamespace(monitoring))
+	if err != nil {
+		return fmt.Errorf("checking OpenTelemetryCollector readiness: %w", err)
+	}
+	if !collectorReady {
+		cm.MarkFalse(conditions.ConditionOpenTelemetryCollectorAvailable,
+			"OpenTelemetryCollectorNotReadyReason",
+			"OpenTelemetryCollector has not been admitted and reported Ready yet")
+	} else {
+		cm.MarkTrue(conditions.ConditionOpenTelemetryCollectorAvailable)
+	}
 
 	*sources = append(*sources,
 		src(CollectorRBACTemplate),
@@ -332,79 +343,24 @@ func deployOpenTelemetryCollector(
 	return nil
 }
 
-const (
-	// gpuOperatorPackageName is the OperatorHub package that installs the DCGM
-	// exporter the accelerator scrape discovers. It is deliberately not a
-	// required dependency: RHOAI does not install or manage it.
-	gpuOperatorPackageName = "gpu-operator-certified"
-	dcgmExporterNamespace  = "nvidia-gpu-operator"
-	dcgmExporterService    = "nvidia-dcgm-exporter"
-)
-
-// deployDCGMExporterDependency reports whether the DCGM exporter the
-// accelerator scrape depends on is present. Nothing is deployed here: the
-// collector template gates its own scrape job, and the condition exists so an
-// operator can tell "no GPU data" from "GPUs are not part of this cluster".
-//
-// Every failure verdict uses Info severity. The GPU Operator is optional, so a
-// missing exporter must never degrade a cluster that simply has no GPUs; the
-// condition participates in the Ready aggregation only when it is True.
-func deployDCGMExporterDependency(
-	ctx context.Context,
-	c client.Client,
-	monitoring *v1alpha1.Monitoring,
-	cm *conditions.ConditionsManager,
-	_ *[]rendertemplate.TemplateSource,
-) error {
-	if monitoring.Spec.Metrics == nil {
-		cm.MarkNotConfigured(conditions.ConditionDCGMExporterAvailable,
-			conditions.MetricsNotConfiguredReason, conditions.MetricsNotConfiguredMessage)
-		return nil
-	}
-
-	// builtinDCGMScrapeEnabled is the documented opt-out: an administrator who
-	// supplies a ServiceMonitor or PodMonitor owns collection, so the platform
-	// has no exporter verdict to give.
-	if !builtinDCGMScrapeEnabled(monitoring.Spec.Metrics) {
-		cm.MarkNotConfigured(conditions.ConditionDCGMExporterAvailable,
-			conditions.DCGMScrapeDisabledReason, conditions.DCGMScrapeDisabledMessage)
-		return nil
-	}
-
-	// A cluster where OLM itself is absent cannot answer the question. That is
-	// "not installed", not a detection failure.
-	if _, err := olm.OperatorExists(ctx, c, gpuOperatorPackageName); err != nil {
-		switch {
-		case errors.Is(err, olm.ErrOperatorNotInstalled), meta.IsNoMatchError(err):
-			cm.MarkWarning(conditions.ConditionDCGMExporterAvailable,
-				conditions.MissingOperatorReason, conditions.GPUOperatorMissingMessage)
-			return nil
-		default:
-			cm.MarkUnknown(conditions.ConditionDCGMExporterAvailable,
-				conditions.DCGMExporterCheckFailedReason,
-				fmt.Sprintf("Cannot determine whether the NVIDIA GPU Operator is installed: %v", err))
-			return fmt.Errorf("checking NVIDIA GPU Operator: %w", err)
+// isOpenTelemetryCollectorReady deliberately checks the collector instance, not
+// just the CRD. CRD discovery only proves that the OpenTelemetry Operator is
+// installed; it does not prove that the collector was admitted and reconciled.
+// The OpenTelemetry Operator's Ready condition represents that admission and
+// reconciliation state; pod replica health is reported separately by the
+// collector status. In particular, the validating webhook can reject a
+// collector before it is persisted when the operator cannot use cert-manager.
+func isOpenTelemetryCollectorReady(ctx context.Context, c client.Client, namespace string) (bool, error) {
+	collector := &unstructured.Unstructured{}
+	collector.SetGroupVersionKind(gvk.OpenTelemetryCollector)
+	if err := c.Get(ctx, types.NamespacedName{Name: openTelemetryCollectorName, Namespace: namespace}, collector); err != nil {
+		if k8serr.IsNotFound(err) {
+			return false, nil
 		}
+		return false, err
 	}
 
-	// The operator can be installed with the exporter disabled, which reads as
-	// healthy at the operator level and leaves the scrape with no target.
-	svc := &corev1.Service{}
-	err := c.Get(ctx, types.NamespacedName{Namespace: dcgmExporterNamespace, Name: dcgmExporterService}, svc)
-	switch {
-	case k8serr.IsNotFound(err):
-		cm.MarkWarning(conditions.ConditionDCGMExporterAvailable,
-			conditions.DCGMExporterServiceNotFoundReason,
-			fmt.Sprintf(conditions.DCGMExporterServiceMissingMessage, dcgmExporterNamespace, dcgmExporterService))
-	case err != nil:
-		cm.MarkUnknown(conditions.ConditionDCGMExporterAvailable,
-			conditions.DCGMExporterCheckFailedReason,
-			fmt.Sprintf("Cannot determine whether the DCGM exporter Service exists: %v", err))
-		return fmt.Errorf("checking DCGM exporter Service: %w", err)
-	default:
-		cm.MarkTrue(conditions.ConditionDCGMExporterAvailable)
-	}
-	return nil
+	return hasCurrentReadyCondition(collector)
 }
 
 // deployOperatorMonitoring deploys PrometheusRules for operator self-monitoring
@@ -628,10 +584,15 @@ func deployPersesPrometheusIntegration(
 	cm.MarkTrue(conditions.ConditionPersesPrometheusDataSourceAvailable)
 	// Feature: default DS datasource → namespace-enforcing Thanos proxy :8443.
 	// Guardrail: cluster :9091 / tenancy :9092 use caller token (no shared SA).
+	// Upgrade dual-default safety: Perses must never see two default:true Prometheus
+	// datasources in one apply. deploy.WithApplyOrder() re-sorts by Kind/GVK/namespace/name
+	// (not this append order); the CR names are chosen so lexicographic order keeps
+	// cluster-prometheus-* (default:false) before data-science-prometheus-datasource
+	// (default:true). See TestPersesDatasourceApplyOrder_SortKeepsNonDefaultFirst.
 	*sources = append(*sources,
-		src(PersesDatasourcePrometheusTemplate),
 		src(PersesDatasourceClusterPrometheusTemplate),
 		src(PersesDatasourceClusterPrometheusTenancyTemplate),
+		src(PersesDatasourcePrometheusTemplate),
 	)
 	return nil
 }
@@ -1590,6 +1551,45 @@ func hasReadyCondition(obj *unstructured.Unstructured) (bool, error) {
 		if (condType == conditionTypeReady || strings.HasSuffix(condType, "/"+conditionTypeReady)) && condStatus == conditionStatusTrue {
 			return true, nil
 		}
+	}
+
+	return false, nil
+}
+
+// hasCurrentReadyCondition is the stricter form used for operands whose
+// readiness must describe the current spec. A stale Ready=True condition from
+// an older generation is not evidence that the current collector was admitted
+// or reconciled.
+func hasCurrentReadyCondition(obj *unstructured.Unstructured) (bool, error) {
+	conds, found, err := unstructured.NestedSlice(obj.Object, "status", "conditions")
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
+	}
+
+	for _, cond := range conds {
+		condMap, ok := cond.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		condType, _, _ := unstructured.NestedString(condMap, "type")
+		condStatus, _, _ := unstructured.NestedString(condMap, "status")
+		if (condType != conditionTypeReady && !strings.HasSuffix(condType, "/"+conditionTypeReady)) ||
+			condStatus != conditionStatusTrue {
+			continue
+		}
+
+		observedGeneration, found, err := unstructured.NestedInt64(condMap, "observedGeneration")
+		if err != nil {
+			return false, err
+		}
+		if !found || observedGeneration != obj.GetGeneration() {
+			return false, nil
+		}
+		return true, nil
 	}
 
 	return false, nil

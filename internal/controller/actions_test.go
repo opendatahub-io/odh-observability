@@ -67,6 +67,73 @@ func registerCRDs(s *runtime.Scheme, gvks ...schema.GroupVersionKind) {
 	}
 }
 
+func openTelemetryCollectorWithReadyStatus(namespace string, ready bool) *unstructured.Unstructured {
+	collector := &unstructured.Unstructured{}
+	collector.SetGroupVersionKind(gvk.OpenTelemetryCollector)
+	collector.SetName(openTelemetryCollectorName)
+	collector.SetNamespace(namespace)
+	collector.SetGeneration(1)
+	status := "False"
+	if ready {
+		status = conditionStatusTrue
+	}
+	collector.Object["status"] = map[string]any{
+		"conditions": []any{
+			map[string]any{
+				"type":               conditionTypeReady,
+				"status":             status,
+				"observedGeneration": int64(1),
+			},
+		},
+	}
+	return collector
+}
+
+func TestHasCurrentReadyConditionRequiresCurrentGeneration(t *testing.T) {
+	tests := []struct {
+		name               string
+		generation         int64
+		observedGeneration any
+		wantReady          bool
+	}{
+		{name: "current", generation: 1, observedGeneration: int64(1), wantReady: true},
+		{name: "stale", generation: 2, observedGeneration: int64(1), wantReady: false},
+		{name: "missing observed generation", generation: 1, wantReady: false},
+		{name: "future", generation: 1, observedGeneration: int64(2), wantReady: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			collector := openTelemetryCollectorWithReadyStatus("test-ns", true)
+			collector.SetGeneration(tt.generation)
+			conditions, found, err := unstructured.NestedSlice(collector.Object, "status", "conditions")
+			if err != nil || !found || len(conditions) != 1 {
+				t.Fatalf("failed to get test condition: found=%v error=%v", found, err)
+			}
+			condition, ok := conditions[0].(map[string]any)
+			if !ok {
+				t.Fatalf("test condition has unexpected type %T", conditions[0])
+			}
+			if tt.observedGeneration == nil {
+				delete(condition, "observedGeneration")
+			} else {
+				condition["observedGeneration"] = tt.observedGeneration
+			}
+			if err := unstructured.SetNestedSlice(collector.Object, conditions, "status", "conditions"); err != nil {
+				t.Fatalf("failed to update test condition: %v", err)
+			}
+
+			got, err := hasCurrentReadyCondition(collector)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.wantReady {
+				t.Fatalf("hasCurrentReadyCondition() = %v, want %v", got, tt.wantReady)
+			}
+		})
+	}
+}
+
 func kubernetesAPIServerEndpointSlice() *discoveryv1.EndpointSlice {
 	ready := true
 	return &discoveryv1.EndpointSlice{
@@ -355,7 +422,8 @@ func TestDeployOpenTelemetryCollector_MetricsOnly_CRDPresent(t *testing.T) {
 	var sources []rendertemplate.TemplateSource
 
 	err := deployOpenTelemetryCollector(context.Background(),
-		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+		fake.NewClientBuilder().WithScheme(s).
+			WithObjects(openTelemetryCollectorWithReadyStatus(m.Spec.Namespace, true)).Build(), m, cm, &sources)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -371,6 +439,73 @@ func TestDeployOpenTelemetryCollector_MetricsOnly_CRDPresent(t *testing.T) {
 	}
 }
 
+func TestDeployOpenTelemetryCollector_MetricsOnly_CRDPresentButCollectorNotReady(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(openTelemetryCollectorWithReadyStatus(m.Spec.Namespace, false)).Build()
+
+	if err := deployOpenTelemetryCollector(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	collectorCondition := findCondition(m, conditions.ConditionOpenTelemetryCollectorAvailable)
+	if collectorCondition == nil || collectorCondition.Status != metav1.ConditionFalse ||
+		collectorCondition.Reason != "OpenTelemetryCollectorNotReadyReason" {
+		t.Fatalf("expected OpenTelemetryCollectorAvailable False/NotReady, got %v", collectorCondition)
+	}
+}
+
+func TestDeployOpenTelemetryCollector_MetricsOnly_StaleReadyCondition(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	collector := openTelemetryCollectorWithReadyStatus(m.Spec.Namespace, true)
+	collector.SetGeneration(2)
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(collector).Build()
+
+	if err := deployOpenTelemetryCollector(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	collectorCondition := findCondition(m, conditions.ConditionOpenTelemetryCollectorAvailable)
+	if collectorCondition == nil || collectorCondition.Status != metav1.ConditionFalse {
+		t.Fatalf("expected stale Ready condition to be unavailable, got %v", collectorCondition)
+	}
+}
+
+func TestDeployOpenTelemetryCollector_MetricsOnly_CRDPresentButCollectorMissing(t *testing.T) {
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.OpenTelemetryCollector)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	cli := fake.NewClientBuilder().WithScheme(s).Build()
+
+	if err := deployOpenTelemetryCollector(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	collectorCondition := findCondition(m, conditions.ConditionOpenTelemetryCollectorAvailable)
+	if collectorCondition == nil || collectorCondition.Status != metav1.ConditionFalse {
+		t.Fatalf("expected OpenTelemetryCollectorAvailable False, got %v", collectorCondition)
+	}
+}
+
 func TestDeployOpenTelemetryCollector_MetricsOnly_WithoutCertManagerCRD(t *testing.T) {
 	s := newActionsTestScheme(t)
 	registerCRDs(s, gvk.OpenTelemetryCollector)
@@ -381,7 +516,8 @@ func TestDeployOpenTelemetryCollector_MetricsOnly_WithoutCertManagerCRD(t *testi
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
 
-	cli := fake.NewClientBuilder().WithScheme(s).Build()
+	cli := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(openTelemetryCollectorWithReadyStatus(m.Spec.Namespace, true)).Build()
 	err := deployOpenTelemetryCollector(context.Background(), cli, m, cm, &sources)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -409,7 +545,8 @@ func TestDeployOpenTelemetryCollector_TracesOnly_CRDPresent(t *testing.T) {
 	var sources []rendertemplate.TemplateSource
 
 	err := deployOpenTelemetryCollector(context.Background(),
-		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+		fake.NewClientBuilder().WithScheme(s).
+			WithObjects(openTelemetryCollectorWithReadyStatus(m.Spec.Namespace, true)).Build(), m, cm, &sources)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -435,7 +572,8 @@ func TestDeployOpenTelemetryCollector_ExportersOnlyMetrics_NoServiceMonitors(t *
 	var sources []rendertemplate.TemplateSource
 
 	err := deployOpenTelemetryCollector(context.Background(),
-		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+		fake.NewClientBuilder().WithScheme(s).
+			WithObjects(openTelemetryCollectorWithReadyStatus(m.Spec.Namespace, true)).Build(), m, cm, &sources)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -472,7 +610,8 @@ func TestDeployOpenTelemetryCollector_MetricsAndTraces_CRDPresent(t *testing.T) 
 	var sources []rendertemplate.TemplateSource
 
 	err := deployOpenTelemetryCollector(context.Background(),
-		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+		fake.NewClientBuilder().WithScheme(s).
+			WithObjects(openTelemetryCollectorWithReadyStatus(m.Spec.Namespace, true)).Build(), m, cm, &sources)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -480,6 +619,11 @@ func TestDeployOpenTelemetryCollector_MetricsAndTraces_CRDPresent(t *testing.T) 
 	// 5 base + ServiceMonitors + prometheus service + 2 traces RBAC (MLflow + Tempo)
 	if len(sources) != 9 {
 		t.Errorf("expected 9 sources for metrics+traces+OTel, got %d", len(sources))
+	}
+
+	otcC := findCondition(m, conditions.ConditionOpenTelemetryCollectorAvailable)
+	if otcC == nil || otcC.Status != metav1.ConditionTrue {
+		t.Error("OTelCollectorAvailable should be True")
 	}
 }
 
@@ -827,11 +971,15 @@ func TestDeployPersesPrometheusIntegration_CRDPresent(t *testing.T) {
 	if len(sources) != 3 {
 		t.Errorf("expected 3 sources (DS proxy + cluster caller-token + tenancy), got %d", len(sources))
 	}
-	assertTemplatePaths(t, sources, []string{
-		PersesDatasourcePrometheusTemplate,
+	// Cluster/tenancy (default:false) must be applied before DS (default:true)
+	// so Perses never rejects a dual-default PrometheusDatasource on upgrade.
+	wantPersesDatasources := []string{
 		PersesDatasourceClusterPrometheusTemplate,
 		PersesDatasourceClusterPrometheusTenancyTemplate,
-	})
+		PersesDatasourcePrometheusTemplate,
+	}
+	assertTemplatePaths(t, sources, wantPersesDatasources)
+	assertTemplateOrder(t, sources, wantPersesDatasources)
 
 	c := findCondition(m, conditions.ConditionPersesPrometheusDataSourceAvailable)
 	if c == nil || c.Status != metav1.ConditionTrue {
@@ -3740,16 +3888,43 @@ func assertUsageLogsNetworkPolicies(t *testing.T, peers usageLogsNetworkPolicyPe
 		got["app.kubernetes.io/instance"] != peers.lokiStackName {
 		t.Errorf("LokiStack NetworkPolicy must select the %q gateway pods, got %v", peers.lokiStackName, got)
 	}
-	if len(lokiStack.Spec.Ingress) != 1 {
-		t.Fatalf("expected a single ingress rule on the LokiStack NetworkPolicy, got %d", len(lokiStack.Spec.Ingress))
+	// Four peers reach the gateway: the collector on the write path, the Perses
+	// server whose Loki datasource proxies through it on the read path, the
+	// usage tenancy proxy, and the OpenShift console backend behind the
+	// console's usage logs view.
+	if len(lokiStack.Spec.Ingress) != 4 {
+		t.Fatalf("expected the collector, Perses, tenancy proxy and console ingress rules on the LokiStack NetworkPolicy, got %d", len(lokiStack.Spec.Ingress))
 	}
-	rule := lokiStack.Spec.Ingress[0]
-	if !networkPolicyAllowsIngressPort(rule, 8080) {
-		t.Errorf("LokiStack NetworkPolicy must admit the gateway port 8080, got %#v", rule.Ports)
+	admitted := map[string]bool{}
+	for _, rule := range lokiStack.Spec.Ingress {
+		if !networkPolicyAllowsIngressPort(rule, 8080) {
+			t.Errorf("LokiStack NetworkPolicy must admit the gateway port 8080, got %#v", rule.Ports)
+		}
+		if len(rule.From) != 1 || rule.From[0].PodSelector == nil {
+			t.Fatalf("every ingress rule must declare exactly one pod peer, got %#v", rule.From)
+		}
+		peer := rule.From[0]
+		if peer.NamespaceSelector == nil {
+			name := peer.PodSelector.MatchLabels["app.kubernetes.io/name"]
+			if name == "" {
+				name = peer.PodSelector.MatchLabels["app"]
+			}
+			admitted[name] = true
+			continue
+		}
+		if peer.PodSelector.MatchLabels["app"] != "console" ||
+			peer.PodSelector.MatchLabels["component"] != "ui" {
+			t.Errorf("console peer must select the console backend pods, got %#v", peer.PodSelector)
+		}
+		if !namespaceSelectorAdmits(peer.NamespaceSelector, "openshift-console") {
+			t.Errorf("console peer must admit the openshift-console namespace, got %#v", peer.NamespaceSelector)
+		}
+		admitted["console"] = true
 	}
-	if len(rule.From) != 1 || rule.From[0].PodSelector == nil ||
-		rule.From[0].PodSelector.MatchLabels["app.kubernetes.io/name"] != peers.collectorPodName {
-		t.Errorf("only the usage logs collector may reach the gateway, got %#v", rule.From)
+	for _, peer := range []string{peers.collectorPodName, "data-science-perses", "usage-tenancy-proxy", "console"} {
+		if !admitted[peer] {
+			t.Errorf("LokiStack NetworkPolicy does not admit its %s peer, got %#v", peer, admitted)
+		}
 	}
 }
 
@@ -4065,6 +4240,12 @@ func networkPolicyAllowsEgress(policy *networkingv1.NetworkPolicy, cidr string, 
 	return false
 }
 
+// namespaceSelectorAdmits reports whether the selector matches the named
+// namespace through the kubernetes.io/metadata.name label.
+func namespaceSelectorAdmits(selector *metav1.LabelSelector, namespace string) bool {
+	return selector != nil && selector.MatchLabels["kubernetes.io/metadata.name"] == namespace
+}
+
 func networkPolicyAllowsPort(rule networkingv1.NetworkPolicyEgressRule, port int32) bool {
 	for _, policyPort := range rule.Ports {
 		protocol := corev1.ProtocolTCP
@@ -4233,6 +4414,7 @@ func TestDeployUsageLogsCollector_RemoteExporters(t *testing.T) {
 	}
 	if collector == nil {
 		t.Fatal("no OpenTelemetryCollector rendered")
+		return
 	}
 
 	exporters, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "exporters")
@@ -4380,6 +4562,7 @@ func TestDeployUsageLogsCollector_ForwardingOnly(t *testing.T) {
 	}
 	if collector == nil {
 		t.Fatal("no OpenTelemetryCollector rendered")
+		return
 	}
 
 	exporters, _, _ := unstructured.NestedMap(collector.Object, "spec", "config", "exporters")
@@ -4442,6 +4625,7 @@ func TestDeployUsageLogsCollector_CredentialWithoutExporters(t *testing.T) {
 	}
 	if collector == nil {
 		t.Fatal("no OpenTelemetryCollector rendered")
+		return
 	}
 
 	if vols, found, _ := unstructured.NestedSlice(collector.Object, "spec", "volumes"); found {

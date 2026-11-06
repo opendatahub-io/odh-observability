@@ -534,7 +534,20 @@ func (tc *TestContext) EnsureDeploymentReady(opts ...ResourceOpts) {
 			replicas = 1
 		}
 
-		return readyReplicas >= replicas, nil
+		observedGeneration, _, _ := unstructured.NestedInt64(u.Object, "status", "observedGeneration")
+		statusReplicas, _, _ := unstructured.NestedInt64(u.Object, "status", "replicas")
+		updatedReplicas, _, _ := unstructured.NestedInt64(u.Object, "status", "updatedReplicas")
+		availableReplicas, _, _ := unstructured.NestedInt64(u.Object, "status", "availableReplicas")
+
+		// Ready replicas alone can include pods from the old ReplicaSet while a
+		// rolling update is still in progress. Require the current generation
+		// to be observed and the rollout to have converged before callers use a
+		// pod as a stable fixture.
+		return observedGeneration >= u.GetGeneration() &&
+			statusReplicas == replicas &&
+			updatedReplicas == replicas &&
+			availableReplicas >= replicas &&
+			readyReplicas >= replicas, nil
 	})
 
 	ro.applyEventuallyTimeouts(eventually)

@@ -357,6 +357,76 @@ func TestValidateMonitoringNamespace(t *testing.T) {
 	})
 }
 
+func TestRequeueForCollectorReadiness(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*v1alpha1.Monitoring)
+		want      time.Duration
+	}{
+		{
+			name: "exporters-only metrics wait for collector",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Metrics = &v1alpha1.Metrics{}
+			},
+			want: 30 * time.Second,
+		},
+		{
+			name: "traces-only waits for collector",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Traces = &v1alpha1.Traces{}
+			},
+			want: 30 * time.Second,
+		},
+		{
+			name: "missing collector condition waits for collector",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Traces = &v1alpha1.Traces{}
+				m.Status.Conditions = nil
+			},
+			want: 30 * time.Second,
+		},
+		{
+			name: "built-in metrics already has periodic refresh",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+			},
+			want: 0,
+		},
+		{
+			name: "logs already has periodic refresh",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Metrics = &v1alpha1.Metrics{}
+				m.Spec.Logs = &v1alpha1.Logs{}
+			},
+			want: 0,
+		},
+		{
+			name: "ready collector does not requeue",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Traces = &v1alpha1.Traces{}
+				m.Status.Conditions[0].Status = metav1.ConditionTrue
+			},
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			m.Status.Conditions = []platformcommon.Condition{{
+				Type:   conditions.ConditionOpenTelemetryCollectorAvailable,
+				Status: metav1.ConditionFalse,
+			}}
+			tt.configure(m)
+
+			result := requeueForCollectorReadiness(reconcile.Result{}, m, nil)
+			if result.RequeueAfter != tt.want {
+				t.Fatalf("RequeueAfter = %s, want %s", result.RequeueAfter, tt.want)
+			}
+		})
+	}
+}
+
 // TestReconcile_Removed: Monitoring with Removed state should short-circuit, set
 // Ready=False and ProvisioningSucceeded=False, and not return an error.
 func TestReconcile_Removed(t *testing.T) {
@@ -546,6 +616,7 @@ func TestReconcile_COOVersionCompatibilityCondition(t *testing.T) {
 			}
 			if compatibility == nil {
 				t.Fatal("COOVersionCompatible condition was not reported")
+				return
 			}
 			if compatibility.Status != tt.wantStatus {
 				t.Errorf("COOVersionCompatible status: want %q, got %q", tt.wantStatus, compatibility.Status)
@@ -585,6 +656,8 @@ func TestReconcile_COOVersionCompatibilityCondition(t *testing.T) {
 }
 
 func TestReconcile_COOVersionCompatibilityUsesInstalledCSV(t *testing.T) {
+	t.Parallel()
+
 	s := newTestScheme(t)
 	registerOperatorConditionTypes(s)
 	registerClusterServiceVersionTypes(s)
@@ -593,6 +666,9 @@ func TestReconcile_COOVersionCompatibilityUsesInstalledCSV(t *testing.T) {
 	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
 	oldCSV := newClusterServiceVersion("cluster-observability-operator.v1.4.0", "Succeeded")
 	currentCSV := newClusterServiceVersion("cluster-observability-operator.v1.5.2", "Succeeded")
+	copiedCSV := newClusterServiceVersion("cluster-observability-operator.v1.5.2", "Succeeded")
+	copiedCSV.SetNamespace("default")
+	copiedCSV.SetLabels(map[string]string{"olm.copiedFrom": "openshift-cluster-observability-operator"})
 	_ = unstructured.SetNestedField(currentCSV.Object, oldCSV.GetName(), "spec", "replaces")
 
 	// OLM can leave an older OperatorCondition behind while the current CSV
@@ -602,6 +678,7 @@ func TestReconcile_COOVersionCompatibilityUsesInstalledCSV(t *testing.T) {
 		newOperatorCondition("cluster-observability-operator.v1.4.0"),
 		oldCSV,
 		currentCSV,
+		copiedCSV,
 	).WithStatusSubresource(m).Build()
 	r := newTestReconciler(t, s, cli)
 

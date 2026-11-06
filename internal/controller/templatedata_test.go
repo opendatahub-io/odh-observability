@@ -45,12 +45,13 @@ func TestAddTLSDataResolvesEffectiveProxyProfile(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name       string
-		apiServer  *configv1.APIServer
-		wantMin    string
-		wantCipher string
-		wantCurves string
-		wantErr    string
+		name               string
+		apiServer          *configv1.APIServer
+		wantMin            string
+		wantCipher         string
+		wantCurves         string
+		wantErr            string
+		wantInvalidProfile bool
 	}{
 		{
 			name:       "missing APIServer uses Intermediate defaults",
@@ -181,6 +182,27 @@ func TestAddTLSDataResolvesEffectiveProxyProfile(t *testing.T) {
 			},
 			wantErr: "TLS profile contains no cipher suites",
 		},
+		{
+			name: "strict TLS 1.2 AES-256-only ciphers cannot serve HTTP/2",
+			apiServer: &configv1.APIServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+				Spec: configv1.APIServerSpec{
+					TLSAdherence: configv1.TLSAdherencePolicyStrictAllComponents,
+					TLSSecurityProfile: &configv1.TLSSecurityProfile{
+						Type: configv1.TLSProfileCustomType,
+						Custom: &configv1.CustomTLSProfile{
+							TLSProfileSpec: configv1.TLSProfileSpec{
+								MinTLSVersion: configv1.VersionTLS12,
+								Ciphers:       []string{"ECDHE-RSA-AES256-GCM-SHA384"},
+								Groups:        []configv1.TLSGroup{configv1.TLSGroupX25519},
+							},
+						},
+					},
+				},
+			},
+			wantErr:            "monitoring proxies cannot serve HTTP/2",
+			wantInvalidProfile: true,
+		},
 	}
 
 	for _, test := range tests {
@@ -198,6 +220,9 @@ func TestAddTLSDataResolvesEffectiveProxyProfile(t *testing.T) {
 			err := addTLSData(context.Background(), builder.Build(), templateData)
 			if test.wantErr != "" {
 				require.ErrorContains(t, err, test.wantErr)
+				if test.wantInvalidProfile {
+					require.ErrorIs(t, err, errInvalidProxyTLSProfile)
+				}
 				return
 			}
 			require.NoError(t, err)
@@ -208,6 +233,53 @@ func TestAddTLSDataResolvesEffectiveProxyProfile(t *testing.T) {
 				assert.Contains(t, templateData["TLSCipherSuites"], test.wantCipher)
 			}
 			assert.Equal(t, test.wantCurves, templateData["TLSCurvePreferences"])
+		})
+	}
+}
+
+func TestValidateProxyHTTP2CipherSuites(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		minVersion  string
+		cipherSuite string
+		wantErr     bool
+	}{
+		{
+			name:        "TLS 1.2 AES-256-only ciphers are rejected",
+			minVersion:  proxyTLSVersion12,
+			cipherSuite: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+			wantErr:     true,
+		},
+		{
+			name:        "TLS 1.2 AES-128-GCM is accepted",
+			minVersion:  proxyTLSVersion12,
+			cipherSuite: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		},
+		{
+			name:       "empty cipher list is accepted",
+			minVersion: proxyTLSVersion12,
+		},
+		{
+			name:        "TLS 1.3 is accepted",
+			minVersion:  proxyTLSVersion13,
+			cipherSuite: "TLS_AES_256_GCM_SHA384",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validateProxyHTTP2CipherSuites(test.minVersion, test.cipherSuite)
+			if test.wantErr {
+				require.ErrorIs(t, err, errInvalidProxyTLSProfile)
+				require.ErrorContains(t, err, "monitoring proxies cannot serve HTTP/2")
+				require.ErrorContains(t, err, test.cipherSuite)
+				return
+			}
+			require.NoError(t, err)
 		})
 	}
 }

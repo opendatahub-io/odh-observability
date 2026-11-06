@@ -121,14 +121,13 @@ Action functions run sequentially in a fixed order. Each function checks whether
 | 3 | `deployMonitoringAdmissionPolicies` | Always | None | None | monitoring-admission-policies |
 | 4 | `deployMonitoringStackWithQuerierAndRestrictions` | `spec.metrics` | `MonitoringStack`, `ThanosQuerier` | `MonitoringStackAvailable`, `ThanosQuerierAvailable` | 14 templates (see inventory) |
 | 5 | `deployTracingStack` | `spec.traces` | `TempoMonolithic`/`TempoStack`, `Instrumentation` | `TempoAvailable`, `InstrumentationAvailable` | Tempo template + instrumentation |
-| 6 | `deployOpenTelemetryCollector` | `spec.metrics` or `spec.traces` | `OpenTelemetryCollector` | `OpenTelemetryCollectorAvailable` | collector, RBAC, ServiceMonitors, Prometheus service |
-| 7 | `deployDCGMExporterDependency` | `spec.metrics` with the built-in DCGM scrape enabled | `OperatorCondition`/`ClusterExtension` (GPU Operator), `Service` | `DCGMExporterAvailable` | None -- condition-only check; the collector gates its own scrape job |
-| 8 | `deployAlerting` | `spec.alerting` | `PrometheusRule` | `AlertingAvailable` | None -- condition-only check |
-| 9 | `deployNodeMetricsEndpoint` | `spec.metrics` | None | `NodeMetricsEndpointAvailable` | prometheus-cluster-proxy |
-| 10 | `deployKorrel8r` | `spec.metrics` or `spec.traces` or `spec.logs` | None | `Korrel8rAvailable` | ConfigMap, Deployment, Service, RBAC, NetworkPolicy |
-| 11 | `deployPerses` | `spec.metrics` or `spec.traces` | `Perses` | `PersesAvailable` | perses, network-policy |
-| 12 | `deployPersesTempoIntegration` | `spec.traces` | `PersesDatasource`, `PersesDashboard` | `PersesTempoDataSourceAvailable` | datasource, CA ConfigMap, dashboard |
-| 13 | `deployPersesPrometheusIntegration` | `spec.metrics` | `PersesDatasource` | `PersesPrometheusDataSourceAvailable` | 2 datasource templates |
+| 6 | `deployOpenTelemetryCollector` | `spec.metrics` or `spec.traces` | `OpenTelemetryCollector` | `OpenTelemetryCollectorAvailable` (current-generation `Ready=True`) | collector, RBAC, ServiceMonitors, Prometheus service |
+| 7 | `deployAlerting` | `spec.alerting` | `PrometheusRule` | `AlertingAvailable` | None -- condition-only check |
+| 8 | `deployNodeMetricsEndpoint` | `spec.metrics` | None | `NodeMetricsEndpointAvailable` | prometheus-cluster-proxy |
+| 9 | `deployKorrel8r` | `spec.metrics` or `spec.traces` or `spec.logs` | None | `Korrel8rAvailable` | ConfigMap, Deployment, Service, RBAC, NetworkPolicy |
+| 10 | `deployPerses` | `spec.metrics` or `spec.traces` | `Perses` | `PersesAvailable` | perses, network-policy |
+| 11 | `deployPersesTempoIntegration` | `spec.traces` | `PersesDatasource`, `PersesDashboard` | `PersesTempoDataSourceAvailable` | datasource, CA ConfigMap, dashboard |
+| 12 | `deployPersesPrometheusIntegration` | `spec.metrics` | `PersesDatasource` | `PersesPrometheusDataSourceAvailable` | 2 datasource templates |
 
 When a feature is not configured, the action calls `MarkNotConfigured` (Info severity) which prevents it from contributing to Degraded status. When a required CRD is missing, `MarkFalse` is used, which does contribute to Degraded.
 
@@ -197,7 +196,7 @@ Perses metrics access model (three lanes — pick by **where the series live**, 
 
 | Lane | Datasource | Backend | Gate | Owns |
 |------|------------|---------|------|------|
-| **DS namespace-scoped** | `data-science-prometheus-datasource` (default) | DS Thanos proxy `:8443` | `namespace=` + caller token + `metrics.k8s.io` SAR | Series in the Data Science MonitoringStack (e.g. `kserve_vllm:*`, DS `accelerator_*` recording rules from OTC/DCGM) |
+| **DS namespace-scoped** | `data-science-prometheus-datasource` (default) | DS Thanos proxy `:8443` | `namespace=` + caller token + `metrics.k8s.io` SAR | Series in the Data Science MonitoringStack (e.g. raw `vllm:*`, DS `accelerator_*` recording rules from OTC/DCGM) |
 | **OCP tenancy** | `cluster-prometheus-tenancy-datasource` | OpenShift Thanos `:9092` | `namespace=` + caller token | Namespaced OpenShift Monitoring series (`node_namespace_pod_container:*`, `kube_*`, OCP accelerator with `exported_namespace` / `exported_pod`) |
 | **OCP admin** | `cluster-prometheus-datasource` | OpenShift Thanos `:9091` | caller RBAC only (e.g. `cluster-monitoring-view`) | Cluster-wide admin views — **not** namespace tenancy |
 
@@ -208,9 +207,9 @@ Perses metrics access model (three lanes — pick by **where the series live**, 
 The [MaaS legacy usage dashboard](https://github.com/opendatahub-io/models-as-a-service/blob/main/deployment/components/observability/observability/dashboards/usage-dashboard.yaml) explicitly uses the DS datasource but has no `namespace` variable. It needs a compatible namespace selection and authorization design before this change can be rolled out; the Observe dashboard companion alone does not update it.
 
 **Metric ownership / dashboard pins (hard rule):** one PromQL query runs against **one** datasource. You cannot join DS Thanos series with OpenShift series in a single query. Observe dashboards (Dashboard repo) must pin explicitly after the DS default flip:
-- **Models:** `kserve_vllm:*` panels → `data-science-prometheus-datasource` (`:8443`). OCP GPU/CPU panels → `cluster-prometheus-tenancy-datasource` (`:9092`).
+- **Models:** raw `vllm:*` panels → `data-science-prometheus-datasource` (`:8443`). OCP GPU/CPU panels → `cluster-prometheus-tenancy-datasource` (`:9092`).
 - **Cluster:** → `cluster-prometheus-datasource` (`:9091`).
-- **Out of scope for RHOAIENG-99814:** rewriting GPU/CPU PromQL that still references `kserve_vllm:*` inside a tenancy query (cross-stack join). That is a separate metric-ownership change.
+- **Datasource boundary:** GPU/CPU PromQL remains on the OpenShift tenancy datasource; raw `vllm:*` is used for model identity and serving metrics. Cross-stack joins must not move either datasource's resource queries into the other lane.
 
 - Upgrade: the reconciler removes legacy Kubernetes SA-token Secrets with these datasource names only when they are owned by the current Monitoring resource and reference the old cluster-proxy service account. Perses operator manages separate Perses API secrets for the datasource TLS configuration.
 - Observe UI / gateway → Perses ingress is owned by Dashboard (`dashboard-perses-access`), not this operator.
@@ -262,7 +261,7 @@ Each action function manages one or more conditions:
 | `ThanosQuerierAvailable` | `deployMonitoringStackWithQuerierAndRestrictions` |
 | `TempoAvailable` | `deployTracingStack` |
 | `InstrumentationAvailable` | `deployTracingStack` |
-| `OpenTelemetryCollectorAvailable` | `deployOpenTelemetryCollector` |
+| `OpenTelemetryCollectorAvailable` | `deployOpenTelemetryCollector` (CR status `Ready=True` with current `observedGeneration`) |
 | `AlertingAvailable` | `deployAlerting` |
 | `PersesAvailable` | `deployPerses` |
 | `PersesTempoDataSourceAvailable` | `deployPersesTempoIntegration` |
@@ -406,7 +405,7 @@ Prometheus (port 9090)
 
 **Query isolation**: prom-label-proxy rewrites PromQL to inject the namespace matcher (`namespace="a"` or `namespace=~"a|b"` for multi-select / Project=All). Project=All must expand to concrete namespaces, not a wildcard. The Thanos proxy omits `--regex-match` to allow repeated `namespace=` values; kube-rbac-proxy checks every URL value. The Prometheus namespace proxy retains `--regex-match` and rejects duplicates.
 
-**Follow-up**: once a verified prom-label-proxy image supports query-only extraction, RHOAIENG-101998 tracks enabling it as an additional safeguard and retaining mixed URL/form and multi-namespace tests.
+**Query-param-only (defense in depth)**: both namespace proxies enable prom-label-proxy `--query-param-only` (v0.16.2+) so a non-empty POST form `namespace` is rejected with HTTP 400 even if it bypassed the method gate. Namespace isolation still depends on URL `namespace=` values that kube-rbac-proxy SAR-checks. Mixed URL/form and multi-namespace behavior is covered by e2e. `RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE` is validated before either proxy Deployment is rendered: digest-pinned refs (including the default) and tags with semver >= v0.16.2 are accepted; older semver tags and floating tags (`:latest`, `:main`, …) are rejected so an incompatible override cannot crash-loop the sidecar.
 
 **TLS profile ownership**: The controller resolves the effective APIServer TLS profile and writes the resulting version, cipher-suite, and curve-preference flags into the PodTemplates of all generated kube-rbac-proxy workloads: the Prometheus namespace proxy, Prometheus cluster proxy, and Thanos Querier proxy. The proxy image does not watch OpenShift TLS resources. `RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE` only selects the image; it does not configure TLS. Under strict adherence, an unrepresentable profile fails reconciliation before any workload is applied. TLS 1.3 omits the cipher-suite restriction because Go does not make TLS 1.3 cipher suites configurable. Curve preferences are emitted as numeric Go CurveIDs, with non-FIPS-approved curves dropped when the cluster install configuration reports FIPS mode. If cluster FIPS status cannot be determined, reconciliation fails before any workload is applied.
 
