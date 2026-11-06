@@ -427,6 +427,105 @@ func TestRequeueForCollectorReadiness(t *testing.T) {
 	}
 }
 
+func TestRequeueForDCGMExporterRefresh(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*v1alpha1.Monitoring)
+		pending   time.Duration
+		err       error
+		want      time.Duration
+	}{
+		{
+			name: "operator installed without the exporter refreshes",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Metrics = &v1alpha1.Metrics{}
+				markDCGMMissingOperator(m)
+			},
+			want: 5 * time.Minute,
+		},
+		{
+			name: "operator removed while the Service is gone refreshes",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Metrics = &v1alpha1.Metrics{}
+				conditions.NewConditionsManager(m, m.Generation).MarkWarning(
+					conditions.ConditionDCGMExporterAvailable, conditions.DCGMExporterServiceNotFoundReason, "gone")
+			},
+			want: 5 * time.Minute,
+		},
+		{
+			name: "metrics not configured is not a verdict to revisit",
+			configure: func(m *v1alpha1.Monitoring) {
+				markDCGMMissingOperator(m)
+			},
+			want: 0,
+		},
+		{
+			name: "scrape opt-out keeps its NotConfigured verdict",
+			configure: func(m *v1alpha1.Monitoring) {
+				disabled := false
+				m.Spec.Metrics = &v1alpha1.Metrics{BuiltinDCGMScrapeEnabled: &disabled}
+				markDCGMMissingOperator(m)
+			},
+			want: 0,
+		},
+		{
+			name: "healthy exporter is already kept fresh by the Service watch",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Metrics = &v1alpha1.Metrics{}
+				conditions.NewConditionsManager(m, m.Generation).MarkTrue(conditions.ConditionDCGMExporterAvailable)
+			},
+			want: 0,
+		},
+		{
+			name: "Removed state does not schedule refreshes",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.ManagementState = platformcommon.Removed
+				m.Spec.Metrics = &v1alpha1.Metrics{}
+				markDCGMMissingOperator(m)
+			},
+			want: 0,
+		},
+		{
+			name: "unknown verdict keeps its short retry",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Metrics = &v1alpha1.Metrics{}
+				markDCGMMissingOperator(m)
+			},
+			pending: 30 * time.Second,
+			want:    30 * time.Second,
+		},
+		{
+			name: "reconcile errors land in backoff instead",
+			configure: func(m *v1alpha1.Monitoring) {
+				m.Spec.Metrics = &v1alpha1.Metrics{}
+				markDCGMMissingOperator(m)
+			},
+			err:  errors.New("boom"),
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			tt.configure(m)
+
+			result := requeueForDCGMExporterRefresh(reconcile.Result{RequeueAfter: tt.pending}, m, tt.err)
+			if result.RequeueAfter != tt.want {
+				t.Fatalf("RequeueAfter = %s, want %s", result.RequeueAfter, tt.want)
+			}
+		})
+	}
+}
+
+// markDCGMMissingOperator leaves the verdict an exporters-only configuration
+// keeps when the operator is absent, or when it is installed with the exporter
+// disabled and no Service ever appears.
+func markDCGMMissingOperator(m *v1alpha1.Monitoring) {
+	conditions.NewConditionsManager(m, m.Generation).MarkWarning(
+		conditions.ConditionDCGMExporterAvailable, conditions.MissingOperatorReason, conditions.GPUOperatorMissingMessage)
+}
+
 // TestReconcile_Removed: Monitoring with Removed state should short-circuit, set
 // Ready=False and ProvisioningSucceeded=False, and not return an error.
 func TestReconcile_Removed(t *testing.T) {
@@ -2678,6 +2777,55 @@ func TestKorrel8rEndpointSliceWatch_EnqueuesForKorrel8rAndKubernetesAPI(t *testi
 	}
 }
 
+// TestDCGMExporterServiceWatch_EnqueuesForTheExporterOnly: the GPU Operator's
+// exporter Service carries no part-of label, so the managed watch skips it and
+// this narrow predicate is the only thing that refreshes the dependency verdict
+// when the exporter is enabled or removed.
+func TestDCGMExporterServiceWatch_EnqueuesForTheExporterOnly(t *testing.T) {
+	pred := predicate.NewPredicateFuncs(isDCGMExporterService)
+	for _, test := range []struct {
+		name    string
+		service *corev1.Service
+		want    bool
+	}{
+		{
+			name: "exporter Service",
+			service: &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+				Namespace: dcgmExporterNamespace,
+				Name:      dcgmExporterService,
+			}},
+			want: true,
+		},
+		{
+			name: "exporter name in another namespace",
+			service: &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+				Namespace: "other-ns",
+				Name:      dcgmExporterService,
+			}},
+			want: false,
+		},
+		{
+			name: "another Service in the GPU Operator namespace",
+			service: &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+				Namespace: dcgmExporterNamespace,
+				Name:      "gpu-operator",
+			}},
+			want: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := pred.Create(event.CreateEvent{Object: test.service}); got != test.want {
+				t.Errorf("Create: want %t, got %t", test.want, got)
+			}
+			// Deletion matters as much as creation: a removed exporter Service
+			// has to turn the condition back over.
+			if got := pred.Delete(event.DeleteEvent{Object: test.service}); got != test.want {
+				t.Errorf("Delete: want %t, got %t", test.want, got)
+			}
+		})
+	}
+}
+
 // TestReconcile_ObservedGenerationSet: ObservedGeneration must match the CR generation.
 func TestReconcile_ObservedGenerationSet(t *testing.T) {
 	s := newTestScheme(t)
@@ -2702,5 +2850,49 @@ func TestReconcile_ObservedGenerationSet(t *testing.T) {
 
 	if got := m.Status.ObservedGeneration; got != 7 {
 		t.Errorf("ObservedGeneration: want 7, got %d", got)
+	}
+}
+
+func TestDCGMExporterCheckPending(t *testing.T) {
+	tests := []struct {
+		name   string
+		mark   func(cm *conditions.ConditionsManager)
+		absent bool
+		want   bool
+	}{
+		{name: "condition absent", absent: true, want: false},
+		{
+			name: "unobservable check is polled",
+			mark: func(cm *conditions.ConditionsManager) {
+				cm.MarkUnknown(conditions.ConditionDCGMExporterAvailable, "ExporterCheckFailed", "boom")
+			},
+			want: true,
+		},
+		{
+			name: "available exporter is a verdict, not a retry",
+			mark: func(cm *conditions.ConditionsManager) {
+				cm.MarkTrue(conditions.ConditionDCGMExporterAvailable)
+			},
+			want: false,
+		},
+		{
+			name: "missing exporter is a verdict, not a retry",
+			mark: func(cm *conditions.ConditionsManager) {
+				cm.MarkWarning(conditions.ConditionDCGMExporterAvailable, "MissingOperator", "no GPU Operator")
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			if !tt.absent {
+				tt.mark(conditions.NewConditionsManager(m, m.Generation))
+			}
+			if got := dcgmExporterCheckPending(m); got != tt.want {
+				t.Errorf("dcgmExporterCheckPending: want %t, got %t", tt.want, got)
+			}
+		})
 	}
 }

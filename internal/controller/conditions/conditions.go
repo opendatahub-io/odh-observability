@@ -95,6 +95,12 @@ const (
 
 	// ConditionKorrel8rAvailable indicates the Korrel8r correlation service is deployed.
 	ConditionKorrel8rAvailable = "Korrel8rAvailable"
+
+	// ConditionDCGMExporterAvailable indicates the DCGM exporter behind the
+	// accelerator scrape exists. The NVIDIA GPU Operator is an optional
+	// dependency: it is never required for monitoring to work, so a cluster
+	// without GPUs reports this at Info severity and stays out of Degraded.
+	ConditionDCGMExporterAvailable = "DCGMExporterAvailable"
 )
 
 // Reason constants.
@@ -107,6 +113,16 @@ const (
 	AlertingNotConfiguredReason          = "AlertingNotConfigured"
 	MetricsAndTracesNotConfiguredReason  = "MetricsAndTracesNotConfigured"
 	MetricsAndTracesNotConfiguredMessage = "Metrics and traces are not configured in Monitoring CR"
+
+	// DCGMExporterServiceNotFoundReason reports a GPU Operator that exists
+	// without the exporter Service the accelerator scrape targets.
+	DCGMExporterServiceNotFoundReason = "ExporterServiceNotFound"
+	// DCGMExporterCheckFailedReason reports a detection error, so the condition
+	// reads Unknown instead of asserting a verdict the controller does not have.
+	DCGMExporterCheckFailedReason = "ExporterCheckFailed"
+	// DCGMScrapeDisabledReason reports the documented opt-out: the administrator
+	// collects DCGM metrics through a ServiceMonitor or PodMonitor instead.
+	DCGMScrapeDisabledReason = "BuiltinScrapeDisabled"
 )
 
 // Message constants.
@@ -121,6 +137,13 @@ const (
 	CertManagerOperatorMissingMessage            = "cert-manager Operator is required for metrics TargetAllocator mTLS; install it from OperatorHub"
 	LokiOperatorMissingMessage                   = "Loki Operator is required for logs and usage logs; install it from OperatorHub"
 	ClusterLoggingOperatorMissingMessage         = "Red Hat OpenShift Logging Operator is required for logs; install it from OperatorHub"
+
+	// GPUOperatorMissingMessage names the optional dependency without implying
+	// a faulty cluster: an environment with no GPUs is a supported state.
+	GPUOperatorMissingMessage = "NVIDIA GPU Operator is not installed; GPU metrics require it (install from OperatorHub)"
+	// DCGMExporterServiceMissingMessage takes the namespace and Service name.
+	DCGMExporterServiceMissingMessage = "DCGM exporter Service %s/%s not found; enable the DCGM exporter in the NVIDIA GPU Operator"
+	DCGMScrapeDisabledMessage         = "Built-in DCGM scrape is disabled; DCGM metrics can be collected through a ServiceMonitor or PodMonitor instead"
 )
 
 // featureConditionTypes lists the feature-specific condition types that
@@ -142,6 +165,7 @@ var featureConditionTypes = map[string]bool{
 	ConditionLokiStackAvailable:                  true,
 	ConditionClusterLogForwarderAvailable:        true,
 	ConditionKorrel8rAvailable:                   true,
+	ConditionDCGMExporterAvailable:               true,
 }
 
 // ConditionsManager manages the set of conditions for a Monitoring CR reconcile cycle.
