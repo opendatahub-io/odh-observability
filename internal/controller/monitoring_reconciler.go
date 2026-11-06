@@ -424,7 +424,11 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	if requeueNeeded || usageLogsAwaitingCredential(monitoring) {
+	// The GPU Operator is not watched (only core kinds are), and the periodic
+	// COO refresh below runs only with built-in metrics storage. An Unknown
+	// exporter verdict rides this requeue so a transient lookup failure is
+	// retried instead of standing until some unrelated event arrives.
+	if requeueNeeded || usageLogsAwaitingCredential(monitoring) || dcgmExporterCheckPending(monitoring) {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -466,6 +470,15 @@ func requeueForCOOVersionRefresh(result ctrl.Result, configured bool, reconcileE
 		result.RequeueAfter = 5 * time.Minute
 	}
 	return result
+}
+
+// dcgmExporterCheckPending reports a DCGM exporter verdict that could not be
+// observed. The check runs inside an action and cannot request a requeue
+// itself, and the GPU Operator is not watched, so the tail schedules the retry
+// here rather than leaving the condition stale until an unrelated event.
+func dcgmExporterCheckPending(monitoring *v1alpha1.Monitoring) bool {
+	return libconditions.IsStatusConditionPresentAndEqual(monitoring,
+		conditions.ConditionDCGMExporterAvailable, metav1.ConditionUnknown)
 }
 
 // requeueForCollectorReadiness covers configurations without another periodic

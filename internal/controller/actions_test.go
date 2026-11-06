@@ -4670,6 +4670,15 @@ func TestDeployUsageLogsCollector_CredentialWithoutExporters(t *testing.T) {
 // unregistered-type error.
 func dcgmTestClient(t *testing.T, objs ...client.Object) client.Client { //nolint:ireturn // test helper; concrete type is not exported by controller-runtime/fake
 	t.Helper()
+	return dcgmTestClientWith(t, interceptor.Funcs{}, objs...)
+}
+
+func dcgmTestClientWith( //nolint:ireturn // test helper; concrete type is not exported by controller-runtime/fake
+	t *testing.T,
+	funcs interceptor.Funcs,
+	objs ...client.Object,
+) client.Client {
+	t.Helper()
 	s := newActionsTestScheme(t)
 	registerCRDs(s,
 		schema.GroupVersionKind{Group: "operators.coreos.com", Version: "v2", Kind: "OperatorCondition"},
@@ -4678,7 +4687,11 @@ func dcgmTestClient(t *testing.T, objs ...client.Object) client.Client { //nolin
 	registerCRDs(s,
 		schema.GroupVersionKind{Group: "core", Version: "v1", Kind: "Service"},
 	)
-	return fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
+	return fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(objs...).
+		WithInterceptorFuncs(funcs).
+		Build()
 }
 
 func TestDeployDCGMExporterDependency_MetricsNotConfigured(t *testing.T) {
@@ -4791,5 +4804,86 @@ func TestDeployDCGMExporterDependency_Available(t *testing.T) {
 	c := mustFindCondition(t, m, conditions.ConditionDCGMExporterAvailable)
 	if c.Status != metav1.ConditionTrue || c.Reason != "Available" {
 		t.Errorf("expected True/Available, got %s/%s", c.Status, c.Reason)
+	}
+}
+
+// serviceGetFails models an apiserver that cannot answer a single Service read,
+// the other half of the fail-closed paths.
+func serviceGetFails() interceptor.Funcs {
+	return interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Service); ok {
+				return k8serr.NewInternalError(errors.New("apiserver unavailable"))
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+}
+
+// olmNotInstalled models a cluster without the OLM APIs at all: both lookups
+// report NoMatch, which is an answer ("not installed"), not a failure.
+func olmNotInstalled() interceptor.Funcs {
+	return interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			gvk := list.GetObjectKind().GroupVersionKind()
+			switch gvk.Group {
+			case "operators.coreos.com", "olm.operatorframework.io":
+				return &meta.NoKindMatchError{GroupKind: gvk.GroupKind()}
+			}
+			return c.List(ctx, list, opts...)
+		},
+	}
+}
+
+func TestDeployDCGMExporterDependency_OLMLookupFailureStaysUnknown(t *testing.T) {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	var sources []rendertemplate.TemplateSource
+	if err := deployDCGMExporterDependency(context.Background(), dcgmTestClientWith(t, operatorConditionListForbidden()), m, cm, &sources); err != nil {
+		t.Fatalf("an optional dependency check must not fail the round: %v", err)
+	}
+
+	c := mustFindCondition(t, m, conditions.ConditionDCGMExporterAvailable)
+	if c.Status != metav1.ConditionUnknown || c.Reason != conditions.DCGMExporterCheckFailedReason {
+		t.Errorf("expected Unknown/%s, got %s/%s", conditions.DCGMExporterCheckFailedReason, c.Status, c.Reason)
+	}
+}
+
+func TestDeployDCGMExporterDependency_ServiceLookupFailureStaysUnknown(t *testing.T) {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	cli := dcgmTestClientWith(t, serviceGetFails(), newOperatorCondition("gpu-operator-certified.v25.3.4"))
+
+	var sources []rendertemplate.TemplateSource
+	if err := deployDCGMExporterDependency(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("an optional dependency check must not fail the round: %v", err)
+	}
+
+	c := mustFindCondition(t, m, conditions.ConditionDCGMExporterAvailable)
+	if c.Status != metav1.ConditionUnknown || c.Reason != conditions.DCGMExporterCheckFailedReason {
+		t.Errorf("expected Unknown/%s, got %s/%s", conditions.DCGMExporterCheckFailedReason, c.Status, c.Reason)
+	}
+}
+
+func TestDeployDCGMExporterDependency_WithoutOLMAPIsMissingOperator(t *testing.T) {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	var sources []rendertemplate.TemplateSource
+	if err := deployDCGMExporterDependency(context.Background(), dcgmTestClientWith(t, olmNotInstalled()), m, cm, &sources); err != nil {
+		t.Fatalf("no OLM is not a check failure: %v", err)
+	}
+
+	c := mustFindCondition(t, m, conditions.ConditionDCGMExporterAvailable)
+	if c.Status != metav1.ConditionFalse || c.Reason != conditions.MissingOperatorReason {
+		t.Errorf("expected False/%s, got %s/%s", conditions.MissingOperatorReason, c.Status, c.Reason)
+	}
+	if c.Severity != platformcommon.ConditionSeverityInfo {
+		t.Errorf("no OLM must stay at Info severity, got %q", c.Severity)
 	}
 }

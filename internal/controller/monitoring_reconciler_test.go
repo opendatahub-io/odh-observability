@@ -2704,3 +2704,47 @@ func TestReconcile_ObservedGenerationSet(t *testing.T) {
 		t.Errorf("ObservedGeneration: want 7, got %d", got)
 	}
 }
+
+func TestDCGMExporterCheckPending(t *testing.T) {
+	tests := []struct {
+		name   string
+		mark   func(cm *conditions.ConditionsManager)
+		absent bool
+		want   bool
+	}{
+		{name: "condition absent", absent: true, want: false},
+		{
+			name: "unobservable check is polled",
+			mark: func(cm *conditions.ConditionsManager) {
+				cm.MarkUnknown(conditions.ConditionDCGMExporterAvailable, "ExporterCheckFailed", "boom")
+			},
+			want: true,
+		},
+		{
+			name: "available exporter is a verdict, not a retry",
+			mark: func(cm *conditions.ConditionsManager) {
+				cm.MarkTrue(conditions.ConditionDCGMExporterAvailable)
+			},
+			want: false,
+		},
+		{
+			name: "missing exporter is a verdict, not a retry",
+			mark: func(cm *conditions.ConditionsManager) {
+				cm.MarkWarning(conditions.ConditionDCGMExporterAvailable, "MissingOperator", "no GPU Operator")
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newMonitoring(v1alpha1.MonitoringInstanceName)
+			if !tt.absent {
+				tt.mark(conditions.NewConditionsManager(m, m.Generation))
+			}
+			if got := dcgmExporterCheckPending(m); got != tt.want {
+				t.Errorf("dcgmExporterCheckPending: want %t, got %t", tt.want, got)
+			}
+		})
+	}
+}
