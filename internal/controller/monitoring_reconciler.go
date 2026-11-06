@@ -258,6 +258,7 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 
 	defer func() {
 		result = requeueForCOOVersionRefresh(result, cooCompatibilityConfigured, reconcileErr)
+		result = requeueForCollectorReadiness(result, monitoring, reconcileErr)
 		if reconcileErr != nil {
 			message := reconcileErr.Error()
 			cm.MarkFalse(string(platformcommon.ConditionTypeReady), "ReconcileFailed", message)
@@ -465,6 +466,41 @@ func requeueForCOOVersionRefresh(result ctrl.Result, configured bool, reconcileE
 		result.RequeueAfter = 5 * time.Minute
 	}
 	return result
+}
+
+// requeueForCollectorReadiness covers configurations without another periodic
+// reconcile source. Built-in metrics already refresh for COO compatibility and
+// log forwarding already refreshes for namespace discovery; exporters-only and
+// traces-only configurations still need to observe a collector that appears or
+// becomes Ready after the desired resource is applied.
+func requeueForCollectorReadiness(result ctrl.Result, monitoring *v1alpha1.Monitoring, reconcileErr error) ctrl.Result {
+	if reconcileErr != nil || result != (ctrl.Result{}) || monitoring.Spec.ManagementState == platformcommon.Removed {
+		return result
+	}
+	if monitoring.Spec.Logs != nil || (monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil) {
+		return result
+	}
+	if !openTelemetryCollectorAwaitingReadiness(monitoring) {
+		return result
+	}
+
+	result.RequeueAfter = 30 * time.Second
+	return result
+}
+
+func openTelemetryCollectorAwaitingReadiness(monitoring *v1alpha1.Monitoring) bool {
+	if monitoring.Spec.Metrics == nil && monitoring.Spec.Traces == nil {
+		return false
+	}
+
+	for i := range monitoring.Status.Conditions {
+		condition := &monitoring.Status.Conditions[i]
+		if condition.Type == conditions.ConditionOpenTelemetryCollectorAvailable {
+			return condition.Status != metav1.ConditionTrue
+		}
+	}
+
+	return true
 }
 
 // cleanupOpenTelemetryOperatorNetworkPolicies removes policies left behind by

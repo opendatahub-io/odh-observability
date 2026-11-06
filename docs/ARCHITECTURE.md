@@ -121,7 +121,7 @@ Action functions run sequentially in a fixed order. Each function checks whether
 | 3 | `deployMonitoringAdmissionPolicies` | Always | None | None | monitoring-admission-policies |
 | 4 | `deployMonitoringStackWithQuerierAndRestrictions` | `spec.metrics` | `MonitoringStack`, `ThanosQuerier` | `MonitoringStackAvailable`, `ThanosQuerierAvailable` | 14 templates (see inventory) |
 | 5 | `deployTracingStack` | `spec.traces` | `TempoMonolithic`/`TempoStack`, `Instrumentation` | `TempoAvailable`, `InstrumentationAvailable` | Tempo template + instrumentation |
-| 6 | `deployOpenTelemetryCollector` | `spec.metrics` or `spec.traces` | `OpenTelemetryCollector` | `OpenTelemetryCollectorAvailable` | collector, RBAC, ServiceMonitors, Prometheus service |
+| 6 | `deployOpenTelemetryCollector` | `spec.metrics` or `spec.traces` | `OpenTelemetryCollector` | `OpenTelemetryCollectorAvailable` (current-generation `Ready=True`) | collector, RBAC, ServiceMonitors, Prometheus service |
 | 7 | `deployAlerting` | `spec.alerting` | `PrometheusRule` | `AlertingAvailable` | None -- condition-only check |
 | 8 | `deployNodeMetricsEndpoint` | `spec.metrics` | None | `NodeMetricsEndpointAvailable` | prometheus-cluster-proxy |
 | 9 | `deployKorrel8r` | `spec.metrics` or `spec.traces` or `spec.logs` | None | `Korrel8rAvailable` | ConfigMap, Deployment, Service, RBAC, NetworkPolicy |
@@ -194,7 +194,7 @@ Perses metrics access model (three lanes — pick by **where the series live**, 
 
 | Lane | Datasource | Backend | Gate | Owns |
 |------|------------|---------|------|------|
-| **DS namespace-scoped** | `data-science-prometheus-datasource` (default) | DS Thanos proxy `:8443` | `namespace=` + caller token + `metrics.k8s.io` SAR | Series in the Data Science MonitoringStack (e.g. `kserve_vllm:*`, DS `accelerator_*` recording rules from OTC/DCGM) |
+| **DS namespace-scoped** | `data-science-prometheus-datasource` (default) | DS Thanos proxy `:8443` | `namespace=` + caller token + `metrics.k8s.io` SAR | Series in the Data Science MonitoringStack (e.g. raw `vllm:*`, DS `accelerator_*` recording rules from OTC/DCGM) |
 | **OCP tenancy** | `cluster-prometheus-tenancy-datasource` | OpenShift Thanos `:9092` | `namespace=` + caller token | Namespaced OpenShift Monitoring series (`node_namespace_pod_container:*`, `kube_*`, OCP accelerator with `exported_namespace` / `exported_pod`) |
 | **OCP admin** | `cluster-prometheus-datasource` | OpenShift Thanos `:9091` | caller RBAC only (e.g. `cluster-monitoring-view`) | Cluster-wide admin views — **not** namespace tenancy |
 
@@ -205,9 +205,9 @@ Perses metrics access model (three lanes — pick by **where the series live**, 
 The [MaaS legacy usage dashboard](https://github.com/opendatahub-io/models-as-a-service/blob/main/deployment/components/observability/observability/dashboards/usage-dashboard.yaml) explicitly uses the DS datasource but has no `namespace` variable. It needs a compatible namespace selection and authorization design before this change can be rolled out; the Observe dashboard companion alone does not update it.
 
 **Metric ownership / dashboard pins (hard rule):** one PromQL query runs against **one** datasource. You cannot join DS Thanos series with OpenShift series in a single query. Observe dashboards (Dashboard repo) must pin explicitly after the DS default flip:
-- **Models:** `kserve_vllm:*` panels → `data-science-prometheus-datasource` (`:8443`). OCP GPU/CPU panels → `cluster-prometheus-tenancy-datasource` (`:9092`).
+- **Models:** raw `vllm:*` panels → `data-science-prometheus-datasource` (`:8443`). OCP GPU/CPU panels → `cluster-prometheus-tenancy-datasource` (`:9092`).
 - **Cluster:** → `cluster-prometheus-datasource` (`:9091`).
-- **Out of scope for RHOAIENG-99814:** rewriting GPU/CPU PromQL that still references `kserve_vllm:*` inside a tenancy query (cross-stack join). That is a separate metric-ownership change.
+- **Datasource boundary:** GPU/CPU PromQL remains on the OpenShift tenancy datasource; raw `vllm:*` is used for model identity and serving metrics. Cross-stack joins must not move either datasource's resource queries into the other lane.
 
 - Upgrade: the reconciler removes legacy Kubernetes SA-token Secrets with these datasource names only when they are owned by the current Monitoring resource and reference the old cluster-proxy service account. Perses operator manages separate Perses API secrets for the datasource TLS configuration.
 - Observe UI / gateway → Perses ingress is owned by Dashboard (`dashboard-perses-access`), not this operator.
@@ -259,7 +259,7 @@ Each action function manages one or more conditions:
 | `ThanosQuerierAvailable` | `deployMonitoringStackWithQuerierAndRestrictions` |
 | `TempoAvailable` | `deployTracingStack` |
 | `InstrumentationAvailable` | `deployTracingStack` |
-| `OpenTelemetryCollectorAvailable` | `deployOpenTelemetryCollector` |
+| `OpenTelemetryCollectorAvailable` | `deployOpenTelemetryCollector` (CR status `Ready=True` with current `observedGeneration`) |
 | `AlertingAvailable` | `deployAlerting` |
 | `PersesAvailable` | `deployPerses` |
 | `PersesTempoDataSourceAvailable` | `deployPersesTempoIntegration` |

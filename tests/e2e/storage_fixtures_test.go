@@ -24,6 +24,7 @@ const (
 	seaweedFSPodName     = "seaweedfs"
 	seaweedFSServiceName = "seaweedfs"
 	seaweedFSBucketPod   = "seaweedfs-bucket-creator"
+	seaweedFSS3Secret    = "seaweedfs-s3-config"
 	seaweedFSImage       = "quay.io/flysangel/chrislusf/seaweedfs@sha256:aba492e2a4e4c90bff795745e8e660affa1f09e7650f5981bd7bccd1a06cd931"
 	seaweedFSAccessKey   = "seaweedfs-test-key"
 	seaweedFSSecretKey   = "seaweedfs-test-secret"
@@ -96,6 +97,11 @@ func (tc *TestContext) deleteFixtureResources(names ...string) {
 func (tc *TestContext) cleanupSeaweedFS() {
 	tc.deleteFixtureResources(seaweedFSBucketPod, seaweedFSPodName)
 	tc.DeleteResource(
+		WithMinimalObject(gvk.Secret, types.NamespacedName{Name: seaweedFSS3Secret, Namespace: tc.MonitoringNamespace}),
+		WithIgnoreNotFound(true),
+		WithWaitForDeletion(true),
+	)
+	tc.DeleteResource(
 		WithMinimalObject(gvk.Service, types.NamespacedName{Name: seaweedFSServiceName, Namespace: tc.MonitoringNamespace}),
 		WithIgnoreNotFound(true),
 		WithWaitForDeletion(true),
@@ -114,6 +120,31 @@ func (tc *TestContext) startSeaweedFS(t *testing.T, buckets ...string) {
 	}
 	tc.cleanupSeaweedFS()
 
+	tc.createFixtureResource(t, gvk.Secret, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      seaweedFSS3Secret,
+			Namespace: tc.MonitoringNamespace,
+		},
+		StringData: map[string]string{
+			"accessKey": seaweedFSAccessKey,
+			"secretKey": seaweedFSSecretKey,
+			"s3.json": fmt.Sprintf(`{
+  "identities": [
+    {
+      "name": "pr110-validation",
+      "credentials": [
+        {
+          "accessKey": %q,
+          "secretKey": %q
+        }
+      ],
+      "actions": ["Admin", "Read", "List", "Tagging", "Write"]
+    }
+  ]
+}`, seaweedFSAccessKey, seaweedFSSecretKey),
+		},
+	})
+
 	tc.createFixtureResource(t, gvk.Pod, &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      seaweedFSPodName,
@@ -126,7 +157,7 @@ func (tc *TestContext) startSeaweedFS(t *testing.T, buckets ...string) {
 				Name:    seaweedFSPodName,
 				Image:   seaweedFSImage,
 				Command: []string{"weed"},
-				Args:    []string{"server", "-s3"},
+				Args:    []string{"server", "-s3", "-s3.config=/etc/seaweedfs/s3.json", "-volume.max=20"},
 				Ports: []corev1.ContainerPort{
 					{Name: "s3", ContainerPort: seaweedFSS3Port},
 					{Name: "master", ContainerPort: seaweedFSMasterPort},
@@ -138,13 +169,24 @@ func (tc *TestContext) startSeaweedFS(t *testing.T, buckets ...string) {
 					InitialDelaySeconds: 10,
 					PeriodSeconds:       5,
 				},
-				VolumeMounts:    []corev1.VolumeMount{{Name: "data", MountPath: "/data"}},
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: "data", MountPath: "/data"},
+					{Name: "s3-config", MountPath: "/etc/seaweedfs", ReadOnly: true},
+				},
 				SecurityContext: fixtureContainerSecurityContext(),
 			}},
-			Volumes: []corev1.Volume{{
-				Name:         "data",
-				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-			}},
+			Volumes: []corev1.Volume{
+				{
+					Name:         "data",
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				},
+				{
+					Name: "s3-config",
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+						SecretName: seaweedFSS3Secret,
+					}},
+				},
+			},
 		},
 	})
 
@@ -163,9 +205,29 @@ func (tc *TestContext) startSeaweedFS(t *testing.T, buckets ...string) {
 	var script strings.Builder
 	for _, bucket := range buckets {
 		endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/%s", seaweedFSServiceName, tc.MonitoringNamespace, seaweedFSS3Port, bucket)
-		fmt.Fprintf(&script, `i=0; until curl -fsS -X PUT %q; do i=$((i+1)); [ "$i" -lt 60 ] || exit 1; sleep 2; done`+"\n", endpoint)
+		fmt.Fprintf(&script,
+			`i=0; while :; do code=$(curl --max-time 30 -sS -o /tmp/response -w '%%{http_code}' `+
+				`--aws-sigv4 'aws:amz:us-east-1:s3' --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" `+
+				`-X PUT %q) || code=000; case "$code" in 200|201|204|409) `+
+				`echo "bucket %s ready (HTTP $code)"; break;; esac; i=$((i+1)); `+
+				`[ "$i" -lt 60 ] || exit 1; sleep 2; done`+"\n", endpoint, bucket)
 	}
-	tc.createBucketPod(t, seaweedFSBucketPod, seaweedFSImage, script.String())
+	tc.createBucketPod(t, seaweedFSBucketPod, fakeGCSClientImage, script.String(), []corev1.EnvVar{
+		{
+			Name: "AWS_ACCESS_KEY_ID",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: seaweedFSS3Secret},
+				Key:                  "accessKey",
+			}},
+		},
+		{
+			Name: "AWS_SECRET_ACCESS_KEY",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: seaweedFSS3Secret},
+				Key:                  "secretKey",
+			}},
+		},
+	})
 }
 
 func (tc *TestContext) cleanupFakeGCS() {
@@ -227,10 +289,10 @@ func (tc *TestContext) startFakeGCS(t *testing.T) {
 		fakeGCSBucket,
 		baseURL+"/storage/v1/b?project=fake-test-project",
 	)
-	tc.createBucketPod(t, fakeGCSBucketPod, fakeGCSClientImage, script)
+	tc.createBucketPod(t, fakeGCSBucketPod, fakeGCSClientImage, script, nil)
 }
 
-func (tc *TestContext) createBucketPod(t *testing.T, name, image, script string) {
+func (tc *TestContext) createBucketPod(t *testing.T, name, image, script string, env []corev1.EnvVar) {
 	t.Helper()
 	tc.createFixtureResource(t, gvk.Pod, &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: tc.MonitoringNamespace},
@@ -242,6 +304,7 @@ func (tc *TestContext) createBucketPod(t *testing.T, name, image, script string)
 				Image:           image,
 				Command:         []string{"/bin/sh", "-c"},
 				Args:            []string{script},
+				Env:             env,
 				SecurityContext: fixtureContainerSecurityContext(),
 			}},
 		},
