@@ -217,8 +217,10 @@ spec:
             # authorize per namespace.
             - --allow-form-post
           ports:
+            # 15 characters max: the API server rejects longer container port
+            # names outright, and that fails the whole Deployment apply.
             - containerPort: 9093
-              name: method-gate-admin
+              name: admin-gate
               protocol: TCP
           resources:
             limits:

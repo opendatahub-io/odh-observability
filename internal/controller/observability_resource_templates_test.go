@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -241,6 +242,7 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 	if len(containers) != 5 {
 		t.Fatalf("Thanos proxy must have the scoped and cluster-wide proxy/method-gate pairs plus prom-label-proxy, got %d", len(containers))
 	}
+	assertContainerPortNamesAreValid(t, containers)
 	assertContainerArgs(t, findContainer(t, containers, "kube-rbac-proxy"),
 		"--secure-listen-address=0.0.0.0:8443",
 		"--upstream=http://127.0.0.1:9092/",
@@ -1582,6 +1584,36 @@ func findContainer(t *testing.T, containers []any, name string) map[string]any {
 	}
 	t.Fatalf("container %q was not rendered", name)
 	return nil
+}
+
+// assertContainerPortNamesAreValid enforces the API server's IANA_SVC_NAME cap
+// on container port names. Nothing in the Go types or the renderer catches it,
+// and because each Deployment is applied as one object a single over-long name
+// rejects the whole apply, which leaves the controller reconcile-erroring rather
+// than reporting one bad field.
+func assertContainerPortNamesAreValid(t *testing.T, containers []any) {
+	t.Helper()
+	ianaServiceName := regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+	for _, rawContainer := range containers {
+		container := asMap(t, rawContainer)
+		ports, _, err := unstructured.NestedSlice(container, "ports")
+		if err != nil {
+			t.Fatalf("container %q ports: %v", container["name"], err)
+		}
+		for _, rawPort := range ports {
+			name, _ := asMap(t, rawPort)["name"].(string)
+			if name == "" {
+				continue
+			}
+			if len(name) > 15 {
+				t.Errorf("container %q port name %q is %d characters; the API server caps it at 15",
+					container["name"], name, len(name))
+			}
+			if !ianaServiceName.MatchString(name) {
+				t.Errorf("container %q port name %q is not a valid IANA service name", container["name"], name)
+			}
+		}
+	}
 }
 
 func assertContainerArgs(t *testing.T, container map[string]any, expected ...string) {
