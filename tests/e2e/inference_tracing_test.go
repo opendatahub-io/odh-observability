@@ -194,6 +194,49 @@ func assertVLLMSpanHasInjectedParent(ctx context.Context, traceID, parentSpanID 
 	return fmt.Errorf("trace %s has no %q span with injected parent ID %s", traceID, vLLMRequestSpanName, wantParent)
 }
 
+func assertAdapterSpanHasInjectedParent(ctx context.Context, traceID, parentSpanID string, oatsEnv []string) error {
+	raw, err := fetchTraceJSON(ctx, traceID, oatsEnv)
+	if err != nil {
+		return err
+	}
+	spans, err := parseTraceSpansFromGCXJSON(raw)
+	if err != nil {
+		return err
+	}
+	wantParent := normalizeSpanID(parentSpanID)
+	for _, span := range spans {
+		if span.Name == "request" && span.ParentSpanID == wantParent {
+			return nil
+		}
+	}
+	return fmt.Errorf("trace %s has no EPP %q span with injected parent ID %s", traceID, "request", wantParent)
+}
+
+func assertAdapterVLLMSpanRelationship(ctx context.Context, traceID string, oatsEnv []string) error {
+	raw, err := fetchTraceJSON(ctx, traceID, oatsEnv)
+	if err != nil {
+		return err
+	}
+	spans, err := parseTraceSpansFromGCXJSON(raw)
+	if err != nil {
+		return err
+	}
+	spansByID := make(map[string]parsedTraceSpan, len(spans))
+	for _, span := range spans {
+		spansByID[span.SpanID] = span
+	}
+	for _, span := range spans {
+		if span.Name != vLLMRequestSpanName || span.ParentSpanID == "" {
+			continue
+		}
+		parent, found := spansByID[span.ParentSpanID]
+		if found && parent.Name == "request" {
+			return nil
+		}
+	}
+	return fmt.Errorf("trace %s has no EPP %q span directly parenting a vLLM %q span", traceID, "request", vLLMRequestSpanName)
+}
+
 func findInferenceServicePredictorPod(ctx context.Context, kube client.Client, namespace, serviceName string) (*corev1.Pod, string, error) {
 	pods := &corev1.PodList{}
 	if err := kube.List(ctx, pods, client.InNamespace(namespace), client.MatchingLabels{
@@ -259,6 +302,18 @@ func TestWriteLLMOatsTraceCaseFileIncludesTraceID(t *testing.T) {
 	require.Contains(t, content, `trace:id = "fedcba9876543210fedcba9876543210"`)
 	require.Contains(t, content, `resource.k8s.pod.name =~ "facebook-opt-125m-single-node-abc.*"`)
 	require.Contains(t, content, `span:parentID = "0123456789abcdef"`)
+}
+
+func TestRenderOatsMetricsCaseScopesQueriesToService(t *testing.T) {
+	template, err := os.ReadFile(filepath.Join("oats", "vllm", "single-node-metrics", "oats-case.yaml"))
+	require.NoError(t, err)
+
+	const serviceName = "facebook-opt-125m-single-node-abc123"
+	content, err := renderOatsMetricsCase(string(template), serviceName)
+	require.NoError(t, err)
+	require.NotContains(t, content, metricsServiceNamePlaceholder)
+	require.Equal(t, 6, strings.Count(content, `llm_isvc_name="`+serviceName+`"`),
+		"every metric selector must be restricted to this LLMInferenceService")
 }
 
 func TestGCXToolingUsesPinnedCacheBinary(t *testing.T) {
