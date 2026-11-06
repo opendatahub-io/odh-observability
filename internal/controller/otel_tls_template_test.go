@@ -16,27 +16,8 @@ func TestMainCollectorOTLPReceiversUseServingTLSCertificate(t *testing.T) {
 func TestUsageLogsCollectorOTLPReceiversUseServingTLSCertificate(t *testing.T) {
 	t.Parallel()
 
-	resources := renderObservabilityTemplate(t, UsageLogsOpenTelemetryCollectorTemplate, map[string]any{
-		"Namespace":                 "redhat-ods-monitoring",
-		"UsageLogsCollectorName":    "data-science-usage-logs",
-		"UsageLogs":                 true,
-		"UsageLogsEndpoint":         "https://loki.example.svc.cluster.local:8080/otlp",
-		"UsageLogsExporters":        map[string]string{},
-		"UsageLogsExporterNames":    []string{},
-		"UsageLogsCredentialSecret": "",
-		"UsageLogsAttributes":       map[string]string{},
-		"UsageLogsAttributeNames":   []string{},
-		"CollectorReplicas":         1,
-		"CollectorCPULimit":         "500m",
-		"CollectorMemoryLimit":      "1Gi",
-		"CollectorCPURequest":       "100m",
-		"CollectorMemoryRequest":    "256Mi",
-	})
-	if len(resources) != 1 {
-		t.Fatalf("expected one usage logs collector, got %d", len(resources))
-	}
-
-	assertCollectorOTLPTLS(t, resources[0], "data-science-usage-logs-collector-headless-tls")
+	collector := renderUsageLogsCollectorTemplate(t)
+	assertCollectorOTLPTLS(t, collector, "data-science-usage-logs-collector-headless-tls")
 }
 
 func TestInstrumentationUsesHTTPSAndTrustsServiceCA(t *testing.T) {
