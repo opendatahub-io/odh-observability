@@ -546,6 +546,7 @@ func (r *MonitoringReconciler) renderMonitoringResources(
 		deployMonitoringStackWithQuerierAndRestrictions,
 		deployTracingStack,
 		deployOpenTelemetryCollector,
+		deployDCGMExporterDependency,
 		deployAlerting,
 		deployOperatorMonitoring,
 		deployNodeMetricsEndpoint,

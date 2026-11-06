@@ -4478,3 +4478,134 @@ func TestDeployUsageLogsCollector_CredentialWithoutExporters(t *testing.T) {
 		t.Errorf("local write credential changed: %q", fn)
 	}
 }
+
+// --- deployDCGMExporterDependency ---
+
+// dcgmTestClient builds a client that can answer the two OLM questions
+// OperatorExists asks, so a missing operator is "not installed" rather than an
+// unregistered-type error.
+func dcgmTestClient(t *testing.T, objs ...client.Object) client.Client { //nolint:ireturn // test helper; concrete type is not exported by controller-runtime/fake
+	t.Helper()
+	s := newActionsTestScheme(t)
+	registerCRDs(s,
+		schema.GroupVersionKind{Group: "operators.coreos.com", Version: "v2", Kind: "OperatorCondition"},
+		schema.GroupVersionKind{Group: "olm.operatorframework.io", Version: "v1", Kind: "ClusterExtension"},
+	)
+	registerCRDs(s,
+		schema.GroupVersionKind{Group: "core", Version: "v1", Kind: "Service"},
+	)
+	return fake.NewClientBuilder().WithScheme(s).WithObjects(objs...).Build()
+}
+
+func TestDeployDCGMExporterDependency_MetricsNotConfigured(t *testing.T) {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	var sources []rendertemplate.TemplateSource
+	if err := deployDCGMExporterDependency(context.Background(), dcgmTestClient(t), m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	c := mustFindCondition(t, m, conditions.ConditionDCGMExporterAvailable)
+	if c.Status != metav1.ConditionFalse || c.Reason != conditions.MetricsNotConfiguredReason {
+		t.Errorf("expected False/%s, got %s/%s", conditions.MetricsNotConfiguredReason, c.Status, c.Reason)
+	}
+	if c.Severity != platformcommon.ConditionSeverityInfo {
+		t.Errorf("metrics-not-configured must stay at Info severity, got %q", c.Severity)
+	}
+}
+
+func TestDeployDCGMExporterDependency_ScrapeDisabled(t *testing.T) {
+	disabled := false
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{BuiltinDCGMScrapeEnabled: &disabled}
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	var sources []rendertemplate.TemplateSource
+	if err := deployDCGMExporterDependency(context.Background(), dcgmTestClient(t), m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	c := mustFindCondition(t, m, conditions.ConditionDCGMExporterAvailable)
+	if c.Status != metav1.ConditionFalse || c.Reason != conditions.DCGMScrapeDisabledReason {
+		t.Errorf("expected False/%s, got %s/%s", conditions.DCGMScrapeDisabledReason, c.Status, c.Reason)
+	}
+	if c.Severity != platformcommon.ConditionSeverityInfo {
+		t.Errorf("the documented opt-out must stay at Info severity, got %q", c.Severity)
+	}
+}
+
+func TestDeployDCGMExporterDependency_OperatorMissingDoesNotDegrade(t *testing.T) {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	var sources []rendertemplate.TemplateSource
+	if err := deployDCGMExporterDependency(context.Background(), dcgmTestClient(t), m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	c := mustFindCondition(t, m, conditions.ConditionDCGMExporterAvailable)
+	if c.Status != metav1.ConditionFalse || c.Reason != conditions.MissingOperatorReason {
+		t.Errorf("expected False/%s, got %s/%s", conditions.MissingOperatorReason, c.Status, c.Reason)
+	}
+	if c.Severity != platformcommon.ConditionSeverityInfo {
+		t.Fatalf("a missing GPU Operator must not degrade the cluster, got severity %q", c.Severity)
+	}
+
+	// The whole point of the severity: a CPU-only cluster still reconciles to
+	// Ready. Without this assertion the severity could be dropped unnoticed.
+	cm.MarkTrue(conditions.ConditionMonitoringDependenciesReady)
+	cm.AggregateReady()
+	if ready := mustFindCondition(t, m, string(platformcommon.ConditionTypeReady)); ready.Status != metav1.ConditionTrue {
+		t.Errorf("Ready must stay True with no GPU Operator, got %s (%s)", ready.Status, ready.Reason)
+	}
+	if degraded := mustFindCondition(t, m, string(platformcommon.ConditionTypeDegraded)); degraded.Status != metav1.ConditionFalse {
+		t.Errorf("Degraded must stay False with no GPU Operator, got %s", degraded.Status)
+	}
+}
+
+func TestDeployDCGMExporterDependency_OperatorWithoutExporterService(t *testing.T) {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	cli := dcgmTestClient(t, newOperatorCondition("gpu-operator-certified.v25.3.4"))
+
+	var sources []rendertemplate.TemplateSource
+	if err := deployDCGMExporterDependency(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	c := mustFindCondition(t, m, conditions.ConditionDCGMExporterAvailable)
+	if c.Status != metav1.ConditionFalse || c.Reason != conditions.DCGMExporterServiceNotFoundReason {
+		t.Errorf("expected False/%s, got %s/%s", conditions.DCGMExporterServiceNotFoundReason, c.Status, c.Reason)
+	}
+	if !strings.Contains(c.Message, dcgmExporterService) {
+		t.Errorf("message must name the missing Service, got %q", c.Message)
+	}
+}
+
+func TestDeployDCGMExporterDependency_Available(t *testing.T) {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	cli := dcgmTestClient(t,
+		newOperatorCondition("gpu-operator-certified.v25.3.4"),
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{
+			Name:      dcgmExporterService,
+			Namespace: dcgmExporterNamespace,
+		}},
+	)
+
+	var sources []rendertemplate.TemplateSource
+	if err := deployDCGMExporterDependency(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	c := mustFindCondition(t, m, conditions.ConditionDCGMExporterAvailable)
+	if c.Status != metav1.ConditionTrue || c.Reason != "Available" {
+		t.Errorf("expected True/Available, got %s/%s", c.Status, c.Reason)
+	}
+}

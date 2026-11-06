@@ -28,12 +28,14 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/olm"
 	libconditions "github.com/opendatahub-io/odh-platform-utilities/pkg/controller/conditions"
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -327,6 +329,81 @@ func deployOpenTelemetryCollector(
 		}
 	}
 
+	return nil
+}
+
+const (
+	// gpuOperatorPackageName is the OperatorHub package that installs the DCGM
+	// exporter the accelerator scrape discovers. It is deliberately not a
+	// required dependency: RHOAI does not install or manage it.
+	gpuOperatorPackageName = "gpu-operator-certified"
+	dcgmExporterNamespace  = "nvidia-gpu-operator"
+	dcgmExporterService    = "nvidia-dcgm-exporter"
+)
+
+// deployDCGMExporterDependency reports whether the DCGM exporter the
+// accelerator scrape depends on is present. Nothing is deployed here: the
+// collector template gates its own scrape job, and the condition exists so an
+// operator can tell "no GPU data" from "GPUs are not part of this cluster".
+//
+// Every failure verdict uses Info severity. The GPU Operator is optional, so a
+// missing exporter must never degrade a cluster that simply has no GPUs; the
+// condition participates in the Ready aggregation only when it is True.
+func deployDCGMExporterDependency(
+	ctx context.Context,
+	c client.Client,
+	monitoring *v1alpha1.Monitoring,
+	cm *conditions.ConditionsManager,
+	_ *[]rendertemplate.TemplateSource,
+) error {
+	if monitoring.Spec.Metrics == nil {
+		cm.MarkNotConfigured(conditions.ConditionDCGMExporterAvailable,
+			conditions.MetricsNotConfiguredReason, conditions.MetricsNotConfiguredMessage)
+		return nil
+	}
+
+	// builtinDCGMScrapeEnabled is the documented opt-out: an administrator who
+	// supplies a ServiceMonitor or PodMonitor owns collection, so the platform
+	// has no exporter verdict to give.
+	if !builtinDCGMScrapeEnabled(monitoring.Spec.Metrics) {
+		cm.MarkNotConfigured(conditions.ConditionDCGMExporterAvailable,
+			conditions.DCGMScrapeDisabledReason, conditions.DCGMScrapeDisabledMessage)
+		return nil
+	}
+
+	// A cluster where OLM itself is absent cannot answer the question. That is
+	// "not installed", not a detection failure.
+	if _, err := olm.OperatorExists(ctx, c, gpuOperatorPackageName); err != nil {
+		switch {
+		case errors.Is(err, olm.ErrOperatorNotInstalled), meta.IsNoMatchError(err):
+			cm.MarkWarning(conditions.ConditionDCGMExporterAvailable,
+				conditions.MissingOperatorReason, conditions.GPUOperatorMissingMessage)
+			return nil
+		default:
+			cm.MarkUnknown(conditions.ConditionDCGMExporterAvailable,
+				conditions.DCGMExporterCheckFailedReason,
+				fmt.Sprintf("Cannot determine whether the NVIDIA GPU Operator is installed: %v", err))
+			return fmt.Errorf("checking NVIDIA GPU Operator: %w", err)
+		}
+	}
+
+	// The operator can be installed with the exporter disabled, which reads as
+	// healthy at the operator level and leaves the scrape with no target.
+	svc := &corev1.Service{}
+	err := c.Get(ctx, types.NamespacedName{Namespace: dcgmExporterNamespace, Name: dcgmExporterService}, svc)
+	switch {
+	case k8serr.IsNotFound(err):
+		cm.MarkWarning(conditions.ConditionDCGMExporterAvailable,
+			conditions.DCGMExporterServiceNotFoundReason,
+			fmt.Sprintf(conditions.DCGMExporterServiceMissingMessage, dcgmExporterNamespace, dcgmExporterService))
+	case err != nil:
+		cm.MarkUnknown(conditions.ConditionDCGMExporterAvailable,
+			conditions.DCGMExporterCheckFailedReason,
+			fmt.Sprintf("Cannot determine whether the DCGM exporter Service exists: %v", err))
+		return fmt.Errorf("checking DCGM exporter Service: %w", err)
+	default:
+		cm.MarkTrue(conditions.ConditionDCGMExporterAvailable)
+	}
 	return nil
 }
 
