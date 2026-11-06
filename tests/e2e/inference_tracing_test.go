@@ -304,6 +304,18 @@ func TestWriteLLMOatsTraceCaseFileIncludesTraceID(t *testing.T) {
 	require.Contains(t, content, `span:parentID = "0123456789abcdef"`)
 }
 
+func TestRenderOatsMetricsCaseScopesQueriesToService(t *testing.T) {
+	template, err := os.ReadFile(filepath.Join("oats", "vllm", "single-node-metrics", "oats-case.yaml"))
+	require.NoError(t, err)
+
+	const serviceName = "facebook-opt-125m-single-node-abc123"
+	content, err := renderOatsMetricsCase(string(template), serviceName)
+	require.NoError(t, err)
+	require.NotContains(t, content, metricsServiceNamePlaceholder)
+	require.Equal(t, 6, strings.Count(content, `llm_isvc_name="`+serviceName+`"`),
+		"every metric selector must be restricted to this LLMInferenceService")
+}
+
 func TestGCXToolingUsesPinnedCacheBinary(t *testing.T) {
 	t.Setenv("OATS_GCX", "")
 	t.Setenv("PATH", "")

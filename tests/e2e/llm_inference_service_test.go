@@ -44,7 +44,6 @@ var (
 		Version: "v1alpha2",
 		Kind:    "LLMInferenceService",
 	}
-
 	// gvk.DSCInitialization is v1; the inference prerequisites use v2.
 	gvkDSCInitializationV2 = schema.GroupVersionKind{
 		Group:   "dscinitialization.opendatahub.io",
@@ -269,6 +268,37 @@ expected:
 `, tag, tag, traceHex, parentSpanID, traceHex, podNamePrefix)
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 	return path
+}
+
+const metricsServiceNamePlaceholder = "__LLM_INFERENCE_SERVICE_NAME__"
+
+func renderOatsMetricsCase(template, serviceName string) (string, error) {
+	if serviceName == "" {
+		return "", errors.New("LLMInferenceService name is required to scope metrics OATS queries")
+	}
+	if !strings.Contains(template, metricsServiceNamePlaceholder) {
+		return "", fmt.Errorf("metrics OATS template does not contain %q", metricsServiceNamePlaceholder)
+	}
+	return strings.ReplaceAll(template, metricsServiceNamePlaceholder, serviceName), nil
+}
+
+func writeOatsMetricsCaseFile(t *testing.T, projectRoot, serviceName string) string {
+	t.Helper()
+	templatePath := filepath.Join(projectRoot, "tests", "e2e", "oats", "vllm", "single-node-metrics", "oats-case.yaml")
+	template, err := os.ReadFile(templatePath)
+	require.NoError(t, err, "failed to read single-node metrics OATS template")
+	content, err := renderOatsMetricsCase(string(template), serviceName)
+	require.NoError(t, err, "failed to scope metrics OATS case to the current LLMInferenceService")
+
+	dir := filepath.Join(t.TempDir(), "single-node-metrics")
+	require.NoError(t, os.MkdirAll(dir, 0o750))
+	caseFile, err := os.CreateTemp(dir, "oats-case-*.yaml")
+	require.NoError(t, err, "failed to create run-specific metrics OATS case")
+	defer caseFile.Close()
+	_, err = caseFile.WriteString(content)
+	require.NoError(t, err, "failed to write run-specific metrics OATS case")
+	require.NoError(t, caseFile.Close(), "failed to close run-specific metrics OATS case")
+	return caseFile.Name()
 }
 
 const oatsGCXVersion = "1.2.0"
@@ -975,8 +1005,9 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 			},
 		}
 		platformTracingEndpoint = endpoint
-		t.Logf("[%s] Using platform-managed tracing preset %s with endpoint %s and Gateway %s",
-			topology, presetName, endpoint, gateway)
+		t.Logf("[%s] Using platform-managed tracing preset %s with endpoint %s",
+			topology, presetName, endpoint)
+		t.Logf("[%s] Using Gateway %s for EPP trace validation", topology, gateway)
 	}
 
 	switch topology {
@@ -1122,33 +1153,8 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 			"Should successfully send completion request with traceparent through %s", completionPath)
 	}
 
-	// 3. Verification via independently tagged OATS cases
-	t.Logf("[%s] Running OATS verification", topology)
-	if tracedRequestTraceID != "" && oatsMode != "metrics" {
-		g.Eventually(func() error {
-			casePath := writeOatsTraceCaseFile(t, topology, llmSvcName, tracedRequestTraceID, tracedRequestParentSpanID)
-			return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
-		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "trace OATS verification should succeed")
-		g.Eventually(func() error {
-			return assertTraceIDInTempo(tc.Context(), t, tracedRequestTraceID, oatsEnv)
-		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "injected trace ID should be retrievable from Tempo via gcx")
-		g.Eventually(func() error {
-			return assertAdapterSpanHasInjectedParent(tc.Context(), tracedRequestTraceID, tracedRequestParentSpanID, oatsEnv)
-		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "EPP request span should retain the injected parent span ID")
-		g.Eventually(func() error {
-			return assertAdapterVLLMSpanRelationship(tc.Context(), tracedRequestTraceID, oatsEnv)
-		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(),
-			"EPP request span should directly parent the vLLM llm_request span")
-	}
-	if topology == "single-node" && oatsMode != "traces" {
-		g.Eventually(func() error {
-			return runOatsCase(tc.Context(), t, oatsBin, "single-node-metrics", oatsEnv, projectRoot)
-		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "metrics OATS verification should succeed")
-	} else if topology != "single-node" {
-		g.Eventually(func() error {
-			return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
-		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "OATS verification should succeed")
-	}
+	verifyLLMInferenceServiceOATS(t, tc, topology, projectRoot, oatsBin, oatsEnv, oatsMode,
+		llmSvcName, tracedRequestTraceID, tracedRequestParentSpanID)
 
 	// 4. Pod Termination & Scrape Recovery
 	if topology == "single-node" && oatsMode == "traces" {
@@ -1166,7 +1172,8 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	g.Eventually(func() error {
 		caseTag := topology
 		if topology == "single-node" {
-			caseTag = "single-node-metrics"
+			casePath := writeOatsMetricsCaseFile(t, projectRoot, llmSvcName)
+			return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
 		}
 		return runOatsCase(tc.Context(), t, oatsBin, caseTag, oatsEnv, projectRoot)
 	}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "Scrape recovery verification should succeed after pod restart")
@@ -1192,6 +1199,44 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		}
 		return true
 	}, 1*time.Minute, 2*time.Second).Should(gomega.BeTrue(), "Associated PodMonitor should be deleted within 1 reconciliation cycle of LLMInferenceService deletion")
+}
+
+func verifyLLMInferenceServiceOATS(
+	t *testing.T,
+	tc *TestContext,
+	topology, projectRoot, oatsBin string,
+	oatsEnv []string,
+	oatsMode, llmSvcName, traceID, parentSpanID string,
+) {
+	t.Helper()
+	g := gomega.NewWithT(t)
+	t.Logf("[%s] Running OATS verification", topology)
+	if traceID != "" && oatsMode != "metrics" {
+		g.Eventually(func() error {
+			casePath := writeOatsTraceCaseFile(t, topology, llmSvcName, traceID, parentSpanID)
+			return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "trace OATS verification should succeed")
+		g.Eventually(func() error {
+			return assertTraceIDInTempo(tc.Context(), t, traceID, oatsEnv)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "injected trace ID should be retrievable from Tempo via gcx")
+		g.Eventually(func() error {
+			return assertAdapterSpanHasInjectedParent(tc.Context(), traceID, parentSpanID, oatsEnv)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "EPP request span should retain the injected parent span ID")
+		g.Eventually(func() error {
+			return assertAdapterVLLMSpanRelationship(tc.Context(), traceID, oatsEnv)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(),
+			"EPP request span should directly parent the vLLM llm_request span")
+	}
+	if topology == "single-node" && oatsMode != "traces" {
+		g.Eventually(func() error {
+			casePath := writeOatsMetricsCaseFile(t, projectRoot, llmSvcName)
+			return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "metrics OATS verification should succeed")
+	} else if topology != "single-node" {
+		g.Eventually(func() error {
+			return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "OATS verification should succeed")
+	}
 }
 
 func inferenceContainerEnv() []map[string]any {
@@ -1891,6 +1936,7 @@ func requireUsageLogsMonitoringReady(t *testing.T, tc *TestContext) {
 func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot string) {
 	t.Helper()
 	g := gomega.NewWithT(t)
+	traceOnlyRun := llmInferenceOATSMode() == "traces"
 
 	// The storage fixtures and the Loki S3 Secret must land where the operator creates the
 	// LokiStack, which dsci.yaml pins to spec.monitoring.namespace.
@@ -2012,8 +2058,16 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 		"Ready",
 	)
 
-	enableMaaSUsageLoggingPrerequisite(t, tc)
+	if !traceOnlyRun {
+		enableMaaSUsageLoggingPrerequisite(t, tc)
+	}
 
+	if traceOnlyRun {
+		t.Log("LLM_OATS_MODE=traces; skipping MaaS usage-logging setup")
+	}
+	// Trace validation sends inference through the platform Gateway, whose authentication
+	// policy is managed by Kuadrant. Keep this prerequisite for trace-only runs; only the
+	// unrelated MaaS usage-logging feature and its OATS case are skipped above.
 	for _, crd := range []string{
 		"kuadrants.kuadrant.io",
 		"authpolicies.kuadrant.io",
@@ -2116,9 +2170,11 @@ func TestLLMInferenceService(t *testing.T) {
 	setupInferencePrerequisites(t, tc, projectRoot)
 
 	// Runs before the OATS setup below: it needs neither the binary nor an LLMInferenceService.
-	t.Run("maas-usage-log-envoyfilter", func(t *testing.T) {
-		testMaaSUsageLogEnvoyFilter(t, tc)
-	})
+	if llmInferenceOATSMode() != "traces" {
+		t.Run("maas-usage-log-envoyfilter", func(t *testing.T) {
+			testMaaSUsageLogEnvoyFilter(t, tc)
+		})
+	}
 
 	oatsBin := ensureOatsBinary(t, projectRoot)
 	oatsEnv := buildOatsEnv(t, tc)
