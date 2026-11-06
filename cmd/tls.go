@@ -393,9 +393,9 @@ func classifyWebhookTLSStandInLeaveWithTimeout(
 	return webhookTLSStandInLeaveHealthy
 }
 
-// markWebhookTLSReloadRequested records that manager shutdown should exit 0 so
-// kube restarts the process and re-resolves webhook TLS.
-func markWebhookTLSReloadRequested(reloadRequested *atomic.Bool, cancel context.CancelFunc) {
+// markTLSReloadRequested records that manager shutdown should exit 0 so
+// kube restarts the process and re-resolves TLS.
+func markTLSReloadRequested(reloadRequested *atomic.Bool, cancel context.CancelFunc) {
 	reloadRequested.Store(true)
 	cancel()
 }
