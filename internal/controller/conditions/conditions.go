@@ -143,7 +143,7 @@ const (
 	GPUOperatorMissingMessage = "NVIDIA GPU Operator is not installed; GPU metrics require it (install from OperatorHub)"
 	// DCGMExporterServiceMissingMessage takes the namespace and Service name.
 	DCGMExporterServiceMissingMessage = "DCGM exporter Service %s/%s not found; enable the DCGM exporter in the NVIDIA GPU Operator"
-	DCGMScrapeDisabledMessage         = "Built-in DCGM scrape is disabled; DCGM metrics are collected through a ServiceMonitor or PodMonitor instead"
+	DCGMScrapeDisabledMessage         = "Built-in DCGM scrape is disabled; DCGM metrics can be collected through a ServiceMonitor or PodMonitor instead"
 )
 
 // featureConditionTypes lists the feature-specific condition types that

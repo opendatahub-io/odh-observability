@@ -1246,6 +1246,14 @@ func isKorrel8rEndpointSlice(obj client.Object) bool {
 		serviceName == Korrel8rServiceName
 }
 
+// isDCGMExporterService matches the one Service the DCGM exporter dependency
+// check reads. The GPU Operator creates and deletes it, so it carries no
+// part-of label and the managed Service watch skips it; without this the
+// condition would keep its old verdict until some unrelated event arrived.
+func isDCGMExporterService(obj client.Object) bool {
+	return obj.GetNamespace() == dcgmExporterNamespace && obj.GetName() == dcgmExporterService
+}
+
 func namespaceWatchPredicate() predicate.Funcs {
 	return predicate.Funcs{
 		CreateFunc: func(event.CreateEvent) bool { return true },
@@ -1306,6 +1314,11 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.storageSecretRequests),
 			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{})).
 		Watches(&corev1.Service{}, toSingleton, builder.WithPredicates(managedPredicate)).
+		// The GPU Operator owns the exporter Service and stamps no part-of
+		// label on it, so the managed watch never sees it. Exporters-only
+		// configurations have no periodic refresh, which would leave
+		// DCGMExporterAvailable stale when the exporter is enabled or removed.
+		Watches(&corev1.Service{}, toSingleton, builder.WithPredicates(predicate.NewPredicateFuncs(isDCGMExporterService))).
 		Watches(&discoveryv1.EndpointSlice{}, toSingleton, builder.WithPredicates(predicate.NewPredicateFuncs(isKorrel8rEndpointSlice))).
 		Watches(&corev1.ServiceAccount{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		// Namespace creation or deletion changes the TargetAllocator Secret Role allowlist.

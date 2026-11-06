@@ -2678,6 +2678,55 @@ func TestKorrel8rEndpointSliceWatch_EnqueuesForKorrel8rAndKubernetesAPI(t *testi
 	}
 }
 
+// TestDCGMExporterServiceWatch_EnqueuesForTheExporterOnly: the GPU Operator's
+// exporter Service carries no part-of label, so the managed watch skips it and
+// this narrow predicate is the only thing that refreshes the dependency verdict
+// when the exporter is enabled or removed.
+func TestDCGMExporterServiceWatch_EnqueuesForTheExporterOnly(t *testing.T) {
+	pred := predicate.NewPredicateFuncs(isDCGMExporterService)
+	for _, test := range []struct {
+		name    string
+		service *corev1.Service
+		want    bool
+	}{
+		{
+			name: "exporter Service",
+			service: &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+				Namespace: dcgmExporterNamespace,
+				Name:      dcgmExporterService,
+			}},
+			want: true,
+		},
+		{
+			name: "exporter name in another namespace",
+			service: &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+				Namespace: "other-ns",
+				Name:      dcgmExporterService,
+			}},
+			want: false,
+		},
+		{
+			name: "another Service in the GPU Operator namespace",
+			service: &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+				Namespace: dcgmExporterNamespace,
+				Name:      "gpu-operator",
+			}},
+			want: false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := pred.Create(event.CreateEvent{Object: test.service}); got != test.want {
+				t.Errorf("Create: want %t, got %t", test.want, got)
+			}
+			// Deletion matters as much as creation: a removed exporter Service
+			// has to turn the condition back over.
+			if got := pred.Delete(event.DeleteEvent{Object: test.service}); got != test.want {
+				t.Errorf("Delete: want %t, got %t", test.want, got)
+			}
+		})
+	}
+}
+
 // TestReconcile_ObservedGenerationSet: ObservedGeneration must match the CR generation.
 func TestReconcile_ObservedGenerationSet(t *testing.T) {
 	s := newTestScheme(t)
