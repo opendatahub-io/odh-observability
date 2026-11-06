@@ -277,6 +277,13 @@ spec:
 
 ### Enabling built-in logs (Loki)
 
+This procedure configures `spec.logs`, which forwards application logs through
+ClusterLogForwarder to `data-science-lokistack`. For structured MaaS inference
+usage logs, configure `spec.usageLogs` and follow
+[Operator-managed MaaS usage logs](usage-logs.md). That pipeline uses a separate
+OpenTelemetry Collector and optional `data-science-usage-logs-lokistack`, including
+the identity attributes required by the AI Grid read proxy.
+
 Metrics, traces, and `dsci.logs` can be set from Helm / `DSCInitialization`. Log forwarding still needs object storage, the Loki secret, and CLO.
 
 1. Provide S3-compatible object storage and a bucket for Loki.
