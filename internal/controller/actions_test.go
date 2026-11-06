@@ -968,14 +968,15 @@ func TestDeployPersesPrometheusIntegration_CRDPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 3 {
-		t.Errorf("expected 3 sources (DS proxy + cluster caller-token + tenancy), got %d", len(sources))
+	if len(sources) != 4 {
+		t.Errorf("expected 4 sources (DS proxy + DS cluster-wide + OCP cluster + tenancy), got %d", len(sources))
 	}
-	// Cluster/tenancy (default:false) must be applied before DS (default:true)
+	// Every default:false datasource must be applied before DS (default:true)
 	// so Perses never rejects a dual-default PrometheusDatasource on upgrade.
 	wantPersesDatasources := []string{
 		PersesDatasourceClusterPrometheusTemplate,
 		PersesDatasourceClusterPrometheusTenancyTemplate,
+		PersesDatasourceDataScienceClusterTemplate,
 		PersesDatasourcePrometheusTemplate,
 	}
 	assertTemplatePaths(t, sources, wantPersesDatasources)
