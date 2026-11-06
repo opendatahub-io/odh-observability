@@ -13,10 +13,19 @@ import json
 import subprocess
 import sys
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 
 READY_STATES = {"ready", "configured", "pending", "not-ready", "unavailable"}
+SENSITIVE_QUERY_MARKERS = (
+    "password",
+    "passwd",
+    "apikey",
+    "secret",
+    "token",
+    "credential",
+    "privatekey",
+)
 
 
 class OcError(RuntimeError):
@@ -70,6 +79,25 @@ def condition_map(resource: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def condition_is_true(conditions: dict[str, dict[str, Any]], name: str) -> bool:
     return conditions.get(name, {}).get("status") == "True"
+
+
+def is_authoritative_platform_thanos_service(
+    service: dict[str, Any], platform_prometheus: dict[str, Any] | None
+) -> bool:
+    if not isinstance(platform_prometheus, dict) or not condition_is_true(
+        condition_map(platform_prometheus), "Available"
+    ):
+        return False
+    metadata = service.get("metadata") or {}
+    labels = metadata.get("labels") or {}
+    return (
+        metadata.get("namespace") == "openshift-monitoring"
+        and labels.get("app.kubernetes.io/managed-by") == "cluster-monitoring-operator"
+        and labels.get("app.kubernetes.io/part-of") == "openshift-monitoring"
+        and labels.get("app.kubernetes.io/component") == "query-layer"
+        and labels.get("app.kubernetes.io/instance") == "thanos-querier"
+        and labels.get("app.kubernetes.io/name") == "thanos-query"
+    )
 
 
 def component_state(
@@ -126,10 +154,10 @@ def service_has_ready_endpoint(
             else endpoint_port.get("port") == target_port
             for endpoint_port in endpoint_ports
         )
-        if not matching_port and not isinstance(target_port, str):
+        if not matching_port and target_port is None:
             # Some generated EndpointSlices omit the port name when the
-            # Service uses a numeric targetPort. In that case, compare the
-            # Service port as a conservative fallback.
+            # Service omits targetPort. In that case, compare the Service
+            # port as a conservative fallback.
             matching_port = any(
                 endpoint_port.get("port") == port.get("port")
                 for endpoint_port in endpoint_ports
@@ -191,7 +219,15 @@ def parse_http_url(value: Any) -> Any | None:
         return None
     if parsed.username or parsed.password:
         return None
+    for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
+        normalized_key = "".join(character for character in key.lower() if character.isalnum())
+        if any(marker in normalized_key for marker in SENSITIVE_QUERY_MARKERS):
+            return None
     return parsed
+
+
+def mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 def source(kind: str, namespace: str, name: str) -> str:
@@ -213,7 +249,9 @@ def endpoint_record(
     **extra: Any,
 ) -> dict[str, Any]:
     if state not in READY_STATES:
-        raise ValueError(f"invalid endpoint state {state!r}")
+        raise ValueError("invalid endpoint state")
+    if url is not None and parse_http_url(url) is None:
+        raise ValueError("endpoint URL is not a valid credential-free HTTP URL")
     record: dict[str, Any] = {
         "signal": signal,
         "name": name,
@@ -621,6 +659,29 @@ def discover() -> dict[str, Any]:
                 notes="GET/HEAD only; namespace must be URL query data",
             )
 
+    platform_prometheus_result = optional_oc(
+        ["get", "prometheuses.monitoring.coreos.com", "-o", "json"],
+        "openshift-monitoring",
+        output["warnings"],
+        "OpenShift platform Prometheus",
+    )
+    platform_prometheus_candidates = [
+        item
+        for item in (platform_prometheus_result or {}).get("items", [])
+        if isinstance(item, dict) and condition_is_true(condition_map(item), "Available")
+    ]
+    platform_prometheus = (
+        platform_prometheus_candidates[0]
+        if len(platform_prometheus_candidates) == 1
+        else None
+    )
+    if len(platform_prometheus_candidates) > 1:
+        output["unavailable"].append(
+            {
+                "component": "openshift-metrics",
+                "reason": "Multiple available OpenShift platform Prometheus resources were discovered",
+            }
+        )
     ocp_thanos_result = optional_oc(
         ["get", "services", "--all-namespaces", "-o", "json"],
         None,
@@ -638,8 +699,37 @@ def discover() -> dict[str, Any]:
         if isinstance(ocp_thanos_result, dict)
         else []
     )
+    ocp_thanos: dict[str, Any] | None = None
     if len(ocp_thanos_candidates) == 1:
-        ocp_thanos = ocp_thanos_candidates[0]
+        candidate = ocp_thanos_candidates[0]
+        if is_authoritative_platform_thanos_service(candidate, platform_prometheus):
+            ocp_thanos = candidate
+        else:
+            output["unavailable"].append(
+                {
+                    "component": "openshift-metrics",
+                    "reason": (
+                        "thanos-querier Service identity could not be verified against "
+                        "the OpenShift platform monitoring resource"
+                    ),
+                }
+            )
+    elif len(ocp_thanos_candidates) > 1:
+        output["unavailable"].append(
+            {
+                "component": "openshift-metrics",
+                "reason": "Multiple Thanos Services named thanos-querier were discovered",
+            }
+        )
+    elif isinstance(platform_prometheus, dict):
+        output["unavailable"].append(
+            {
+                "component": "openshift-metrics",
+                "reason": "Authoritative thanos-querier Service was not discovered",
+            }
+        )
+
+    if ocp_thanos is not None:
         platform_namespace = (ocp_thanos.get("metadata") or {}).get("namespace")
         output["monitoring"]["platform_metrics_namespace"] = platform_namespace
         ocp_slices_obj = optional_oc(
@@ -681,14 +771,6 @@ def discover() -> dict[str, Any]:
                     conditions=conditions,
                     notes="OpenShift platform metrics; do not combine with Data Science metrics in one PromQL query",
                 )
-    elif len(ocp_thanos_candidates) > 1:
-        output["unavailable"].append(
-            {
-                "component": "openshift-metrics",
-                "reason": "Multiple Thanos Services named thanos-querier were discovered",
-            }
-        )
-
     if logs_configured:
         logs_endpoint = status.get("logsEndpoint")
         if logs_endpoint and condition_is_true(conditions, "LokiStackAvailable"):
@@ -793,12 +875,51 @@ def discover() -> dict[str, Any]:
 
     if traces_storage:
         trace_backend = trace_storage.get("backend")
+        tempo_resource = {
+            "pv": ("tempomonolithic", "data-science-tempomonolithic"),
+            "s3": ("tempostack", "data-science-tempostack"),
+            "gcs": ("tempostack", "data-science-tempostack"),
+        }.get(trace_backend)
         expected_gateway = {
             "pv": "tempo-data-science-tempomonolithic-gateway",
             "s3": "tempo-data-science-tempostack-gateway",
             "gcs": "tempo-data-science-tempostack-gateway",
         }.get(trace_backend)
-        if expected_gateway and expected_gateway in services:
+        tempo_object = None
+        tempo_ready = False
+        if tempo_resource:
+            tempo_object = optional_oc(
+                ["get", tempo_resource[0], tempo_resource[1], "-o", "json"],
+                namespace,
+                output["warnings"],
+                f"Tempo resource {tempo_resource[1]}",
+            )
+            tempo_ready = isinstance(tempo_object, dict) and condition_is_true(
+                condition_map(tempo_object), "Ready"
+            )
+        if tempo_resource and tempo_object is None:
+            output["unavailable"].append(
+                {
+                    "component": "traces",
+                    "reason": (
+                        f"Tempo resource {tempo_resource[1]} could not be read; "
+                        "gateway readiness cannot be verified"
+                    ),
+                }
+            )
+        elif tempo_resource and not tempo_ready:
+            output["warnings"].append(
+                f"Tempo resource {tempo_resource[1]} does not report Ready=True; "
+                "its gateway will remain not-ready"
+            )
+
+        tempo_conditions = dict(conditions)
+        tempo_conditions["TempoAvailable"] = {
+            "status": "True"
+            if tempo_ready and condition_is_true(conditions, "TempoAvailable")
+            else "False"
+        }
+        if expected_gateway and expected_gateway in services and tempo_object is not None:
             gateway_name = expected_gateway
             gateway = services[gateway_name]
             port = service_port(gateway, numbers=(8080,))
@@ -815,11 +936,11 @@ def discover() -> dict[str, Any]:
                 tls="service-ca",
                 paths=["/api/search", "/api/traces/<trace-id>"],
                 condition="TempoAvailable",
-                conditions=conditions,
+                conditions=tempo_conditions,
                 tenant=namespace,
                 required_headers=[f"X-Scope-OrgID: {namespace}"],
             )
-        else:
+        elif tempo_object is not None or not tempo_resource:
             output["unavailable"].append(
                 {
                     "component": "traces",
@@ -882,15 +1003,19 @@ def discover() -> dict[str, Any]:
         )
         for datasource in (datasources or {}).get("items", []):
             ds_name = (datasource.get("metadata") or {}).get("name", "unknown")
-            proxy = (
-                ((datasource.get("spec") or {}).get("config") or {})
-                .get("plugin", {})
-                .get("spec", {})
-                .get("proxy", {})
-                .get("spec", {})
-            )
-            url = proxy.get("url")
-            if url:
+            datasource_config = mapping(mapping(datasource.get("spec")).get("config"))
+            plugin = mapping(datasource_config.get("plugin"))
+            plugin_spec = mapping(plugin.get("spec"))
+            proxy = mapping(plugin_spec.get("proxy"))
+            proxy_spec = mapping(proxy.get("spec"))
+            url = proxy_spec.get("url")
+            parsed = parse_http_url(url)
+            if url and not parsed:
+                output["warnings"].append(
+                    f"Perses datasource {ds_name} URL was not discoverable because it "
+                    "is not a valid credential-free HTTP URL"
+                )
+            if parsed:
                 output["diagnostic_endpoints"].append(
                     endpoint_record(
                         signal="datasource",
@@ -903,12 +1028,7 @@ def discover() -> dict[str, Any]:
                         paths=[],
                         state="configured",
                         source_ref=source("PersesDatasource", namespace, ds_name),
-                        query_parameters=(
-                            ((datasource.get("spec") or {}).get("config") or {})
-                            .get("plugin", {})
-                            .get("spec", {})
-                            .get("queryParams")
-                        ),
+                        query_parameters=plugin_spec.get("queryParams"),
                     )
                 )
 

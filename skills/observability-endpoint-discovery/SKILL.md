@@ -19,6 +19,7 @@ For a deterministic inventory, run the read-only helper and validate its JSON
 handoff:
 
 ```bash
+set -o pipefail
 python3 scripts/discover_endpoints.py --pretty \
   | tee observability-endpoints.json \
   | python3 scripts/validate_inventory.py
@@ -45,6 +46,9 @@ can reach every endpoint; consume the readiness state and warnings.
   authorization. Do not request, print, decode, or store service-account tokens.
 - Do not read Secrets, object-storage credentials, or exporter credentials. A
   configured exporter URL is a sink, not evidence of a query endpoint.
+- Reject endpoint URLs containing credentials or sensitive query parameters such
+  as `password`, `api_key`, `secret`, or `token`; never write those values to the
+  inventory or diagnostic output.
 - Use HTTPS and the cluster/service CA for TLS endpoints. Do not use `curl -k`
   as a normal discovery or verification method.
 - Do not start a long-running port-forward automatically. Report the
@@ -215,7 +219,11 @@ namespace proxy is GET/HEAD-only.
 
 The Perses integration may expose two caller-token lanes through the COO
 `thanos-querier` Service. Discover the Service across namespaces when RBAC
-permits and retain its observed namespace and actual ports before reporting it:
+permits and retain its observed namespace and actual ports before reporting it.
+Require an available OpenShift platform Prometheus resource and the
+cluster-monitoring-operator-managed Service identity labels before accepting
+the Service as the platform Thanos endpoint. If either source cannot be
+verified, fail closed and omit the platform endpoint:
 
 - `:9091` — cluster-wide OpenShift Monitoring metrics; caller RBAC applies.
 - `:9092` — namespace-tenanted OpenShift Monitoring metrics; `namespace=` is
@@ -285,6 +293,11 @@ Determine which CR exists and is ready:
 oc -n "$MONITORING_NAMESPACE" get tempomonolithic data-science-tempomonolithic -o json
 oc -n "$MONITORING_NAMESPACE" get tempostack data-science-tempostack -o json
 ```
+
+Require the matching Tempo resource to report `status.conditions[type=Ready,
+status=True]`. A `TempoAvailable` Monitoring condition alone is insufficient;
+if the matching CR cannot be read, report that readiness could not be verified
+and do not report its gateway as ready.
 
 Then discover the ready gateway Service. The operator-managed candidates are:
 
