@@ -84,8 +84,9 @@ func TestOperandNetworkPolicyTemplatesContract(t *testing.T) {
 		},
 		{
 			// The usage logs gateway, guarded by the usage logs LokiStack deployment
-			// alongside the stack it fronts. Its only peer is the collector, so unlike the
-			// general-logs gateway it admits no Korrel8r and no Prometheus.
+			// alongside the stack it fronts. It admits the collector, Perses, the usage
+			// tenancy proxy and the OpenShift console backend, so unlike the general-logs
+			// gateway it admits no Korrel8r and no Prometheus.
 			name:       "usage logs loki stack gateway",
 			template:   "resources/usage-logs-lokistack-network-policy.tmpl.yaml",
 			policyName: "data-science-usage-logs-lokistack-allow",

@@ -971,11 +971,15 @@ func TestDeployPersesPrometheusIntegration_CRDPresent(t *testing.T) {
 	if len(sources) != 3 {
 		t.Errorf("expected 3 sources (DS proxy + cluster caller-token + tenancy), got %d", len(sources))
 	}
-	assertTemplatePaths(t, sources, []string{
-		PersesDatasourcePrometheusTemplate,
+	// Cluster/tenancy (default:false) must be applied before DS (default:true)
+	// so Perses never rejects a dual-default PrometheusDatasource on upgrade.
+	wantPersesDatasources := []string{
 		PersesDatasourceClusterPrometheusTemplate,
 		PersesDatasourceClusterPrometheusTenancyTemplate,
-	})
+		PersesDatasourcePrometheusTemplate,
+	}
+	assertTemplatePaths(t, sources, wantPersesDatasources)
+	assertTemplateOrder(t, sources, wantPersesDatasources)
 
 	c := findCondition(m, conditions.ConditionPersesPrometheusDataSourceAvailable)
 	if c == nil || c.Status != metav1.ConditionTrue {
@@ -3884,16 +3888,43 @@ func assertUsageLogsNetworkPolicies(t *testing.T, peers usageLogsNetworkPolicyPe
 		got["app.kubernetes.io/instance"] != peers.lokiStackName {
 		t.Errorf("LokiStack NetworkPolicy must select the %q gateway pods, got %v", peers.lokiStackName, got)
 	}
-	if len(lokiStack.Spec.Ingress) != 1 {
-		t.Fatalf("expected a single ingress rule on the LokiStack NetworkPolicy, got %d", len(lokiStack.Spec.Ingress))
+	// Four peers reach the gateway: the collector on the write path, the Perses
+	// server whose Loki datasource proxies through it on the read path, the
+	// usage tenancy proxy, and the OpenShift console backend behind the
+	// console's usage logs view.
+	if len(lokiStack.Spec.Ingress) != 4 {
+		t.Fatalf("expected the collector, Perses, tenancy proxy and console ingress rules on the LokiStack NetworkPolicy, got %d", len(lokiStack.Spec.Ingress))
 	}
-	rule := lokiStack.Spec.Ingress[0]
-	if !networkPolicyAllowsIngressPort(rule, 8080) {
-		t.Errorf("LokiStack NetworkPolicy must admit the gateway port 8080, got %#v", rule.Ports)
+	admitted := map[string]bool{}
+	for _, rule := range lokiStack.Spec.Ingress {
+		if !networkPolicyAllowsIngressPort(rule, 8080) {
+			t.Errorf("LokiStack NetworkPolicy must admit the gateway port 8080, got %#v", rule.Ports)
+		}
+		if len(rule.From) != 1 || rule.From[0].PodSelector == nil {
+			t.Fatalf("every ingress rule must declare exactly one pod peer, got %#v", rule.From)
+		}
+		peer := rule.From[0]
+		if peer.NamespaceSelector == nil {
+			name := peer.PodSelector.MatchLabels["app.kubernetes.io/name"]
+			if name == "" {
+				name = peer.PodSelector.MatchLabels["app"]
+			}
+			admitted[name] = true
+			continue
+		}
+		if peer.PodSelector.MatchLabels["app"] != "console" ||
+			peer.PodSelector.MatchLabels["component"] != "ui" {
+			t.Errorf("console peer must select the console backend pods, got %#v", peer.PodSelector)
+		}
+		if !namespaceSelectorAdmits(peer.NamespaceSelector, "openshift-console") {
+			t.Errorf("console peer must admit the openshift-console namespace, got %#v", peer.NamespaceSelector)
+		}
+		admitted["console"] = true
 	}
-	if len(rule.From) != 1 || rule.From[0].PodSelector == nil ||
-		rule.From[0].PodSelector.MatchLabels["app.kubernetes.io/name"] != peers.collectorPodName {
-		t.Errorf("only the usage logs collector may reach the gateway, got %#v", rule.From)
+	for _, peer := range []string{peers.collectorPodName, "data-science-perses", "usage-tenancy-proxy", "console"} {
+		if !admitted[peer] {
+			t.Errorf("LokiStack NetworkPolicy does not admit its %s peer, got %#v", peer, admitted)
+		}
 	}
 }
 
@@ -4207,6 +4238,12 @@ func networkPolicyAllowsEgress(policy *networkingv1.NetworkPolicy, cidr string, 
 		}
 	}
 	return false
+}
+
+// namespaceSelectorAdmits reports whether the selector matches the named
+// namespace through the kubernetes.io/metadata.name label.
+func namespaceSelectorAdmits(selector *metav1.LabelSelector, namespace string) bool {
+	return selector != nil && selector.MatchLabels["kubernetes.io/metadata.name"] == namespace
 }
 
 func networkPolicyAllowsPort(rule networkingv1.NetworkPolicyEgressRule, port int32) bool {
