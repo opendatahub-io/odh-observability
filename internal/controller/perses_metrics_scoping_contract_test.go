@@ -121,8 +121,9 @@ func TestPersesMetricsScopingContract_ClusterPrometheusUsesCallerTokenNotSharedS
 // TestPersesMetricsScopingContract_DataScienceClusterDatasourceUsesAuthorizedProxyHub
 // locks the cluster-wide Data Science lane: it goes through the proxy (never
 // straight to the querier), carries no namespace projection, and is not the
-// default. accelerator_* only exists here, because the scoped lane drops series
-// without a namespace label.
+// default. accelerator_* is only reachable here: the scoped lane projects
+// namespace=<selected>, and the series carry the collector's namespace instead
+// of a workload one.
 func TestPersesMetricsScopingContract_DataScienceClusterDatasourceUsesAuthorizedProxyHub(t *testing.T) {
 	t.Parallel()
 

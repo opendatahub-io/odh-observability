@@ -20,8 +20,9 @@ import (
 )
 
 // The GPU panels read accelerator_* through the cluster-wide Data Science lane:
-// those series carry no namespace label, so the scoped datasource cannot serve
-// them, and OpenShift Thanos never sees the Data Science recording rules.
+// those series are not workload-namespaced (their only namespace label is the
+// collector's own), so the namespace-scoped datasource cannot serve them, and
+// OpenShift Thanos never sees the Data Science recording rules.
 const clusterPrometheusDatasourceName = "data-science-cluster-prometheus-datasource"
 
 // The capacity panel is the one query the Data Science stack cannot answer:

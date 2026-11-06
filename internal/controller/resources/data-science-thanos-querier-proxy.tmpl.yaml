@@ -63,8 +63,9 @@ data:
     # Cluster-wide lane (port 8444). The caller proves access to cluster-level
     # metrics instead of to one namespace, then the query is forwarded
     # unmodified -- there is no namespace to rewrite and prom-label-proxy is not
-    # in this path. Needed because accelerator_* series carry no namespace
-    # label, so the namespace-enforcing lane can never serve them.
+    # in this path. Needed because accelerator_* series are not namespaced by
+    # GPU workload (their only namespace label is the collector's), so the
+    # namespace-enforcing lane can never serve them.
     authorization:
       resourceAttributes:
         apiGroup: metrics.k8s.io
