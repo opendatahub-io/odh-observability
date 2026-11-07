@@ -149,7 +149,7 @@ def service_has_ready_endpoint(
     for endpoint_slice in slices:
         endpoint_ports = endpoint_slice.get("ports") or []
         matching_port = any(
-            endpoint_port.get("name") == target_port
+            endpoint_port.get("name") == port.get("name")
             if isinstance(target_port, str)
             else endpoint_port.get("port") == target_port
             for endpoint_port in endpoint_ports
@@ -693,6 +693,7 @@ def discover() -> dict[str, Any]:
             item
             for item in ocp_thanos_result.get("items", [])
             if (item.get("metadata") or {}).get("name") == "thanos-querier"
+            and (item.get("metadata") or {}).get("namespace") == "openshift-monitoring"
         ]
         if isinstance(ocp_thanos_result, dict) and isinstance(ocp_thanos_result.get("items"), list)
         else [ocp_thanos_result]
@@ -1180,7 +1181,8 @@ def main() -> int:
         return 2
     print(json.dumps(result, indent=2 if args.pretty else None, sort_keys=args.pretty))
     return 0 if not result["unavailable"] or all(
-        item.get("component") != "monitoring" for item in result["unavailable"]
+        item.get("component") not in {"monitoring", "dsci"}
+        for item in result["unavailable"]
     ) else 2
 
 

@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+from unittest.mock import patch
+
+
+SCRIPT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
+sys.path.insert(0, SCRIPT_DIR)
+
+import discover_endpoints  # noqa: E402
+
+
+class DiscoverEndpointsTests(unittest.TestCase):
+    def test_named_target_port_matches_service_port_name(self) -> None:
+        service = {
+            "metadata": {"name": "metrics-proxy"},
+            "spec": {
+                "ports": [{"name": "https", "port": 8443, "targetPort": "metrics-tls"}]
+            },
+        }
+        slices = {
+            "metrics-proxy": [
+                {
+                    "ports": [{"name": "https", "port": 8443}],
+                    "endpoints": [{"addresses": ["10.0.0.1"], "conditions": {"ready": True}}],
+                }
+            ]
+        }
+
+        port = discover_endpoints.service_port(service, names=("https",))
+        self.assertTrue(discover_endpoints.service_has_ready_endpoint(service, slices, port))
+
+    @patch.object(discover_endpoints, "discover")
+    def test_dsci_unavailability_is_failure(self, mock_discover: object) -> None:
+        mock_discover.return_value = {"unavailable": [{"component": "dsci"}]}  # type: ignore[attr-defined]
+        with patch.object(sys, "argv", ["discover_endpoints.py"]), patch("builtins.print"):
+            self.assertEqual(discover_endpoints.main(), 2)
+
+    def test_thanos_candidates_are_limited_to_openshift_monitoring(self) -> None:
+        monitoring = {
+            "spec": {"namespace": "redhat-ods-monitoring", "managementState": "Managed"},
+            "status": {},
+        }
+        platform_prometheus = {
+            "status": {"conditions": [{"type": "Available", "status": "True"}]}
+        }
+        labels = {
+            "app.kubernetes.io/managed-by": "cluster-monitoring-operator",
+            "app.kubernetes.io/part-of": "openshift-monitoring",
+            "app.kubernetes.io/component": "query-layer",
+            "app.kubernetes.io/instance": "thanos-querier",
+            "app.kubernetes.io/name": "thanos-query",
+        }
+        services = {
+            "items": [
+                {
+                    "metadata": {
+                        "name": "thanos-querier",
+                        "namespace": "openshift-monitoring",
+                        "labels": labels,
+                    },
+                    "spec": {"ports": [{"port": 9091}, {"port": 9092}]},
+                },
+                {"metadata": {"name": "thanos-querier", "namespace": "other"}},
+            ]
+        }
+
+        def optional_oc(
+            args: list[str],
+            namespace: str | None,
+            warnings: list[str],
+            description: str,
+        ) -> dict:
+            if args == ["get", "prometheuses.monitoring.coreos.com", "-o", "json"]:
+                return {"items": [platform_prometheus]}
+            if args == ["get", "services", "--all-namespaces", "-o", "json"]:
+                return services
+            return {"items": []}
+
+        with patch.object(discover_endpoints, "run_oc", return_value=monitoring), patch.object(
+            discover_endpoints, "optional_oc", side_effect=optional_oc
+        ):
+            result = discover_endpoints.discover()
+
+        self.assertEqual(result["monitoring"]["platform_metrics_namespace"], "openshift-monitoring")
+        self.assertNotIn(
+            "Multiple Thanos Services named thanos-querier were discovered",
+            [item["reason"] for item in result["unavailable"]],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
