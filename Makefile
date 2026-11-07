@@ -42,16 +42,20 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
-test: manifests generate fmt vet ## Run tests with coverage (full pipeline).
+test: manifests generate fmt vet logs-query-test ## Run tests with coverage (full pipeline).
 	go test $(shell go list ./... | grep -v /tests/e2e) -coverprofile cover.out
 
 .PHONY: unit-test
-unit-test: ## Run unit tests (no codegen prerequisites).
+unit-test: logs-query-test ## Run unit tests (no codegen prerequisites).
 	go test $(shell go list ./... | grep -v /tests/e2e)
 
 .PHONY: test-verbose
-test-verbose: ## Run unit tests with verbose output.
+test-verbose: logs-query-test ## Run unit tests with verbose output.
 	go test -v $(shell go list ./... | grep -v /tests/e2e)
+
+.PHONY: logs-query-test
+logs-query-test: ## Run the observability logs-query Python tests.
+	python3 -m unittest discover -s skills/observability-logs-query/tests -v
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint against code.
