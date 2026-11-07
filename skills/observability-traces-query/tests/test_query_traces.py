@@ -123,10 +123,34 @@ class QueryTracesTests(unittest.TestCase):
         self.assertEqual(parsed.path, "/api/traces/v1/redhat-ods-monitoring/tempo/api/search")
         params = parse_qs(parsed.query)
         self.assertEqual(params["limit"], ["100"])
-        self.assertEqual(params["status"], ["error"])
-        self.assertEqual(params["tags"], ["service.name=checkout,name=GET /orders,http.method=GET"])
+        self.assertEqual(
+            params["q"],
+            ['{ status = error && resource.service.name = "checkout" && name = "GET /orders" }'],
+        )
+        self.assertNotIn("status", params)
+        self.assertEqual(params["tags"], ["http.method=GET"])
         self.assertEqual(headers["X-Scope-OrgID"], "redhat-ods-monitoring")
         self.assertEqual(headers["Authorization"], "Bearer test-token")
+
+    @patch.dict(os.environ, {"TRACE_TOKEN": "test-token"})
+    def test_builds_logfmt_tags_with_spaces_and_commas(self) -> None:
+        args = search_args(
+            service="checkout,blue",
+            operation="GET /orders",
+            tag=["http.route=/orders,bulk", "http.target=/v1/orders 42"],
+        )
+        metadata = query_traces.query_metadata(args, "search")
+        url, _ = query_traces.build_request(inventory()["query_endpoints"][0], args, metadata)
+        params = parse_qs(urlsplit(url).query)
+        self.assertEqual(
+            params["tags"],
+            ['service.name=checkout,blue name="GET /orders" http.route=/orders,bulk http.target="/v1/orders 42"'],
+        )
+
+    def test_rejects_status_with_query(self) -> None:
+        with self.assertRaises(query_traces.QueryError) as context:
+            query_traces.query_metadata(search_args(status="error", query="{ .http.status_code = 500 }"), "search")
+        self.assertEqual(context.exception.kind, "invalid_argument")
 
     @patch.dict(os.environ, {"TRACE_TOKEN": "test-token"})
     def test_builds_trace_lookup_request(self) -> None:
@@ -145,6 +169,15 @@ class QueryTracesTests(unittest.TestCase):
         with self.assertRaises(query_traces.QueryError) as context:
             query_traces.query_metadata(args, "search")
         self.assertEqual(context.exception.kind, "invalid_argument")
+
+    @patch.dict(os.environ, {"TRACE_TOKEN": "test-token"})
+    def test_rounds_search_timestamps_outward_to_epoch_seconds(self) -> None:
+        args = search_args(start="1704067200.1", end="1704067200.9")
+        metadata = query_traces.query_metadata(args, "search")
+        url, _ = query_traces.build_request(inventory()["query_endpoints"][0], args, metadata)
+        params = parse_qs(urlsplit(url).query)
+        self.assertEqual(params["start"], ["1704067200"])
+        self.assertEqual(params["end"], ["1704067201"])
 
     def test_rejects_unbounded_search(self) -> None:
         args = search_args(start=None, end=None)
@@ -244,6 +277,11 @@ class QueryTracesTests(unittest.TestCase):
             query_traces.query_metadata(search_args(tag=["password=secret"]), "search")
         self.assertEqual(context.exception.kind, "invalid_argument")
 
+    def test_rejects_invalid_tag_key(self) -> None:
+        with self.assertRaises(query_traces.QueryError) as context:
+            query_traces.query_metadata(search_args(tag=["http route=value"]), "search")
+        self.assertEqual(context.exception.kind, "invalid_argument")
+
     def test_rejects_http_trace_endpoint(self) -> None:
         endpoint = inventory()["query_endpoints"][0].copy()
         endpoint["url"] = endpoint["url"].replace("https://", "http://")
@@ -305,8 +343,9 @@ class QueryTracesTests(unittest.TestCase):
             self.assertEqual(validate_result.main(), 0)
 
     def test_rejects_tag_delimiter_and_duration_order(self) -> None:
+        query_traces.query_metadata(search_args(tag=["http.route=/a,b"]), "search")
         with self.assertRaises(query_traces.QueryError):
-            query_traces.query_metadata(search_args(tag=["http.route=/a,b"]), "search")
+            query_traces.query_metadata(search_args(min_duration="1d"), "search")
         with self.assertRaises(query_traces.QueryError):
             query_traces.query_metadata(
                 search_args(min_duration="5s", max_duration="1s"), "search"

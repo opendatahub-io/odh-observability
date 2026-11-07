@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -15,6 +16,25 @@ import discover_endpoints  # noqa: E402
 
 
 class DiscoverEndpointsTests(unittest.TestCase):
+    @patch.object(discover_endpoints.subprocess, "run")
+    def test_run_oc_uses_bounded_client_and_subprocess_timeouts(self, mock_run: object) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="{}", stderr=""
+        )  # type: ignore[attr-defined]
+        self.assertEqual(discover_endpoints.run_oc(["get", "pods", "-o", "json"]), {})
+        call = mock_run.call_args  # type: ignore[attr-defined]
+        self.assertEqual(call.kwargs["timeout"], discover_endpoints.OC_SUBPROCESS_TIMEOUT_SECONDS)
+        self.assertEqual(call.args[0][:2], ["oc", "--request-timeout=20s"])
+
+    @patch.object(discover_endpoints.subprocess, "run")
+    def test_run_oc_timeout_uses_discovery_error_handling(self, mock_run: object) -> None:
+        mock_run.side_effect = subprocess.TimeoutExpired(
+            ["oc"], discover_endpoints.OC_SUBPROCESS_TIMEOUT_SECONDS
+        )  # type: ignore[attr-defined]
+        with self.assertRaises(discover_endpoints.OcError) as context:
+            discover_endpoints.run_oc(["get", "pods"])
+        self.assertIn("timed out", str(context.exception))
+
     def test_named_target_port_matches_service_port_name(self) -> None:
         service = {
             "metadata": {"name": "metrics-proxy"},

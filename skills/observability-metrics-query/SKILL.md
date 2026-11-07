@@ -46,7 +46,7 @@ credentials, or query an internal Prometheus or Thanos backend directly.
 5. Run a bounded query:
 
    ```bash
-   python3 scripts/query_metrics.py \
+   python3 skills/observability-metrics-query/scripts/query_metrics.py \
      --inventory observability-endpoints.json \
      --endpoint data-science-thanos-route \
      --namespace <authorized-workload-namespace> \
@@ -54,7 +54,7 @@ credentials, or query an internal Prometheus or Thanos backend directly.
      --bearer-token-env RHOAI_METRICS_BEARER_TOKEN \
      --pretty \
      | tee metrics-result.json \
-     | python3 scripts/validate_result.py
+     | python3 skills/observability-metrics-query/scripts/validate_result.py
    ```
 
    Use `--start`, `--end`, and `--step` together for a range query. The
@@ -102,7 +102,7 @@ The helper returns a deterministic JSON object with:
 Validate a saved result before handing it to another skill:
 
 ```bash
-python3 scripts/validate_result.py < metrics-result.json
+python3 skills/observability-metrics-query/scripts/validate_result.py < metrics-result.json
 ```
 
 For endpoint selection, readiness states, RBAC limitations, and service/route

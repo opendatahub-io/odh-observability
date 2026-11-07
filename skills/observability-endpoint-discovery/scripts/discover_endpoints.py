@@ -26,6 +26,8 @@ SENSITIVE_QUERY_MARKERS = (
     "credential",
     "privatekey",
 )
+OC_REQUEST_TIMEOUT = "20s"
+OC_SUBPROCESS_TIMEOUT_SECONDS = 30.0
 
 
 class OcError(RuntimeError):
@@ -33,11 +35,22 @@ class OcError(RuntimeError):
 
 
 def run_oc(args: list[str], namespace: str | None = None) -> Any:
-    command = ["oc"]
+    command = ["oc", f"--request-timeout={OC_REQUEST_TIMEOUT}"]
     if namespace:
         command.extend(["-n", namespace])
     command.extend(args)
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=OC_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise OcError(
+            f"oc timed out after {OC_SUBPROCESS_TIMEOUT_SECONDS:g} seconds"
+        ) from error
     if result.returncode != 0:
         detail = result.stderr.strip().splitlines()
         raise OcError(detail[-1] if detail else f"oc exited with {result.returncode}")

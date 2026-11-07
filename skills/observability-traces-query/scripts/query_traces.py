@@ -56,7 +56,8 @@ SEARCH_PATH = "/api/search"
 TRACE_PATH_TEMPLATE = "/api/traces/<trace-id>"
 TRACE_ID_PATTERN = re.compile(r"^(?:[0-9a-fA-F]{16}|[0-9a-fA-F]{32})$")
 HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
-DURATION_PATTERN = re.compile(r"(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>ms|s|m|h|d|w|y)")
+DURATION_PATTERN = re.compile(r"(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>ns|us|µs|ms|s|m|h)")
+TAG_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]+$")
 RESERVED_QUERY_PARAMETERS = {
     "start",
     "end",
@@ -231,9 +232,9 @@ def parse_timestamp(value: str, option: str) -> float:
     return timestamp
 
 
-def format_timestamp(timestamp: float) -> str:
-    formatted = f"{timestamp:.6f}".rstrip("0").rstrip(".")
-    return formatted or "0"
+def format_timestamp(timestamp: float, *, round_up: bool = False) -> str:
+    rounded = math.ceil(timestamp) if round_up else math.floor(timestamp)
+    return str(rounded)
 
 
 def parse_duration(value: str, option: str) -> float:
@@ -241,7 +242,15 @@ def parse_duration(value: str, option: str) -> float:
         raise QueryError("invalid_argument", f"{option} must not be empty")
     position = 0
     seconds = 0.0
-    units = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0, "w": 604800.0, "y": 31536000.0}
+    units = {
+        "ns": 1e-9,
+        "us": 1e-6,
+        "µs": 1e-6,
+        "ms": 0.001,
+        "s": 1.0,
+        "m": 60.0,
+        "h": 3600.0,
+    }
     for match in DURATION_PATTERN.finditer(value):
         if match.start() != position:
             raise QueryError("invalid_argument", f"{option} is not a valid duration")
@@ -275,8 +284,8 @@ def parse_key_value(value: str, option: str) -> tuple[str, str]:
 
 def parse_tag(value: str) -> tuple[str, str]:
     key, item = parse_key_value(value, "--tag")
-    if "," in key or "," in item:
-        raise QueryError("invalid_argument", "--tag keys and values must not contain commas")
+    if not TAG_KEY_PATTERN.fullmatch(key):
+        raise QueryError("invalid_argument", "--tag keys must contain only letters, digits, '.', ':', '_' or '-'")
     return key, item
 
 
@@ -284,7 +293,7 @@ def parse_tags(values: list[str]) -> list[tuple[str, str]]:
     if len(values) > MAX_TAG_COUNT:
         raise QueryError("invalid_argument", f"at most {MAX_TAG_COUNT} --tag values are allowed")
     tags = [parse_tag(value) for value in values]
-    encoded_length = sum(len(key) + len(value) + 2 for key, value in tags)
+    encoded_length = sum(len(encode_logfmt_pair(key, value)) + 1 for key, value in tags)
     if encoded_length > MAX_TAG_QUERY_LENGTH:
         raise QueryError("invalid_argument", "combined --tag values exceed the maximum length")
     return tags
@@ -309,10 +318,49 @@ def parse_parameters(values: list[str]) -> dict[str, str]:
 
 
 def validate_tag_component(value: str, option: str) -> str:
-    value = validate_filter_value(value, option)
-    if "," in value:
-        raise QueryError("invalid_argument", f"{option} must not contain commas")
-    return value
+    return validate_filter_value(value, option)
+
+
+def encode_logfmt_pair(key: str, value: str) -> str:
+    if value and not any(character.isspace() or character in {'"', "\\"} for character in value):
+        return f"{key}={value}"
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'{key}="{escaped}"'
+
+
+def traceql_string(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def build_traceql_query(args: argparse.Namespace) -> str | None:
+    if args.status is not None and args.query is not None:
+        raise QueryError("invalid_argument", "--status cannot be combined with --query")
+    if args.query is None and args.status is None:
+        return None
+    conditions: list[str] = []
+    if args.service is not None:
+        conditions.append(
+            f"resource.service.name = {traceql_string(validate_tag_component(args.service, '--service'))}"
+        )
+    if args.operation is not None:
+        conditions.append(f"name = {traceql_string(validate_tag_component(args.operation, '--operation'))}")
+    if args.status is not None:
+        status = validate_filter_value(args.status, "--status").lower()
+        if status not in {"ok", "error", "unset"}:
+            raise QueryError("invalid_argument", "--status must be one of ok, error, or unset")
+        conditions.insert(0, f"status = {status}")
+    if args.query is not None:
+        query = validate_filter_value(args.query, "--query")
+        if not conditions:
+            return query
+        if query.startswith("{") and query.endswith("}"):
+            inner = query[1:-1].strip()
+            return "{ " + " && ".join([inner, *conditions]) + " }"
+        return f"({query}) && {{ {' && '.join(conditions)} }}"
+    if not conditions:
+        return None
+    return "{ " + " && ".join(conditions) + " }"
 
 
 def query_metadata(args: argparse.Namespace, mode: str) -> dict[str, Any]:
@@ -345,6 +393,8 @@ def query_metadata(args: argparse.Namespace, mode: str) -> dict[str, Any]:
     if args.operation is not None:
         filters["operation"] = validate_tag_component(args.operation, "--operation")
     if args.status is not None:
+        if args.query is not None:
+            raise QueryError("invalid_argument", "--status cannot be combined with --query")
         status = validate_filter_value(args.status, "--status").lower()
         if status not in {"ok", "error", "unset"}:
             raise QueryError("invalid_argument", "--status must be one of ok, error, or unset")
@@ -455,20 +505,20 @@ def build_request(
 
     if mode == "search":
         start = format_timestamp(parse_timestamp(args.start, "--start"))
-        end = format_timestamp(parse_timestamp(args.end, "--end"))
+        end = format_timestamp(parse_timestamp(args.end, "--end"), round_up=True)
         params.update({"start": start, "end": end, "limit": str(args.limit)})
-        if args.query is not None:
-            params["q"] = validate_filter_value(args.query, "--query")
+        traceql_query = build_traceql_query(args)
+        if traceql_query is not None:
+            params["q"] = traceql_query
         tag_pairs = []
-        if args.service is not None:
-            tag_pairs.append(f"service.name={validate_tag_component(args.service, '--service')}")
-        if args.operation is not None:
-            tag_pairs.append(f"name={validate_tag_component(args.operation, '--operation')}")
-        tag_pairs.extend(f"{key}={value}" for key, value in parse_tags(args.tag))
+        if traceql_query is None:
+            if args.service is not None:
+                tag_pairs.append(encode_logfmt_pair("service.name", validate_tag_component(args.service, "--service")))
+            if args.operation is not None:
+                tag_pairs.append(encode_logfmt_pair("name", validate_tag_component(args.operation, "--operation")))
+        tag_pairs.extend(encode_logfmt_pair(key, value) for key, value in parse_tags(args.tag))
         if tag_pairs:
-            params["tags"] = ",".join(tag_pairs)
-        if args.status is not None:
-            params["status"] = validate_filter_value(args.status, "--status").lower()
+            params["tags"] = " ".join(tag_pairs)
         if args.min_duration is not None:
             parse_duration(args.min_duration, "--min-duration")
             params["minDuration"] = args.min_duration
