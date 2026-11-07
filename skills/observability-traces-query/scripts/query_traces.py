@@ -411,6 +411,12 @@ def validate_filter_combinations(args: argparse.Namespace) -> None:
         raise QueryError(
             "invalid_argument", "--tag cannot be combined with --status or --query; include filters in --query instead"
         )
+    if (args.min_duration is not None or args.max_duration is not None) and (
+        args.status is not None or args.query is not None
+    ):
+        raise QueryError(
+            "invalid_argument", "--min-duration and --max-duration cannot be combined with --status or --query"
+        )
 
 
 def build_traceql_query(args: argparse.Namespace) -> str | None:

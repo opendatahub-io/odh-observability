@@ -122,7 +122,9 @@ through `--ca-file`. It never obtains credentials or disables TLS verification.
   are logfmt encoded, separated by spaces, and values containing spaces, quotes,
   or backslashes are quoted and escaped. Commas in values are valid.
 - Duration filters use Go duration units: `ns`, `us`, `µs`, `ms`, `s`, `m`, or
-  `h`. Endpoint-specific non-Tempo parameters use `--param KEY=VALUE`.
+  `h`. They cannot be combined with `--status` or `--query` because Tempo may
+  ignore duration parameters for TraceQL searches. Endpoint-specific non-Tempo
+  parameters use `--param KEY=VALUE`.
 - Trace IDs must be 16- or 32-character hexadecimal values. Trace lookup does
   not require a time window.
 - Requests use GET and the endpoint's discovered tenant header, normally
