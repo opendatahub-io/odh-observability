@@ -118,7 +118,7 @@ validation, and the least-privilege live-cluster setup and cleanup path.
 make test              # Full pipeline: codegen + fmt + vet + unit tests
 make unit-test         # Unit tests only (fastest iteration)
 make test-verbose      # Unit tests with -v
-make logs-query-test   # Python tests for the observability logs-query skill
+make logs-query-test   # Python tests for all observability skills
 
 # Single test
 go test ./internal/controller/ -run TestBuildTemplateData -v

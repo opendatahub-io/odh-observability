@@ -7,6 +7,7 @@ import subprocess
 import sys
 import unittest
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 
 SCRIPT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
@@ -90,6 +91,27 @@ class DiscoverEndpointsTests(unittest.TestCase):
             output["query_endpoints"][0]["url"],
             "https://tempo-gateway.monitoring.svc.cluster.local:8080/api/traces/v1/monitoring/tempo",
         )
+
+    def test_cluster_service_name_requires_full_current_namespace_dns(self) -> None:
+        self.assertEqual(
+            discover_endpoints.cluster_service_name(
+                urlsplit("https://gateway.monitoring.svc.cluster.local:8080/path"),
+                "monitoring",
+            ),
+            "gateway",
+        )
+        for hostname in (
+            "gateway.other.svc.cluster.local",
+            "gateway.monitoring.svc.cluster.local.attacker.example",
+            "gateway.extra.monitoring.svc.cluster.local",
+            "gateway.monitoring.svc",
+        ):
+            with self.subTest(hostname=hostname):
+                self.assertIsNone(
+                    discover_endpoints.cluster_service_name(
+                        urlsplit(f"https://{hostname}:8080/path"), "monitoring"
+                    )
+                )
 
     @patch.object(discover_endpoints, "discover")
     def test_dsci_unavailability_is_failure(self, mock_discover: object) -> None:

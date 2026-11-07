@@ -239,6 +239,20 @@ def parse_http_url(value: Any) -> Any | None:
     return parsed
 
 
+def cluster_service_name(parsed: Any, namespace: str) -> str | None:
+    """Return a Service name only for its full cluster-local DNS name."""
+    hostname = parsed.hostname if parsed is not None else None
+    if not isinstance(hostname, str) or not namespace:
+        return None
+    suffix = f".{namespace}.svc.cluster.local"
+    if not hostname.endswith(suffix):
+        return None
+    service_name = hostname[: -len(suffix)]
+    if not service_name or "." in service_name:
+        return None
+    return service_name
+
+
 def mapping(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
@@ -799,39 +813,50 @@ def discover() -> dict[str, Any]:
                     }
                 )
             else:
-                gateway_service_name = (parsed.hostname or "").split(".")[0]
-                gateway_service = services.get(gateway_service_name)
-                gateway_port = service_port(
-                    gateway_service or {},
-                    numbers=(parsed.port or (443 if parsed.scheme == "https" else 80),),
-                )
-                ready = bool(
-                    gateway_service
-                    and service_has_ready_endpoint(gateway_service, slices_by_service, gateway_port)
-                )
-                output["query_endpoints"].append(
-                    endpoint_record(
-                        signal="logs",
-                        name="data-science-loki",
-                        url=logs_endpoint,
-                        access="cluster-service",
-                        scope="application",
-                        auth="caller-bearer",
-                        tls="service-ca" if parsed.scheme == "https" else "none",
-                        paths=["/loki/api/v1/query", "/loki/api/v1/query_range", "/loki/api/v1/labels"],
-                        state="ready" if ready else "configured",
-                        source_ref=source("Monitoring", "cluster", "default-monitoring"),
-                        tenant="application",
-                        gateway_service=gateway_service_name,
-                        service_port=parsed.port,
-                        required_headers=["X-Scope-OrgID: application"],
+                gateway_service_name = cluster_service_name(parsed, namespace)
+                if gateway_service_name is None:
+                    output["unavailable"].append(
+                        {
+                            "component": "logs",
+                            "reason": (
+                                "Monitoring.status.logsEndpoint hostname must be a full "
+                                f"<service>.{namespace}.svc.cluster.local name"
+                            ),
+                        }
                     )
-                )
-                if not condition_is_true(conditions, "ClusterLogForwarderAvailable"):
-                    output["warnings"].append(
-                        "Loki gateway is ready but ClusterLogForwarder is not ready; "
-                        "historical application logs may be incomplete"
+                else:
+                    gateway_service = services.get(gateway_service_name)
+                    gateway_port = service_port(
+                        gateway_service or {},
+                        numbers=(parsed.port or (443 if parsed.scheme == "https" else 80),),
                     )
+                    ready = bool(
+                        gateway_service
+                        and service_has_ready_endpoint(gateway_service, slices_by_service, gateway_port)
+                    )
+                    output["query_endpoints"].append(
+                        endpoint_record(
+                            signal="logs",
+                            name="data-science-loki",
+                            url=logs_endpoint,
+                            access="cluster-service",
+                            scope="application",
+                            auth="caller-bearer",
+                            tls="service-ca" if parsed.scheme == "https" else "none",
+                            paths=["/loki/api/v1/query", "/loki/api/v1/query_range", "/loki/api/v1/labels"],
+                            state="ready" if ready else "configured",
+                            source_ref=source("Monitoring", "cluster", "default-monitoring"),
+                            tenant="application",
+                            gateway_service=gateway_service_name,
+                            service_port=parsed.port,
+                            required_headers=["X-Scope-OrgID: application"],
+                        )
+                    )
+                    if not condition_is_true(conditions, "ClusterLogForwarderAvailable"):
+                        output["warnings"].append(
+                            "Loki gateway is ready but ClusterLogForwarder is not ready; "
+                            "historical application logs may be incomplete"
+                        )
         else:
             output["unavailable"].append(
                 {"component": "logs", "reason": "Loki query endpoint is not published and ready"}
@@ -849,40 +874,51 @@ def discover() -> dict[str, Any]:
                 }
             )
         else:
-            usage_service_name = (parsed.hostname or "").split(".")[0]
-            usage_service = services.get(usage_service_name)
-            usage_port = service_port(
-                usage_service or {},
-                numbers=(parsed.port or (443 if parsed.scheme == "https" else 80),),
-            )
-            ready = bool(
-                usage_service
-                and service_has_ready_endpoint(usage_service, slices_by_service, usage_port)
-            )
-            usage_condition = conditions.get("UsageLogsLokiStackAvailable", {}).get("status")
-            if usage_condition == "False":
-                usage_state = "not-ready"
-            elif usage_condition == "True" and ready:
-                usage_state = "ready"
-            else:
-                usage_state = "configured"
-            output["telemetry_ingest"].append(
-                endpoint_record(
-                    signal="logs",
-                    name="usage-logs-otlp",
-                    url=usage_endpoint,
-                    access="cluster-service",
-                    scope="application",
-                    auth="service-account",
-                    tls="service-ca" if parsed.scheme == "https" else "none",
-                    paths=["/api/logs/v1/application/otlp"],
-                    state=usage_state,
-                    source_ref=source("Monitoring", "cluster", "default-monitoring"),
-                    gateway_service=usage_service_name,
-                    service_port=parsed.port,
-                    notes="OTLP ingestion only; not a query endpoint",
+            usage_service_name = cluster_service_name(parsed, namespace)
+            if usage_service_name is None:
+                output["unavailable"].append(
+                    {
+                        "component": "usage-logs",
+                        "reason": (
+                            "Monitoring.status.usageLogsEndpoint hostname must be a full "
+                            f"<service>.{namespace}.svc.cluster.local name"
+                        ),
+                    }
                 )
-            )
+            else:
+                usage_service = services.get(usage_service_name)
+                usage_port = service_port(
+                    usage_service or {},
+                    numbers=(parsed.port or (443 if parsed.scheme == "https" else 80),),
+                )
+                ready = bool(
+                    usage_service
+                    and service_has_ready_endpoint(usage_service, slices_by_service, usage_port)
+                )
+                usage_condition = conditions.get("UsageLogsLokiStackAvailable", {}).get("status")
+                if usage_condition == "False":
+                    usage_state = "not-ready"
+                elif usage_condition == "True" and ready:
+                    usage_state = "ready"
+                else:
+                    usage_state = "configured"
+                output["telemetry_ingest"].append(
+                    endpoint_record(
+                        signal="logs",
+                        name="usage-logs-otlp",
+                        url=usage_endpoint,
+                        access="cluster-service",
+                        scope="application",
+                        auth="service-account",
+                        tls="service-ca" if parsed.scheme == "https" else "none",
+                        paths=["/api/logs/v1/application/otlp"],
+                        state=usage_state,
+                        source_ref=source("Monitoring", "cluster", "default-monitoring"),
+                        gateway_service=usage_service_name,
+                        service_port=parsed.port,
+                        notes="OTLP ingestion only; not a query endpoint",
+                    )
+                )
     elif usage_logs_storage:
         output["unavailable"].append(
             {"component": "usage-logs", "reason": "Usage log storage is configured but no OTLP endpoint is published"}

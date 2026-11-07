@@ -125,7 +125,6 @@ Run discovery first and keep its validated inventory for the test workload:
 
 ```bash
 set -euo pipefail
-MONITORING_NAMESPACE=redhat-ods-monitoring
 RUN_ID="$(date +%s)-$$"
 TEST_NAMESPACE="rhai-15151-logs-query-${RUN_ID}"
 TEST_SERVICE_ACCOUNT=logs-query-test
@@ -141,6 +140,11 @@ python3 skills/observability-endpoint-discovery/scripts/discover_endpoints.py \
   --pretty > "$INVENTORY"
 python3 skills/observability-endpoint-discovery/scripts/validate_inventory.py \
   < "$INVENTORY"
+
+# Read the operand namespace only after validating the inventory; never assume
+# a product-default monitoring namespace.
+MONITORING_NAMESPACE="$(python3 -c 'import json, sys; print((json.load(open(sys.argv[1], encoding="utf-8")).get("monitoring") or {}).get("namespace") or "")' "$INVENTORY")"
+test -n "$MONITORING_NAMESPACE"
 
 # This reads a public service-CA ConfigMap, not a Secret.
 oc get configmap data-science-lokistack-gateway-ca-bundle \
@@ -246,6 +250,7 @@ oc create configmap logs-query-skill -n "$TEST_NAMESPACE" \
   --from-file=query_logs.py=skills/observability-logs-query/scripts/query_logs.py \
   --from-file=validate_inventory.py=skills/observability-endpoint-discovery/scripts/validate_inventory.py \
   --from-file=validate_result.py=skills/observability-logs-query/scripts/validate_result.py \
+  --from-file=sanitize_live_result.py=skills/observability-logs-query/scripts/sanitize_live_result.py \
   --from-file=inventory.json="$INVENTORY"
 ```
 
@@ -286,8 +291,15 @@ EOF
 
 Create a short-lived, non-root test pod. The wrapper reads the projected token
 only to place it in the explicit environment variable consumed by the helper;
-the helper itself never discovers or reads that token. The token is never
-printed or placed in the result:
+the helper itself never discovers or reads that token. The query response is
+written only to an `emptyDir`, validated in the pod, and replaced on stdout by
+a sanitized summary containing counts and endpoint identity—not log lines,
+LogQL, or tokens.
+
+The runner image is pinned to the verified amd64 digest
+`registry.access.redhat.com/ubi9/python-311@sha256:a0bdb55576fc5b8d6704279307817828ef027e1065533ceba133fe9516003a6c`.
+That digest was verified with `skopeo inspect --override-arch amd64
+--override-os linux` against the Red Hat registry.
 
 ```bash
 END=$(date +%s)
@@ -309,24 +321,18 @@ spec:
       type: RuntimeDefault
   containers:
   - name: runner
-    image: registry.access.redhat.com/ubi9/python-311:latest
+    image: registry.access.redhat.com/ubi9/python-311@sha256:a0bdb55576fc5b8d6704279307817828ef027e1065533ceba133fe9516003a6c
     imagePullPolicy: IfNotPresent
     command: ["/bin/sh", "-c"]
     args:
     - >-
       export LOGS_TOKEN="\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)";
-      python3 /opt/logs-query/query_logs.py
-      --inventory /opt/logs-query/inventory.json
-      --endpoint data-science-loki
-      --query '{kubernetes_namespace_name="${MONITORING_NAMESPACE}"}'
-      --start "${START}"
-      --end "${END}"
-      --limit 5
-      --direction backward
-      --bearer-token-env LOGS_TOKEN
-      --ca-file /etc/loki-ca/service-ca.crt
-      --max-response-bytes 1048576
-      --pretty
+      query_status=0;
+      python3 /opt/logs-query/query_logs.py --inventory /opt/logs-query/inventory.json --endpoint data-science-loki --query '{kubernetes_namespace_name="${MONITORING_NAMESPACE}"}' --start "${START}" --end "${END}" --limit 5 --direction backward --bearer-token-env LOGS_TOKEN --ca-file /etc/loki-ca/service-ca.crt --max-response-bytes 1048576 --pretty > /var/run/logs-query/raw-result.json 2> /var/run/logs-query/query.stderr || query_status=\$?;
+      sanitize_status=0;
+      python3 /opt/logs-query/sanitize_live_result.py --input /var/run/logs-query/raw-result.json || sanitize_status=\$?;
+      rm -f /var/run/logs-query/raw-result.json /var/run/logs-query/query.stderr;
+      if [ "\$query_status" -ne 0 ] || [ "\$sanitize_status" -ne 0 ]; then exit 1; fi
     securityContext:
       allowPrivilegeEscalation: false
       readOnlyRootFilesystem: true
@@ -335,6 +341,8 @@ spec:
     - name: logs-query
       mountPath: /opt/logs-query
       readOnly: true
+    - name: result
+      mountPath: /var/run/logs-query
     - name: loki-ca
       mountPath: /etc/loki-ca
       readOnly: true
@@ -345,6 +353,8 @@ spec:
   - name: logs-query
     configMap:
       name: logs-query-skill
+  - name: result
+    emptyDir: {}
   - name: loki-ca
     configMap:
       name: loki-gateway-ca
@@ -369,8 +379,6 @@ EOF
 oc wait --for=jsonpath='{.status.phase}'=Succeeded \
   pod/logs-query-test -n "$TEST_NAMESPACE" --timeout=180s
 oc logs pod/logs-query-test -n "$TEST_NAMESPACE" > logs-result.json
-python3 skills/observability-logs-query/scripts/validate_result.py \
-  < logs-result.json
 python3 skills/observability-logs-query/scripts/validate_live_setup.py \
   --monitoring-namespace "$MONITORING_NAMESPACE" \
   --test-namespace "$TEST_NAMESPACE" \
@@ -385,9 +393,10 @@ python3 skills/observability-logs-query/scripts/validate_live_setup.py \
 
 The expected successful result is `status: "success"`, endpoint
 `data-science-loki`, `auth: "caller-bearer"`, `tls: "service-ca"`, tenant
-`application`, and Loki `streams` data (possibly an empty list). A 403 means
-the caller's gateway authorization is incomplete; a timeout usually means the
-temporary NetworkPolicy selector or pod labels are wrong.
+`application`, and a sanitized `result.result_type` of `streams` (possibly with
+zero values). The summary must not contain `data` or `query.logql`. A 403
+means the caller's gateway authorization is incomplete; a timeout usually
+means the temporary NetworkPolicy selector or pod labels are wrong.
 
 ### Live cleanup
 

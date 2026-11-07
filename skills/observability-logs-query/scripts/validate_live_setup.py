@@ -12,7 +12,6 @@ from typing import Any
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-RESULT_VALIDATOR = SCRIPT_DIR / "validate_result.py"
 OC_SUBPROCESS_TIMEOUT_SECONDS = 30.0
 
 
@@ -180,24 +179,27 @@ def validate_result(path: str) -> None:
         payload = json.loads(raw)
     except (OSError, json.JSONDecodeError) as error:
         raise SetupError(f"could not read live query result: {error}") from error
-    if not isinstance(payload, dict) or payload.get("status") != "success":
-        raise SetupError("live query result is not successful")
+    require(isinstance(payload, dict), "live query result is not an object")
+    require(payload.get("status") == "success", "live query result is not successful")
+    require("data" not in payload, "live query result must not contain raw Loki data")
     endpoint = payload.get("endpoint") or {}
     require(endpoint.get("auth") == "caller-bearer", "live result did not use caller-bearer auth")
     require(endpoint.get("tls") == "service-ca", "live result did not use service-ca TLS")
     require(endpoint.get("tenant") == "application", "live result did not use the application tenant")
-    try:
-        completed = subprocess.run(
-            [sys.executable, str(RESULT_VALIDATOR)],
-            input=raw,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError as error:
-        raise SetupError(f"could not run result validator: {error}") from error
-    if completed.returncode != 0:
-        raise SetupError("live query result failed standalone validation")
+    query = payload.get("query") or {}
+    require(isinstance(query, dict), "live query summary is missing query metadata")
+    require("logql" not in query, "live query summary must not contain the raw LogQL query")
+    result = payload.get("result") or {}
+    require(isinstance(result, dict), "live query summary is missing result metadata")
+    require(result.get("result_type") in {"streams", "matrix"}, "live result type is invalid")
+    for field in ("stream_count", "value_count"):
+        value = result.get(field)
+        require(isinstance(value, int) and not isinstance(value, bool) and value >= 0, f"live {field} is invalid")
+    warning_count = payload.get("warning_count")
+    require(
+        isinstance(warning_count, int) and not isinstance(warning_count, bool) and warning_count >= 0,
+        "live warning count is invalid",
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

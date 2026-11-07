@@ -115,22 +115,12 @@ class QueryTracesTests(unittest.TestCase):
         self.assertIs(context.exception.endpoint, endpoint)
 
     @patch.dict(os.environ, {"TRACE_TOKEN": "test-token"})
-    def test_builds_search_request_with_tenant_and_filters(self) -> None:
+    def test_rejects_traceql_query_with_logfmt_tags(self) -> None:
         args = search_args(service="checkout", operation="GET /orders", status="error", tag=["http.method=GET"])
         metadata = query_traces.query_metadata(args, "search")
-        url, headers = query_traces.build_request(inventory()["query_endpoints"][0], args, metadata)
-        parsed = urlsplit(url)
-        self.assertEqual(parsed.path, "/api/traces/v1/redhat-ods-monitoring/tempo/api/search")
-        params = parse_qs(parsed.query)
-        self.assertEqual(params["limit"], ["100"])
-        self.assertEqual(
-            params["q"],
-            ['{ status = error && resource.service.name = "checkout" && name = "GET /orders" }'],
-        )
-        self.assertNotIn("status", params)
-        self.assertEqual(params["tags"], ["http.method=GET"])
-        self.assertEqual(headers["X-Scope-OrgID"], "redhat-ods-monitoring")
-        self.assertEqual(headers["Authorization"], "Bearer test-token")
+        with self.assertRaises(query_traces.QueryError) as context:
+            query_traces.build_request(inventory()["query_endpoints"][0], args, metadata)
+        self.assertEqual(context.exception.kind, "invalid_argument")
 
     @patch.dict(os.environ, {"TRACE_TOKEN": "test-token"})
     def test_builds_logfmt_tags_with_spaces_and_commas(self) -> None:
@@ -146,6 +136,32 @@ class QueryTracesTests(unittest.TestCase):
             params["tags"],
             ['service.name=checkout,blue name="GET /orders" http.route=/orders,bulk http.target="/v1/orders 42"'],
         )
+
+    @patch.dict(os.environ, {"TRACE_TOKEN": "test-token"})
+    def test_appends_service_and_operation_as_a_separate_spanset(self) -> None:
+        args = search_args(query="{ .http.status_code = 500 }", service="checkout", operation="GET /orders")
+        metadata = query_traces.query_metadata(args, "search")
+        url, _ = query_traces.build_request(inventory()["query_endpoints"][0], args, metadata)
+        params = parse_qs(urlsplit(url).query)
+        self.assertEqual(
+            params["q"],
+            ['({ .http.status_code = 500 }) && { resource.service.name = "checkout" && name = "GET /orders" }'],
+        )
+        self.assertNotIn("tags", params)
+
+    @patch.dict(os.environ, {"TRACE_TOKEN": "test-token"})
+    def test_rejects_traceql_query_with_logfmt_or_duration_filters(self) -> None:
+        for overrides in (
+            {"tag": ["http.method=GET"]},
+            {"min_duration": "1s"},
+            {"max_duration": "5s"},
+        ):
+            with self.subTest(overrides=overrides):
+                args = search_args(query="{ .http.status_code = 500 }", **overrides)
+                metadata = query_traces.query_metadata(args, "search")
+                with self.assertRaises(query_traces.QueryError) as context:
+                    query_traces.build_request(inventory()["query_endpoints"][0], args, metadata)
+                self.assertEqual(context.exception.kind, "invalid_argument")
 
     def test_rejects_status_with_query(self) -> None:
         with self.assertRaises(query_traces.QueryError) as context:

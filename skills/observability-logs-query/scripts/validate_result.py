@@ -142,43 +142,39 @@ def validate_data(data: object) -> str | None:
     return None
 
 
-def main() -> int:
-    try:
-        result = json.load(sys.stdin)
-    except json.JSONDecodeError as error:
-        return fail(f"invalid JSON: {error}")
+def validation_error(result: object) -> str | None:
     if not isinstance(result, dict):
-        return fail("top-level value must be an object")
+        return "top-level value must be an object"
     if result.get("schema_version") != "1":
-        return fail("schema_version must be '1'")
+        return "schema_version must be '1'"
     status = result.get("status")
     if status not in {"success", "error"}:
-        return fail("status must be success or error")
+        return "status must be success or error"
     endpoint_error = validate_endpoint(result.get("endpoint"), require_ready=status == "success")
     if endpoint_error:
-        return fail(endpoint_error)
+        return endpoint_error
     if status == "success" and result.get("endpoint") is None:
-        return fail("successful result must include endpoint metadata")
+        return "successful result must include endpoint metadata"
     query = result.get("query")
     if query is not None:
         query_error = validate_query(query)
         if query_error:
-            return fail(query_error)
+            return query_error
     if status == "success" and query is None:
-        return fail("successful result must include query metadata")
+        return "successful result must include query metadata"
     warnings = result.get("warnings")
     if (
         not isinstance(warnings, list)
         or len(warnings) > MAX_WARNING_COUNT
         or any(not isinstance(warning, str) or len(warning) > MAX_WARNING_LENGTH for warning in warnings)
     ):
-        return fail("warnings must be a bounded list of strings")
+        return "warnings must be a bounded list of strings"
     if status == "success":
         data_error = validate_data(result.get("data"))
         if data_error:
-            return fail(data_error)
+            return data_error
         if "error" in result:
-            return fail("successful result must not include error")
+            return "successful result must not include error"
     else:
         error = result.get("error")
         if (
@@ -189,9 +185,20 @@ def main() -> int:
             or not error["message"]
             or len(error["message"]) > MAX_ERROR_MESSAGE_LENGTH
         ):
-            return fail("error result must include a typed error")
+            return "error result must include a typed error"
         if "data" in result:
-            return fail("error result must not include data")
+            return "error result must not include data"
+    return None
+
+
+def main() -> int:
+    try:
+        result = json.load(sys.stdin)
+    except json.JSONDecodeError as error:
+        return fail(f"invalid JSON: {error}")
+    error = validation_error(result)
+    if error:
+        return fail(error)
     print("logs result validation passed")
     return 0
 

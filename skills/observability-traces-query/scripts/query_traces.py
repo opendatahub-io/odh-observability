@@ -354,9 +354,6 @@ def build_traceql_query(args: argparse.Namespace) -> str | None:
         query = validate_filter_value(args.query, "--query")
         if not conditions:
             return query
-        if query.startswith("{") and query.endswith("}"):
-            inner = query[1:-1].strip()
-            return "{ " + " && ".join([inner, *conditions]) + " }"
         return f"({query}) && {{ {' && '.join(conditions)} }}"
     if not conditions:
         return None
@@ -508,6 +505,13 @@ def build_request(
         end = format_timestamp(parse_timestamp(args.end, "--end"), round_up=True)
         params.update({"start": start, "end": end, "limit": str(args.limit)})
         traceql_query = build_traceql_query(args)
+        if traceql_query is not None and (
+            args.tag or args.min_duration is not None or args.max_duration is not None
+        ):
+            raise QueryError(
+                "invalid_argument",
+                "--query cannot be combined with --tag, --min-duration, or --max-duration",
+            )
         if traceql_query is not None:
             params["q"] = traceql_query
         tag_pairs = []

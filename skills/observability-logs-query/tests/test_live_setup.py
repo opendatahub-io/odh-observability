@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import os
+import io
+import json
 import subprocess
 import sys
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 
@@ -13,6 +16,7 @@ SCRIPT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scri
 sys.path.insert(0, SCRIPT_DIR)
 
 import validate_live_setup  # noqa: E402
+import sanitize_live_result  # noqa: E402
 
 
 def role(name: str) -> dict:
@@ -37,6 +41,50 @@ def namespace_role(name: str) -> dict:
 
 
 class LiveSetupContractTests(unittest.TestCase):
+    def test_live_result_sanitizer_removes_raw_data_and_logql(self) -> None:
+        payload = {
+            "schema_version": "1",
+            "status": "success",
+            "endpoint": {
+                "name": "data-science-loki",
+                "signal": "logs",
+                "scope": "application",
+                "auth": "caller-bearer",
+                "tls": "service-ca",
+                "state": "ready",
+                "source": "Monitoring/cluster/default-monitoring",
+                "url": "https://loki.example.test:8080/api/logs/v1/application",
+                "tenant": "application",
+                "required_headers": ["X-Scope-OrgID"],
+                "required_query_parameters": [],
+            },
+            "query": {
+                "mode": "range",
+                "logql": "{secret=\"do-not-print\"}",
+                "start": "2026-01-01T00:00:00Z",
+                "end": "2026-01-01T00:05:00Z",
+                "range_seconds": 300,
+                "limit": 5,
+                "direction": "backward",
+            },
+            "data": {
+                "resultType": "streams",
+                "result": [{"stream": {"app": "test"}, "values": [["1", "secret line"]]}],
+            },
+            "warnings": [],
+        }
+        output = io.StringIO()
+        with redirect_stdout(output):
+            summary, status = sanitize_live_result.sanitize(payload)
+        self.assertEqual(status, 0)
+        self.assertIsNotNone(summary)
+        rendered = json.dumps(summary)
+        self.assertNotIn("secret line", rendered)
+        self.assertNotIn("do-not-print", rendered)
+        self.assertNotIn("data", summary)
+        self.assertNotIn("logql", summary["query"])
+        self.assertEqual(summary["result"]["value_count"], 1)
+
     def test_oc_reads_are_time_bounded(self) -> None:
         with patch(
             "validate_live_setup.subprocess.run",
