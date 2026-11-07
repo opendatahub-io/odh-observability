@@ -747,6 +747,7 @@ func TestLokiStackTemplatesCarryComponentLabel(t *testing.T) {
 		LokiStackTemplate:                           componentLokiLogs,
 		LokiStackNetworkPolicyTemplate:              componentLokiLogs,
 		LokiStackGatewayNetworkPolicyTemplate:       componentLokiLogs,
+		LokiApplicationLogsRBACTemplate:             componentLokiLogs,
 		ClusterLogForwarderTemplate:                 componentLokiLogs,
 		ClusterLogForwarderRBACTemplate:             componentLokiLogs,
 		ClusterLogForwarderNetworkPolicyTemplate:    componentLokiLogs,
@@ -766,6 +767,62 @@ func TestLokiStackTemplatesCarryComponentLabel(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestLokiApplicationLogsRBACTemplateContract(t *testing.T) {
+	t.Parallel()
+
+	resources := renderObservabilityTemplate(t, LokiApplicationLogsRBACTemplate, map[string]any{})
+	role := findRenderedResource(t, resources, "ClusterRole", "data-science-application-logs-view")
+
+	labels := role.GetLabels()
+	for _, key := range []string{
+		"rbac.authorization.k8s.io/aggregate-to-admin",
+		"rbac.authorization.k8s.io/aggregate-to-edit",
+		"rbac.authorization.k8s.io/aggregate-to-view",
+	} {
+		if labels[key] != "true" {
+			t.Errorf("ClusterRole must set %s=true so project roles gain Loki application-tenant access, got %q", key, labels[key])
+		}
+	}
+	if labels[componentLabel] != componentLokiLogs {
+		t.Errorf("ClusterRole component label: want %s, got %q", componentLokiLogs, labels[componentLabel])
+	}
+
+	rules, found, err := unstructured.NestedSlice(role.Object, "rules")
+	if err != nil || !found || len(rules) != 1 {
+		t.Fatalf("ClusterRole must have exactly one rule: found=%t len=%d err=%v", found, len(rules), err)
+	}
+	rule, ok := rules[0].(map[string]any)
+	if !ok {
+		t.Fatalf("ClusterRole rule has unexpected type %T", rules[0])
+	}
+	apiGroups, _, _ := unstructured.NestedStringSlice(rule, "apiGroups")
+	resourcesList, _, _ := unstructured.NestedStringSlice(rule, "resources")
+	resourceNames, _, _ := unstructured.NestedStringSlice(rule, "resourceNames")
+	verbs, _, _ := unstructured.NestedStringSlice(rule, "verbs")
+	if !reflect.DeepEqual(apiGroups, []string{"loki.grafana.com"}) ||
+		!reflect.DeepEqual(resourcesList, []string{"application"}) ||
+		!reflect.DeepEqual(resourceNames, []string{"logs"}) ||
+		!reflect.DeepEqual(verbs, []string{"get"}) {
+		t.Fatalf("ClusterRole rule must grant get on application.loki.grafana.com/logs, got %#v", rule)
+	}
+	// Negative: Stage-1 must not be pinned to a LokiStack identity (name/labels
+	// beyond aggregation). Any openshift-logging gateway can accept this SAR;
+	// Stage-2 still scopes returned logs to the caller's namespaces.
+	if name := role.GetName(); name != "data-science-application-logs-view" {
+		t.Fatalf("unexpected ClusterRole name %q", name)
+	}
+	for key := range role.GetLabels() {
+		if strings.Contains(strings.ToLower(key), "lokistack") {
+			t.Fatalf("ClusterRole must not carry LokiStack identity label %q", key)
+		}
+	}
+	for key := range role.GetAnnotations() {
+		if strings.Contains(strings.ToLower(key), "lokistack") {
+			t.Fatalf("ClusterRole must not carry LokiStack identity annotation %q", key)
+		}
 	}
 }
 

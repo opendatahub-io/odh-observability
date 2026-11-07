@@ -96,6 +96,7 @@ const (
 	LokiStackNetworkPolicyTemplate                   = "resources/data-science-lokistack-network-policy.tmpl.yaml"
 	LokiStackGatewayNetworkPolicyTemplate            = "resources/data-science-lokistack-gateway-network-policy.tmpl.yaml"
 	LokiStackTemplate                                = "resources/loki-stack.tmpl.yaml"
+	LokiApplicationLogsRBACTemplate                  = "resources/loki-application-logs-rbac.tmpl.yaml"
 	ClusterLogForwarderTemplate                      = "resources/cluster-log-forwarder.tmpl.yaml"
 	ClusterLogForwarderRBACTemplate                  = "resources/cluster-log-forwarder-rbac.tmpl.yaml"
 	ClusterLogForwarderNetworkPolicyTemplate         = "resources/cluster-log-forwarder-network-policy.tmpl.yaml"
@@ -804,6 +805,7 @@ func deployRHOAILogsLokiStack(
 			LokiStackTemplate,
 			LokiStackNetworkPolicyTemplate,
 			LokiStackGatewayNetworkPolicyTemplate,
+			LokiApplicationLogsRBACTemplate,
 		},
 	}); err != nil {
 		return err
