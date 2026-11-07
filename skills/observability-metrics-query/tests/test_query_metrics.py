@@ -162,6 +162,25 @@ class QueryMetricsTests(unittest.TestCase):
         self.assertEqual(context.exception.kind, "unsupported_auth")
 
     @patch.dict(os.environ, {"METRICS_TOKEN": "test-token"})
+    def test_rejects_http_caller_bearer_endpoint(self) -> None:
+        endpoint = inventory()["query_endpoints"][0].copy()
+        endpoint.update({"url": "http://metrics.example.test", "tls": "none"})
+        args = Namespace(
+            namespace="team-a",
+            param=[],
+            query="up",
+            time=None,
+            start=None,
+            end=None,
+            step=None,
+            bearer_token_env="METRICS_TOKEN",
+        )
+        with self.assertRaises(query_metrics.QueryError) as context:
+            query_metrics.build_request(endpoint, args, {"mode": "instant", "promql": "up"})
+        self.assertEqual(context.exception.kind, "invalid_endpoint")
+        self.assertEqual(context.exception.exit_code, 3)
+
+    @patch.dict(os.environ, {"METRICS_TOKEN": "test-token"})
     @patch("query_metrics.build_opener")
     def test_queries_prometheus_and_returns_data(self, mock_build_opener: object) -> None:
         response = FakeResponse(
@@ -182,6 +201,38 @@ class QueryMetricsTests(unittest.TestCase):
         request = mock_opener.open.call_args.args[0]
         self.assertEqual(request.method, "GET")
         self.assertEqual(request.get_header("Authorization"), "Bearer test-token")
+
+    @patch("query_metrics.build_opener")
+    @patch("query_metrics.ssl.create_default_context")
+    def test_adds_supplied_ca_to_default_context(
+        self, mock_create_default_context: object, mock_build_opener: object
+    ) -> None:
+        response = FakeResponse(
+            {
+                "status": "success",
+                "data": {"resultType": "vector", "result": []},
+            }
+        )
+        context = mock_create_default_context.return_value  # type: ignore[attr-defined]
+        mock_opener = mock_build_opener.return_value  # type: ignore[attr-defined]
+        mock_opener.open.return_value.__enter__.return_value = response
+        args = Namespace(
+            timeout=20,
+            max_response_bytes=1024,
+            ca_file="/path/to/service-ca.crt",
+            bearer_token_env=None,
+        )
+
+        query_metrics.request_metrics(
+            "https://metrics.example.test/api/v1/query?query=up",
+            {"Accept": "application/json"},
+            args,
+        )
+
+        mock_create_default_context.assert_called_once_with()  # type: ignore[attr-defined]
+        context.load_verify_locations.assert_called_once_with(  # type: ignore[attr-defined]
+            cafile="/path/to/service-ca.crt"
+        )
 
     @patch.dict(os.environ, {"METRICS_TOKEN": "test-token"})
     def test_requires_namespace_option_instead_of_generic_parameter(self) -> None:

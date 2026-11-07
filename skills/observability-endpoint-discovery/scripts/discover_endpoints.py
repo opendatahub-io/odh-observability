@@ -1312,7 +1312,8 @@ def main() -> int:
         return 2
     print(json.dumps(result, indent=2 if args.pretty else None, sort_keys=args.pretty))
     return 0 if not result["unavailable"] or all(
-        item.get("component") != "monitoring" for item in result["unavailable"]
+        item.get("component") not in {"monitoring", "dsci"}
+        for item in result["unavailable"]
     ) else 2
 
 

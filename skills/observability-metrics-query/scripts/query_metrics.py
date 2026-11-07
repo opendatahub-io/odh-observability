@@ -245,6 +245,8 @@ def build_request(
     parsed = parse_safe_url(endpoint["url"])
     if parsed.scheme != "https" and endpoint.get("tls") != "none":
         raise QueryError("invalid_endpoint", "metrics endpoint requires HTTPS for its declared TLS mode", 3)
+    if parsed.scheme == "http" and endpoint.get("auth") == "caller-bearer":
+        raise QueryError("invalid_endpoint", "caller-bearer metrics endpoints require HTTPS", 3)
     mode = metadata["mode"]
     path = "/api/v1/query_range" if mode == "range" else "/api/v1/query"
     if not path_supported(endpoint, path):
@@ -400,7 +402,9 @@ def request_metrics(
     request_url: str, headers: dict[str, str], args: argparse.Namespace
 ) -> dict[str, Any]:
     try:
-        context = ssl.create_default_context(cafile=args.ca_file)
+        context = ssl.create_default_context()
+        if args.ca_file:
+            context.load_verify_locations(cafile=args.ca_file)
     except (OSError, ssl.SSLError) as error:
         raise QueryError("tls_error", f"could not configure TLS verification: {error}", 4) from error
     request = Request(request_url, headers=headers, method="GET")
