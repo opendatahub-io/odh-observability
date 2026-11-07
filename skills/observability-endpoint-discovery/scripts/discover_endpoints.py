@@ -286,6 +286,7 @@ def add_service_endpoint(
     conditions: dict[str, dict[str, Any]],
     collection: str = "query_endpoints",
     required_query_parameters: list[str] | None = None,
+    url_path: str = "",
     **extra: Any,
 ) -> dict[str, Any]:
     service_name = (service.get("metadata") or {}).get("name", "unknown")
@@ -297,7 +298,7 @@ def add_service_endpoint(
         state = "ready" if ready else "not-ready"
     port_number = port.get("port") if port else None
     url = (
-        f"{scheme}://{service_name}.{service_namespace}.svc.cluster.local:{port_number}"
+        f"{scheme}://{service_name}.{service_namespace}.svc.cluster.local:{port_number}{url_path}"
         if port_number
         else None
     )
@@ -940,6 +941,7 @@ def discover() -> dict[str, Any]:
                 conditions=tempo_conditions,
                 tenant=namespace,
                 required_headers=[f"X-Scope-OrgID: {namespace}"],
+                url_path=f"/api/traces/v1/{namespace}/tempo",
             )
         elif tempo_object is not None or not tempo_resource:
             output["unavailable"].append(

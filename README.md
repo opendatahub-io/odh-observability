@@ -95,6 +95,14 @@ spec:
 
 ## Development
 
+### Trace query skill
+
+The read-only [`observability-traces-query`](skills/observability-traces-query/SKILL.md)
+skill queries bounded RHOAI Tempo searches and trace IDs through the validated
+endpoints returned by `observability-endpoint-discovery`. Its documentation
+covers the required inventory, caller token, service CA, query, and result
+validation steps.
+
 ### Testing
 
 ```bash
