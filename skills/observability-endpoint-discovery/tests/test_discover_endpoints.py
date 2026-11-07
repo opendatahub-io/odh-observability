@@ -17,6 +17,20 @@ import discover_endpoints  # noqa: E402
 
 
 class DiscoverEndpointsTests(unittest.TestCase):
+    @patch.object(discover_endpoints.subprocess, "run")
+    def test_run_oc_uses_bounded_client_and_subprocess_timeouts(
+        self, mock_run: object
+    ) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="{}", stderr=""
+        )  # type: ignore[attr-defined]
+        self.assertEqual(discover_endpoints.run_oc(["get", "pods", "-o", "json"]), {})
+        call = mock_run.call_args  # type: ignore[attr-defined]
+        self.assertEqual(
+            call.kwargs["timeout"], discover_endpoints.OC_COMMAND_TIMEOUT_SECONDS
+        )
+        self.assertEqual(call.args[0][:2], ["oc", "--request-timeout=20s"])
+
     def test_service_endpoint_preserves_query_base_path(self) -> None:
         output = {"query_endpoints": []}
         service = {
@@ -101,43 +115,6 @@ class DiscoverEndpointsTests(unittest.TestCase):
             discover_endpoints.service_has_ready_endpoint(
                 service, slices, service["spec"]["ports"][0]
             )
-        )
-
-    def test_service_endpoint_preserves_query_base_path(self) -> None:
-        output = {"query_endpoints": []}
-        service = {
-            "metadata": {"name": "tempo-gateway", "namespace": "monitoring"},
-            "spec": {"ports": [{"port": 8080}]},
-        }
-        slices = {
-            "tempo-gateway": [
-                {
-                    "ports": [{"port": 8080}],
-                    "endpoints": [{"addresses": ["10.0.0.1"], "conditions": {"ready": True}}],
-                }
-            ]
-        }
-
-        discover_endpoints.add_service_endpoint(
-            output,
-            service=service,
-            port={"port": 8080},
-            slices_by_service=slices,
-            signal="traces",
-            name="tempo-gateway",
-            scheme="https",
-            scope="monitoring",
-            auth="caller-bearer",
-            tls="service-ca",
-            paths=["/api/search"],
-            condition=None,
-            conditions={},
-            url_path="/api/traces/v1/monitoring/tempo",
-        )
-
-        self.assertEqual(
-            output["query_endpoints"][0]["url"],
-            "https://tempo-gateway.monitoring.svc.cluster.local:8080/api/traces/v1/monitoring/tempo",
         )
 
     @patch.object(discover_endpoints, "discover")

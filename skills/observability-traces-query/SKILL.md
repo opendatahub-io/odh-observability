@@ -90,14 +90,20 @@ through `--ca-file`. It never obtains credentials or disables TLS verification.
 ## Query behavior
 
 - Search requires explicit `--start` and `--end` values as Unix seconds or
-  timezone-qualified RFC3339 timestamps. The default maximum window is 24
-  hours.
+  timezone-qualified RFC3339 timestamps. Requests round the start down and end
+  up to integer Unix seconds so the requested window remains covered. The
+  default maximum window is 24 hours.
 - Search supports a TraceQL query (`--query`), service, operation, status,
   tags, minimum/maximum duration, and a bounded result limit.
-- `--service`, `--operation`, and `--tag KEY=VALUE` are sent through Tempo's
-  search tag filters. `--query` is sent as the Tempo search `q` parameter.
-- Search tag values cannot contain commas because Tempo uses commas to delimit
-  tag filters. Endpoint-specific non-Tempo parameters use `--param KEY=VALUE`.
+- `--status` is represented in Tempo's TraceQL `q` expression and cannot be
+  combined with `--query`. When a TraceQL query is used, service and operation
+  filters are included in that same expression so they are not lost.
+- `--service`, `--operation`, and `--tag KEY=VALUE` use Tempo's search filters
+  when they are not incorporated into TraceQL. Tag pairs are logfmt encoded,
+  separated by spaces, and values containing spaces, quotes, or backslashes are
+  quoted and escaped. Commas in values are valid.
+- Duration filters use Go duration units: `ns`, `us`, `µs`, `ms`, `s`, `m`, or
+  `h`. Endpoint-specific non-Tempo parameters use `--param KEY=VALUE`.
 - Trace IDs must be 16- or 32-character hexadecimal values. Trace lookup does
   not require a time window.
 - Requests use GET and the endpoint's discovered tenant header, normally
