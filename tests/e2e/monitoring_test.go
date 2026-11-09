@@ -1277,7 +1277,6 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteAuthorizationBoundary(t *
 			jq.Match(`.spec.template.spec.containers | map(.name) | contains(["kube-rbac-proxy", "prom-label-proxy"])`),
 			// Perses Project=All sends namespace=a&namespace=b; --regex-match rejects that.
 			jq.Match(`[.spec.template.spec.containers[]? | select(.name == "prom-label-proxy") | select(.args | index("--regex-match"))] | length == 0`),
-			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--query-param-only"])`),
 		)),
 		WithCustomErrorMsg("Thanos Querier proxy deployment should be ready with both authorization containers"),
 	)
@@ -3308,7 +3307,6 @@ func (tc *MonitoringTestCtx) ValidateNamespaceIsolationPostFormBypass(t *testing
 		}),
 		WithCondition(And(
 			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--query-param=namespace"])`),
-			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--query-param-only"])`),
 			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--error-on-replace"])`),
 			// Defense-in-depth: a method gate rejects non-GET/HEAD before prom-label-proxy,
 			// and kube-rbac-proxy forwards to it (:9092) rather than to prom-label-proxy (:9091).

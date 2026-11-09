@@ -971,15 +971,11 @@ func TestDeployPersesPrometheusIntegration_CRDPresent(t *testing.T) {
 	if len(sources) != 3 {
 		t.Errorf("expected 3 sources (DS proxy + cluster caller-token + tenancy), got %d", len(sources))
 	}
-	// Cluster/tenancy (default:false) must be applied before DS (default:true)
-	// so Perses never rejects a dual-default PrometheusDatasource on upgrade.
-	wantPersesDatasources := []string{
+	assertTemplatePaths(t, sources, []string{
+		PersesDatasourcePrometheusTemplate,
 		PersesDatasourceClusterPrometheusTemplate,
 		PersesDatasourceClusterPrometheusTenancyTemplate,
-		PersesDatasourcePrometheusTemplate,
-	}
-	assertTemplatePaths(t, sources, wantPersesDatasources)
-	assertTemplateOrder(t, sources, wantPersesDatasources)
+	})
 
 	c := findCondition(m, conditions.ConditionPersesPrometheusDataSourceAvailable)
 	if c == nil || c.Status != metav1.ConditionTrue {

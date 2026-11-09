@@ -840,24 +840,15 @@ func addImageTLSAndKorrel8rData(ctx context.Context, c client.Client, monitoring
 	return addKorrel8rAPIServerData(ctx, c, monitoring, templateData)
 }
 
-// Default prom-label-proxy image (v0.16.2+) required for --query-param-only on both
-// namespace proxies. RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE may override it, but a
-// parseable tag older than v0.16.2 is rejected so the sidecar cannot crash-loop on
-// an unknown flag.
-const defaultPromLabelProxyImage = "quay.io/prometheuscommunity/prom-label-proxy@sha256:9812cce38fa78c39250c9c59c78bbe75895ef9126952a098cd44adef2e21dbc5"
-
-var promLabelProxySemverTag = regexp.MustCompile(`:v?(\d+)\.(\d+)(?:\.(\d+))?(?:[-:@]|$)`)
-
 func addImageURLs(templateData map[string]any) error {
 	templateData["KubeRBACProxyImage"] = getEnvOrDefault(
 		"RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE",
 		"quay.io/opendatahub/odh-kube-rbac-proxy@sha256:69c4b767117b9dab040070ca3cd6a4d08f87c197f92c2e9d7637101a39018a7d",
 	)
-	promLabelProxyImage, err := resolvePromLabelProxyImage()
-	if err != nil {
-		return err
-	}
-	templateData["PromLabelProxyImage"] = promLabelProxyImage
+	templateData["PromLabelProxyImage"] = getEnvOrDefault(
+		"RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE",
+		"quay.io/prometheuscommunity/prom-label-proxy@sha256:28f81efb6574556011e7914851faaccce4a64b1b72a338aaaf3cc9d45e66fd96",
+	)
 	// HTTPMethodGateImage runs the "method-gate" subcommand of this operator binary
 	// as a sidecar. There is no digest fallback: an image built before that
 	// subcommand treats "method-gate" as a non-flag and starts the manager,
@@ -869,82 +860,6 @@ func addImageURLs(templateData map[string]any) error {
 	}
 	templateData["HTTPMethodGateImage"] = image
 	return nil
-}
-
-func resolvePromLabelProxyImage() (string, error) {
-	image := getEnvOrDefault("RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE", defaultPromLabelProxyImage)
-	if err := validatePromLabelProxyImageSupportsQueryParamOnly(image); err != nil {
-		return "", err
-	}
-	return image, nil
-}
-
-// validatePromLabelProxyImageSupportsQueryParamOnly gates RELATED_IMAGE overrides
-// for both namespace proxies (Prometheus + Thanos), which always pass
-// --query-param-only (prom-label-proxy v0.16.2+).
-//
-// Allowed:
-//   - digest-pinned refs (@sha256:…), including the default — release pipelines own digests
-//   - tags with a parseable stable semver >= v0.16.2 (no prerelease / build metadata)
-//
-// Rejected:
-//   - tags with a parseable semver < v0.16.2
-//   - prerelease / build tags (:v0.16.2-rc1, :v0.16.2+build) — not treated as >= stable
-//   - floating / unversioned tags (:latest, :main, …) — cannot prove flag support
-func validatePromLabelProxyImageSupportsQueryParamOnly(image string) error {
-	if strings.Contains(image, "@sha256:") {
-		return nil
-	}
-	major, minor, patch, ok := parsePromLabelProxySemverTag(image)
-	if !ok {
-		return fmt.Errorf(
-			"RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE %q must be digest-pinned or tagged >= v0.16.2 (required for --query-param-only)",
-			image,
-		)
-	}
-	if major > 0 || minor > 16 || (minor == 16 && patch >= 2) {
-		return nil
-	}
-	return fmt.Errorf(
-		"RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE %q is older than v0.16.2 required for --query-param-only",
-		image,
-	)
-}
-
-func parsePromLabelProxySemverTag(image string) (int, int, int, bool) {
-	// Prefer the tag after the last '/', so registry paths with dotted hostnames
-	// are not mistaken for versions.
-	ref := image
-	if i := strings.LastIndex(image, "/"); i >= 0 {
-		ref = image[i+1:]
-	}
-	tag := ref
-	if i := strings.LastIndex(ref, ":"); i >= 0 {
-		tag = ref[i+1:]
-	}
-	// Prerelease / build metadata must not satisfy ">= v0.16.2" (e.g. v0.16.2-rc1).
-	ver := strings.TrimPrefix(tag, "v")
-	if strings.ContainsAny(ver, "-+") {
-		return 0, 0, 0, false
-	}
-	match := promLabelProxySemverTag.FindStringSubmatch(ref)
-	if match == nil {
-		return 0, 0, 0, false
-	}
-	major, errMajor := strconv.Atoi(match[1])
-	minor, errMinor := strconv.Atoi(match[2])
-	if errMajor != nil || errMinor != nil {
-		return 0, 0, 0, false
-	}
-	patch := 0
-	if match[3] != "" {
-		var errPatch error
-		patch, errPatch = strconv.Atoi(match[3])
-		if errPatch != nil {
-			return 0, 0, 0, false
-		}
-	}
-	return major, minor, patch, true
 }
 
 // getKorrel8rImage returns the pinned Korrel8r image, allowing release
