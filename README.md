@@ -1,6 +1,6 @@
 # ODH Observability Operator
 
-A Kubernetes operator for the [Open Data Hub](https://opendatahub.io/) observability module. It manages a single cluster-scoped `Monitoring` custom resource that declaratively provisions a full metrics, traces, and dashboarding stack on OpenShift.
+A Kubernetes operator for the [Open Data Hub](https://opendatahub.io/) observability module. It manages a single cluster-scoped `Monitoring` custom resource that declaratively provisions metrics, traces, usage logs, and dashboards on OpenShift.
 
 ## Overview
 
@@ -13,6 +13,7 @@ The operator watches a singleton `Monitoring` CR (`services.platform.opendatahub
 | MonitoringStack + ThanosQuerier | Cluster Observability Operator | Prometheus metrics collection |
 | TempoMonolithic / TempoStack | Tempo Operator | Distributed tracing |
 | OpenTelemetry Collector | OpenTelemetry Operator | Telemetry pipeline |
+| MaaS usage logs | OpenTelemetry Operator; Loki Operator for local storage | Structured inference logs with optional local storage and remote forwarding |
 | Perses | Perses Operator | Dashboarding |
 | Alerting (PrometheusRules) | COO + metrics storage | Alert definitions |
 | Mutating Webhook | cert-manager | Label injection on ServiceMonitor/PodMonitor |
@@ -25,7 +26,7 @@ The operator watches a singleton `Monitoring` CR (`services.platform.opendatahub
 - An OpenShift cluster with `KUBECONFIG` configured
 - OpenTelemetry Operator for metrics; Cluster Observability Operator for built-in metrics storage
 - OpenTelemetry Operator for traces; Tempo Operator for built-in trace storage
-- OpenTelemetry Operator and Loki Operator for usage logs
+- OpenTelemetry Operator for usage logs; Loki Operator for built-in usage-log storage
 - cert-manager for the mutating webhook and metrics TargetAllocator mTLS
 
 ### Build
@@ -89,7 +90,7 @@ spec:
 | `namespace` | Target namespace for monitoring resources (default: `opendatahub`, immutable) |
 | `metrics` | Prometheus metrics — storage size/retention, replicas, OTel exporters |
 | `traces` | Distributed tracing — storage backend (`pv`/`s3`/`gcs`), sample ratio, TLS, exporters |
-| `usageLogs` | Usage logging via LokiStack |
+| `usageLogs` | MaaS usage-log collector with optional LokiStack storage and remote exporters; see [usage-log setup and AI Grid identity filtering](docs/usage-logs.md) |
 | `alerting` | Enables PrometheusRules (requires `metrics.storage`) |
 | `collectorReplicas` | OTel Collector replica count (requires metrics or traces) |
 

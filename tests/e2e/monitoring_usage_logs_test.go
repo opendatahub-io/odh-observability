@@ -548,6 +548,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorConfiguration(t *testing.
 			jq.Match(`.spec.config.processors.k8sattributes != null`),
 			jq.Match(`.spec.config.processors.k8sattributes.auth_type == "serviceAccount"`),
 			jq.Match(`.spec.config.processors."groupbyattrs/maas" != null`),
+			jq.Match(`.spec.config.processors."groupbyattrs/maas".keys | contains(["organization_id", "user_id"])`),
 			jq.Match(`.spec.config.processors.batch != null`),
 
 			// log_type is pinned to the Loki application tenant. It must NOT be copied
@@ -885,7 +886,7 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLokiStackConfiguration(t *testing.
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithCondition(And(
-			jq.Match(`.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes | length == 8`),
+			jq.Match(`.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes | length == 10`),
 			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "kubernetes_namespace_name")] | length == 1`),
 			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "model")] | length == 1`),
 			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "subscription")] | length == 1`),
@@ -894,6 +895,8 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLokiStackConfiguration(t *testing.
 			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "gateway_deployment_name")] | length == 1`),
 			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "upstream_namespace_name")] | length == 1`),
 			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "upstream_deployment_name")] | length == 1`),
+			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "organization_id")] | length == 1`),
+			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "user_id")] | length == 1`),
 		)),
 		WithCustomErrorMsg("LokiStack should have correct OTLP stream labels"),
 	)
