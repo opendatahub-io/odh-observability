@@ -96,12 +96,30 @@ spec:
 
 ## Development
 
+### Trace query skill
+
+The read-only [`observability-traces-query`](skills/observability-traces-query/SKILL.md)
+skill queries bounded RHOAI Tempo searches and trace IDs through the validated
+endpoints returned by `observability-endpoint-discovery`. Its documentation
+covers the required inventory, caller token, service CA, query, and result
+validation steps.
+
+### Logs query skill
+
+The read-only [`observability-logs-query`](skills/observability-logs-query/SKILL.md)
+skill queries bounded RHOAI forwarded application logs through the validated
+Loki endpoints returned by `observability-endpoint-discovery`. It keeps the
+historical Loki query lane separate from usage-log ingestion and direct pod-log
+fallback, and documents caller authentication, service CA, LogQL, result
+validation, and the least-privilege live-cluster setup and cleanup path.
+
 ### Testing
 
 ```bash
 make test              # Full pipeline: codegen + fmt + vet + unit tests
 make unit-test         # Unit tests only (fastest iteration)
 make test-verbose      # Unit tests with -v
+make logs-query-test   # Python tests for all observability skills
 
 # Single test
 go test ./internal/controller/ -run TestBuildTemplateData -v
