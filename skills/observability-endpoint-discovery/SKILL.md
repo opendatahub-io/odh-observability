@@ -218,8 +218,9 @@ namespace proxy is GET/HEAD-only.
 #### OpenShift platform metrics lanes
 
 The Perses integration may expose two caller-token lanes through the COO
-`thanos-querier` Service. Discover the Service across namespaces when RBAC
-permits and retain its observed namespace and actual ports before reporting it.
+`thanos-querier` Service in `openshift-monitoring`. Read that namespaced Service
+directly, rather than treating same-named tenant Services as candidates, and
+retain its actual ports before reporting it.
 Require an available OpenShift platform Prometheus resource and the
 cluster-monitoring-operator-managed Service identity labels before accepting
 the Service as the platform Thanos endpoint. If either source cannot be

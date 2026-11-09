@@ -26,10 +26,46 @@ SENSITIVE_QUERY_MARKERS = (
     "credential",
     "privatekey",
 )
+SAFE_OC_ERROR_CATEGORIES = frozenset(
+    {
+        "permission denied",
+        "resource not found",
+        "request timed out",
+        "cluster unavailable",
+        "command failed",
+        "oc unavailable",
+        "oc execution failed",
+        "invalid JSON response",
+    }
+)
 
 
 class OcError(RuntimeError):
     """Raised when a required oc command cannot be completed."""
+
+    def __init__(self, category: str, context: str | None = None) -> None:
+        self.category = (
+            category if category in SAFE_OC_ERROR_CATEGORIES else "command failed"
+        )
+        message = f"{context}: {self.category}" if context else self.category
+        super().__init__(message)
+
+
+def oc_error_category(stderr: str) -> str:
+    """Map oc stderr to a safe category without exposing its contents."""
+    normalized = stderr.casefold()
+    if any(
+        marker in normalized
+        for marker in ("forbidden", "unauthorized", "permission denied")
+    ):
+        return "permission denied"
+    if "not found" in normalized:
+        return "resource not found"
+    if "timeout" in normalized or "timed out" in normalized:
+        return "request timed out"
+    if "unable to connect" in normalized or "connection refused" in normalized:
+        return "cluster unavailable"
+    return "command failed"
 
 
 def run_oc(args: list[str], namespace: str | None = None) -> Any:
@@ -37,15 +73,19 @@ def run_oc(args: list[str], namespace: str | None = None) -> Any:
     if namespace:
         command.extend(["-n", namespace])
     command.extend(args)
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except FileNotFoundError as error:
+        raise OcError("oc unavailable") from error
+    except OSError as error:
+        raise OcError("oc execution failed") from error
     if result.returncode != 0:
-        detail = result.stderr.strip().splitlines()
-        raise OcError(detail[-1] if detail else f"oc exited with {result.returncode}")
+        raise OcError(oc_error_category(result.stderr))
     if "-o" in args and "json" in args:
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError as error:
-            raise OcError(f"oc returned invalid JSON: {error}") from error
+            raise OcError("invalid JSON response") from error
     return result.stdout.strip()
 
 
@@ -58,7 +98,7 @@ def optional_oc(
     try:
         return run_oc(args, namespace)
     except OcError as error:
-        warnings.append(f"{description} was not discoverable: {error}")
+        warnings.append(f"{description} was not discoverable: {error.category}")
         return None
 
 
@@ -68,7 +108,9 @@ def required_oc(
     try:
         return run_oc(args, namespace)
     except OcError as error:
-        raise OcError(f"{description} could not be read: {error}") from error
+        raise OcError(
+            error.category, context=f"{description} could not be read"
+        ) from error
 
 
 def condition_map(resource: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -158,7 +200,7 @@ def service_has_ready_endpoint(
     for endpoint_slice in slices:
         endpoint_ports = endpoint_slice.get("ports") or []
         matching_port = any(
-            endpoint_port.get("name") == target_port
+            endpoint_port.get("name") == port.get("name")
             if isinstance(target_port, str)
             else endpoint_port.get("port") == target_port
             for endpoint_port in endpoint_ports
@@ -229,10 +271,27 @@ def parse_http_url(value: Any) -> Any | None:
     if parsed.username or parsed.password:
         return None
     for key, _ in parse_qsl(parsed.query, keep_blank_values=True):
-        normalized_key = "".join(character for character in key.lower() if character.isalnum())
-        if any(marker in normalized_key for marker in SENSITIVE_QUERY_MARKERS):
+        if is_sensitive_query_key(key):
             return None
     return parsed
+
+
+def is_sensitive_query_key(key: Any) -> bool:
+    if not isinstance(key, str):
+        return False
+    normalized_key = "".join(character for character in key.lower() if character.isalnum())
+    return any(marker in normalized_key for marker in SENSITIVE_QUERY_MARKERS)
+
+
+def sanitize_query_parameters(value: Any) -> dict[str, str] | None:
+    """Keep safe parameter names while never retaining configured values."""
+    if not isinstance(value, dict):
+        return None
+    return {
+        key: "<redacted>"
+        for key in value
+        if isinstance(key, str) and not is_sensitive_query_key(key)
+    }
 
 
 def cluster_service_name(parsed: Any, namespace: str) -> str | None:
@@ -713,27 +772,22 @@ def discover() -> dict[str, Any]:
             }
         )
     ocp_thanos_result = optional_oc(
-        ["get", "services", "--all-namespaces", "-o", "json"],
-        None,
+        ["get", "service", "thanos-querier", "-o", "json"],
+        "openshift-monitoring",
         output["warnings"],
         "OpenShift Thanos Service",
     )
-    ocp_thanos_candidates = (
-        [
-            item
-            for item in ocp_thanos_result.get("items", [])
-            if (item.get("metadata") or {}).get("name") == "thanos-querier"
-        ]
-        if isinstance(ocp_thanos_result, dict) and isinstance(ocp_thanos_result.get("items"), list)
-        else [ocp_thanos_result]
-        if isinstance(ocp_thanos_result, dict)
-        else []
-    )
     ocp_thanos: dict[str, Any] | None = None
-    if len(ocp_thanos_candidates) == 1:
-        candidate = ocp_thanos_candidates[0]
-        if is_authoritative_platform_thanos_service(candidate, platform_prometheus):
-            ocp_thanos = candidate
+    if isinstance(platform_prometheus, dict):
+        if not isinstance(ocp_thanos_result, dict):
+            output["unavailable"].append(
+                {
+                    "component": "openshift-metrics",
+                    "reason": "Authoritative thanos-querier Service was not discovered",
+                }
+            )
+        elif is_authoritative_platform_thanos_service(ocp_thanos_result, platform_prometheus):
+            ocp_thanos = ocp_thanos_result
         else:
             output["unavailable"].append(
                 {
@@ -744,20 +798,6 @@ def discover() -> dict[str, Any]:
                     ),
                 }
             )
-    elif len(ocp_thanos_candidates) > 1:
-        output["unavailable"].append(
-            {
-                "component": "openshift-metrics",
-                "reason": "Multiple Thanos Services named thanos-querier were discovered",
-            }
-        )
-    elif isinstance(platform_prometheus, dict):
-        output["unavailable"].append(
-            {
-                "component": "openshift-metrics",
-                "reason": "Authoritative thanos-querier Service was not discovered",
-            }
-        )
 
     if ocp_thanos is not None:
         platform_namespace = (ocp_thanos.get("metadata") or {}).get("namespace")
@@ -1109,7 +1149,9 @@ def discover() -> dict[str, Any]:
                         paths=[],
                         state="configured",
                         source_ref=source("PersesDatasource", namespace, ds_name),
-                        query_parameters=plugin_spec.get("queryParams"),
+                        query_parameters=sanitize_query_parameters(
+                            plugin_spec.get("queryParams")
+                        ),
                     )
                 )
 

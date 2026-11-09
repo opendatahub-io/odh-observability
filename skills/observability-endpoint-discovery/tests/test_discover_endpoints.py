@@ -57,6 +57,42 @@ class DiscoverEndpointsTests(unittest.TestCase):
             "api/traces/v1/monitoring/tempo",
         )
 
+    def test_named_target_port_matches_service_port_name(self) -> None:
+        service = {
+            "metadata": {"name": "gateway", "namespace": "monitoring"},
+            "spec": {
+                "ports": [{"name": "https", "port": 8443, "targetPort": "web"}]
+            },
+        }
+        slices = {
+            "gateway": [
+                {
+                    "ports": [{"name": "https", "port": 8443}],
+                    "endpoints": [
+                        {"addresses": ["10.0.0.1"], "conditions": {"ready": True}}
+                    ],
+                }
+            ]
+        }
+
+        self.assertTrue(
+            discover_endpoints.service_has_ready_endpoint(
+                service, slices, service["spec"]["ports"][0]
+            )
+        )
+
+    def test_datasource_query_parameters_redact_values_and_sensitive_keys(self) -> None:
+        self.assertEqual(
+            discover_endpoints.sanitize_query_parameters(
+                {
+                    "namespace": "${namespace:queryparam}",
+                    "api_key": "do-not-record",
+                    "safe": "also-do-not-record",
+                }
+            ),
+            {"namespace": "<redacted>", "safe": "<redacted>"},
+        )
+
     def test_cluster_service_name_requires_full_current_namespace_dns(self) -> None:
         self.assertEqual(
             discover_endpoints.cluster_service_name(
@@ -102,8 +138,14 @@ class DiscoverEndpointsTests(unittest.TestCase):
             mock_subprocess.run.return_value = subprocess.CompletedProcess(
                 args=[], returncode=1, stdout="", stderr="forbidden"
             )
-            with self.assertRaises(discover_endpoints.OcError):
+            with self.assertRaises(discover_endpoints.OcError) as context:
                 discover_endpoints.run_oc(["get", "services"])
+
+            self.assertNotIn("forbidden", str(context.exception))
+            self.assertEqual(
+                discover_endpoints.oc_error_category("forbidden: user=alice"),
+                "permission denied",
+            )
 
 
 if __name__ == "__main__":
