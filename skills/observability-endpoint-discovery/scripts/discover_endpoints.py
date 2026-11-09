@@ -38,6 +38,7 @@ SAFE_OC_ERROR_CATEGORIES = frozenset(
         "invalid JSON response",
     }
 )
+OC_COMMAND_TIMEOUT_SECONDS = 30
 
 
 class OcError(RuntimeError):
@@ -74,7 +75,15 @@ def run_oc(args: list[str], namespace: str | None = None) -> Any:
         command.extend(["-n", namespace])
     command.extend(args)
     try:
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=OC_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise OcError("request timed out") from error
     except FileNotFoundError as error:
         raise OcError("oc unavailable") from error
     except OSError as error:
@@ -200,7 +209,7 @@ def service_has_ready_endpoint(
     for endpoint_slice in slices:
         endpoint_ports = endpoint_slice.get("ports") or []
         matching_port = any(
-            endpoint_port.get("name") == port.get("name")
+            (endpoint_port.get("name") or "") == (port.get("name") or "")
             if isinstance(target_port, str)
             else endpoint_port.get("port") == target_port
             for endpoint_port in endpoint_ports

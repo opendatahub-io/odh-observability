@@ -81,6 +81,28 @@ class DiscoverEndpointsTests(unittest.TestCase):
             )
         )
 
+    def test_named_target_port_matches_empty_service_port_name(self) -> None:
+        service = {
+            "metadata": {"name": "gateway", "namespace": "monitoring"},
+            "spec": {"ports": [{"port": 8443, "targetPort": "web"}]},
+        }
+        slices = {
+            "gateway": [
+                {
+                    "ports": [{"name": "", "port": 8443}],
+                    "endpoints": [
+                        {"addresses": ["10.0.0.1"], "conditions": {"ready": True}}
+                    ],
+                }
+            ]
+        }
+
+        self.assertTrue(
+            discover_endpoints.service_has_ready_endpoint(
+                service, slices, service["spec"]["ports"][0]
+            )
+        )
+
     def test_datasource_query_parameters_redact_values_and_sensitive_keys(self) -> None:
         self.assertEqual(
             discover_endpoints.sanitize_query_parameters(
@@ -146,6 +168,87 @@ class DiscoverEndpointsTests(unittest.TestCase):
                 discover_endpoints.oc_error_category("forbidden: user=alice"),
                 "permission denied",
             )
+
+    def test_run_oc_timeout_is_a_discovery_error(self) -> None:
+        with patch.object(
+            discover_endpoints.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(
+                cmd=["oc"], timeout=discover_endpoints.OC_COMMAND_TIMEOUT_SECONDS
+            ),
+        ) as mock_run:
+            with self.assertRaises(discover_endpoints.OcError) as context:
+                discover_endpoints.run_oc(["get", "services"])
+
+            self.assertEqual(str(context.exception), "request timed out")
+            self.assertEqual(
+                mock_run.call_args.kwargs["timeout"],
+                discover_endpoints.OC_COMMAND_TIMEOUT_SECONDS,
+            )
+
+    def test_authoritative_platform_thanos_service_requires_all_identity_inputs(
+        self,
+    ) -> None:
+        platform_prometheus = {
+            "status": {
+                "conditions": [{"type": "Available", "status": "True"}]
+            }
+        }
+        labels = {
+            "app.kubernetes.io/managed-by": "cluster-monitoring-operator",
+            "app.kubernetes.io/part-of": "openshift-monitoring",
+            "app.kubernetes.io/component": "query-layer",
+            "app.kubernetes.io/instance": "thanos-querier",
+            "app.kubernetes.io/name": "thanos-query",
+        }
+        service = {
+            "metadata": {"namespace": "openshift-monitoring", "labels": labels}
+        }
+
+        self.assertTrue(
+            discover_endpoints.is_authoritative_platform_thanos_service(
+                service, platform_prometheus
+            )
+        )
+        self.assertFalse(
+            discover_endpoints.is_authoritative_platform_thanos_service(
+                {"metadata": {"namespace": "tenant", "labels": labels}},
+                platform_prometheus,
+            )
+        )
+        for label_name, label_value in (
+            ("app.kubernetes.io/managed-by", None),
+            ("app.kubernetes.io/managed-by", "other-controller"),
+            ("app.kubernetes.io/component", None),
+            ("app.kubernetes.io/component", "other-component"),
+        ):
+            with self.subTest(label_name=label_name, label_value=label_value):
+                altered_labels = labels.copy()
+                if label_value is None:
+                    altered_labels.pop(label_name)
+                else:
+                    altered_labels[label_name] = label_value
+                self.assertFalse(
+                    discover_endpoints.is_authoritative_platform_thanos_service(
+                        {
+                            "metadata": {
+                                "namespace": "openshift-monitoring",
+                                "labels": altered_labels,
+                            }
+                        },
+                        platform_prometheus,
+                    )
+                )
+
+        self.assertFalse(
+            discover_endpoints.is_authoritative_platform_thanos_service(
+                service,
+                {"status": {"conditions": [{"type": "Available", "status": "False"}]}},
+            )
+        )
+        self.assertFalse(
+            discover_endpoints.is_authoritative_platform_thanos_service(service, None)
+        )
 
 
 if __name__ == "__main__":
