@@ -904,7 +904,10 @@ func hasReadOnlyServiceCAMount(pod *corev1.Pod, container corev1.Container, cert
 			continue
 		}
 		if len(volume.ConfigMap.Items) == 0 {
-			return true
+			if relativePath == "service-ca.crt" {
+				return true
+			}
+			continue
 		}
 		for _, item := range volume.ConfigMap.Items {
 			if item.Key == "service-ca.crt" && filepath.Clean(item.Path) == relativePath {

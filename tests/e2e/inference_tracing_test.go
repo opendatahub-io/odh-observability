@@ -342,17 +342,33 @@ func TestHasReadOnlyServiceCAMount(t *testing.T) {
 			Items:                []corev1.KeyToPath{{Key: "service-ca.crt", Path: "service-ca.crt"}},
 		}},
 	}
+	serviceCAVolumeWithoutItems := serviceCAVolume.DeepCopy()
+	serviceCAVolumeWithoutItems.ConfigMap.Items = nil
 	tests := []struct {
-		name      string
-		volume    corev1.Volume
-		mount     corev1.VolumeMount
-		wantMount bool
+		name            string
+		volume          corev1.Volume
+		mount           corev1.VolumeMount
+		certificatePath string
+		wantMount       bool
 	}{
 		{
 			name:      "read-only service CA mounted at certificate path",
 			volume:    serviceCAVolume,
 			mount:     corev1.VolumeMount{Name: "service-ca", MountPath: "/var/run/secrets/service-ca", ReadOnly: true},
 			wantMount: true,
+		},
+		{
+			name:            "read-only service CA with default key path",
+			volume:          *serviceCAVolumeWithoutItems,
+			mount:           corev1.VolumeMount{Name: "service-ca", MountPath: "/var/run/secrets/service-ca", ReadOnly: true},
+			certificatePath: "/var/run/secrets/service-ca/service-ca.crt",
+			wantMount:       true,
+		},
+		{
+			name:            "read-only service CA with mismatched default key path",
+			volume:          *serviceCAVolumeWithoutItems,
+			mount:           corev1.VolumeMount{Name: "service-ca", MountPath: "/var/run/secrets/service-ca", ReadOnly: true},
+			certificatePath: "/var/run/secrets/service-ca/nested/ca.pem",
 		},
 		{
 			name:   "writable service CA mount",
@@ -372,7 +388,11 @@ func TestHasReadOnlyServiceCAMount(t *testing.T) {
 			t.Parallel()
 			pod := &corev1.Pod{Spec: corev1.PodSpec{Volumes: []corev1.Volume{tt.volume}}}
 			container := corev1.Container{VolumeMounts: []corev1.VolumeMount{tt.mount}}
-			require.Equal(t, tt.wantMount, hasReadOnlyServiceCAMount(pod, container, certificatePath))
+			path := tt.certificatePath
+			if path == "" {
+				path = certificatePath
+			}
+			require.Equal(t, tt.wantMount, hasReadOnlyServiceCAMount(pod, container, path))
 		})
 	}
 }
