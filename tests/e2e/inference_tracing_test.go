@@ -304,6 +304,79 @@ func TestWriteLLMOatsTraceCaseFileIncludesTraceID(t *testing.T) {
 	require.Contains(t, content, `span:parentID = "0123456789abcdef"`)
 }
 
+func TestHTTPSOnlyStatusEndpoint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		endpoint string
+		want     bool
+	}{
+		{name: "https endpoint", endpoint: "https://inference.example.test", want: true},
+		{name: "http endpoint", endpoint: "http://inference.example.test", want: false},
+		{name: "missing host", endpoint: "https:", want: false},
+		{name: "malformed endpoint", endpoint: "://bad", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := httpsEndpoint(tt.endpoint)
+			require.Equal(t, tt.want, ok)
+			if ok {
+				require.Equal(t, tt.endpoint, got)
+			} else {
+				require.Empty(t, got)
+			}
+		})
+	}
+}
+
+func TestHasReadOnlyServiceCAMount(t *testing.T) {
+	t.Parallel()
+
+	certificatePath := "/var/run/secrets/service-ca/service-ca.crt"
+	serviceCAVolume := corev1.Volume{
+		Name: "service-ca",
+		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "openshift-service-ca.crt"},
+			Items:                []corev1.KeyToPath{{Key: "service-ca.crt", Path: "service-ca.crt"}},
+		}},
+	}
+	tests := []struct {
+		name      string
+		volume    corev1.Volume
+		mount     corev1.VolumeMount
+		wantMount bool
+	}{
+		{
+			name:      "read-only service CA mounted at certificate path",
+			volume:    serviceCAVolume,
+			mount:     corev1.VolumeMount{Name: "service-ca", MountPath: "/var/run/secrets/service-ca", ReadOnly: true},
+			wantMount: true,
+		},
+		{
+			name:   "writable service CA mount",
+			volume: serviceCAVolume,
+			mount:  corev1.VolumeMount{Name: "service-ca", MountPath: "/var/run/secrets/service-ca"},
+		},
+		{
+			name: "different ConfigMap",
+			volume: corev1.Volume{Name: "service-ca", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "unrelated-config"},
+			}}},
+			mount: corev1.VolumeMount{Name: "service-ca", MountPath: "/var/run/secrets/service-ca", ReadOnly: true},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			pod := &corev1.Pod{Spec: corev1.PodSpec{Volumes: []corev1.Volume{tt.volume}}}
+			container := corev1.Container{VolumeMounts: []corev1.VolumeMount{tt.mount}}
+			require.Equal(t, tt.wantMount, hasReadOnlyServiceCAMount(pod, container, certificatePath))
+		})
+	}
+}
+
 func TestRenderOatsMetricsCaseScopesQueriesToService(t *testing.T) {
 	template, err := os.ReadFile(filepath.Join("oats", "vllm", "single-node-metrics", "oats-case.yaml"))
 	require.NoError(t, err)
@@ -314,6 +387,8 @@ func TestRenderOatsMetricsCaseScopesQueriesToService(t *testing.T) {
 	require.NotContains(t, content, metricsServiceNamePlaceholder)
 	require.Equal(t, 6, strings.Count(content, `llm_isvc_name="`+serviceName+`"`),
 		"every metric selector must be restricted to this LLMInferenceService")
+	require.Equal(t, 4, strings.Count(content, `value: "> 0"`),
+		"counter and latency bucket assertions should require observations from the test request")
 }
 
 func TestGCXToolingUsesPinnedCacheBinary(t *testing.T) {

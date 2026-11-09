@@ -672,13 +672,85 @@ func randomServiceName(base string) (string, error) {
 	return name, nil
 }
 
-func findPlatformLLMTracingPreset(tc *TestContext, namespace string) (string, string, error) {
+func findDefaultInferenceGateway(tc *TestContext) (string, string, error) {
+	gatewayConfigs := &unstructured.UnstructuredList{}
+	gatewayConfigs.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "services.platform.opendatahub.io", Version: "v1alpha1", Kind: "GatewayConfigList",
+	})
+	if err := tc.Client().List(tc.Context(), gatewayConfigs); err != nil {
+		return "", "", fmt.Errorf("list platform GatewayConfig resources: %w", err)
+	}
+	if len(gatewayConfigs.Items) != 1 {
+		return "", "", fmt.Errorf("expected one platform GatewayConfig, found %d", len(gatewayConfigs.Items))
+	}
+	gatewayConfig := &gatewayConfigs.Items[0]
+
+	additionalIngresses, _, err := unstructured.NestedSlice(gatewayConfig.Object, "spec", "additionalIngresses")
+	if err != nil {
+		return "", "", fmt.Errorf("read additional ingresses from GatewayConfig %s: %w", gatewayConfig.GetName(), err)
+	}
+	additionalGatewayNames := make(map[string]struct{}, len(additionalIngresses))
+	for _, ingress := range additionalIngresses {
+		entry, ok := ingress.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := entry["name"].(string)
+		if name != "" {
+			additionalGatewayNames[name] = struct{}{}
+		}
+	}
+
+	gateways := &unstructured.UnstructuredList{}
+	gateways.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "gateway.networking.k8s.io", Version: "v1", Kind: "GatewayList",
+	})
+	if err := tc.Client().List(tc.Context(), gateways); err != nil {
+		return "", "", fmt.Errorf("list Gateway resources: %w", err)
+	}
+	var defaultGateway *unstructured.Unstructured
+	for i := range gateways.Items {
+		gateway := &gateways.Items[i]
+		if _, isAdditional := additionalGatewayNames[gateway.GetName()]; isAdditional {
+			continue
+		}
+		for _, owner := range gateway.GetOwnerReferences() {
+			if owner.UID == gatewayConfig.GetUID() && owner.Kind == "GatewayConfig" {
+				if defaultGateway != nil {
+					return "", "", fmt.Errorf("multiple default Gateways are owned by GatewayConfig %s", gatewayConfig.GetName())
+				}
+				defaultGateway = gateway
+			}
+		}
+	}
+	if defaultGateway == nil {
+		return "", "", fmt.Errorf("no default Gateway is owned by GatewayConfig %s", gatewayConfig.GetName())
+	}
+
+	conditions, _, err := unstructured.NestedSlice(defaultGateway.Object, "status", "conditions")
+	if err != nil {
+		return "", "", fmt.Errorf("read status conditions for Gateway %s/%s: %w", defaultGateway.GetNamespace(), defaultGateway.GetName(), err)
+	}
+	for _, rawCondition := range conditions {
+		condition, ok := rawCondition.(map[string]any)
+		if !ok || condition["type"] != "Programmed" {
+			continue
+		}
+		if condition["status"] != "True" {
+			return "", "", fmt.Errorf("default Gateway %s/%s is not programmed", defaultGateway.GetNamespace(), defaultGateway.GetName())
+		}
+		return defaultGateway.GetName(), defaultGateway.GetNamespace(), nil
+	}
+	return "", "", fmt.Errorf("default Gateway %s/%s has no Programmed condition", defaultGateway.GetNamespace(), defaultGateway.GetName())
+}
+
+func findPlatformLLMTracingPreset(tc *TestContext, namespace string) (string, string, string, error) {
 	configs := &unstructured.UnstructuredList{}
 	configs.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: "serving.kserve.io", Version: "v1alpha2", Kind: "LLMInferenceServiceConfigList",
 	})
 	if err := tc.Client().List(tc.Context(), configs, client.InNamespace(namespace)); err != nil {
-		return "", "", fmt.Errorf("list LLMInferenceServiceConfig resources: %w", err)
+		return "", "", "", fmt.Errorf("list LLMInferenceServiceConfig resources: %w", err)
 	}
 	for _, config := range configs.Items {
 		previousName := config.GetAnnotations()["internal.config.kubernetes.io/previousNames"]
@@ -687,65 +759,28 @@ func findPlatformLLMTracingPreset(tc *TestContext, namespace string) (string, st
 		}
 		endpoint, found, err := unstructured.NestedString(config.Object, "spec", "tracing", "exporterEndpoint")
 		if err != nil {
-			return "", "", fmt.Errorf("read tracing endpoint from preset %s: %w", config.GetName(), err)
+			return "", "", "", fmt.Errorf("read tracing endpoint from preset %s: %w", config.GetName(), err)
 		}
 		if !found || endpoint == "" {
-			return "", "", fmt.Errorf("platform tracing preset %s has no exporterEndpoint", config.GetName())
+			return "", "", "", fmt.Errorf("platform tracing preset %s has no exporterEndpoint", config.GetName())
 		}
-		return config.GetName(), endpoint, nil
+		if _, ok := httpsEndpoint(endpoint); !ok {
+			return "", "", "", fmt.Errorf("platform tracing preset %s must use an HTTPS exporterEndpoint", config.GetName())
+		}
+		certificate, found, err := unstructured.NestedString(config.Object, "spec", "tracing", "exporterCertificate")
+		if err != nil {
+			return "", "", "", fmt.Errorf("read tracing certificate from preset %s: %w", config.GetName(), err)
+		}
+		if !found || certificate == "" {
+			return "", "", "", fmt.Errorf("platform tracing preset %s has no exporterCertificate", config.GetName())
+		}
+		return config.GetName(), endpoint, certificate, nil
 	}
-	return "", "", fmt.Errorf("platform LLM tracing preset was not found in namespace %s", namespace)
-}
-
-func findPlatformInferenceGateway(tc *TestContext) (types.NamespacedName, error) {
-	gateways := &unstructured.UnstructuredList{}
-	gateways.SetGroupVersionKind(schema.GroupVersionKind{
-		Group: "gateway.networking.k8s.io", Version: "v1", Kind: "GatewayList",
-	})
-	if err := tc.Client().List(tc.Context(), gateways,
-		client.MatchingLabels{"platform.opendatahub.io/part-of": "gatewayconfig"},
-	); err != nil {
-		return types.NamespacedName{}, fmt.Errorf("list platform inference Gateways: %w", err)
-	}
-	for i := range gateways.Items {
-		gateway := &gateways.Items[i]
-		conditions, _, _ := unstructured.NestedSlice(gateway.Object, "status", "conditions")
-		programmed := false
-		for _, rawCondition := range conditions {
-			condition, ok := rawCondition.(map[string]any)
-			if ok && condition["type"] == "Programmed" && condition["status"] == "True" {
-				programmed = true
-				break
-			}
-		}
-		if !programmed {
-			continue
-		}
-		nn := types.NamespacedName{Name: gateway.GetName(), Namespace: gateway.GetNamespace()}
-		route := &unstructured.Unstructured{}
-		route.SetGroupVersionKind(gvk.Route)
-		if err := tc.Client().Get(tc.Context(), nn, route); err == nil {
-			return nn, nil
-		}
-	}
-	return types.NamespacedName{}, errors.New("no programmed platform inference Gateway with an OpenShift Route was found")
+	return "", "", "", fmt.Errorf("platform LLM tracing preset was not found in namespace %s", namespace)
 }
 
 func llmInferenceServiceRoutedEndpoint(t *testing.T, tc *TestContext, nn types.NamespacedName) string {
 	t.Helper()
-	service := tc.FetchResource(WithMinimalObject(gvkLLMInferenceService, nn))
-	for _, path := range [][]string{{"status", "url"}, {"status", "address", "url"}} {
-		endpoint, found, err := unstructured.NestedString(service.Object, path...)
-		require.NoError(t, err, "failed to read LLMInferenceService routed URL")
-		if found && endpoint != "" {
-			parsed, parseErr := url.Parse(endpoint)
-			require.NoError(t, parseErr, "LLMInferenceService routed URL should be valid")
-			require.Contains(t, []string{"http", "https"}, parsed.Scheme)
-			require.NotEmpty(t, parsed.Host)
-			return endpoint
-		}
-	}
-
 	routes := &unstructured.UnstructuredList{}
 	routes.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRouteList",
@@ -780,10 +815,21 @@ func llmInferenceServiceRoutedEndpoint(t *testing.T, tc *TestContext, nn types.N
 	require.True(t, found, "OpenShift Route %s/%s should have a host", gatewayNamespace, gatewayName)
 	require.NotEmpty(t, host, "OpenShift Route %s/%s should have a host", gatewayNamespace, gatewayName)
 
+	// The LLMInferenceService status URL can be the Gateway's internal Service
+	// address, which is not resolvable from the test runner. Use the OpenShift
+	// Route host associated with the HTTPRoute's parent Gateway.
 	return fmt.Sprintf("https://%s/%s/%s", host, nn.Namespace, nn.Name)
 }
 
-func requireLLMTracingEndpoint(t *testing.T, tc *TestContext, namespace, serviceName, expectedEndpoint string) {
+func httpsEndpoint(endpoint string) (string, bool) {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return "", false
+	}
+	return endpoint, true
+}
+
+func requireLLMTracingEndpoint(t *testing.T, tc *TestContext, namespace, serviceName, expectedEndpoint, expectedCertificate string) {
 	t.Helper()
 	pods := &corev1.PodList{}
 	require.NoError(t, tc.Client().List(tc.Context(), pods,
@@ -792,27 +838,81 @@ func requireLLMTracingEndpoint(t *testing.T, tc *TestContext, namespace, service
 	))
 	foundWorkload := false
 	foundScheduler := false
+	foundWorkloadCertificate := false
+	foundSchedulerCertificate := false
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		component := pod.Labels["app.kubernetes.io/component"]
 		for _, container := range pod.Spec.Containers {
+			hasEndpoint := false
+			certificatePath := ""
 			for _, env := range container.Env {
-				if env.Name != "OTEL_EXPORTER_OTLP_ENDPOINT" {
-					continue
+				switch env.Name {
+				case "OTEL_EXPORTER_OTLP_ENDPOINT":
+					require.Equal(t, expectedEndpoint, env.Value,
+						"pod %s container %s should use the platform tracing endpoint", pod.Name, container.Name)
+					hasEndpoint = true
+				case "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE":
+					certificatePath = env.Value
 				}
-				require.Equal(t, expectedEndpoint, env.Value,
-					"pod %s container %s should use the platform tracing endpoint", pod.Name, container.Name)
-				if strings.HasPrefix(component, "llminferenceservice-workload") {
-					foundWorkload = true
-				}
-				if component == "llminferenceservice-router-scheduler" {
-					foundScheduler = true
-				}
+			}
+			if !hasEndpoint {
+				continue
+			}
+			require.NotEmpty(t, certificatePath,
+				"pod %s container %s should receive OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE", pod.Name, container.Name)
+			require.Equal(t, expectedCertificate, certificatePath,
+				"pod %s container %s should use the certificate configured by the platform tracing preset", pod.Name, container.Name)
+			require.True(t, hasReadOnlyServiceCAMount(pod, container, certificatePath),
+				"pod %s container %s should mount the service CA at %s read-only", pod.Name, container.Name, certificatePath)
+			if strings.HasPrefix(component, "llminferenceservice-workload") {
+				foundWorkload = true
+				foundWorkloadCertificate = true
+			}
+			if component == "llminferenceservice-router-scheduler" {
+				foundScheduler = true
+				foundSchedulerCertificate = true
 			}
 		}
 	}
 	require.True(t, foundWorkload, "a vLLM workload pod should receive OTEL_EXPORTER_OTLP_ENDPOINT")
 	require.True(t, foundScheduler, "the EPP scheduler pod should receive OTEL_EXPORTER_OTLP_ENDPOINT")
+	require.True(t, foundWorkloadCertificate,
+		"a vLLM workload pod should receive OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE and mount the service CA")
+	require.True(t, foundSchedulerCertificate,
+		"the EPP scheduler pod should receive OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE and mount the service CA")
+}
+
+func hasReadOnlyServiceCAMount(pod *corev1.Pod, container corev1.Container, certificatePath string) bool {
+	certificatePath = filepath.Clean(certificatePath)
+	volumes := make(map[string]corev1.Volume, len(pod.Spec.Volumes))
+	for _, volume := range pod.Spec.Volumes {
+		volumes[volume.Name] = volume
+	}
+
+	for _, mount := range container.VolumeMounts {
+		if !mount.ReadOnly {
+			continue
+		}
+		mountPath := filepath.Clean(mount.MountPath)
+		relativePath, err := filepath.Rel(mountPath, certificatePath)
+		if err != nil || relativePath == "." || relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(os.PathSeparator)) {
+			continue
+		}
+		volume, ok := volumes[mount.Name]
+		if !ok || volume.ConfigMap == nil || volume.ConfigMap.Name != "openshift-service-ca.crt" {
+			continue
+		}
+		if len(volume.ConfigMap.Items) == 0 {
+			return true
+		}
+		for _, item := range volume.ConfigMap.Items {
+			if item.Key == "service-ca.crt" && filepath.Clean(item.Path) == relativePath {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func discoverInferenceService(tc *TestContext, namespace, llmSvcName string) (string, int64, error) {
@@ -975,13 +1075,11 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		},
 		"replicas": int64(1),
 		"template": map[string]any{
-			"volumes": serviceCAVolumes(),
 			"containers": []map[string]any{
 				{
-					"name":         "main",
-					"image":        "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
-					"env":          inferenceContainerEnv(),
-					"volumeMounts": serviceCAVolumeMounts(),
+					"name":  "main",
+					"image": "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
+					"env":   inferenceContainerEnv(),
 					"resources": map[string]any{
 						"requests": map[string]any{"memory": memory},
 						"limits":   map[string]any{"memory": memory},
@@ -990,24 +1088,29 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 			},
 		},
 	}
-	var platformTracingEndpoint string
+	var platformTracingEndpoint, platformTracingCertificate string
 	if topology == "single-node" && oatsMode != "metrics" {
-		presetName, endpoint, presetErr := findPlatformLLMTracingPreset(tc, workloadNS)
+		presetName, endpoint, certificate, presetErr := findPlatformLLMTracingPreset(tc, workloadNS)
 		require.NoError(t, presetErr, "platform-managed LLM tracing preset is required for trace validation")
-		gateway, gatewayErr := findPlatformInferenceGateway(tc)
-		require.NoError(t, gatewayErr, "platform inference Gateway is required for EPP trace validation")
+		gatewayName, gatewayNamespace, gatewayErr := findDefaultInferenceGateway(tc)
+		require.NoError(t, gatewayErr, "the platform default inference Gateway is required for trace validation")
 		spec["tracing"] = map[string]any{}
 		spec["router"] = map[string]any{
 			"route":     map[string]any{},
 			"scheduler": map[string]any{},
+			// Resolve the default Gateway from GatewayConfig ownership rather than
+			// relying on KServe's potentially stale built-in Gateway name.
 			"gateway": map[string]any{
-				"refs": []map[string]any{{"name": gateway.Name, "namespace": gateway.Namespace}},
+				"refs": []any{map[string]any{
+					"name":      gatewayName,
+					"namespace": gatewayNamespace,
+				}},
 			},
 		}
 		platformTracingEndpoint = endpoint
-		t.Logf("[%s] Using platform-managed tracing preset %s with endpoint %s",
-			topology, presetName, endpoint)
-		t.Logf("[%s] Using Gateway %s for EPP trace validation", topology, gateway)
+		platformTracingCertificate = certificate
+		t.Logf("[%s] Using platform-managed tracing preset %s and default Gateway %s/%s",
+			topology, presetName, gatewayNamespace, gatewayName)
 	}
 
 	switch topology {
@@ -1019,13 +1122,11 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		// it does not contain a nested template. Unknown fields are pruned by
 		// the API server, so keep the containers directly under worker.
 		spec["worker"] = map[string]any{
-			"volumes": serviceCAVolumes(),
 			"containers": []map[string]any{
 				{
-					"name":         "main",
-					"image":        "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
-					"env":          inferenceContainerEnv(),
-					"volumeMounts": serviceCAVolumeMounts(),
+					"name":  "main",
+					"image": "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
+					"env":   inferenceContainerEnv(),
 					"resources": map[string]any{
 						"requests": map[string]any{"memory": memory},
 						"limits":   map[string]any{"memory": memory},
@@ -1036,13 +1137,11 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	case "disaggregated":
 		spec["prefill"] = map[string]any{
 			"template": map[string]any{
-				"volumes": serviceCAVolumes(),
 				"containers": []map[string]any{
 					{
-						"name":         "main",
-						"image":        "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
-						"env":          inferenceContainerEnv(),
-						"volumeMounts": serviceCAVolumeMounts(),
+						"name":  "main",
+						"image": "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
+						"env":   inferenceContainerEnv(),
 						"resources": map[string]any{
 							"requests": map[string]any{"memory": memory},
 							"limits":   map[string]any{"memory": memory},
@@ -1130,7 +1229,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	if useGatewayPath {
 		completionEndpoint = llmInferenceServiceRoutedEndpoint(t, tc, llmSvcNN)
 		completionPath = "LLMISVC Gateway/EPP route"
-		requireLLMTracingEndpoint(t, tc, workloadNS, llmSvcName, platformTracingEndpoint)
+		requireLLMTracingEndpoint(t, tc, workloadNS, llmSvcName, platformTracingEndpoint, platformTracingCertificate)
 	}
 	send := func() error {
 		return sendCompletionToEndpoint(tc.Context(), completionEndpoint, ocToken, routeCAs)
@@ -1170,12 +1269,11 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Second completion request should succeed after pod restart")
 
 	g.Eventually(func() error {
-		caseTag := topology
 		if topology == "single-node" {
 			casePath := writeOatsMetricsCaseFile(t, projectRoot, llmSvcName)
 			return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
 		}
-		return runOatsCase(tc.Context(), t, oatsBin, caseTag, oatsEnv, projectRoot)
+		return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
 	}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "Scrape recovery verification should succeed after pod restart")
 
 	// 5. Teardown & PodMonitor Cleanup
@@ -1242,26 +1340,7 @@ func verifyLLMInferenceServiceOATS(
 func inferenceContainerEnv() []map[string]any {
 	return []map[string]any{
 		{"name": "VLLM_CPU_KVCACHE_SPACE", "value": "1"},
-		{"name": "OTEL_EXPORTER_OTLP_CERTIFICATE", "value": "/var/run/secrets/service-ca/service-ca.crt"},
 	}
-}
-
-func serviceCAVolumeMounts() []map[string]any {
-	return []map[string]any{{
-		"name":      "service-ca",
-		"mountPath": "/var/run/secrets/service-ca",
-		"readOnly":  true,
-	}}
-}
-
-func serviceCAVolumes() []map[string]any {
-	return []map[string]any{{
-		"name": "service-ca",
-		"configMap": map[string]any{
-			"name":  "openshift-service-ca.crt",
-			"items": []map[string]any{{"key": "service-ca.crt", "path": "service-ca.crt"}},
-		},
-	}}
 }
 
 func logManualCleanupCommands(t *testing.T, topology, workloadNS, proxyNS, llmSvcName, bindingName string) {
