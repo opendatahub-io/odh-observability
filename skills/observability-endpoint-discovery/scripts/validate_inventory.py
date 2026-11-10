@@ -27,11 +27,17 @@ def fail(message: str) -> int:
 
 
 def has_sensitive_query_parameter(query: str) -> bool:
-    for key, _ in parse_qsl(query, keep_blank_values=True):
-        normalized_key = "".join(character for character in key.lower() if character.isalnum())
-        if any(marker in normalized_key for marker in SENSITIVE_QUERY_MARKERS):
-            return True
-    return False
+    return any(
+        is_sensitive_query_key(key)
+        for key, _ in parse_qsl(query, keep_blank_values=True)
+    )
+
+
+def is_sensitive_query_key(key: object) -> bool:
+    if not isinstance(key, str):
+        return False
+    normalized_key = "".join(character for character in key.lower() if character.isalnum())
+    return any(marker in normalized_key for marker in SENSITIVE_QUERY_MARKERS)
 
 
 def validate_endpoint(collection: str, index: int, endpoint: object) -> str | None:
@@ -73,6 +79,15 @@ def validate_endpoint(collection: str, index: int, endpoint: object) -> str | No
         return f"{collection}[{index}] is ready but has no URL"
     if not isinstance(endpoint.get("paths"), list):
         return f"{collection}[{index}] paths must be a list"
+    query_parameters = endpoint.get("query_parameters")
+    if query_parameters is not None:
+        if not isinstance(query_parameters, dict):
+            return f"{collection}[{index}] query_parameters must be an object or null"
+        for key, value in query_parameters.items():
+            if not isinstance(key, str) or is_sensitive_query_key(key):
+                return f"{collection}[{index}] query_parameters contains a sensitive key"
+            if value != "<redacted>":
+                return f"{collection}[{index}] query_parameters values must be redacted"
     return None
 
 
