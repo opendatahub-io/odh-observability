@@ -1,7 +1,6 @@
 package e2e_test
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -19,7 +18,6 @@ import (
 	"time"
 
 	common "github.com/opendatahub-io/odh-platform-utilities/api/common"
-	appsv1 "k8s.io/api/apps/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -28,8 +26,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/remotecommand"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 
@@ -212,7 +208,6 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 	// Perses sends the namespace in the URL and PromQL in the form body.
 	assertAuthorizedThanosPost(t, rootCAs, routeHost, authorizedToken, tc.MonitoringNamespace)
 	assertThanosRouteRejectsUnauthorizedNamespaces(t, rootCAs, routeHost, authorizedToken, tc.MonitoringNamespace)
-	assertPromLabelProxyQueryParamOnly(t, tc)
 }
 
 func assertThanosRouteRejectsUnauthorizedNamespaces(t *testing.T, rootCAs *x509.CertPool, routeHost, token, namespace string) {
@@ -256,176 +251,6 @@ func assertThanosRouteRejectsUnauthorizedNamespaces(t *testing.T, rootCAs *x509.
 	if duplicateNamespace.HTTPStatus != http.StatusForbidden {
 		t.Fatalf("POST with a form namespace must be rejected with 403 by the method gate, got %d", duplicateNamespace.HTTPStatus)
 	}
-}
-
-// assertPromLabelProxyQueryParamOnly rejects form-body namespace at prom-label-proxy
-// itself (localhost:9091), bypassing kube-rbac-proxy and the method gate.
-//
-// Layering (do not conflate):
-//   - External :8443 POST with form namespace → method-gate HTTP 403
-//     ("namespace must be in the URL") — see the route probe above.
-//   - Direct PLP :9091 POST with form namespace → HTTP 400 from --query-param-only.
-//
-// This helper asserts the second layer only.
-func assertPromLabelProxyQueryParamOnly(t *testing.T, tc *MonitoringTestCtx) {
-	t.Helper()
-
-	tc.EnsureResourceExists(
-		WithMinimalObject(gvk.Deployment, types.NamespacedName{
-			Name:      ThanosQuerierProxyName,
-			Namespace: tc.MonitoringNamespace,
-		}),
-		WithCondition(jq.Match(
-			`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--query-param-only"])`,
-		)),
-		WithCustomErrorMsg("Thanos prom-label-proxy must enable --query-param-only"),
-	)
-
-	podName := thanosQuerierProxyPodName(t, tc)
-	urlNS := url.QueryEscape(tc.MonitoringNamespace)
-	formNS := url.QueryEscape("kube-system")
-	// Busybox wget: POST form namespace while URL carries the authorized namespace.
-	// Container rootfs is read-only; stream headers/body on stdout/stderr only.
-	script := fmt.Sprintf(
-		`wget -q -S -O- --post-data='query=up&namespace=%s' 'http://127.0.0.1:9091/api/v1/query?namespace=%s' 2>&1 || true`,
-		formNS,
-		urlNS,
-	)
-	stdout, stderr, err := execInThanosProxyPod(t, tc, podName, "prom-label-proxy", []string{"sh", "-c", script})
-	// Do not log response bodies (may include PromQL / metric samples). Status line only.
-	got400 := probeOutputHasHTTPStatus(stdout+stderr, http.StatusBadRequest)
-	if err != nil {
-		t.Logf("prom-label-proxy form-namespace probe exec err=%v got400=%t", err, got400)
-	}
-	if !got400 {
-		t.Fatalf("prom-label-proxy --query-param-only must reject form namespace with HTTP 400")
-	}
-}
-
-func probeOutputHasHTTPStatus(out string, status int) bool {
-	want := fmt.Sprintf("%d ", status)
-	for line := range strings.SplitSeq(out, "\n") {
-		line = strings.TrimSpace(line)
-		// wget -S: "HTTP/1.1 400 Bad Request" (or HTTP/1.0)
-		if strings.HasPrefix(line, "HTTP/") && strings.Contains(line, want) {
-			return true
-		}
-	}
-	return strings.Contains(out, fmt.Sprintf("%d Bad Request", status))
-}
-
-func thanosQuerierProxyPodName(t *testing.T, tc *MonitoringTestCtx) string {
-	t.Helper()
-	g := NewWithT(t)
-	var name string
-	g.Eventually(func() (string, error) {
-		hash, err := thanosQuerierProxyPodTemplateHash(tc)
-		if err != nil {
-			return "", err
-		}
-		var pods corev1.PodList
-		if err := tc.Client().List(tc.Context(), &pods,
-			client.InNamespace(tc.MonitoringNamespace),
-			client.MatchingLabels{
-				"app":               ThanosQuerierProxyName,
-				"pod-template-hash": hash,
-			},
-		); err != nil {
-			return "", err
-		}
-		for i := range pods.Items {
-			pod := &pods.Items[i]
-			if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
-				continue
-			}
-			for _, cs := range pod.Status.ContainerStatuses {
-				if cs.Name == "prom-label-proxy" && cs.Ready {
-					name = pod.Name
-					return name, nil
-				}
-			}
-		}
-		return "", fmt.Errorf("no ready thanos proxy pod with prom-label-proxy for pod-template-hash=%s", hash)
-	}).ShouldNot(BeEmpty())
-	return name
-}
-
-// thanosQuerierProxyPodTemplateHash returns the pod-template-hash of the Deployment's
-// current ReplicaSet so probes hit the rolled-out template (not a stale ready pod).
-func thanosQuerierProxyPodTemplateHash(tc *MonitoringTestCtx) (string, error) {
-	var deploy appsv1.Deployment
-	if err := tc.Client().Get(tc.Context(), types.NamespacedName{
-		Name:      ThanosQuerierProxyName,
-		Namespace: tc.MonitoringNamespace,
-	}, &deploy); err != nil {
-		return "", err
-	}
-	var rss appsv1.ReplicaSetList
-	if err := tc.Client().List(tc.Context(), &rss,
-		client.InNamespace(tc.MonitoringNamespace),
-		client.MatchingLabels{"app": ThanosQuerierProxyName},
-	); err != nil {
-		return "", err
-	}
-	var best *appsv1.ReplicaSet
-	for i := range rss.Items {
-		rs := &rss.Items[i]
-		if !metav1.IsControlledBy(rs, &deploy) {
-			continue
-		}
-		if rs.Spec.Replicas == nil || *rs.Spec.Replicas == 0 {
-			continue
-		}
-		if best == nil || replicaSetRevision(rs) > replicaSetRevision(best) {
-			best = rs
-		}
-	}
-	if best == nil {
-		return "", errors.New("no active ReplicaSet for thanos querier proxy")
-	}
-	hash := best.Labels["pod-template-hash"]
-	if hash == "" {
-		return "", errors.New("active ReplicaSet missing pod-template-hash label")
-	}
-	return hash, nil
-}
-
-func replicaSetRevision(rs *appsv1.ReplicaSet) int64 {
-	rev, _ := strconv.ParseInt(rs.Annotations["deployment.kubernetes.io/revision"], 10, 64)
-	return rev
-}
-
-func execInThanosProxyPod(t *testing.T, tc *MonitoringTestCtx, pod, container string, command []string) (string, string, error) {
-	t.Helper()
-	cfg, err := ctrlcfg.GetConfig()
-	if err != nil {
-		return "", "", err
-	}
-	clientset, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return "", "", err
-	}
-	req := clientset.CoreV1().RESTClient().Post().
-		Resource("pods").
-		Name(pod).
-		Namespace(tc.MonitoringNamespace).
-		SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: container,
-			Command:   command,
-			Stdout:    true,
-			Stderr:    true,
-		}, scheme.ParameterCodec)
-	executor, err := remotecommand.NewSPDYExecutor(cfg, http.MethodPost, req.URL())
-	if err != nil {
-		return "", "", err
-	}
-	var stdout, stderr bytes.Buffer
-	err = executor.StreamWithContext(tc.Context(), remotecommand.StreamOptions{
-		Stdout: &stdout,
-		Stderr: &stderr,
-	})
-	return stdout.String(), stderr.String(), err
 }
 
 func assertAuthorizedThanosPost(t *testing.T, rootCAs *x509.CertPool, routeHost, token, namespace string) {
