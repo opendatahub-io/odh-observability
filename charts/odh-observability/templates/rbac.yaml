@@ -101,6 +101,7 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["clusterrolebindings"]
     resourceNames:
+      - data-science-alertmanager-proxy-auth-delegator
       - data-science-cluster-log-forwarder-collector-collect-app-logs
       - data-science-cluster-log-forwarder-collector-loki-writer
       - data-science-collector-mlflow-trace-export

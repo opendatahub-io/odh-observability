@@ -105,6 +105,7 @@ func TestOperandNetworkPolicyTemplatesContract(t *testing.T) {
 
 			resources := renderObservabilityTemplate(t, tt.template, map[string]any{
 				"Namespace":              testMonitoringNamespace,
+				"GatewayNamespace":       "",
 				"LokiStackName":          "data-science-lokistack",
 				"UsageLogsLokiStackName": "data-science-usage-logs-lokistack",
 				"UsageLogsCollectorName": "data-science-usage-logs",

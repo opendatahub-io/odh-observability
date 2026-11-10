@@ -13,6 +13,20 @@ spec:
   policyTypes:
     - Ingress
   ingress:
+    # OpenShift Router reaches the authenticated Tempo gateway through the Route.
+    - from:
+      {{ if .GatewayNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{.GatewayNamespace}}
+      {{ else }}
+        - namespaceSelector:
+            matchLabels:
+              policy-group.network.openshift.io/ingress: ""
+      {{ end }}
+      ports:
+        - protocol: TCP
+          port: 8080
     # The monitoring collector sends OTLP traces to the Tempo gateway.
     - from:
         - podSelector:
