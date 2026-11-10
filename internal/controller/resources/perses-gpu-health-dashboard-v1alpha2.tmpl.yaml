@@ -1,0 +1,364 @@
+apiVersion: perses.dev/v1alpha2
+kind: PersesDashboard
+metadata:
+  name: data-science-gpu-health
+  namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+spec:
+  config:
+    display:
+      name: "RHOAI GPU Health"
+      description: "NVIDIA DCGM device health for the cluster. Every query reads the accelerator recording rules through the cluster-wide Data Science Prometheus datasource, because those series are not namespaced by GPU workload: the only namespace label they carry is the collector's own, added by its ServiceMonitor scrape, so the namespace-scoped datasource cannot serve them; the capacity panel reads kube-state-metrics from OpenShift Monitoring instead, because the Data Science stack does not scrape it. The panels describe node-level GPU health. Per-project attribution comes from the DCGM exporter's Kubernetes pod mapping, so it covers pods holding a device and cannot split a device shared by several pods."
+    duration: "1h"
+    layouts:
+      - kind: Grid
+        spec:
+          display:
+            title: "GPU fleet"
+            collapse:
+              open: true
+          items:
+            - x: 0
+              y: 0
+              width: 6
+              height: 4
+              content:
+                $ref: "#/spec/panels/gpusReporting"
+            - x: 6
+              y: 0
+              width: 6
+              height: 4
+              content:
+                $ref: "#/spec/panels/gpusAdvertised"
+            - x: 12
+              y: 0
+              width: 6
+              height: 4
+              content:
+                $ref: "#/spec/panels/meanUtilization"
+            - x: 18
+              y: 0
+              width: 6
+              height: 4
+              content:
+                $ref: "#/spec/panels/hotGpus"
+      - kind: Grid
+        spec:
+          display:
+            title: "Per-device health"
+            collapse:
+              open: true
+          items:
+            - x: 0
+              y: 0
+              width: 12
+              height: 8
+              content:
+                $ref: "#/spec/panels/gpuUtilization"
+            - x: 12
+              y: 0
+              width: 12
+              height: 8
+              content:
+                $ref: "#/spec/panels/gpuFramebuffer"
+            - x: 0
+              y: 8
+              width: 12
+              height: 8
+              content:
+                $ref: "#/spec/panels/gpuTemperature"
+            - x: 12
+              y: 8
+              width: 12
+              height: 8
+              content:
+                $ref: "#/spec/panels/gpuPower"
+      - kind: Grid
+        spec:
+          display:
+            title: "Workload correlation"
+            collapse:
+              open: true
+          items:
+            - x: 0
+              y: 0
+              width: 24
+              height: 8
+              content:
+                $ref: "#/spec/panels/gpuByProject"
+    panels:
+      gpusReporting:
+        kind: Panel
+        spec:
+          display:
+            name: "GPUs reporting"
+            description: "Distinct devices (node and device index) emitting DCGM metrics. Zero while a non-zero GPUs advertised count means the NVIDIA GPU Operator is installed but the collector is not scraping its ServiceMonitor."
+          plugin:
+            kind: StatChart
+            spec:
+              calculation: last-number
+              format:
+                unit: decimal
+                decimalPlaces: 0
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    datasource:
+                      kind: PrometheusDatasource
+                      name: data-science-cluster-prometheus-datasource
+                    query: count(count by (node, gpu) (accelerator_gpu_utilization))
+                    seriesNameFormat: Reporting
+      gpusAdvertised:
+        kind: Panel
+        spec:
+          display:
+            name: "GPUs advertised"
+            description: "Capacity the cluster advertises (sum of the nvidia.com/gpu extended resource, from kube-state-metrics in OpenShift Monitoring). A gap against GPUs reporting means part of the fleet is not exporting metrics, for example a node whose GPU Operator pod is not Ready."
+          plugin:
+            kind: StatChart
+            spec:
+              calculation: last-number
+              format:
+                unit: decimal
+                decimalPlaces: 0
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    # Capacity comes from kube-state-metrics, which OpenShift
+                    # Monitoring scrapes and the Data Science stack does not.
+                    datasource:
+                      kind: PrometheusDatasource
+                      name: cluster-prometheus-datasource
+                    query: sum(kube_node_status_capacity{resource="nvidia_com_gpu"})
+                    seriesNameFormat: Advertised
+      meanUtilization:
+        kind: Panel
+        spec:
+          display:
+            name: "Mean utilization"
+            description: "Average SM utilization across every reporting GPU."
+          plugin:
+            kind: StatChart
+            spec:
+              calculation: mean
+              format:
+                unit: percent
+                decimalPlaces: 1
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    datasource:
+                      kind: PrometheusDatasource
+                      name: data-science-cluster-prometheus-datasource
+                    query: avg(accelerator_gpu_utilization)
+                    seriesNameFormat: Utilization
+      hotGpus:
+        kind: Panel
+        spec:
+          display:
+            name: "GPUs above 80 C"
+            description: "Devices at or above the 80 C warning line. NVIDIA GPUs begin clock throttling around 83 C, so a sustained count here is a cooling problem, not a load problem."
+          plugin:
+            kind: StatChart
+            spec:
+              calculation: last-number
+              format:
+                unit: decimal
+                decimalPlaces: 0
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    datasource:
+                      kind: PrometheusDatasource
+                      name: data-science-cluster-prometheus-datasource
+                    query: count(accelerator_temperature_celsius > 80) or vector(0)
+                    seriesNameFormat: Hot
+      gpuUtilization:
+        kind: Panel
+        spec:
+          display:
+            name: "Utilization by device"
+            description: "SM utilization per GPU. A device pinned at 100% while the fleet average is low is usually a single workload occupying one card."
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              legend:
+                mode: list
+                position: bottom
+                values: []
+              visual:
+                areaOpacity: 0.3
+                connectNulls: false
+                display: line
+                lineWidth: 1.5
+              yAxis:
+                format:
+                  unit: percent
+                min: 0
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    datasource:
+                      kind: PrometheusDatasource
+                      name: data-science-cluster-prometheus-datasource
+                    query: accelerator_gpu_utilization
+                    seriesNameFormat: 'GPU {{ "{{" }}gpu{{ "}}" }}'
+      gpuFramebuffer:
+        kind: Panel
+        spec:
+          display:
+            name: "Framebuffer memory by device"
+            description: "Framebuffer used per GPU. Unlike utilization this only falls when the workload releases memory, so it is the better signal for leaked or over-requested GPU memory."
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              legend:
+                mode: list
+                position: bottom
+                values: []
+              visual:
+                areaOpacity: 0.3
+                connectNulls: false
+                display: line
+                lineWidth: 1.5
+              yAxis:
+                format:
+                  unit: bytes
+                min: 0
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    datasource:
+                      kind: PrometheusDatasource
+                      name: data-science-cluster-prometheus-datasource
+                    query: accelerator_memory_used_bytes
+                    seriesNameFormat: 'GPU {{ "{{" }}gpu{{ "}}" }}'
+      gpuTemperature:
+        kind: Panel
+        spec:
+          display:
+            name: "Temperature by device"
+            description: "Die temperature per GPU against the 83 C throttle threshold. Hitting the threshold costs clocks before it costs hardware."
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              legend:
+                mode: list
+                position: bottom
+                values: []
+              visual:
+                areaOpacity: 0.3
+                connectNulls: false
+                display: line
+                lineWidth: 1.5
+              yAxis:
+                format:
+                  unit: celsius
+                min: 0
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    datasource:
+                      kind: PrometheusDatasource
+                      name: data-science-cluster-prometheus-datasource
+                    query: accelerator_temperature_celsius
+                    seriesNameFormat: 'GPU {{ "{{" }}gpu{{ "}}" }}'
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    datasource:
+                      kind: PrometheusDatasource
+                      name: data-science-cluster-prometheus-datasource
+                    query: vector(83)
+                    seriesNameFormat: Throttle threshold
+      gpuPower:
+        kind: Panel
+        spec:
+          display:
+            name: "Power draw by device"
+            description: "Board power per GPU. A device drawing full power at low utilization is not doing useful work; a device far below its cap is power limited."
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              legend:
+                mode: list
+                position: bottom
+                values: []
+              visual:
+                areaOpacity: 0.3
+                connectNulls: false
+                display: line
+                lineWidth: 1.5
+              yAxis:
+                format:
+                  unit: watts
+                min: 0
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    datasource:
+                      kind: PrometheusDatasource
+                      name: data-science-cluster-prometheus-datasource
+                    query: accelerator_power_usage_watts
+                    seriesNameFormat: 'GPU {{ "{{" }}gpu{{ "}}" }}'
+      gpuByProject:
+        kind: Panel
+        spec:
+          display:
+            name: "Utilization by project"
+            description: "Utilization summed per consuming namespace. The DCGM exporter maps each device to the pod holding it through the kubelet pod-resources API, so exported_namespace is the workload's namespace and the exporter's own namespace is excluded; a device no pod holds is absent rather than counted under an unnamed project."
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              legend:
+                mode: list
+                position: bottom
+                values: []
+              visual:
+                areaOpacity: 1
+                connectNulls: false
+                display: line
+                lineWidth: 0.25
+                stack: all
+              yAxis:
+                format:
+                  unit: percent
+                min: 0
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    datasource:
+                      kind: PrometheusDatasource
+                      name: data-science-cluster-prometheus-datasource
+                    query: sum by (exported_namespace) (accelerator_gpu_utilization{exported_namespace=~".+", exported_namespace!="nvidia-gpu-operator"})
+                    seriesNameFormat: '{{ "{{" }}exported_namespace{{ "}}" }}'

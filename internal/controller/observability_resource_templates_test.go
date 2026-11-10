@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -213,6 +214,23 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		}
 	}
 
+	adminConfig, found, err := unstructured.NestedString(configMap.Object, "data", "kube-rbac-proxy-admin.yaml")
+	if err != nil || !found {
+		t.Fatalf("Thanos proxy cluster-wide authorization config is missing: found=%t error=%v", found, err)
+	}
+	for _, expected := range []string{
+		"resource: nodes",
+		"apiGroup: metrics.k8s.io",
+		"verb: get",
+	} {
+		if !strings.Contains(adminConfig, expected) {
+			t.Errorf("Thanos proxy cluster-wide config must contain %q, got %q", expected, adminConfig)
+		}
+	}
+	if strings.Contains(adminConfig, "byQueryParameter") {
+		t.Errorf("cluster-wide config must not rewrite a namespace, got %q", adminConfig)
+	}
+
 	deployment := findRenderedResource(t, resources, "Deployment", "data-science-thanos-querier-proxy")
 	serviceAccount, found, err := unstructured.NestedString(
 		deployment.Object, "spec", "template", "spec", "serviceAccountName",
@@ -221,9 +239,10 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		t.Fatalf("Thanos proxy must use its service account: found=%t value=%q error=%v", found, serviceAccount, err)
 	}
 	containers := nestedSliceAt(t, deployment, "spec", "template", "spec", "containers")
-	if len(containers) != 3 {
-		t.Fatalf("Thanos proxy must have kube-rbac-proxy, method-gate and prom-label-proxy containers, got %d", len(containers))
+	if len(containers) != 5 {
+		t.Fatalf("Thanos proxy must have the scoped and cluster-wide proxy/method-gate pairs plus prom-label-proxy, got %d", len(containers))
 	}
+	assertContainerPortNamesAreValid(t, containers)
 	assertContainerArgs(t, findContainer(t, containers, "kube-rbac-proxy"),
 		"--secure-listen-address=0.0.0.0:8443",
 		"--upstream=http://127.0.0.1:9092/",
@@ -249,10 +268,25 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		"--upstream=http://127.0.0.1:9091",
 		"--allow-form-post",
 	)
+	assertContainerArgs(t, findContainer(t, containers, "method-gate-admin"),
+		"--listen=127.0.0.1:9093",
+		"--upstream=http://thanos-querier-data-science-thanos-querier."+testMonitoringNamespace+".svc.cluster.local:10902",
+		"--allow-form-post",
+	)
+	assertContainerArgs(t, findContainer(t, containers, "kube-rbac-proxy-admin"),
+		"--secure-listen-address=0.0.0.0:8444",
+		"--upstream=http://127.0.0.1:9093/",
+		"--config-file=/etc/kube-rbac-proxy/kube-rbac-proxy-admin.yaml",
+		"--tls-cert-file=/etc/tls/private/tls.crt",
+		"--tls-private-key-file=/etc/tls/private/tls.key",
+		"--tls-min-version="+proxyTLSVersion12,
+	)
 	service := findRenderedResource(t, resources, "Service", "data-science-thanos-querier-proxy")
 	ports := nestedSlice(t, service, "spec", "ports")
-	if len(ports) != 1 || asMap(t, ports[0])["port"] != int64(8443) || asMap(t, ports[0])["targetPort"] != "https" {
-		t.Fatalf("Thanos proxy Service must expose HTTPS port 8443: %#v", ports)
+	if len(ports) != 2 ||
+		asMap(t, ports[0])["port"] != int64(8443) || asMap(t, ports[0])["targetPort"] != "https" ||
+		asMap(t, ports[1])["port"] != int64(8444) || asMap(t, ports[1])["targetPort"] != "https-admin" {
+		t.Fatalf("Thanos proxy Service must expose HTTPS 8443 (scoped) and 8444 (cluster-wide): %#v", ports)
 	}
 }
 
@@ -265,8 +299,8 @@ func TestThanosQuerierProxyNetworkPolicyTemplateContract(t *testing.T) {
 		t.Fatalf("Thanos proxy NetworkPolicy must select the proxy pods: found=%t value=%q error=%v", found, selector, err)
 	}
 	ingress := nestedSlice(t, policy, "spec", "ingress")
-	if len(ingress) != 2 {
-		t.Fatalf("Thanos proxy NetworkPolicy must have gateway and Perses ingress rules, got %d", len(ingress))
+	if len(ingress) != 3 {
+		t.Fatalf("Thanos proxy NetworkPolicy must have gateway and both Perses ingress rules, got %d", len(ingress))
 	}
 
 	gatewayRule := asMap(t, ingress[0])
@@ -307,6 +341,20 @@ func TestThanosQuerierProxyNetworkPolicyTemplateContract(t *testing.T) {
 	persesPorts, ok := persesRule["ports"].([]any)
 	if !ok || len(persesPorts) != 1 || asMap(t, persesPorts[0])["port"] != int64(8443) {
 		t.Fatalf("Thanos proxy NetworkPolicy Perses rule must allow HTTPS 8443: %#v", persesRule["ports"])
+	}
+
+	adminRule := asMap(t, ingress[2])
+	adminFrom, ok := adminRule["from"].([]any)
+	if !ok || len(adminFrom) != 1 {
+		t.Fatalf("Thanos proxy NetworkPolicy cluster-wide rule must have one ingress source, got %#v", adminRule["from"])
+	}
+	adminSelector, found, err := unstructured.NestedStringMap(asMap(t, asMap(t, adminFrom[0])["podSelector"]), "matchLabels")
+	if err != nil || !found || !reflect.DeepEqual(adminSelector, wantPerses) {
+		t.Fatalf("cluster-wide lane must be reachable from Perses only: got %#v, error=%v", adminSelector, err)
+	}
+	adminPorts, ok := adminRule["ports"].([]any)
+	if !ok || len(adminPorts) != 1 || asMap(t, adminPorts[0])["port"] != int64(8444) {
+		t.Fatalf("Thanos proxy NetworkPolicy must allow Perses on the cluster-wide port 8444: %#v", adminRule["ports"])
 	}
 }
 
@@ -1251,11 +1299,14 @@ func TestDeployPersesPrometheusIntegrationSelectsDatasourceTemplates(t *testing.
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			assertTemplatePaths(t, sources, []string{
-				PersesDatasourcePrometheusTemplate,
+			wantPersesDatasources := []string{
 				PersesDatasourceClusterPrometheusTemplate,
 				PersesDatasourceClusterPrometheusTenancyTemplate,
-			})
+				PersesDatasourceDataScienceClusterTemplate,
+				PersesDatasourcePrometheusTemplate,
+			}
+			assertTemplatePaths(t, sources, wantPersesDatasources)
+			assertTemplateOrder(t, sources, wantPersesDatasources)
 			condition := findCondition(monitoring, conditions.ConditionPersesPrometheusDataSourceAvailable)
 			if condition == nil || condition.Status != metav1.ConditionTrue {
 				t.Fatalf("PersesPrometheusDataSourceAvailable should be True, got %v", condition)
@@ -1465,6 +1516,18 @@ func assertTemplatePaths(t *testing.T, sources []rendertemplate.TemplateSource, 
 	}
 }
 
+func assertTemplateOrder(t *testing.T, sources []rendertemplate.TemplateSource, want []string) {
+	t.Helper()
+	if len(sources) != len(want) {
+		t.Fatalf("expected %d templates, got %d", len(want), len(sources))
+	}
+	for i, path := range want {
+		if sources[i].Path != path {
+			t.Errorf("template %d: expected %q, got %q", i, path, sources[i].Path)
+		}
+	}
+}
+
 func nestedSlice(t *testing.T, resource unstructured.Unstructured, fields ...string) []any {
 	t.Helper()
 	return nestedSliceAt(t, resource, fields...)
@@ -1518,6 +1581,36 @@ func findContainer(t *testing.T, containers []any, name string) map[string]any {
 	}
 	t.Fatalf("container %q was not rendered", name)
 	return nil
+}
+
+// assertContainerPortNamesAreValid enforces the API server's IANA_SVC_NAME cap
+// on container port names. Nothing in the Go types or the renderer catches it,
+// and because each Deployment is applied as one object a single over-long name
+// rejects the whole apply, which leaves the controller reconcile-erroring rather
+// than reporting one bad field.
+func assertContainerPortNamesAreValid(t *testing.T, containers []any) {
+	t.Helper()
+	ianaServiceName := regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+	for _, rawContainer := range containers {
+		container := asMap(t, rawContainer)
+		ports, _, err := unstructured.NestedSlice(container, "ports")
+		if err != nil {
+			t.Fatalf("container %q ports: %v", container["name"], err)
+		}
+		for _, rawPort := range ports {
+			name, _ := asMap(t, rawPort)["name"].(string)
+			if name == "" {
+				continue
+			}
+			if len(name) > 15 {
+				t.Errorf("container %q port name %q is %d characters; the API server caps it at 15",
+					container["name"], name, len(name))
+			}
+			if !ianaServiceName.MatchString(name) {
+				t.Errorf("container %q port name %q is not a valid IANA service name", container["name"], name)
+			}
+		}
+	}
 }
 
 func assertContainerArgs(t *testing.T, container map[string]any, expected ...string) {
