@@ -11,6 +11,7 @@ import re
 import ssl
 import sys
 from datetime import datetime, timezone
+from http.client import HTTPException
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -46,6 +47,7 @@ VALID_AUTH = {"none", "caller-bearer"}
 RESERVED_QUERY_PARAMETERS = {"query", "time", "start", "end", "step"}
 NAMESPACE_PATTERN = re.compile(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?")
 DURATION_PATTERN = re.compile(r"(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>ms|s|m|h|d|w|y)")
+TOKEN_ENV_NAME_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 
 
 class QueryError(RuntimeError):
@@ -120,6 +122,25 @@ def load_inventory(path: str) -> dict[str, Any]:
 
 def path_supported(endpoint: dict[str, Any], path: str) -> bool:
     return any(str(candidate).split("?", 1)[0].rstrip("/") == path for candidate in endpoint["paths"])
+
+
+def trusted_endpoint_host(endpoint: dict[str, Any], parsed: Any) -> str | None:
+    """Return a host verified by endpoint-discovery provenance, if available."""
+    hostname = getattr(parsed, "hostname", None)
+    source = endpoint.get("source")
+    access = endpoint.get("access")
+    if endpoint.get("state") != "ready" or not isinstance(hostname, str) or not isinstance(source, str):
+        return None
+    source_parts = source.split("/")
+    if len(source_parts) != 3 or any(not part for part in source_parts):
+        return None
+    source_kind, namespace, name = source_parts
+    if access == "route":
+        return hostname if source_kind == "Route" and endpoint.get("route_admitted") is True else None
+    if access == "cluster-service" and source_kind == "Service":
+        expected_host = f"{name}.{namespace}.svc.cluster.local"
+        return hostname if hostname == expected_host else None
+    return None
 
 
 def select_endpoint(
@@ -321,6 +342,16 @@ def build_request(
     if auth == "caller-bearer":
         if not args.bearer_token_env:
             raise QueryError("missing_auth", "endpoint requires caller bearer authentication", 3)
+        if not isinstance(args.bearer_token_env, str) or not TOKEN_ENV_NAME_PATTERN.fullmatch(
+            args.bearer_token_env
+        ):
+            raise QueryError("invalid_auth", "bearer token environment variable name is invalid", 3)
+        if trusted_endpoint_host(endpoint, parsed) is None:
+            raise QueryError(
+                "invalid_auth",
+                "caller-bearer authorization requires a host verified by endpoint discovery",
+                3,
+            )
         token = os.environ.get(args.bearer_token_env)
         if not token:
             raise QueryError("missing_auth", f"bearer token environment variable '{args.bearer_token_env}' is empty", 3)
@@ -399,16 +430,36 @@ def validate_prometheus_data(data: Any) -> None:
 
 
 def request_metrics(
-    request_url: str, headers: dict[str, str], args: argparse.Namespace
+    request_url: str,
+    headers: dict[str, str],
+    args: argparse.Namespace,
+    endpoint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    authorization_key = next(
+        (key for key in headers if key.lower() == "authorization"), None
+    )
+    if authorization_key is not None:
+        try:
+            request_host = urlsplit(request_url).hostname
+        except ValueError as error:
+            raise QueryError("invalid_auth", "authorization target URL is malformed", 3) from error
+        trusted_host = None
+        if endpoint is not None:
+            trusted_host = trusted_endpoint_host(endpoint, parse_safe_url(endpoint.get("url")))
+        if trusted_host is None or request_host != trusted_host:
+            raise QueryError(
+                "invalid_auth",
+                "caller-bearer authorization target is not trusted",
+                3,
+            )
     try:
         context = ssl.create_default_context()
         if args.ca_file:
             context.load_verify_locations(cafile=args.ca_file)
     except (OSError, ssl.SSLError) as error:
         raise QueryError("tls_error", f"could not configure TLS verification: {error}", 4) from error
-    request = Request(request_url, headers=headers, method="GET")
     try:
+        request = Request(request_url, headers=headers, method="GET")
         opener = build_opener(NoRedirectHandler(), HTTPSHandler(context=context))
         with opener.open(request, timeout=args.timeout) as response:
             raw = read_limited(response, args.max_response_bytes)
@@ -420,7 +471,16 @@ def request_metrics(
             if isinstance(payload, dict):
                 message = str(payload.get("error") or message)
                 warnings = response_warnings(payload)
-        except (QueryError, UnicodeDecodeError, json.JSONDecodeError):
+        except (
+            QueryError,
+            HTTPException,
+            URLError,
+            TimeoutError,
+            OSError,
+            ValueError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ):
             pass
         raise QueryError(
             "http_error",
@@ -428,7 +488,7 @@ def request_metrics(
             4,
             warnings,
         ) from error
-    except (URLError, TimeoutError, OSError) as error:
+    except (HTTPException, URLError, TimeoutError, OSError, ValueError) as error:
         raise QueryError("transport_error", f"metrics request failed: {error}", 4) from error
     try:
         payload = json.loads(raw)
@@ -512,7 +572,12 @@ def main(argv: list[str] | None = None) -> int:
         inventory = load_inventory(args.inventory)
         endpoint = select_endpoint(inventory, args.endpoint, args.scope)
         request_url, headers = build_request(endpoint, args, metadata)
-        response = request_metrics(request_url, headers, args)
+        response = request_metrics(
+            request_url,
+            headers,
+            args,
+            endpoint=endpoint,
+        )
         payload = {
             "schema_version": SCHEMA_VERSION,
             "status": "success",

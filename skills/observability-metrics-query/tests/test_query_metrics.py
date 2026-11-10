@@ -7,6 +7,7 @@ import os
 import sys
 import unittest
 from argparse import Namespace
+from http.client import HTTPException
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
@@ -35,6 +36,7 @@ def inventory(endpoint: dict | None = None) -> dict:
                 "required_query_parameters": ["namespace"],
                 "state": "ready",
                 "source": "Route/redhat-ods-monitoring/data-science-thanos-querier-route",
+                "route_admitted": True,
             }
         ],
         "telemetry_ingest": [],
@@ -181,6 +183,47 @@ class QueryMetricsTests(unittest.TestCase):
         self.assertEqual(context.exception.exit_code, 3)
 
     @patch.dict(os.environ, {"METRICS_TOKEN": "test-token"})
+    def test_rejects_invalid_bearer_token_environment_name(self) -> None:
+        args = Namespace(
+            namespace="team-a",
+            param=[],
+            query="up",
+            time=None,
+            start=None,
+            end=None,
+            step=None,
+            bearer_token_env="metrics-token",
+        )
+        with self.assertRaises(query_metrics.QueryError) as context:
+            query_metrics.build_request(
+                inventory()["query_endpoints"][0], args, {"mode": "instant", "promql": "up"}
+            )
+        self.assertEqual(context.exception.kind, "invalid_auth")
+
+    @patch.dict(os.environ, {"METRICS_TOKEN": "test-token"})
+    def test_rejects_bearer_auth_to_untrusted_host(self) -> None:
+        endpoint = inventory()["query_endpoints"][0].copy()
+        endpoint.update(
+            {
+                "access": "cluster-service",
+                "source": "Service/redhat-ods-monitoring/data-science-thanos-querier-proxy",
+            }
+        )
+        args = Namespace(
+            namespace="team-a",
+            param=[],
+            query="up",
+            time=None,
+            start=None,
+            end=None,
+            step=None,
+            bearer_token_env="METRICS_TOKEN",
+        )
+        with self.assertRaises(query_metrics.QueryError) as context:
+            query_metrics.build_request(endpoint, args, {"mode": "instant", "promql": "up"})
+        self.assertEqual(context.exception.kind, "invalid_auth")
+
+    @patch.dict(os.environ, {"METRICS_TOKEN": "test-token"})
     @patch("query_metrics.build_opener")
     def test_queries_prometheus_and_returns_data(self, mock_build_opener: object) -> None:
         response = FakeResponse(
@@ -196,6 +239,7 @@ class QueryMetricsTests(unittest.TestCase):
             "https://metrics.example.test/api/v1/query?namespace=team-a&query=up",
             {"Accept": "application/json", "Authorization": "Bearer test-token"},
             args,
+            endpoint=inventory()["query_endpoints"][0],
         )
         self.assertEqual(result["data"]["resultType"], "vector")
         request = mock_opener.open.call_args.args[0]
@@ -320,6 +364,21 @@ class QueryMetricsTests(unittest.TestCase):
             )
         self.assertEqual(context.exception.kind, "bad_data")
         self.assertEqual(context.exception.warnings, ["partial response"])
+
+    @patch("query_metrics.build_opener")
+    def test_converts_transport_exceptions_to_query_errors(self, mock_build_opener: object) -> None:
+        args = Namespace(timeout=20, max_response_bytes=1024, ca_file=None)
+        mock_opener = mock_build_opener.return_value  # type: ignore[attr-defined]
+        for exception in (HTTPException("connection failed"), ValueError("invalid request")):
+            with self.subTest(exception=type(exception).__name__):
+                mock_opener.open.side_effect = exception
+                with self.assertRaises(query_metrics.QueryError) as context:
+                    query_metrics.request_metrics(
+                        "https://metrics.example.test/api/v1/query?query=up",
+                        {"Accept": "application/json"},
+                        args,
+                    )
+                self.assertEqual(context.exception.kind, "transport_error")
 
 
 if __name__ == "__main__":

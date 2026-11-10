@@ -39,8 +39,10 @@ credentials, or query an internal Prometheus or Thanos backend directly.
    Never put the namespace in a POST body or bypass the proxy.
 
 4. If the endpoint has `auth: caller-bearer`, provide a token through an
-   explicitly populated environment variable with `--bearer-token-env`. The
-   script uses it only in the request and never prints, stores, or returns it.
+   explicitly populated uppercase environment variable name matching
+   `[A-Z][A-Z0-9_]{0,63}` with `--bearer-token-env`. The name must refer to a
+   token-bearing endpoint verified by discovery. The script uses the token only
+   in the request and never prints, stores, or returns it.
    The script does not obtain tokens or read Kubernetes Secrets.
 
 5. Run a bounded query:
