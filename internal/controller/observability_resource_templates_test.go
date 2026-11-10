@@ -259,7 +259,6 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		"--upstream=http://thanos-querier-data-science-thanos-querier."+testMonitoringNamespace+".svc.cluster.local:10902",
 		"--label=namespace",
 		"--query-param=namespace",
-		"--query-param-only",
 		"--error-on-replace",
 		"--enable-label-apis",
 	)
@@ -1087,8 +1086,6 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		"--insecure-listen-address=127.0.0.1:9091",
 		"--upstream=https://prometheus-operated."+testMonitoringNamespace+".svc:9090",
 		"--label=namespace",
-		"--query-param=namespace",
-		"--query-param-only",
 		"--enable-label-apis",
 		"--regex-match",
 	)

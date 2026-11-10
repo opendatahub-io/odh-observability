@@ -585,11 +585,6 @@ func deployPersesPrometheusIntegration(
 	cm.MarkTrue(conditions.ConditionPersesPrometheusDataSourceAvailable)
 	// Feature: default DS datasource → namespace-enforcing Thanos proxy :8443.
 	// Guardrail: cluster :9091 / tenancy :9092 use caller token (no shared SA).
-	// Upgrade dual-default safety: Perses must never see two default:true Prometheus
-	// datasources in one apply. deploy.WithApplyOrder() re-sorts by Kind/GVK/namespace/name
-	// (not this append order); the CR names are chosen so lexicographic order keeps
-	// cluster-prometheus-* (default:false) before data-science-prometheus-datasource
-	// (default:true). See TestPersesDatasourceApplyOrder_SortKeepsNonDefaultFirst.
 	*sources = append(*sources,
 		src(PersesDatasourceClusterPrometheusTemplate),
 		src(PersesDatasourceClusterPrometheusTenancyTemplate),
