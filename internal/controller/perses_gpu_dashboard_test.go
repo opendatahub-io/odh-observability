@@ -117,16 +117,16 @@ func TestPersesGPUHealthDashboardTemplateContract(t *testing.T) {
 	// identity from accelerator series, so a scoped datasource never matches.
 	ocpLaneQueries := []string{`sum(kube_node_status_capacity{resource="nvidia_com_gpu"})`}
 	wantQueries := []string{
-		"count(count by (Hostname, gpu) (accelerator_gpu_utilization))",
+		"count(count by (node, gpu) (accelerator_gpu_utilization))",
 		`sum(kube_node_status_capacity{resource="nvidia_com_gpu"})`,
 		"avg(accelerator_gpu_utilization)",
-		"count(accelerator_temperature_celsius > 80)",
+		"count(accelerator_temperature_celsius > 80) or vector(0)",
 		"accelerator_gpu_utilization",
 		"accelerator_memory_used_bytes",
 		"accelerator_temperature_celsius",
 		"vector(83)",
 		"accelerator_power_usage_watts",
-		`sum by (exported_namespace) (accelerator_gpu_utilization{exported_namespace!="nvidia-gpu-operator"})`,
+		`sum by (exported_namespace) (accelerator_gpu_utilization{exported_namespace=~".+", exported_namespace!="nvidia-gpu-operator"})`,
 	}
 	wantPanels := []string{
 		"gpusReporting", "gpusAdvertised", "meanUtilization", "hotGpus",
@@ -214,15 +214,15 @@ func TestPersesGPUHealthDashboardTemplateContract(t *testing.T) {
 				t.Errorf("series name format: want %q, got %q", "GPU {{gpu}}", format)
 			}
 
-			// The correlation panel is a deliberate empty state, so its
-			// description has to say why it carries no data.
+			// The by-project panel is populated from the DCGM exporter's pod
+			// mapping, so its description has to name that source of truth.
 			correlation, ok := panels["gpuByProject"].(map[string]any)
 			if !ok {
 				t.Fatalf("gpuByProject has unexpected type %T", panels["gpuByProject"])
 			}
 			description, _, _ := unstructured.NestedString(correlation, "spec", "display", "description")
-			if !strings.Contains(description, "pod-level") {
-				t.Errorf("correlation panel must explain the missing pod attribution, got %q", description)
+			if !strings.Contains(description, "pod-resources") {
+				t.Errorf("by-project panel must name the pod-mapping source, got %q", description)
 			}
 		})
 	}
