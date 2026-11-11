@@ -25,6 +25,7 @@ DISCOVERY_SCRIPTS = Path(__file__).resolve().parents[2] / "observability-endpoin
 if str(DISCOVERY_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(DISCOVERY_SCRIPTS))
 
+import discover_endpoints  # noqa: E402
 from validate_inventory import validate_inventory as validate_discovery_inventory  # noqa: E402
 
 
@@ -48,6 +49,11 @@ RESERVED_QUERY_PARAMETERS = {"query", "time", "start", "end", "step"}
 NAMESPACE_PATTERN = re.compile(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?")
 DURATION_PATTERN = re.compile(r"(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>ms|s|m|h|d|w|y)")
 TOKEN_ENV_NAME_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+VERIFIED_ENDPOINT_FIELDS = (
+    "name", "signal", "url", "access", "scope", "auth", "tls", "paths",
+    "required_query_parameters", "state", "source", "route_admitted",
+    "target_service", "service_port",
+)
 
 
 class QueryError(RuntimeError):
@@ -124,23 +130,26 @@ def path_supported(endpoint: dict[str, Any], path: str) -> bool:
     return any(str(candidate).split("?", 1)[0].rstrip("/") == path for candidate in endpoint["paths"])
 
 
-def trusted_endpoint_host(endpoint: dict[str, Any], parsed: Any) -> str | None:
-    """Return a host verified by endpoint-discovery provenance, if available."""
-    hostname = getattr(parsed, "hostname", None)
-    source = endpoint.get("source")
-    access = endpoint.get("access")
-    if endpoint.get("state") != "ready" or not isinstance(hostname, str) or not isinstance(source, str):
-        return None
-    source_parts = source.split("/")
-    if len(source_parts) != 3 or any(not part for part in source_parts):
-        return None
-    source_kind, namespace, name = source_parts
-    if access == "route":
-        return hostname if source_kind == "Route" and endpoint.get("route_admitted") is True else None
-    if access == "cluster-service" and source_kind == "Service":
-        expected_host = f"{name}.{namespace}.svc.cluster.local"
-        return hostname if hostname == expected_host else None
-    return None
+def verify_bearer_endpoint(endpoint: dict[str, Any]) -> None:
+    """Bind inventory data to a fresh discovery using the current oc context."""
+    try:
+        discovered = discover_endpoints.discover()
+    except discover_endpoints.OcError as error:
+        raise QueryError("invalid_auth", f"could not verify endpoint with discovery: {error}", 3) from error
+    if validate_discovery_inventory(discovered):
+        raise QueryError("invalid_auth", "could not verify endpoint with discovery", 3)
+    matches = [item for item in discovered["query_endpoints"] if item.get("name") == endpoint.get("name")]
+    if (
+        len(matches) != 1
+        or matches[0].get("signal") != "metrics"
+        or matches[0].get("state") != "ready"
+        or matches[0].get("auth") != "caller-bearer"
+        or matches[0].get("access") not in {"route", "cluster-service"}
+        or any(matches[0].get(field) != endpoint.get(field) for field in VERIFIED_ENDPOINT_FIELDS)
+    ):
+        raise QueryError(
+            "invalid_auth", "caller-bearer endpoint does not match current discovery evidence", 3
+        )
 
 
 def select_endpoint(
@@ -340,25 +349,15 @@ def build_request(
     if auth not in VALID_AUTH:
         raise QueryError("unsupported_auth", f"unsupported metrics endpoint auth mode: {auth}", 3)
     if auth == "caller-bearer":
-        if not args.bearer_token_env:
-            raise QueryError("missing_auth", "endpoint requires caller bearer authentication", 3)
-        if not isinstance(args.bearer_token_env, str) or not TOKEN_ENV_NAME_PATTERN.fullmatch(
-            args.bearer_token_env
-        ):
-            raise QueryError("invalid_auth", "bearer token environment variable name is invalid", 3)
-        if trusted_endpoint_host(endpoint, parsed) is None:
-            raise QueryError(
-                "invalid_auth",
-                "caller-bearer authorization requires a host verified by endpoint discovery",
-                3,
-            )
-        token = os.environ.get(args.bearer_token_env)
-        if not token:
-            raise QueryError("missing_auth", f"bearer token environment variable '{args.bearer_token_env}' is empty", 3)
-        if any(character in token for character in "\r\n"):
-            raise QueryError("invalid_auth", "bearer token contains invalid characters", 3)
-        headers["Authorization"] = f"Bearer {token}"
+        validate_token_env_name(args.bearer_token_env)
     return request_url, headers
+
+
+def validate_token_env_name(name: str | None) -> None:
+    if not name:
+        raise QueryError("missing_auth", "endpoint requires caller bearer authentication", 3)
+    if not isinstance(name, str) or not TOKEN_ENV_NAME_PATTERN.fullmatch(name):
+        raise QueryError("invalid_auth", "bearer token environment variable name is invalid", 3)
 
 
 def read_limited(response: Any, maximum: int) -> bytes:
@@ -435,23 +434,31 @@ def request_metrics(
     args: argparse.Namespace,
     endpoint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    authorization_key = next(
-        (key for key in headers if key.lower() == "authorization"), None
-    )
-    if authorization_key is not None:
+    if any(key.lower() == "authorization" for key in headers):
+        raise QueryError("invalid_auth", "authorization headers must not be supplied directly", 3)
+    if endpoint is not None and endpoint.get("auth") == "caller-bearer":
+        validate_token_env_name(args.bearer_token_env)
         try:
-            request_host = urlsplit(request_url).hostname
+            target = urlsplit(request_url)
+            target_port = target.port
+            target_origin = (target.scheme, target.hostname, 443 if target_port is None else target_port)
         except ValueError as error:
             raise QueryError("invalid_auth", "authorization target URL is malformed", 3) from error
-        trusted_host = None
-        if endpoint is not None:
-            trusted_host = trusted_endpoint_host(endpoint, parse_safe_url(endpoint.get("url")))
-        if trusted_host is None or request_host != trusted_host:
+        parsed = parse_safe_url(endpoint.get("url"))
+        endpoint_origin = (parsed.scheme, parsed.hostname, 443 if parsed.port is None else parsed.port)
+        if target.scheme != "https" or endpoint_origin != target_origin:
             raise QueryError(
                 "invalid_auth",
                 "caller-bearer authorization target is not trusted",
                 3,
             )
+        verify_bearer_endpoint(endpoint)
+        token = os.environ.get(args.bearer_token_env)
+        if not token:
+            raise QueryError("missing_auth", f"bearer token environment variable '{args.bearer_token_env}' is empty", 3)
+        if any(character in token for character in "\r\n"):
+            raise QueryError("invalid_auth", "bearer token contains invalid characters", 3)
+        headers = {**headers, "Authorization": f"Bearer {token}"}
     try:
         context = ssl.create_default_context()
         if args.ca_file:

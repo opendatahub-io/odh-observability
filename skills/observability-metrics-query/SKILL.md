@@ -2,7 +2,7 @@
 name: observability-metrics-query
 description: Queries RHOAI Prometheus-compatible metrics through a ready endpoint returned by observability-endpoint-discovery. Use when an agent needs bounded instant or range PromQL results from RHOAI or OpenShift metrics without hardcoding endpoints, bypassing namespace isolation, or exposing credentials.
 license: Apache-2.0
-compatibility: Requires a validated observability-endpoint-discovery JSON inventory, Python 3.11+, network access to the selected endpoint, and caller-provided authentication when the endpoint requires a bearer token.
+compatibility: Requires a validated observability-endpoint-discovery JSON inventory, Python 3.11+, network access to the selected endpoint, and caller-provided authentication when the endpoint requires a bearer token. Bearer authentication also requires oc access for fresh endpoint discovery.
 metadata:
   issue: RHAI-15149
   version: "1.0"
@@ -12,8 +12,9 @@ metadata:
 
 Query RHOAI metrics only through an endpoint that the
 `observability-endpoint-discovery` skill has discovered and marked `ready`.
-The discovery inventory is the source of truth for endpoint selection,
-namespace isolation, TLS, and authentication requirements.
+The discovery inventory supplies endpoint selection, namespace isolation, TLS,
+and authentication requirements. Inventory validation checks structure, not
+provenance; it does not establish that an inventory is trustworthy.
 
 This skill is read-only. It does not change cluster resources, discover
 credentials, or query an internal Prometheus or Thanos backend directly.
@@ -41,9 +42,14 @@ credentials, or query an internal Prometheus or Thanos backend directly.
 4. If the endpoint has `auth: caller-bearer`, provide a token through an
    explicitly populated uppercase environment variable name matching
    `[A-Z][A-Z0-9_]{0,63}` with `--bearer-token-env`. The name must refer to a
-   token-bearing endpoint verified by discovery. The script uses the token only
-   in the request and never prints, stores, or returns it.
-   The script does not obtain tokens or read Kubernetes Secrets.
+   token for the selected endpoint. Before reading it, the script repeats
+   endpoint discovery using the current `oc` context and requires the selected
+   ready Route or Service and its security-relevant fields, including URL,
+   to match. A missing, stale, ambiguous, or unverifiable endpoint fails closed.
+   Run with the same trusted cluster context and discovery permissions used to
+   produce the inventory; regenerate the inventory if the endpoint changes.
+   The script uses the token only in the request and never prints, stores, or
+   returns it. It does not obtain tokens or read Kubernetes Secrets.
 
 5. Run a bounded query:
 
@@ -82,6 +88,9 @@ credentials, or query an internal Prometheus or Thanos backend directly.
   insecure TLS bypass such as `curl -k` or an equivalent SSL context.
 - Do not follow endpoint redirects; this prevents caller bearer tokens from
   being sent to an untrusted redirect target.
+- Fresh discovery relies on the current `oc` context, cluster API and operator
+  configuration being trusted; it cannot protect against a compromised cluster,
+  local environment, or trusted CA. TLS verification remains mandatory.
 - Do not read Secrets, service-account token files, kubeconfig credentials, or
   print authorization headers.
 - Return the structured JSON result even on query errors, but never include the

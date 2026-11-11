@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 from argparse import Namespace
+from contextlib import redirect_stdout
 from http.client import HTTPException
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
@@ -95,7 +98,7 @@ class QueryMetricsTests(unittest.TestCase):
         parsed = urlsplit(url)
         self.assertEqual(parsed.path, "/api/v1/query")
         self.assertEqual(parse_qs(parsed.query), {"namespace": ["team-a"], "query": ["up"]})
-        self.assertEqual(headers["Authorization"], "Bearer test-token")
+        self.assertNotIn("Authorization", headers)
 
     def test_enforces_range_limits(self) -> None:
         args = Namespace(
@@ -219,9 +222,193 @@ class QueryMetricsTests(unittest.TestCase):
             step=None,
             bearer_token_env="METRICS_TOKEN",
         )
-        with self.assertRaises(query_metrics.QueryError) as context:
-            query_metrics.build_request(endpoint, args, {"mode": "instant", "promql": "up"})
+        with patch.object(query_metrics.discover_endpoints, "discover", return_value=inventory()):
+            with self.assertRaises(query_metrics.QueryError) as context:
+                query_metrics.request_metrics(endpoint["url"] + "/api/v1/query", {}, args, endpoint)
         self.assertEqual(context.exception.kind, "invalid_auth")
+
+    @patch.dict(os.environ, {"METRICS_TOKEN": "test-token"})
+    @patch("query_metrics.build_opener")
+    def test_forged_inventory_cannot_send_bearer_token(self, mock_build_opener: object) -> None:
+        forged = inventory()
+        forged["query_endpoints"][0]["url"] = "https://attacker.example.test"
+        self.assertIsNone(query_metrics.validate_discovery_inventory(forged))
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as stream:
+            json.dump(forged, stream)
+            stream.flush()
+            output = io.StringIO()
+            with (
+                patch.object(query_metrics.discover_endpoints, "discover", return_value=inventory()),
+                patch.object(os.environ, "get", wraps=os.environ.get) as get_env,
+                redirect_stdout(output),
+            ):
+                result = query_metrics.main([
+                    "--inventory", stream.name, "--query", "up", "--namespace", "team-a",
+                    "--bearer-token-env", "METRICS_TOKEN",
+                ])
+            self.assertNotIn("METRICS_TOKEN", [call.args[0] for call in get_env.call_args_list])
+        self.assertEqual(result, 3)
+        self.assertEqual(json.loads(output.getvalue())["error"]["type"], "invalid_auth")
+        self.assertNotIn("test-token", output.getvalue())
+        mock_build_opener.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_discovery_must_match_security_relevant_fields(self) -> None:
+        baseline = inventory()["query_endpoints"][0]
+        changes = {
+            "url": "https://metrics.example.test:8443",
+            "source": "Route/other/other",
+            "state": "not-ready",
+            "access": "cluster-service",
+            "scope": "openshift-cluster",
+            "auth": "none",
+            "tls": "none",
+            "paths": ["/api/v1/query"],
+            "required_query_parameters": [],
+            "route_admitted": False,
+            "target_service": "attacker",
+        }
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                altered = baseline.copy()
+                altered[field] = value
+                with patch.object(query_metrics.discover_endpoints, "discover", return_value=inventory()):
+                    with self.assertRaises(query_metrics.QueryError) as context:
+                        query_metrics.verify_bearer_endpoint(altered)
+                self.assertEqual(context.exception.kind, "invalid_auth")
+
+    def test_discovery_failure_and_ambiguous_or_stale_evidence_fail_closed(self) -> None:
+        endpoint = inventory()["query_endpoints"][0]
+        absent = inventory()
+        absent["query_endpoints"] = []
+        ambiguous = inventory()
+        ambiguous["query_endpoints"].append(endpoint.copy())
+        not_ready = inventory()
+        not_ready["query_endpoints"][0]["state"] = "pending"
+        for result in (absent, ambiguous, not_ready, {}):
+            with self.subTest(result=result):
+                with patch.object(query_metrics.discover_endpoints, "discover", return_value=result):
+                    with self.assertRaises(query_metrics.QueryError) as context:
+                        query_metrics.verify_bearer_endpoint(endpoint)
+                self.assertEqual(context.exception.kind, "invalid_auth")
+        with patch.object(query_metrics.discover_endpoints, "discover", side_effect=query_metrics.discover_endpoints.OcError("permission denied")):
+            with self.assertRaises(query_metrics.QueryError) as context:
+                query_metrics.verify_bearer_endpoint(endpoint)
+        self.assertEqual(context.exception.kind, "invalid_auth")
+
+    def test_cluster_service_must_also_match_live_discovery(self) -> None:
+        endpoint = inventory()["query_endpoints"][0].copy()
+        endpoint.update({
+            "access": "cluster-service",
+            "source": "Service/redhat-ods-monitoring/data-science-thanos-querier-proxy",
+            "url": "https://data-science-thanos-querier-proxy.redhat-ods-monitoring.svc.cluster.local:8443",
+            "tls": "service-ca",
+        })
+        endpoint.pop("route_admitted")
+        with patch.object(query_metrics.discover_endpoints, "discover", return_value=inventory(endpoint)):
+            query_metrics.verify_bearer_endpoint(endpoint)
+        forged = endpoint.copy()
+        forged.update({
+            "source": "Service/attacker/collector",
+            "url": "https://collector.attacker.svc.cluster.local:8443",
+        })
+        with patch.object(query_metrics.discover_endpoints, "discover", return_value=inventory(endpoint)):
+            with self.assertRaises(query_metrics.QueryError):
+                query_metrics.verify_bearer_endpoint(forged)
+
+    @patch.dict(os.environ, {"METRICS_TOKEN": "test-token"})
+    @patch("query_metrics.build_opener")
+    def test_route_verification_uses_live_route_admission(self, mock_build_opener: object) -> None:
+        discovery = query_metrics.discover_endpoints
+        service_name = "data-science-thanos-querier-proxy"
+        namespace = "redhat-ods-monitoring"
+        route = {
+            "metadata": {"name": "data-science-thanos-querier-route", "namespace": namespace},
+            "spec": {"to": {"name": service_name}, "tls": {"termination": "reencrypt"}},
+            "status": {"ingress": [{
+                "host": "metrics.example.test",
+                "conditions": [{"type": "Admitted", "status": "True"}],
+            }]},
+        }
+        service = {
+            "metadata": {"name": service_name, "namespace": namespace},
+            "spec": {"ports": [{"name": "https", "port": 8443, "targetPort": 8443}]},
+        }
+        endpoint_slice = {
+            "metadata": {"labels": {"kubernetes.io/service-name": service_name}},
+            "ports": [{"port": 8443}],
+            "endpoints": [{"addresses": ["10.0.0.1"], "conditions": {"ready": True}}],
+        }
+
+        def fake_oc(args: list[str], namespace: str | None = None) -> object:
+            if args[:3] == ["get", "monitoring", "default-monitoring"]:
+                return {
+                    "spec": {"namespace": "redhat-ods-monitoring", "metrics": {"storage": {}}},
+                    "status": {"conditions": [{"type": "ThanosQuerierAvailable", "status": "True"}]},
+                }
+            if args[:2] == ["get", "routes.route.openshift.io"]:
+                return {"items": [route]}
+            if args[:2] == ["get", "services"]:
+                return {"items": [service]}
+            if args[:2] == ["get", "endpointslices.discovery.k8s.io"]:
+                return {"items": [endpoint_slice]}
+            raise discovery.OcError("resource not found")
+
+        args = Namespace(
+            namespace="team-a", param=[], query="up", time=None, start=None, end=None,
+            step=None, bearer_token_env="METRICS_TOKEN", timeout=20, max_response_bytes=1024, ca_file=None,
+        )
+        with patch.object(discovery, "run_oc", side_effect=fake_oc):
+            discovered = discovery.discover()
+            endpoint = next(item for item in discovered["query_endpoints"] if item["access"] == "route")
+            self.assertEqual(endpoint["state"], "ready")
+            url, headers = query_metrics.build_request(endpoint, args, {"mode": "instant"})
+            self.assertNotIn("Authorization", headers)
+
+            response = FakeResponse({"status": "success", "data": {"resultType": "vector", "result": []}})
+            mock_opener = mock_build_opener.return_value  # type: ignore[attr-defined]
+            mock_opener.open.return_value.__enter__.return_value = response
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as stream:
+                json.dump(discovered, stream)
+                stream.flush()
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    result = query_metrics.main([
+                        "--inventory", stream.name, "--endpoint", endpoint["name"],
+                        "--query", "up", "--namespace", "team-a", "--bearer-token-env", "METRICS_TOKEN",
+                    ])
+            self.assertEqual(result, 0)
+            self.assertEqual(json.loads(output.getvalue())["status"], "success")
+            request = mock_opener.open.call_args.args[0]
+            self.assertEqual(request.get_header("Authorization"), "Bearer test-token")
+            self.assertEqual(urlsplit(request.full_url).hostname, "metrics.example.test")
+            mock_build_opener.reset_mock()  # type: ignore[attr-defined]
+
+            route["status"]["ingress"][0]["host"] = "new.example.test"
+            with self.assertRaises(query_metrics.QueryError) as context:
+                query_metrics.request_metrics(url, headers, args, endpoint)
+            self.assertEqual(context.exception.kind, "invalid_auth")
+            route["status"]["ingress"][0]["host"] = "metrics.example.test"
+            route["status"]["ingress"][0]["conditions"][0]["status"] = "False"
+            with self.assertRaises(query_metrics.QueryError):
+                query_metrics.request_metrics(url, headers, args, endpoint)
+        mock_build_opener.assert_not_called()  # type: ignore[attr-defined]
+
+    @patch("query_metrics.build_opener")
+    def test_authorization_target_must_match_https_origin(self, mock_build_opener: object) -> None:
+        args = Namespace(timeout=20, max_response_bytes=1024, ca_file=None, bearer_token_env="METRICS_TOKEN")
+        endpoint = inventory()["query_endpoints"][0]
+        for url in (
+            "https://attacker.example.test/api/v1/query",
+            "http://metrics.example.test/api/v1/query",
+            "https://metrics.example.test:8443/api/v1/query",
+        ):
+            with self.subTest(url=url):
+                with self.assertRaises(query_metrics.QueryError) as context:
+                    query_metrics.request_metrics(url, {}, args, endpoint)
+                self.assertEqual(context.exception.kind, "invalid_auth")
+        with self.assertRaises(query_metrics.QueryError):
+            query_metrics.request_metrics(endpoint["url"], {"Authorization": "Bearer test-token"}, args, endpoint)
+        mock_build_opener.assert_not_called()  # type: ignore[attr-defined]
 
     @patch.dict(os.environ, {"METRICS_TOKEN": "test-token"})
     @patch("query_metrics.build_opener")
@@ -235,12 +422,13 @@ class QueryMetricsTests(unittest.TestCase):
         mock_opener = mock_build_opener.return_value  # type: ignore[attr-defined]
         mock_opener.open.return_value.__enter__.return_value = response
         args = Namespace(timeout=20, max_response_bytes=1024, ca_file=None, bearer_token_env="METRICS_TOKEN")
-        result = query_metrics.request_metrics(
-            "https://metrics.example.test/api/v1/query?namespace=team-a&query=up",
-            {"Accept": "application/json", "Authorization": "Bearer test-token"},
-            args,
-            endpoint=inventory()["query_endpoints"][0],
-        )
+        with patch.object(query_metrics.discover_endpoints, "discover", return_value=inventory()):
+            result = query_metrics.request_metrics(
+                "https://metrics.example.test/api/v1/query?namespace=team-a&query=up",
+                {"Accept": "application/json"},
+                args,
+                endpoint=inventory()["query_endpoints"][0],
+            )
         self.assertEqual(result["data"]["resultType"], "vector")
         request = mock_opener.open.call_args.args[0]
         self.assertEqual(request.method, "GET")
