@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -75,13 +76,103 @@ func TestDCGMMetricsAreRetainedWithOriginalNames(t *testing.T) {
 	}
 }
 
-func TestPrometheusScrapeConfigContainsOnlyDCGMJob(t *testing.T) {
-	jobs := renderedPrometheusScrapeJobs(t, renderCollectorTemplate(t))
+func TestPrometheusScrapeConfigContainsDCGMAndModelResourceJobs(t *testing.T) {
+	collector := renderCollectorTemplate(t)
+	jobs := renderedPrometheusScrapeJobs(t, collector)
 	if _, found := jobs["data-science-collector-prometheus"]; found {
 		t.Error("unused generic pod scrape job must not be rendered")
 	}
 	if len(jobs) != 1 || jobs["dcgm-exporter-accelerator-metrics"] == nil {
-		t.Fatalf("expected one DCGM scrape job; job count=%d, DCGM job present=%t", len(jobs), jobs["dcgm-exporter-accelerator-metrics"] != nil)
+		t.Fatalf("expected one DCGM scrape job in the TargetAllocator receiver; job count=%d, jobs=%v", len(jobs), jobs)
+	}
+	resourceJobs := renderedPrometheusScrapeJobsForReceiver(t, collector, "prometheus/cluster_resources")
+	if len(resourceJobs) != 1 || resourceJobs["cluster-prometheus-model-resources"] == nil {
+		t.Fatalf("expected one model-resource scrape job in the static receiver; job count=%d, jobs=%v", len(resourceJobs), resourceJobs)
+	}
+}
+
+func TestModelResourceFederationScrapeIsNarrowAndAuthenticated(t *testing.T) {
+	collector := renderCollectorTemplate(t)
+	job := renderedPrometheusScrapeJobsForReceiver(t, collector, "prometheus/cluster_resources")["cluster-prometheus-model-resources"]
+	if job == nil {
+		t.Fatal("model-resource federation scrape job must be present")
+	}
+	if !containsString(metricsPipelines(t, collector)["metrics/scrape"]["receivers"], "prometheus/cluster_resources") {
+		t.Fatal("metrics/scrape pipeline must include the model-resource federation receiver")
+	}
+	metricRelabelConfigs, found, err := unstructured.NestedSlice(job, "metric_relabel_configs")
+	if err != nil || !found || len(metricRelabelConfigs) != 2 {
+		t.Fatalf("federation job must have two metric relabel rules: found=%t configs=%v error=%v", found, metricRelabelConfigs, err)
+	}
+	markerRule, ok := metricRelabelConfigs[0].(map[string]any)
+	if !ok || markerRule["action"] != "replace" || markerRule["target_label"] != "odh_federation_source" || markerRule["replacement"] != "model-resources" {
+		t.Errorf("federation job must mark its source: %v", metricRelabelConfigs[0])
+	}
+	metricRelabelRule, ok := metricRelabelConfigs[1].(map[string]any)
+	if !ok || metricRelabelRule["action"] != "labeldrop" || metricRelabelRule["regex"] != "prometheus(_replica)?" {
+		t.Errorf("federation job must drop Prometheus replica identity labels: %v", metricRelabelConfigs[1])
+	}
+	for key, want := range map[string]any{
+		"scrape_interval":   "30s",
+		"scrape_timeout":    "10s",
+		"scheme":            "https",
+		"metrics_path":      "/federate",
+		"bearer_token_file": "/var/run/secrets/kubernetes.io/serviceaccount/token",
+		"honor_labels":      true,
+	} {
+		if got := job[key]; got != want {
+			t.Errorf("federation job %q: got %v, want %v", key, got, want)
+		}
+	}
+
+	tlsConfig, found, err := unstructured.NestedMap(job, "tls_config")
+	if err != nil || !found {
+		t.Fatalf("federation job must configure TLS: found=%t error=%v", found, err)
+	}
+	if tlsConfig["ca_file"] != "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt" || tlsConfig["server_name"] != "prometheus-k8s.openshift-monitoring.svc" {
+		t.Errorf("federation job must use the in-cluster service CA and Prometheus service name: %v", tlsConfig)
+	}
+
+	staticConfigs, found, err := unstructured.NestedSlice(job, "static_configs")
+	if err != nil || !found || len(staticConfigs) != 1 {
+		t.Fatalf("federation job must have one static target group: found=%t configs=%v error=%v", found, staticConfigs, err)
+	}
+	staticConfig, ok := staticConfigs[0].(map[string]any)
+	if !ok {
+		t.Fatalf("federation static target group has unexpected type %T", staticConfigs[0])
+	}
+	targets, ok := staticConfig["targets"].([]any)
+	if !ok || len(targets) != 1 || targets[0] != "prometheus-k8s.openshift-monitoring.svc:9091" {
+		t.Errorf("federation job must target OpenShift Prometheus web: targets=%v", staticConfig["targets"])
+	}
+
+	params, found, err := unstructured.NestedStringSlice(job, "params", "match[]")
+	if err != nil || !found || len(params) != 2 {
+		t.Fatalf("federation job must have exactly two metric matchers: found=%t params=%v error=%v", found, params, err)
+	}
+	for _, want := range []string{
+		`{__name__="node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate"}`,
+		`{__name__="kube_resourcequota", resource="limits.cpu", type="hard"}`,
+	} {
+		if !slices.Contains(params, want) {
+			t.Errorf("federation job is missing matcher %q: %v", want, params)
+		}
+	}
+}
+
+func TestModelResourceFederationIsOmittedWithoutMetricsStorage(t *testing.T) {
+	collector := renderCollectorTemplateWithOptionsAndStorage(t, true, true, false)
+	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
+	if err != nil || !found {
+		t.Fatalf("collector config must be present: found=%t error=%v", found, err)
+	}
+	if _, found, err := unstructured.NestedMap(config, "receivers", "prometheus/cluster_resources"); err != nil {
+		t.Fatalf("reading model-resource receiver: %v", err)
+	} else if found {
+		t.Fatal("model-resource federation receiver must not render without metrics storage")
+	}
+	if containsString(metricsPipelines(t, collector)["metrics/scrape"]["receivers"], "prometheus/cluster_resources") {
+		t.Fatal("metrics/scrape pipeline must not include model-resource federation without metrics storage")
 	}
 }
 
@@ -742,13 +833,18 @@ func renderCollectorTemplateWithDCGMScrapeEnabled(t *testing.T, enabled bool) un
 
 func renderCollectorTemplateWithOptions(t *testing.T, acceleratorMetrics, builtinDCGMScrapeEnabled bool) unstructured.Unstructured {
 	t.Helper()
+	return renderCollectorTemplateWithOptionsAndStorage(t, acceleratorMetrics, builtinDCGMScrapeEnabled, true)
+}
+
+func renderCollectorTemplateWithOptionsAndStorage(t *testing.T, acceleratorMetrics, builtinDCGMScrapeEnabled, metricsStorage bool) unstructured.Unstructured {
+	t.Helper()
 	resources, err := rendertemplate.Render(context.Background(), nil, []rendertemplate.TemplateSource{{
 		FS:   resourcesFS,
 		Path: OpenTelemetryCollectorTemplate,
 	}}, map[string]any{
 		"Namespace":                       "redhat-ods-monitoring",
 		"Metrics":                         true,
-		"MetricsStorage":                  true,
+		"MetricsStorage":                  metricsStorage,
 		"AcceleratorMetrics":              acceleratorMetrics,
 		"BuiltinDCGMScrapeEnabled":        builtinDCGMScrapeEnabled,
 		"Traces":                          false,
@@ -856,14 +952,18 @@ func TestDCGMScrapeJobRetainsDiscoveryAndRelabeling(t *testing.T) {
 }
 
 func renderedPrometheusScrapeJobs(t *testing.T, collector unstructured.Unstructured) map[string]map[string]any {
+	return renderedPrometheusScrapeJobsForReceiver(t, collector, "prometheus")
+}
+
+func renderedPrometheusScrapeJobsForReceiver(t *testing.T, collector unstructured.Unstructured, receiverName string) map[string]map[string]any {
 	t.Helper()
 	config, found, err := unstructured.NestedMap(collector.Object, "spec", "config")
 	if err != nil || !found {
 		t.Fatalf("collector config must be present: found=%t error=%v", found, err)
 	}
-	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus", "config", "scrape_configs")
+	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", receiverName, "config", "scrape_configs")
 	if err != nil || !found {
-		t.Fatalf("Prometheus scrape configs must be present: found=%t error=%v", found, err)
+		t.Fatalf("Prometheus scrape configs for receiver %q must be present: found=%t error=%v", receiverName, found, err)
 	}
 	jobs := make(map[string]map[string]any, len(scrapeConfigs))
 	for _, rawConfig := range scrapeConfigs {

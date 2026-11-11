@@ -123,6 +123,47 @@ spec:
         target_allocator: {}
       {{- end }}
       {{- end }}
+      {{- if .MetricsStorage }}
+      # Federate only the model-resource series that are already collected by
+      # OpenShift Monitoring. Keeping this in a separate receiver avoids
+      # coupling the static federation scrape to TargetAllocator-managed
+      # workload monitors. The collector's service account is authorized for
+      # the Prometheus API by collector-rbac.tmpl.yaml.
+      prometheus/cluster_resources:
+        config:
+          scrape_configs:
+            - job_name: 'cluster-prometheus-model-resources'
+              scrape_interval: 30s
+              scrape_timeout: 10s
+              scheme: https
+              metrics_path: /federate
+              params:
+                'match[]':
+                  - '{__name__="node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate"}'
+                  - '{__name__="kube_resourcequota", resource="limits.cpu", type="hard"}'
+              bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+              tls_config:
+                ca_file: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
+                server_name: prometheus-k8s.openshift-monitoring.svc
+              honor_labels: true
+              metric_relabel_configs:
+                # Mark the static receiver so the ordinal-0 ServiceMonitor
+                # cannot accidentally retain a user workload metric that
+                # happens to reuse one of the federated metric names.
+                - action: replace
+                  target_label: odh_federation_source
+                  replacement: model-resources
+                # The service can load-balance between Prometheus replicas.
+                # Drop source replica identity so it does not become another
+                # aggregation dimension. Models dashboard queries also max
+                # over the workload/quota identity to tolerate replicated
+                # federation scrapes.
+                - action: labeldrop
+                  regex: 'prometheus(_replica)?'
+              static_configs:
+                - targets:
+                    - prometheus-k8s.openshift-monitoring.svc:9091
+      {{- end }}
       otlp:
         protocols:
           grpc:
@@ -306,7 +347,7 @@ spec:
       {{- end }}
       {{- if .Metrics }}
         metrics/scrape:
-          receivers: [prometheus]
+          receivers: [prometheus{{- if .MetricsStorage }}, prometheus/cluster_resources{{- end }}]
           processors: [memory_limiter, k8sattributes, transform/sanitize_k8s_labels, transform/exclude_dcgm_k8s_labels, resourcedetection, transform/gpu_metrics, batch]
           exporters: [{{- if .MetricsStorage }}prometheus{{- if .MetricsExporterNames }}, {{ end }}{{- end }}{{- range $i, $name := .MetricsExporterNames }}{{- if $i }}, {{ end }}{{ $name }}{{- end }}]
         # OTLP metrics enter through a dedicated pipeline so client-supplied

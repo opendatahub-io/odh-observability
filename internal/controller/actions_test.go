@@ -428,9 +428,9 @@ func TestDeployOpenTelemetryCollector_MetricsOnly_CRDPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// 7 sources with the always-on OTel templates included in the metrics path
-	if len(sources) != 7 {
-		t.Errorf("expected 7 sources for metrics+OTel, got %d", len(sources))
+	// 8 sources with the ordinal-0 resource scrape service included in the metrics path
+	if len(sources) != 8 {
+		t.Errorf("expected 8 sources for metrics+OTel, got %d", len(sources))
 	}
 
 	otcC := findCondition(m, conditions.ConditionOpenTelemetryCollectorAvailable)
@@ -583,7 +583,7 @@ func TestDeployOpenTelemetryCollector_ExportersOnlyMetrics_NoServiceMonitors(t *
 		t.Errorf("expected 5 sources for exporters-only metrics, got %d", len(sources))
 	}
 	for _, source := range sources {
-		if source.Path == CollectorServiceMonitorsTemplate || source.Path == CollectorPrometheusServiceTemplate {
+		if source.Path == CollectorServiceMonitorsTemplate || source.Path == CollectorPrometheusServiceTemplate || source.Path == CollectorResourcePrometheusServiceTemplate {
 			t.Errorf("exporters-only metrics must not include %s", source.Path)
 		}
 	}
@@ -616,9 +616,9 @@ func TestDeployOpenTelemetryCollector_MetricsAndTraces_CRDPresent(t *testing.T) 
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// 5 base + ServiceMonitors + prometheus service + 2 traces RBAC (MLflow + Tempo)
-	if len(sources) != 9 {
-		t.Errorf("expected 9 sources for metrics+traces+OTel, got %d", len(sources))
+	// 5 base + ServiceMonitors + prometheus services + 2 traces RBAC (MLflow + Tempo)
+	if len(sources) != 10 {
+		t.Errorf("expected 10 sources for metrics+traces+OTel, got %d", len(sources))
 	}
 
 	otcC := findCondition(m, conditions.ConditionOpenTelemetryCollectorAvailable)

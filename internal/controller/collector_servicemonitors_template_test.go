@@ -15,8 +15,9 @@ import (
 // labels Korrel8r relies on).
 func TestCollectorServiceMonitorsPrometheusEndpointConfig(t *testing.T) {
 	resources := renderObservabilityTemplate(t, CollectorServiceMonitorsTemplate, map[string]any{
-		"Namespace": "redhat-ods-monitoring",
-		"Metrics":   true,
+		"Namespace":      "redhat-ods-monitoring",
+		"Metrics":        true,
+		"MetricsStorage": true,
 	})
 
 	prometheusSM := findRenderedResource(t, resources, "ServiceMonitor", "data-science-prometheus-monitor")
@@ -38,10 +39,14 @@ func TestCollectorServiceMonitorsPrometheusEndpointConfig(t *testing.T) {
 		{sourceLabels: []string{"k8s_namespace_name"}, targetLabel: "namespace"},
 		{sourceLabels: []string{"k8s_pod_name"}, targetLabel: "pod"},
 	}
-	if len(relabels) != len(want) {
-		t.Fatalf("expected %d metricRelabelings, got %d", len(want), len(relabels))
+	if len(relabels) != len(want)+1 {
+		t.Fatalf("expected %d metricRelabelings, got %d", len(want)+1, len(relabels))
 	}
-	for i, raw := range relabels {
+	dropRule, ok := relabels[0].(map[string]any)
+	if !ok || dropRule["action"] != "drop" || dropRule["regex"] != "node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate|kube_resourcequota" {
+		t.Fatalf("first metricRelabeling must exclude federated resource metrics: %v", relabels[0])
+	}
+	for i, raw := range relabels[1:] {
 		relabel, ok := raw.(map[string]any)
 		if !ok {
 			t.Fatalf("metricRelabelings[%d] has unexpected type: %T", i, raw)
@@ -60,6 +65,20 @@ func TestCollectorServiceMonitorsPrometheusEndpointConfig(t *testing.T) {
 		}
 	}
 
+	resourceSM := findRenderedResource(t, resources, "ServiceMonitor", "data-science-prometheus-resources-monitor")
+	resourceEndpoint := singleEndpoint(t, resourceSM)
+	resourceRelabels, found, err := unstructured.NestedSlice(resourceEndpoint, "metricRelabelings")
+	if err != nil || !found || len(resourceRelabels) != 1 {
+		t.Fatalf("resource endpoint must keep exactly the federated resource metrics: found=%t error=%v relabels=%v", found, err, resourceRelabels)
+	}
+	keepRule, ok := resourceRelabels[0].(map[string]any)
+	if !ok || keepRule["action"] != "keep" || keepRule["regex"] != "model-resources" || !containsString(keepRule["sourceLabels"], "odh_federation_source") {
+		t.Errorf("resource endpoint must keep only federated resource metrics: %v", resourceRelabels[0])
+	}
+	if serverName, found, err := unstructured.NestedString(resourceEndpoint, "tlsConfig", "serverName"); err != nil || !found || serverName != "data-science-collector-prometheus.redhat-ods-monitoring.svc" {
+		t.Errorf("resource endpoint must verify the mounted collector serving certificate: found=%t value=%q error=%v", found, serverName, err)
+	}
+
 	// The collector's own telemetry endpoint must stay untouched.
 	monitorSM := findRenderedResource(t, resources, "ServiceMonitor", "data-science-collector-monitor")
 	monitorEndpoint := singleEndpoint(t, monitorSM)
@@ -73,10 +92,11 @@ func TestCollectorServiceMonitorsPrometheusEndpointConfig(t *testing.T) {
 
 func TestOwnedServiceMonitorsCarryScrapeLabel(t *testing.T) {
 	collectorResources := renderObservabilityTemplate(t, CollectorServiceMonitorsTemplate, map[string]any{
-		"Namespace": "redhat-ods-monitoring",
-		"Metrics":   true,
+		"Namespace":      "redhat-ods-monitoring",
+		"Metrics":        true,
+		"MetricsStorage": true,
 	})
-	for _, name := range []string{"data-science-collector-monitor", "data-science-prometheus-monitor"} {
+	for _, name := range []string{"data-science-collector-monitor", "data-science-prometheus-monitor", "data-science-prometheus-resources-monitor"} {
 		serviceMonitor := findRenderedResource(t, collectorResources, "ServiceMonitor", name)
 		assertScrapeLabel(t, serviceMonitor)
 	}
@@ -85,6 +105,20 @@ func TestOwnedServiceMonitorsCarryScrapeLabel(t *testing.T) {
 		"Namespace": "redhat-ods-monitoring",
 	})
 	assertScrapeLabel(t, findRenderedResource(t, prometheusResources, "ServiceMonitor", "prometheus-self-fixed"))
+}
+
+func TestResourcePrometheusServiceSelectsOnlyOrdinalZero(t *testing.T) {
+	resources := renderObservabilityTemplate(t, CollectorResourcePrometheusServiceTemplate, map[string]any{
+		"Namespace": "redhat-ods-monitoring",
+	})
+	service := findRenderedResource(t, resources, "Service", "data-science-prometheus-resources")
+	selector, found, err := unstructured.NestedStringMap(service.Object, "spec", "selector")
+	if err != nil || !found {
+		t.Fatalf("resource Prometheus service must have a selector: found=%t error=%v", found, err)
+	}
+	if selector["statefulset.kubernetes.io/pod-name"] != "data-science-collector-collector-0" {
+		t.Fatalf("resource Prometheus service must select collector ordinal 0, got %v", selector)
+	}
 }
 
 func assertScrapeLabel(t *testing.T, serviceMonitor unstructured.Unstructured) {
@@ -100,13 +134,17 @@ func assertScrapeLabel(t *testing.T, serviceMonitor unstructured.Unstructured) {
 // user-workload ServiceMonitor is gated on metrics.storage.
 func TestCollectorServiceMonitorsOmitPrometheusMonitorWithoutMetrics(t *testing.T) {
 	resources := renderObservabilityTemplate(t, CollectorServiceMonitorsTemplate, map[string]any{
-		"Namespace": "redhat-ods-monitoring",
-		"Metrics":   false,
+		"Namespace":      "redhat-ods-monitoring",
+		"Metrics":        false,
+		"MetricsStorage": false,
 	})
 
 	for _, resource := range resources {
 		if resource.GetName() == "data-science-prometheus-monitor" {
 			t.Error("data-science-prometheus-monitor must not render without metrics.storage")
+		}
+		if resource.GetName() == "data-science-prometheus-resources-monitor" {
+			t.Error("data-science-prometheus-resources-monitor must not render without metrics.storage")
 		}
 	}
 }

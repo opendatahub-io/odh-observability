@@ -1,0 +1,29 @@
+# Service for the federated model-resource metrics. The StatefulSet ordinal-0
+# selector gives the static federation receiver a single scrape target even
+# when the workload collectors are replicated for high availability. The
+# serving certificate is reused from data-science-collector-prometheus; the
+# ServiceMonitor therefore uses that service name for TLS verification.
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-science-prometheus-resources
+  namespace: {{.Namespace}}
+  labels:
+    app.kubernetes.io/component: opentelemetry-collector
+    app.kubernetes.io/instance: {{.Namespace}}.data-science-collector
+    app.kubernetes.io/managed-by: opentelemetry-operator
+    app.kubernetes.io/name: data-science-prometheus-resources
+    app.kubernetes.io/part-of: opentelemetry
+spec:
+  ports:
+  - name: prometheus
+    port: 8889
+    protocol: TCP
+    targetPort: 8889
+  selector:
+    app.kubernetes.io/component: opentelemetry-collector
+    app.kubernetes.io/instance: {{.Namespace}}.data-science-collector
+    app.kubernetes.io/managed-by: opentelemetry-operator
+    app.kubernetes.io/part-of: opentelemetry
+    statefulset.kubernetes.io/pod-name: data-science-collector-collector-0
+  type: ClusterIP

@@ -60,6 +60,12 @@ spec:
       # exported_namespace/exported_pod). Do NOT set honorLabels: it would
       # trust workload-supplied labels and drop those exported_ labels.
       metricRelabelings:
+        # Static federation is configured on every replicated collector. The
+        # resource-only ServiceMonitor below selects ordinal 0, so exclude
+        # these series from the all-collector scrape to prevent duplicates.
+        - sourceLabels: [__name__]
+          regex: 'node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate|kube_resourcequota'
+          action: drop
         - sourceLabels: [k8s_namespace_name]
           regex: (.+)
           targetLabel: namespace
@@ -75,5 +81,40 @@ spec:
       app.kubernetes.io/instance: {{.Namespace}}.data-science-collector
       app.kubernetes.io/managed-by: opentelemetry-operator
       app.kubernetes.io/name: data-science-collector-prometheus
+      app.kubernetes.io/part-of: opentelemetry
+{{- end }}
+---
+# Scrape federated CPU/quota metrics from exactly one collector replica.
+# The source labels already contain the workload namespace/pod and quota
+# identity; do not apply the workload identity promotion rules above.
+{{- if and .Metrics .MetricsStorage }}
+apiVersion: monitoring.rhobs/v1
+kind: ServiceMonitor
+metadata:
+  name: data-science-prometheus-resources-monitor
+  namespace: {{.Namespace}}
+  labels:
+    monitoring.opendatahub.io/scrape: "true"
+spec:
+  endpoints:
+    - port: prometheus
+      scheme: https
+      tlsConfig:
+        caFile: /etc/prometheus/secrets/prometheus-web-tls-ca/service-ca.crt
+        serverName: "data-science-collector-prometheus.{{.Namespace}}.svc"
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      metricRelabelings:
+        - sourceLabels: [odh_federation_source]
+          regex: model-resources
+          action: keep
+  namespaceSelector:
+    matchNames:
+      - {{.Namespace}}
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: opentelemetry-collector
+      app.kubernetes.io/instance: {{.Namespace}}.data-science-collector
+      app.kubernetes.io/managed-by: opentelemetry-operator
+      app.kubernetes.io/name: data-science-prometheus-resources
       app.kubernetes.io/part-of: opentelemetry
 {{- end }}

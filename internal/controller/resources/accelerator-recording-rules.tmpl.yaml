@@ -13,22 +13,28 @@ spec:
       rules:
         # Align with OpenShift accelerator dashboard metric names on the data-science
         # MonitoringStack. Source series come from OTC DCGM scrape (canonical DCGM_FI_*
-        # names; GPU util is 0-1 after transform/gpu_metrics).
+        # names; GPU util is 0-1 after transform/gpu_metrics). DCGM's workload
+        # attribution arrives as exported_namespace/exported_pod because the
+        # exporter pod itself must not become the tenant identity. Copy those
+        # trusted attribution labels to the canonical names used by the model
+        # table joins. Do not filter out unattributed GPUs here: they remain
+        # part of the existing aggregate metric, while only attributed series
+        # can participate in model pod joins.
         - record: accelerator_gpu_utilization
-          expr: DCGM_FI_DEV_GPU_UTIL * 100
+          expr: label_replace(label_replace(DCGM_FI_DEV_GPU_UTIL * 100, "namespace", "$1", "exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)")
           labels:
             vendor: nvidia
         # DCGM_FI_DEV_FB_USED is framebuffer used in MiB; metric name is bytes.
         - record: accelerator_memory_used_bytes
-          expr: DCGM_FI_DEV_FB_USED * 1024 * 1024
+          expr: label_replace(label_replace(DCGM_FI_DEV_FB_USED * 1024 * 1024, "namespace", "$1", "exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)")
           labels:
             vendor: nvidia
         - record: accelerator_temperature_celsius
-          expr: DCGM_FI_DEV_GPU_TEMP
+          expr: label_replace(label_replace(DCGM_FI_DEV_GPU_TEMP, "namespace", "$1", "exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)")
           labels:
             vendor: nvidia
         - record: accelerator_power_usage_watts
-          expr: DCGM_FI_DEV_POWER_USAGE
+          expr: label_replace(label_replace(DCGM_FI_DEV_POWER_USAGE, "namespace", "$1", "exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)")
           labels:
             vendor: nvidia
 {{- end }}

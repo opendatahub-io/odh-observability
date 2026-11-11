@@ -224,7 +224,7 @@ Perses metrics access model (three lanes — pick by **where the series live**, 
 
 | Lane | Datasource | Backend | Gate | Owns |
 |------|------------|---------|------|------|
-| **DS namespace-scoped** | `data-science-prometheus-datasource` (default) | DS Thanos proxy `:8443` | `namespace=` + caller token + `metrics.k8s.io` SAR | Series in the Data Science MonitoringStack (e.g. raw `vllm:*`, DS `accelerator_*` recording rules from OTC/DCGM) |
+| **DS namespace-scoped** | `data-science-prometheus-datasource` (default) | DS Thanos proxy `:8443` | `namespace=` + caller token + `metrics.k8s.io` SAR | Series in the Data Science MonitoringStack (e.g. raw `vllm:*`, DS `accelerator_*` recording rules from OTC/DCGM, and model-resource series federated from OpenShift Monitoring) |
 | **OCP tenancy** | `cluster-prometheus-tenancy-datasource` | OpenShift Thanos `:9092` | `namespace=` + caller token | Namespaced OpenShift Monitoring series (`node_namespace_pod_container:*`, `kube_*`, OCP accelerator with `exported_namespace` / `exported_pod`) |
 | **OCP admin** | `cluster-prometheus-datasource` | OpenShift Thanos `:9091` | caller RBAC only (e.g. `cluster-monitoring-view`) | Cluster-wide admin views — **not** namespace tenancy |
 
@@ -235,9 +235,11 @@ Perses metrics access model (three lanes — pick by **where the series live**, 
 The [MaaS legacy usage dashboard](https://github.com/opendatahub-io/models-as-a-service/blob/main/deployment/components/observability/observability/dashboards/usage-dashboard.yaml) explicitly uses the DS datasource but has no `namespace` variable. It needs a compatible namespace selection and authorization design before this change can be rolled out; the Observe dashboard companion alone does not update it.
 
 **Metric ownership / dashboard pins (hard rule):** one PromQL query runs against **one** datasource. You cannot join DS Thanos series with OpenShift series in a single query. Observe dashboards (Dashboard repo) must pin explicitly after the DS default flip:
-- **Models:** raw `vllm:*` panels → `data-science-prometheus-datasource` (`:8443`). OCP GPU/CPU panels → `cluster-prometheus-tenancy-datasource` (`:9092`).
+- **Models:** raw `vllm:*` and model GPU/CPU/quota panels → `data-science-prometheus-datasource` (`:8443`). The collector federates only the existing OpenShift CPU recording rule and hard `limits.cpu` quota series into the Data Science MonitoringStack; model joins therefore remain within one datasource. The resource-only ServiceMonitor scrapes collector ordinal 0 so replicated collectors do not duplicate federation data; CPU/quota panels also deduplicate by workload and quota identity defensively.
 - **Cluster:** → `cluster-prometheus-datasource` (`:9091`).
-- **Datasource boundary:** GPU/CPU PromQL remains on the OpenShift tenancy datasource; raw `vllm:*` is used for model identity and serving metrics. Cross-stack joins must not move either datasource's resource queries into the other lane.
+- **Datasource boundary:** the Models dashboard must use the Data Science datasource for all model resource queries. Cross-datasource PromQL joins remain unsupported; cluster-wide/admin panels continue to use the OpenShift datasources.
+
+The federation reader is limited by RBAC to the OpenShift `k8s` Prometheus resource. Kubernetes RBAC does not distinguish `/federate` from other read-only Prometheus API paths, so the collector service account remains a trusted cluster-metrics reader; a stricter path-level boundary requires an authenticated federation proxy.
 
 - Upgrade: the reconciler removes legacy Kubernetes SA-token Secrets with these datasource names only when they are owned by the current Monitoring resource and reference the old cluster-proxy service account. Perses operator manages separate Perses API secrets for the datasource TLS configuration.
 - Observe UI / gateway → Perses ingress is owned by Dashboard (`dashboard-perses-access`), not this operator.
