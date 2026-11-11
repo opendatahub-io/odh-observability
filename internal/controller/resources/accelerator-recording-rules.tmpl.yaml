@@ -13,25 +13,24 @@ spec:
       rules:
         # Align with OpenShift accelerator dashboard metric names on the data-science
         # MonitoringStack. Source series come from OTC DCGM scrape (canonical DCGM_FI_*
-        # names; GPU util is 0-1 after transform/gpu_metrics). Only verified
-        # DCGM sources may copy exported_namespace/exported_pod to the
-        # canonical names used by model table joins. Keep unmarked series in
-        # the aggregate metric without rewriting their identity.
+        # names; GPU util is 0-1 after transform/gpu_metrics). No current
+        # scrape path can attest workload-label provenance, so preserve the
+        # source identity and never promote exported_namespace/exported_pod.
         - record: accelerator_gpu_utilization
-          expr: (label_replace(label_replace(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified"} * 100, "namespace", "$1", "exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)") or DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source!="verified"} * 100)
+          expr: DCGM_FI_DEV_GPU_UTIL * 100
           labels:
             vendor: nvidia
         # DCGM_FI_DEV_FB_USED is framebuffer used in MiB; metric name is bytes.
         - record: accelerator_memory_used_bytes
-          expr: (label_replace(label_replace(DCGM_FI_DEV_FB_USED{odh_dcgm_source="verified"} * 1024 * 1024, "namespace", "$1", "exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)") or DCGM_FI_DEV_FB_USED{odh_dcgm_source!="verified"} * 1024 * 1024)
+          expr: DCGM_FI_DEV_FB_USED * 1024 * 1024
           labels:
             vendor: nvidia
         - record: accelerator_temperature_celsius
-          expr: (label_replace(label_replace(DCGM_FI_DEV_GPU_TEMP{odh_dcgm_source="verified"}, "namespace", "$1", "exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)") or DCGM_FI_DEV_GPU_TEMP{odh_dcgm_source!="verified"})
+          expr: DCGM_FI_DEV_GPU_TEMP
           labels:
             vendor: nvidia
         - record: accelerator_power_usage_watts
-          expr: (label_replace(label_replace(DCGM_FI_DEV_POWER_USAGE{odh_dcgm_source="verified"}, "namespace", "$1", "exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)") or DCGM_FI_DEV_POWER_USAGE{odh_dcgm_source!="verified"})
+          expr: DCGM_FI_DEV_POWER_USAGE
           labels:
             vendor: nvidia
 {{- end }}

@@ -205,30 +205,26 @@ spec:
               - set(datapoint.value_double, datapoint.value_double / 100) where metric.name == "DCGM_FI_DEV_GPU_UTIL"
               - set(datapoint.value_double, datapoint.value_double / 100) where metric.name == "DCGM_FI_DEV_MEM_COPY_UTIL"
       # Source markers are internal trust-boundary labels. Remove any marker
-      # supplied by workload scrapes or OTLP clients before export. The
-      # federation pipeline deliberately does not use this processor.
+      # supplied by workload scrapes or OTLP clients before export. Match
+      # alternate spellings too: the Prometheus exporter normalizes characters
+      # such as '.' and '-' to '_'. The federation pipeline deliberately does
+      # not use this processor. Escape $ for collector config expansion.
       transform/sanitize_provenance_markers:
         error_mode: propagate
         metric_statements:
           - context: resource
             statements:
-              - delete_key(attributes, "odh_federation_source")
-              - delete_key(attributes, "odh_dcgm_source")
+              - delete_matching_keys(attributes, "^odh[^a-zA-Z0-9]federation[^a-zA-Z0-9]source$$")
+              - delete_matching_keys(attributes, "^odh[^a-zA-Z0-9]dcgm[^a-zA-Z0-9]source$$")
           - context: datapoint
             statements:
-              - delete_key(attributes, "odh_federation_source")
-              - delete_key(attributes, "odh_dcgm_source")
-      # Mark only DCGM metrics identified by collector-side scrape metadata.
-      # The first branch is the built-in nvidia-gpu-operator scrape; the
-      # second is the supported HTTPS monitor contract, which retains the
-      # collector-generated job and exporter component labels. This processor
-      # runs after marker sanitization, so clients cannot preserve the marker.
-      transform/mark_verified_dcgm_source:
-        error_mode: propagate
-        metric_statements:
-          - context: datapoint
-            statements:
-              - set(attributes["odh_dcgm_source"], "verified") where IsMatch(metric.name, "^DCGM_FI_.*") and resource.attributes["service.name"] == "rhoai-accelerator-metrics" and (resource.attributes["k8s.namespace.name"] == "nvidia-gpu-operator" or attributes["component"] == "nvidia-dcgm-exporter")
+              - delete_matching_keys(attributes, "^odh[^a-zA-Z0-9]federation[^a-zA-Z0-9]source$$")
+              - delete_matching_keys(attributes, "^odh[^a-zA-Z0-9]dcgm[^a-zA-Z0-9]source$$")
+      # Do not mark DCGM sources as verified here. TargetAllocator mixes the
+      # built-in scrape with tenant-controlled monitors in the same receiver;
+      # monitor relabelings can impersonate its job, component and target
+      # identity. Promoting exported workload labels requires an isolated,
+      # trusted scrape path, not a check of these mutable attributes.
       # Workloads control their exposition labels and pushed metric
       # attributes, so a datapoint attribute named k8s_namespace_name or
       # k8s_pod_name must never be trusted: the collector ServiceMonitor
@@ -373,13 +369,15 @@ spec:
       {{- if .Metrics }}
         metrics/scrape:
           receivers: [prometheus]
-          processors: [memory_limiter, k8sattributes, transform/sanitize_provenance_markers, transform/mark_verified_dcgm_source, transform/sanitize_k8s_labels, transform/exclude_dcgm_k8s_labels, resourcedetection, transform/gpu_metrics, batch]
+          processors: [memory_limiter, k8sattributes, transform/sanitize_provenance_markers, transform/sanitize_k8s_labels, transform/exclude_dcgm_k8s_labels, resourcedetection, transform/gpu_metrics, batch]
           exporters: [{{- if .MetricsStorage }}prometheus{{- if .MetricsExporterNames }}, {{ end }}{{- end }}{{- range $i, $name := .MetricsExporterNames }}{{- if $i }}, {{ end }}{{ $name }}{{- end }}]
       {{- if .MetricsStorage }}
         metrics/federation:
           receivers: [prometheus/cluster_resources]
           processors: [memory_limiter, batch]
-          exporters: [prometheus{{- if .MetricsExporterNames }}, {{ end }}{{- range $i, $name := .MetricsExporterNames }}{{- if $i }}, {{ end }}{{ $name }}{{- end }}]
+          # Every replica federates; only the ordinal-0 MonitoringStack scrape
+          # deduplicates these samples. Do not send them to custom exporters.
+          exporters: [prometheus]
       {{- end }}
         # OTLP metrics enter through a dedicated pipeline so client-supplied
         # identity attributes can be stripped before trusted, connection-based

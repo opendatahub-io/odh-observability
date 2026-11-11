@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -395,9 +396,26 @@ func TestWorkloadPipelinesSanitizeSourceMarkers(t *testing.T) {
 	blocks := statementBlocksByContext(t, metricStatements)
 	for _, context := range []string{"resource", "datapoint"} {
 		requireStatements(t, "source marker sanitizer "+context, blocks[context], []string{
-			`delete_key(attributes, "odh_federation_source")`,
-			`delete_key(attributes, "odh_dcgm_source")`,
+			`delete_matching_keys(attributes, "^odh[^a-zA-Z0-9]federation[^a-zA-Z0-9]source$$")`,
+			`delete_matching_keys(attributes, "^odh[^a-zA-Z0-9]dcgm[^a-zA-Z0-9]source$$")`,
 		})
+	}
+
+	// Collector config expansion turns $$ into $. Verify the regex covers
+	// spellings the Prometheus exporter normalizes to the same marker while
+	// leaving unrelated labels intact.
+	for _, kind := range []string{"federation", "dcgm"} {
+		pattern := regexp.MustCompile(`^odh[^a-zA-Z0-9]` + kind + `[^a-zA-Z0-9]source$`)
+		for _, key := range []string{"odh_" + kind + "_source", "odh." + kind + ".source", "odh-" + kind + "/source"} {
+			if !pattern.MatchString(key) {
+				t.Errorf("marker sanitizer must remove normalized spelling %q", key)
+			}
+		}
+		for _, key := range []string{"odh_" + kind + "_source_extra", "odh_" + kind + "_source2", "prefix_odh_" + kind + "_source"} {
+			if pattern.MatchString(key) {
+				t.Errorf("marker sanitizer must preserve unrelated key %q", key)
+			}
+		}
 	}
 
 	pipelines := metricsPipelines(t, collector)
@@ -411,34 +429,24 @@ func TestWorkloadPipelinesSanitizeSourceMarkers(t *testing.T) {
 	}
 }
 
-func TestDCGMSourceMarkerRequiresVerifiedScrapeIdentity(t *testing.T) {
+func TestWorkloadSourcesCannotMarkDCGMAsVerified(t *testing.T) {
 	collector := renderCollectorTemplate(t)
 	processors := renderedProcessors(t, collector)
-	transform, found, err := unstructured.NestedMap(processors, "transform/mark_verified_dcgm_source")
-	if err != nil || !found {
-		t.Fatalf("verified DCGM source marker transform must be present: found=%t error=%v", found, err)
-	}
-	metricStatements, ok := transform["metric_statements"].([]any)
-	if !ok || len(metricStatements) != 1 {
-		t.Fatalf("verified DCGM source marker must contain one datapoint block: %v", transform["metric_statements"])
-	}
-	blocks := statementBlocksByContext(t, metricStatements)
-	verifiedMarkerStatement := `set(attributes["odh_dcgm_source"], "verified") where IsMatch(metric.name, "^DCGM_FI_.*") and ` +
-		`resource.attributes["service.name"] == "rhoai-accelerator-metrics" and ` +
-		`(resource.attributes["k8s.namespace.name"] == "nvidia-gpu-operator" or attributes["component"] == "nvidia-dcgm-exporter")`
-	requireStatements(t, "verified DCGM source marker", blocks["datapoint"], []string{
-		verifiedMarkerStatement,
-	})
-
 	pipelines := metricsPipelines(t, collector)
-	if !containsString(pipelines["metrics/scrape"]["processors"], "transform/mark_verified_dcgm_source") {
-		t.Error("metrics/scrape pipeline must mark verified DCGM sources")
-	}
-	if containsString(pipelines["metrics/otlp"]["processors"], "transform/mark_verified_dcgm_source") {
-		t.Error("metrics/otlp pipeline must not mark client-pushed metrics as verified DCGM")
-	}
-	if containsString(pipelines["metrics/federation"]["processors"], "transform/mark_verified_dcgm_source") {
-		t.Error("metrics/federation pipeline must not mark resource metrics as DCGM")
+	for _, name := range []string{"metrics/scrape", "metrics/otlp"} {
+		pipelineProcessors, ok := pipelines[name]["processors"].([]any)
+		if !ok {
+			t.Fatalf("%s processors have unexpected type: %T", name, pipelines[name]["processors"])
+		}
+		for _, rawName := range pipelineProcessors {
+			processorName, ok := rawName.(string)
+			if !ok {
+				t.Fatalf("%s processor name has unexpected type: %T", name, rawName)
+			}
+			if strings.Contains(fmt.Sprint(processors[processorName]), `set(attributes["odh_dcgm_source"]`) {
+				t.Errorf("%s must not set a verified DCGM marker based on spoofable metadata: %s", name, processorName)
+			}
+		}
 	}
 }
 
@@ -785,8 +793,36 @@ func TestOTLPMetricsPipelineWiring(t *testing.T) {
 		t.Error("metrics/scrape pipeline must invoke the shared k8sattributes processor")
 	}
 
-	if !reflect.DeepEqual(scrapePipeline["exporters"], otlpPipeline["exporters"]) || !reflect.DeepEqual(scrapePipeline["exporters"], federationPipeline["exporters"]) {
-		t.Errorf("metrics pipelines must share exporters, scrape=%v federation=%v otlp=%v", scrapePipeline["exporters"], federationPipeline["exporters"], otlpPipeline["exporters"])
+	if !reflect.DeepEqual(scrapePipeline["exporters"], otlpPipeline["exporters"]) {
+		t.Errorf("scrape and OTLP pipelines must share exporters, scrape=%v otlp=%v", scrapePipeline["exporters"], otlpPipeline["exporters"])
+	}
+}
+
+func TestFederationExcludesCustomExporters(t *testing.T) {
+	for _, storage := range []bool{true, false} {
+		t.Run(fmt.Sprintf("storage=%t", storage), func(t *testing.T) {
+			collector := renderCollectorTemplateWithExporters(t, true, true, storage, 3, []string{"otlp/first", "otlp/second"})
+			pipelines := metricsPipelines(t, collector)
+			wantWorkload := []any{"otlp/first", "otlp/second"}
+			if storage {
+				wantWorkload = append([]any{"prometheus"}, wantWorkload...)
+			}
+			for _, name := range []string{"metrics/scrape", "metrics/otlp"} {
+				if got := pipelines[name]["exporters"]; !reflect.DeepEqual(got, wantWorkload) {
+					t.Errorf("%s exporters: got %v, want %v", name, got, wantWorkload)
+				}
+			}
+			federation, found := pipelines["metrics/federation"]
+			if !storage {
+				if found {
+					t.Error("federation pipeline must be absent without metrics storage")
+				}
+				return
+			}
+			if !found || !reflect.DeepEqual(federation["exporters"], []any{"prometheus"}) {
+				t.Errorf("federation must export only to built-in storage: %v", federation)
+			}
+		})
 	}
 }
 
@@ -939,6 +975,15 @@ func renderCollectorTemplateWithOptions(t *testing.T, acceleratorMetrics, builti
 
 func renderCollectorTemplateWithOptionsAndStorage(t *testing.T, acceleratorMetrics, builtinDCGMScrapeEnabled, metricsStorage bool) unstructured.Unstructured {
 	t.Helper()
+	return renderCollectorTemplateWithExporters(t, acceleratorMetrics, builtinDCGMScrapeEnabled, metricsStorage, 1, nil)
+}
+
+func renderCollectorTemplateWithExporters(t *testing.T, acceleratorMetrics, builtinDCGMScrapeEnabled, metricsStorage bool, replicas int, exporterNames []string) unstructured.Unstructured {
+	t.Helper()
+	exporters := make(map[string]string, len(exporterNames))
+	for _, name := range exporterNames {
+		exporters[name] = "endpoint: example.com:4317"
+	}
 	resources, err := rendertemplate.Render(context.Background(), nil, []rendertemplate.TemplateSource{{
 		FS:   resourcesFS,
 		Path: OpenTelemetryCollectorTemplate,
@@ -949,13 +994,13 @@ func renderCollectorTemplateWithOptionsAndStorage(t *testing.T, acceleratorMetri
 		"AcceleratorMetrics":              acceleratorMetrics,
 		"BuiltinDCGMScrapeEnabled":        builtinDCGMScrapeEnabled,
 		"Traces":                          false,
-		"CollectorReplicas":               1,
+		"CollectorReplicas":               replicas,
 		"CollectorCPULimit":               "1",
 		"CollectorMemoryLimit":            "1Gi",
 		"CollectorCPURequest":             "100m",
 		"CollectorMemoryRequest":          "256Mi",
-		"MetricsExporterNames":            []string{},
-		"MetricsExporters":                map[string]string{},
+		"MetricsExporterNames":            exporterNames,
+		"MetricsExporters":                exporters,
 		"TargetAllocatorServiceAccount":   targetAllocatorServiceAccountName,
 		"TargetAllocatorSecretNamespaces": []string{"redhat-ods-monitoring", "team-a"},
 		"TracesExporterNames":             []string{},
