@@ -40,7 +40,7 @@ func TestAcceleratorRecordingRulesPromQL(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cmd := exec.Command(promtool, "test", "rules", filepath.Join(dir, "test.yaml"))
+	cmd := exec.CommandContext(t.Context(), promtool, "test", "rules", filepath.Join(dir, "test.yaml"))
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("promtool test rules: %v\n%s", err, output)
 	}

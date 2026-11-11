@@ -1,0 +1,135 @@
+package e2e_test
+
+import (
+	"fmt"
+	"math"
+	"net/http"
+	"strconv"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
+
+	. "github.com/onsi/gomega" //nolint:revive // dot import is idiomatic for gomega matchers
+)
+
+// ValidateModelResourceFederation checks real quota and container-limit
+// values through the Data Science namespace proxy, including tenant isolation.
+func (tc *MonitoringTestCtx) ValidateModelResourceFederation(t *testing.T) {
+	t.Helper()
+	tc = tc.WithT(t)
+	tc.setupMetrics(t)
+
+	runID := strconv.FormatInt(time.Now().UnixNano(), 16)
+	namespace := "tests-cpu-federation-" + runID
+	foreignNamespace := "tests-cpu-foreign-" + runID
+	for _, name := range []string{namespace, foreignNamespace} {
+		tc.createFixtureResource(t, gvk.Namespace, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}})
+		t.Cleanup(func() {
+			tc.DeleteResource(
+				WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: name}),
+				WithIgnoreNotFound(true), WithWaitForDeletion(true), WithEventuallyTimeout(5*time.Minute),
+			)
+		})
+	}
+
+	quotaKind := schema.GroupVersionKind{Version: "v1", Kind: "ResourceQuota"}
+	quotas := []corev1.ResourceQuota{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "cpu-quota-a", Namespace: namespace},
+			Spec: corev1.ResourceQuotaSpec{Hard: corev1.ResourceList{
+				corev1.ResourceRequestsCPU: resource.MustParse("2"),
+				corev1.ResourceLimitsCPU:   resource.MustParse("4"),
+			}},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "cpu-quota-b", Namespace: namespace},
+			Spec: corev1.ResourceQuotaSpec{Hard: corev1.ResourceList{
+				corev1.ResourceCPU: resource.MustParse("3"),
+			}},
+		},
+	}
+	for i := range quotas {
+		quota := &quotas[i]
+		tc.createFixtureResource(t, quotaKind, quota)
+		tc.g.Eventually(func() error {
+			var current corev1.ResourceQuota
+			if err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: quota.Name, Namespace: namespace}, &current); err != nil {
+				return err
+			}
+			if len(current.Status.Hard) != len(quota.Spec.Hard) {
+				return fmt.Errorf("quota %s has not initialized", quota.Name)
+			}
+			return nil
+		}, 2*time.Minute, 5*time.Second).Should(Succeed(), "quota accounting must initialize before creating the fixture pod")
+	}
+
+	const podName = "cpu-limit-fixture"
+	tc.createFixtureResource(t, gvk.Pod, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace},
+		Spec: corev1.PodSpec{
+			SecurityContext: fixturePodSecurityContext(),
+			Containers: []corev1.Container{{
+				Name: "fixture", Image: tenantMetricsImage,
+				SecurityContext: fixtureContainerSecurityContext(),
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("64Mi")},
+					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("256Mi")},
+				},
+			}},
+		},
+	})
+
+	viewer := tc.metricsViewerToken(t, "cpu-federation-viewer", namespace)
+	foreignViewer := tc.metricsViewerToken(t, "cpu-federation-foreign-viewer", foreignNamespace)
+	rootCAs := clusterIngressCAPool(t, tc)
+	routeHost := tc.fetchPrometheusRouteHost(t)
+	checks := []struct {
+		query string
+		want  float64
+	}{
+		{`kube_resourcequota{resourcequota="cpu-quota-a",resource="requests.cpu",type="hard",odh_federation_source="model-resources"}`, 2},
+		{`kube_resourcequota{resourcequota="cpu-quota-a",resource="requests.cpu",type="used",odh_federation_source="model-resources"}`, 0.1},
+		{`kube_resourcequota{resourcequota="cpu-quota-a",resource="limits.cpu",type="hard",odh_federation_source="model-resources"}`, 4},
+		{`kube_resourcequota{resourcequota="cpu-quota-a",resource="limits.cpu",type="used",odh_federation_source="model-resources"}`, 0.5},
+		{`kube_resourcequota{resourcequota="cpu-quota-b",resource="cpu",type="hard",odh_federation_source="model-resources"}`, 3},
+		{`kube_resourcequota{resourcequota="cpu-quota-b",resource="cpu",type="used",odh_federation_source="model-resources"}`, 0.1},
+		{`kube_pod_container_resource_limits{pod="cpu-limit-fixture",container="fixture",resource="cpu",unit="core",odh_federation_source="model-resources"}`, 0.5},
+	}
+	for _, check := range checks {
+		tc.g.Eventually(func() error {
+			status, response, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, viewer, namespace, check.query)
+			if err != nil {
+				return err
+			}
+			if status != http.StatusOK || len(response.Data.Result) == 0 {
+				return fmt.Errorf("query %q: HTTP %d, %d series", check.query, status, len(response.Data.Result))
+			}
+			for _, result := range response.Data.Result {
+				if result.Metric["namespace"] != namespace || len(result.Value) != 2 {
+					return fmt.Errorf("query %q returned invalid namespace or value", check.query)
+				}
+				valueText, ok := result.Value[1].(string)
+				if !ok {
+					return fmt.Errorf("query %q returned non-string value", check.query)
+				}
+				value, err := strconv.ParseFloat(valueText, 64)
+				if err != nil || math.IsNaN(value) || math.Abs(value-check.want) > 0.000001 {
+					return fmt.Errorf("query %q value %q, want %v", check.query, valueText, check.want)
+				}
+			}
+			return nil
+		}, 10*time.Minute, 15*time.Second).Should(Succeed(), "federated quota and limit values must reach the Data Science namespace proxy")
+
+		status, response, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, foreignViewer, foreignNamespace, check.query)
+		if err != nil || status != http.StatusOK || len(response.Data.Result) != 0 {
+			t.Fatalf("foreign namespace must not see query %q: HTTP %d, %d series, error=%v", check.query, status, len(response.Data.Result), err)
+		}
+	}
+}

@@ -11,6 +11,8 @@ import (
 
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
+	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 )
 
 func TestDCGMMetricsAreRetainedWithOriginalNames(t *testing.T) {
@@ -21,7 +23,7 @@ func TestDCGMMetricsAreRetainedWithOriginalNames(t *testing.T) {
 
 	templateContent := string(templateBytes)
 
-	dcgmJob := extractSection(templateContent, "job_name: 'dcgm-exporter-accelerator-metrics'", "{{- end }}")
+	dcgmJob := extractSection(templateContent, "job_name: 'trusted-dcgm-exporter'", "\n      {{- else }}")
 	if dcgmJob == "" {
 		t.Fatal("dcgm-exporter-accelerator-metrics job must exist in template")
 	}
@@ -30,10 +32,11 @@ func TestDCGMMetricsAreRetainedWithOriginalNames(t *testing.T) {
 	if relabelSection == "" {
 		t.Fatal("relabel_configs section must be extractable from dcgm job")
 	}
-	metricRelabelSection := extractSection(dcgmJob, "metric_relabel_configs:", "scrape_interval:")
-	if metricRelabelSection == "" {
+	metricRelabelIndex := strings.Index(dcgmJob, "metric_relabel_configs:")
+	if metricRelabelIndex < 0 {
 		t.Fatal("metric_relabel_configs section must be extractable from dcgm job")
 	}
+	metricRelabelSection := dcgmJob[metricRelabelIndex:]
 
 	dcgmMetrics := []string{
 		"DCGM_FI_DEV_GPU_TEMP",
@@ -120,12 +123,13 @@ func TestModelResourceFederationScrapeIsNarrowAndAuthenticated(t *testing.T) {
 	assertAuthenticatedModelResourceFederationJob(t, job)
 
 	params, found, err := unstructured.NestedStringSlice(job, "params", "match[]")
-	if err != nil || !found || len(params) != 2 {
-		t.Fatalf("federation job must have exactly two metric matchers: found=%t params=%v error=%v", found, params, err)
+	if err != nil || !found || len(params) != 3 {
+		t.Fatalf("federation job must have exactly three metric matchers: found=%t params=%v error=%v", found, params, err)
 	}
 	for _, want := range []string{
 		`{__name__="node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate"}`,
-		`{__name__="kube_resourcequota", resource="limits.cpu", type="hard"}`,
+		`{__name__="kube_resourcequota", resource=~"cpu|requests[.]cpu|limits[.]cpu", type=~"hard|used"}`,
+		`{__name__="kube_pod_container_resource_limits", resource="cpu", unit="core"}`,
 	} {
 		if !slices.Contains(params, want) {
 			t.Errorf("federation job is missing matcher %q: %v", want, params)
@@ -396,8 +400,8 @@ func TestWorkloadPipelinesSanitizeSourceMarkers(t *testing.T) {
 	blocks := statementBlocksByContext(t, metricStatements)
 	for _, context := range []string{"resource", "datapoint"} {
 		requireStatements(t, "source marker sanitizer "+context, blocks[context], []string{
-			`delete_matching_keys(attributes, "^odh[^a-zA-Z0-9]federation[^a-zA-Z0-9]source$$")`,
-			`delete_matching_keys(attributes, "^odh[^a-zA-Z0-9]dcgm[^a-zA-Z0-9]source$$")`,
+			`delete_matching_keys(attributes, "^odh[^a-zA-Z0-9]+federation[^a-zA-Z0-9]+source$$")`,
+			`delete_matching_keys(attributes, "^odh[^a-zA-Z0-9]+dcgm[^a-zA-Z0-9]+.*$$")`,
 		})
 	}
 
@@ -405,8 +409,8 @@ func TestWorkloadPipelinesSanitizeSourceMarkers(t *testing.T) {
 	// spellings the Prometheus exporter normalizes to the same marker while
 	// leaving unrelated labels intact.
 	for _, kind := range []string{"federation", "dcgm"} {
-		pattern := regexp.MustCompile(`^odh[^a-zA-Z0-9]` + kind + `[^a-zA-Z0-9]source$`)
-		for _, key := range []string{"odh_" + kind + "_source", "odh." + kind + ".source", "odh-" + kind + "/source"} {
+		pattern := regexp.MustCompile(`^odh[^a-zA-Z0-9]+` + kind + `[^a-zA-Z0-9]+source$`)
+		for _, key := range []string{"odh_" + kind + "_source", "odh." + kind + ".source", "odh-" + kind + "/source", "odh__" + kind + "__source", "odh._-" + kind + "_./source"} {
 			if !pattern.MatchString(key) {
 				t.Errorf("marker sanitizer must remove normalized spelling %q", key)
 			}
@@ -415,6 +419,11 @@ func TestWorkloadPipelinesSanitizeSourceMarkers(t *testing.T) {
 			if pattern.MatchString(key) {
 				t.Errorf("marker sanitizer must preserve unrelated key %q", key)
 			}
+		}
+	}
+	for _, key := range []string{"odh_dcgm_workload_namespace", "odh.dcgm.workload.pod", "odh-dcgm/source", "odh__dcgm__workload__namespace", "odh._dcgm-.workload__pod"} {
+		if !regexp.MustCompile(`^odh[^a-zA-Z0-9]+dcgm[^a-zA-Z0-9]+.*$`).MatchString(key) {
+			t.Errorf("DCGM sanitizer must remove internal attribution label %q", key)
 		}
 	}
 
@@ -445,6 +454,54 @@ func TestWorkloadSourcesCannotMarkDCGMAsVerified(t *testing.T) {
 			}
 			if strings.Contains(fmt.Sprint(processors[processorName]), `set(attributes["odh_dcgm_source"]`) {
 				t.Errorf("%s must not set a verified DCGM marker based on spoofable metadata: %s", name, processorName)
+			}
+		}
+	}
+}
+
+// The Prometheus exporter may replace runs of punctuation with one underscore.
+// Exercise the rendered sanitizer patterns against the spellings that can
+// normalize to reserved markers, not just against the canonical spelling.
+func TestProvenanceSanitizerCoversNormalizedMarkers(t *testing.T) {
+	collector := renderCollectorTemplate(t)
+	processor := renderedProcessors(t, collector)["transform/sanitize_provenance_markers"]
+	processorConfig, ok := processor.(map[string]any)
+	if !ok {
+		t.Fatalf("invalid provenance sanitizer: %v", processor)
+	}
+	blocks, ok := processorConfig["metric_statements"].([]any)
+	if !ok || len(blocks) != 2 {
+		t.Fatalf("invalid provenance sanitizer: %v", processor)
+	}
+	for context, block := range statementBlocksByContext(t, blocks) {
+		statements, ok := block["statements"].([]any)
+		if !ok {
+			t.Fatalf("invalid %s sanitizer statements: %v", context, block)
+		}
+		for _, raw := range statements {
+			statement, ok := raw.(string)
+			if !ok {
+				t.Fatalf("invalid %s sanitizer statement: %v", context, raw)
+			}
+			start := strings.IndexByte(statement, '"')
+			end := strings.LastIndexByte(statement, '"')
+			if start < 0 || end <= start {
+				t.Fatalf("invalid %s statement: %s", context, statement)
+			}
+			pattern := regexp.MustCompile(strings.ReplaceAll(statement[start+1:end], "$$", "$"))
+			kind := "dcgm"
+			suffixes := []string{"source", "workload_namespace", "workload_pod"}
+			if strings.Contains(statement, "federation") {
+				kind = "federation"
+				suffixes = []string{"source"}
+			}
+			for _, separator := range []string{"_", "__", ".", "-", "._-", "🔥"} {
+				for _, suffix := range suffixes {
+					key := "odh" + separator + kind + separator + strings.ReplaceAll(suffix, "_", separator)
+					if !pattern.MatchString(key) {
+						t.Errorf("%s sanitizer must remove %q before normalization", context, key)
+					}
+				}
 			}
 		}
 	}
@@ -487,8 +544,8 @@ func TestCollectorStripsWorkloadSuppliedK8sLabelAttributes(t *testing.T) {
 		t.Fatalf("k8s label sanitize statements have unexpected type: %T", statementBlock["statements"])
 	}
 	expectedStatements := []string{
-		`delete_key(attributes, "k8s_namespace_name")`,
-		`delete_key(attributes, "k8s_pod_name")`,
+		`delete_matching_keys(attributes, "^k8s[^a-zA-Z0-9]+namespace[^a-zA-Z0-9]+name$$")`,
+		`delete_matching_keys(attributes, "^k8s[^a-zA-Z0-9]+pod[^a-zA-Z0-9]+name$$")`,
 	}
 	if len(statements) != len(expectedStatements) {
 		t.Fatalf("expected %d k8s label sanitize statements, got %d", len(expectedStatements), len(statements))
@@ -713,6 +770,8 @@ func TestOTLPPipelineSanitizesClientSuppliedIdentity(t *testing.T) {
 		`delete_key(attributes, "container.id")`,
 		`delete_key(attributes, "k8s_namespace_name")`,
 		`delete_key(attributes, "k8s_pod_name")`,
+		`delete_matching_keys(attributes, "^k8s[^a-zA-Z0-9]+namespace[^a-zA-Z0-9]+name$$")`,
+		`delete_matching_keys(attributes, "^k8s[^a-zA-Z0-9]+pod[^a-zA-Z0-9]+name$$")`,
 		`delete_key(attributes, "namespace")`,
 		`delete_key(attributes, "pod")`,
 		`delete_key(attributes, "exported_namespace")`,
@@ -871,13 +930,13 @@ func dcgmScrapeJobName(t *testing.T, collector unstructured.Unstructured) string
 	if err != nil || !found {
 		t.Fatalf("collector config must be present in rendered resource: found=%t, error=%v", found, err)
 	}
-	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus", "config", "scrape_configs")
+	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus/trusted_dcgm", "config", "scrape_configs")
 	if err != nil || !found {
 		t.Fatalf("expected scrape configs in rendered resource: found=%t, error=%v", found, err)
 	}
 	for _, rawScrapeConfig := range scrapeConfigs {
 		scrapeConfig, ok := rawScrapeConfig.(map[string]any)
-		if !ok || scrapeConfig["job_name"] != "dcgm-exporter-accelerator-metrics" {
+		if !ok || scrapeConfig["job_name"] != "trusted-dcgm-exporter" {
 			continue
 		}
 		relabelConfigs, found, err := unstructured.NestedSlice(scrapeConfig, "relabel_configs")
@@ -907,14 +966,14 @@ func TestDCGMMetricRelabelingPreservesDRAAttributionLabels(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("collector config must be present in rendered resource: found=%t, error=%v", found, err)
 	}
-	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus", "config", "scrape_configs")
+	scrapeConfigs, found, err := unstructured.NestedSlice(config, "receivers", "prometheus/trusted_dcgm", "config", "scrape_configs")
 	if err != nil || !found || len(scrapeConfigs) == 0 {
 		t.Fatalf("expected DCGM scrape config in rendered resource: found=%t, error=%v", found, err)
 	}
 	var dcgmJob map[string]any
 	for _, rawScrapeConfig := range scrapeConfigs {
 		scrapeConfig, ok := rawScrapeConfig.(map[string]any)
-		if ok && scrapeConfig["job_name"] == "dcgm-exporter-accelerator-metrics" {
+		if ok && scrapeConfig["job_name"] == "trusted-dcgm-exporter" {
 			dcgmJob = scrapeConfig
 			break
 		}
@@ -931,16 +990,16 @@ func TestDCGMMetricRelabelingPreservesDRAAttributionLabels(t *testing.T) {
 		if !ok {
 			t.Fatal("DCGM metric relabel rule has unexpected type")
 		}
-		if action, _ := rule["action"].(string); action == "labeldrop" || action == "labelkeep" {
-			t.Errorf("metric relabel rule must not remove DRA attribution labels: %v", rule)
+		if rule["action"] == "labeldrop" && rule["regex"] != `odh[^a-zA-Z0-9]+dcgm[^a-zA-Z0-9]+.*` {
+			t.Errorf("only internal provenance labels may be dropped: %v", rule)
 		}
 		for _, label := range []string{"pod", "namespace", "dra_claim_name"} {
-			if strings.Contains(fmt.Sprint(rule), label) {
+			if rule["target_label"] == label {
 				t.Errorf("metric relabel rule must not modify DRA attribution label %q: %v", label, rule)
 			}
 		}
 	}
-	keepRule, ok := metricRelabelConfigs[len(metricRelabelConfigs)-1].(map[string]any)
+	keepRule, ok := metricRelabelConfigs[0].(map[string]any)
 	if !ok {
 		t.Fatal("final DCGM metric relabel rule has unexpected type")
 	}
@@ -978,7 +1037,16 @@ func renderCollectorTemplateWithOptionsAndStorage(t *testing.T, acceleratorMetri
 	return renderCollectorTemplateWithExporters(t, acceleratorMetrics, builtinDCGMScrapeEnabled, metricsStorage, 1, nil)
 }
 
-func renderCollectorTemplateWithExporters(t *testing.T, acceleratorMetrics, builtinDCGMScrapeEnabled, metricsStorage bool, replicas int, exporterNames []string) unstructured.Unstructured {
+func renderCollectorTemplateWithExporters(
+	t *testing.T, acceleratorMetrics, builtinDCGMScrapeEnabled, metricsStorage bool, replicas int, exporterNames []string,
+) unstructured.Unstructured {
+	t.Helper()
+	return renderCollectorTemplateWithTLS(t, acceleratorMetrics, builtinDCGMScrapeEnabled, metricsStorage, replicas, exporterNames, nil)
+}
+
+func renderCollectorTemplateWithTLS(
+	t *testing.T, acceleratorMetrics, builtinDCGMScrapeEnabled, metricsStorage bool, replicas int, exporterNames []string, dcgmTLS *v1alpha1.DCGMTLS,
+) unstructured.Unstructured {
 	t.Helper()
 	exporters := make(map[string]string, len(exporterNames))
 	for _, name := range exporterNames {
@@ -993,6 +1061,7 @@ func renderCollectorTemplateWithExporters(t *testing.T, acceleratorMetrics, buil
 		"MetricsStorage":                  metricsStorage,
 		"AcceleratorMetrics":              acceleratorMetrics,
 		"BuiltinDCGMScrapeEnabled":        builtinDCGMScrapeEnabled,
+		"BuiltinDCGMTLS":                  dcgmTLS,
 		"Traces":                          false,
 		"CollectorReplicas":               replicas,
 		"CollectorCPULimit":               "1",
@@ -1088,7 +1157,7 @@ func TestDCGMScrapeJobRetainsDiscoveryAndRelabeling(t *testing.T) {
 		"__address__": "$1:9400",
 		"node":        "__meta_kubernetes_pod_node_name",
 		"component":   "__meta_kubernetes_pod_label_app",
-		"job":         "rhoai-accelerator-metrics",
+		"job":         "rhoai-accelerator-discovery",
 	}
 	for targetLabel, expected := range expectedRules {
 		if !hasPrometheusRelabelRule(relabelRules, targetLabel, expected) {

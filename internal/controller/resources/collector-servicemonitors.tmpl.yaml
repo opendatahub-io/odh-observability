@@ -54,7 +54,9 @@ spec:
       # exporter's resource_to_telemetry_conversion exposes them as labels.
       # The transform/sanitize_k8s_labels processor strips workload-supplied
       # attributes with the same names and excludes the dcgm-exporter job,
-      # so only collector-derived workload values are promoted. Workload-
+      # so this first promotion uses collector-derived workload values. The
+      # separate verified-DCGM promotion below uses exporter workload labels.
+      # Workload-
       # supplied namespace/pod/job labels keep receiving the exported_ prefix
       # from this scrape, exactly as before (Korrel8r relies on
       # exported_namespace/exported_pod). Do NOT set honorLabels: it would
@@ -62,9 +64,10 @@ spec:
       metricRelabelings:
         # Static federation is configured on every replicated collector. The
         # resource-only ServiceMonitor below selects ordinal 0, so exclude
-        # these series from the all-collector scrape to prevent duplicates.
-        - sourceLabels: [__name__]
-          regex: 'node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate|kube_resourcequota'
+        # marked federation series from the all-collector scrape. Workload
+        # pipelines strip this marker, even from similarly named metrics.
+        - sourceLabels: [odh_federation_source]
+          regex: model-resources
           action: drop
         - sourceLabels: [k8s_namespace_name]
           regex: (.+)
@@ -72,6 +75,16 @@ spec:
         - sourceLabels: [k8s_pod_name]
           regex: (.+)
           targetLabel: pod
+        # Only the isolated built-in receiver can set these labels. Require
+        # both workload identity fields before promoting either one.
+        - sourceLabels: [odh_dcgm_source, odh_dcgm_workload_namespace, odh_dcgm_workload_pod]
+          regex: 'verified;([^;]+);([^;]+)'
+          targetLabel: namespace
+          replacement: '$1'
+        - sourceLabels: [odh_dcgm_source, odh_dcgm_workload_namespace, odh_dcgm_workload_pod]
+          regex: 'verified;([^;]+);([^;]+)'
+          targetLabel: pod
+          replacement: '$2'
   namespaceSelector:
     matchNames:
       - {{.Namespace}}

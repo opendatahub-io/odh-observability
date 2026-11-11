@@ -13,7 +13,7 @@ import (
 // metricRelabelings, and must not set honorLabels (which would trust
 // workload-supplied labels and drop the exported_namespace/exported_pod
 // labels Korrel8r relies on).
-func TestCollectorServiceMonitorsPrometheusEndpointConfig(t *testing.T) {
+func TestCollectorServiceMonitorsPrometheusEndpointConfig(t *testing.T) { //nolint:gocyclo // Validate related trust-boundary relabel rules together.
 	resources := renderObservabilityTemplate(t, CollectorServiceMonitorsTemplate, map[string]any{
 		"Namespace":      "redhat-ods-monitoring",
 		"Metrics":        true,
@@ -39,14 +39,14 @@ func TestCollectorServiceMonitorsPrometheusEndpointConfig(t *testing.T) {
 		{sourceLabels: []string{"k8s_namespace_name"}, targetLabel: "namespace"},
 		{sourceLabels: []string{"k8s_pod_name"}, targetLabel: "pod"},
 	}
-	if len(relabels) != len(want)+1 {
-		t.Fatalf("expected %d metricRelabelings, got %d", len(want)+1, len(relabels))
+	if len(relabels) != len(want)+3 {
+		t.Fatalf("expected %d metricRelabelings, got %d", len(want)+3, len(relabels))
 	}
 	dropRule, ok := relabels[0].(map[string]any)
-	if !ok || dropRule["action"] != "drop" || dropRule["regex"] != "node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate|kube_resourcequota" {
-		t.Fatalf("first metricRelabeling must exclude federated resource metrics: %v", relabels[0])
+	if !ok || dropRule["action"] != "drop" || dropRule["regex"] != "model-resources" || !containsString(dropRule["sourceLabels"], "odh_federation_source") {
+		t.Fatalf("first metricRelabeling must exclude marked federation samples, not same-named workload metrics: %v", relabels[0])
 	}
-	for i, raw := range relabels[1:] {
+	for i, raw := range relabels[1:3] {
 		relabel, ok := raw.(map[string]any)
 		if !ok {
 			t.Fatalf("metricRelabelings[%d] has unexpected type: %T", i, raw)
@@ -62,6 +62,14 @@ func TestCollectorServiceMonitorsPrometheusEndpointConfig(t *testing.T) {
 		}
 		if action, present := relabel["action"]; present && action != "replace" {
 			t.Errorf("metricRelabelings[%d].action = %v, want unset or %q", i, action, "replace")
+		}
+	}
+	for i, target := range []string{"namespace", "pod"} {
+		rule, ok := relabels[i+3].(map[string]any)
+		if !ok || rule["targetLabel"] != target || rule["regex"] != `verified;([^;]+);([^;]+)` || rule["replacement"] != []string{"$1", "$2"}[i] ||
+			!containsString(rule["sourceLabels"], "odh_dcgm_source") || !containsString(rule["sourceLabels"], "odh_dcgm_workload_namespace") ||
+			!containsString(rule["sourceLabels"], "odh_dcgm_workload_pod") {
+			t.Errorf("trusted DCGM identity promotion rule %d is invalid: %v", i, relabels[i+3])
 		}
 	}
 

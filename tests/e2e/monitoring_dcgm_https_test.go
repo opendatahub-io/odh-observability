@@ -48,7 +48,7 @@ const (
 // The Prometheus fixture's build-info metric is renamed to a canonical DCGM
 // name by the test-only monitor relabeling, so no GPU hardware or NVIDIA
 // exporter is required.
-func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMonitor(t *testing.T) {
+func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMonitor(t *testing.T) { //nolint:maintidx // Keep the TLS and spoofing checks in one fixture.
 	t.Helper()
 	tc = tc.WithT(t)
 	tc.setupMetrics(t)
@@ -147,7 +147,7 @@ func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMon
 			if result.Metric["exported_job"] == "rhoai-accelerator-metrics" &&
 				result.Metric["node"] != "" &&
 				result.Metric["component"] == "nvidia-dcgm-exporter" {
-				if result.Metric["odh_dcgm_source"] != "" {
+				if result.Metric["odh_dcgm_source"] != "" || result.Metric["odh_dcgm_workload_namespace"] != "" || result.Metric["odh_dcgm_workload_pod"] != "" {
 					return fmt.Errorf("tenant monitor forged DCGM provenance: %v", result.Metric)
 				}
 				if result.Metric["exported_namespace"] != dcgmSpoofedNamespace || result.Metric["exported_pod"] != dcgmSpoofedPod {
@@ -162,7 +162,9 @@ func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMon
 	// The monitor impersonates the DCGM job/component and supplies a verified
 	// marker plus another workload's labels. Recording rules must retain the
 	// actual source namespace rather than promote those forged labels.
-	recordQuery := fmt.Sprintf(`accelerator_gpu_utilization{namespace=%q,exported_job="rhoai-accelerator-metrics",component="nvidia-dcgm-exporter",exported_namespace=%q,exported_pod=%q}`, namespace, dcgmSpoofedNamespace, dcgmSpoofedPod)
+	recordQuery := fmt.Sprintf(`accelerator_gpu_utilization{namespace=%q,exported_job="rhoai-accelerator-metrics",`+
+		`component="nvidia-dcgm-exporter",exported_namespace=%q,exported_pod=%q}`,
+		namespace, dcgmSpoofedNamespace, dcgmSpoofedPod)
 	tc.g.Eventually(func() error {
 		status, response, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, viewerToken, namespace, recordQuery)
 		if err != nil {
@@ -400,7 +402,9 @@ func dcgmHTTPSExporterPodMonitor(namespace, serverName string) *unstructured.Uns
 						"sourceLabels": []any{"__name__"},
 						"regex":        dcgmHTTPSMetricFilter,
 					},
-					map[string]any{"action": "replace", "targetLabel": "odh_dcgm_source", "replacement": "verified"},
+					map[string]any{"action": "replace", "targetLabel": "odh__dcgm__source", "replacement": "verified"},
+					map[string]any{"action": "replace", "targetLabel": "odh__dcgm__workload__namespace", "replacement": dcgmSpoofedNamespace},
+					map[string]any{"action": "replace", "targetLabel": "odh__dcgm__workload__pod", "replacement": dcgmSpoofedPod},
 					map[string]any{"action": "replace", "targetLabel": "exported_namespace", "replacement": dcgmSpoofedNamespace},
 					map[string]any{"action": "replace", "targetLabel": "exported_pod", "replacement": dcgmSpoofedPod},
 				},
