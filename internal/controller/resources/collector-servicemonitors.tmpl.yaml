@@ -62,10 +62,8 @@ spec:
       # exported_namespace/exported_pod). Do NOT set honorLabels: it would
       # trust workload-supplied labels and drop those exported_ labels.
       metricRelabelings:
-        # Static federation is configured on every replicated collector. The
-        # resource-only ServiceMonitor below selects ordinal 0, so exclude
-        # marked federation series from the all-collector scrape. Workload
-        # pipelines strip this marker, even from similarly named metrics.
+        # Defense in depth: federation uses a separate exporter, and workload
+        # pipelines strip this marker even from similarly named metrics.
         - sourceLabels: [odh_federation_source]
           regex: model-resources
           action: drop
@@ -110,7 +108,7 @@ metadata:
     monitoring.opendatahub.io/scrape: "true"
 spec:
   endpoints:
-    - port: prometheus
+    - port: federation
       scheme: https
       tlsConfig:
         caFile: /etc/prometheus/secrets/prometheus-web-tls-ca/service-ca.crt

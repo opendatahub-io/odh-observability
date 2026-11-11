@@ -262,8 +262,9 @@ spec:
     processors:
       memory_limiter:
         check_interval: 1s
-        spike_limit_mib: 800
-        limit_mib: 4000
+        # Keep the heap hard limit below the default 256 MiB container limit.
+        spike_limit_mib: 50
+        limit_mib: 200
       batch:
         send_batch_size: 10000
       k8sattributes: {}
@@ -396,6 +397,15 @@ spec:
           key_file: "/etc/otel-collector/tls/tls.key"
         resource_to_telemetry_conversion:
           enabled: true # by default resource attributes are dropped
+      # A separate registry prevents workload-controlled metric descriptors
+      # from colliding with the trusted federated metric families.
+      prometheus/federation:
+        endpoint: 0.0.0.0:8891
+        tls:
+          cert_file: "/etc/otel-collector/tls/tls.crt"
+          key_file: "/etc/otel-collector/tls/tls.key"
+        resource_to_telemetry_conversion:
+          enabled: true
       {{- end }}
       {{- if .MetricsExporterNames }}
       {{- range .MetricsExporterNames }}
@@ -462,7 +472,7 @@ spec:
           processors: [memory_limiter, batch]
           # Every replica federates; only the ordinal-0 MonitoringStack scrape
           # deduplicates these samples. Do not send them to custom exporters.
-          exporters: [prometheus]
+          exporters: [prometheus/federation]
       {{- end }}
         # OTLP metrics enter through a dedicated pipeline so client-supplied
         # identity attributes can be stripped before trusted, connection-based

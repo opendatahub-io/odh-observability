@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
@@ -186,8 +187,25 @@ func TestModelResourceFederationIsOmittedWithoutMetricsStorage(t *testing.T) {
 	} else if found {
 		t.Fatal("model-resource federation receiver must not render without metrics storage")
 	}
+	if _, found, err := unstructured.NestedMap(config, "exporters", "prometheus/federation"); err != nil || found {
+		t.Fatalf("federation exporter must not render without metrics storage: found=%t error=%v", found, err)
+	}
 	if containsString(metricsPipelines(t, collector)["metrics/scrape"]["receivers"], "prometheus/cluster_resources") {
 		t.Fatal("metrics/scrape pipeline must not include model-resource federation without metrics storage")
+	}
+}
+
+func TestCollectorMemoryLimiterFitsDefaultContainerLimit(t *testing.T) {
+	collector := renderCollectorTemplate(t)
+	limiter, found, err := unstructured.NestedMap(collector.Object, "spec", "config", "processors", "memory_limiter")
+	if err != nil || !found {
+		t.Fatalf("memory limiter must be configured: found=%t error=%v", found, err)
+	}
+	hard, hardOK := limiter["limit_mib"].(int64)
+	spike, spikeOK := limiter["spike_limit_mib"].(int64)
+	containerLimit := resource.MustParse(defaultCollectorMemoryLimit)
+	if !hardOK || !spikeOK || spike <= 0 || spike >= hard || hard*(1<<20) >= containerLimit.Value() {
+		t.Fatalf("memory limits must be positive, with spike < hard < container limit %s: %v", defaultCollectorMemoryLimit, limiter)
 	}
 }
 
@@ -878,8 +896,16 @@ func TestFederationExcludesCustomExporters(t *testing.T) {
 				}
 				return
 			}
-			if !found || !reflect.DeepEqual(federation["exporters"], []any{"prometheus"}) {
-				t.Errorf("federation must export only to built-in storage: %v", federation)
+			if !found || !reflect.DeepEqual(federation["exporters"], []any{"prometheus/federation"}) {
+				t.Errorf("federation must export only to its isolated storage endpoint: %v", federation)
+			}
+			exporter, found, err := unstructured.NestedMap(collector.Object, "spec", "config", "exporters", "prometheus/federation")
+			if err != nil || !found || exporter["endpoint"] != "0.0.0.0:8891" {
+				t.Fatalf("federation exporter must use the dedicated endpoint: found=%t exporter=%v error=%v", found, exporter, err)
+			}
+			tls, found, err := unstructured.NestedMap(exporter, "tls")
+			if err != nil || !found || tls["cert_file"] != "/etc/otel-collector/tls/tls.crt" || tls["key_file"] != "/etc/otel-collector/tls/tls.key" {
+				t.Errorf("federation exporter must use the collector serving certificate: found=%t tls=%v error=%v", found, tls, err)
 			}
 		})
 	}

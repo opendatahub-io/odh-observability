@@ -19,8 +19,8 @@ import (
 	. "github.com/onsi/gomega" //nolint:revive // dot import is idiomatic for gomega matchers
 )
 
-// ValidateModelResourceFederation checks real quota and container-limit
-// values through the Data Science namespace proxy, including tenant isolation.
+// ValidateModelResourceFederation checks quota, container-limit and CPU-usage
+// series through the Data Science namespace proxy, including tenant isolation.
 func (tc *MonitoringTestCtx) ValidateModelResourceFederation(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
@@ -91,16 +91,25 @@ func (tc *MonitoringTestCtx) ValidateModelResourceFederation(t *testing.T) {
 	rootCAs := clusterIngressCAPool(t, tc)
 	routeHost := tc.fetchPrometheusRouteHost(t)
 	checks := []struct {
-		query string
-		want  float64
+		query         string
+		want          float64
+		variableValue bool
+		podLabels     bool
 	}{
-		{`kube_resourcequota{resourcequota="cpu-quota-a",resource="requests.cpu",type="hard",odh_federation_source="model-resources"}`, 2},
-		{`kube_resourcequota{resourcequota="cpu-quota-a",resource="requests.cpu",type="used",odh_federation_source="model-resources"}`, 0.1},
-		{`kube_resourcequota{resourcequota="cpu-quota-a",resource="limits.cpu",type="hard",odh_federation_source="model-resources"}`, 4},
-		{`kube_resourcequota{resourcequota="cpu-quota-a",resource="limits.cpu",type="used",odh_federation_source="model-resources"}`, 0.5},
-		{`kube_resourcequota{resourcequota="cpu-quota-b",resource="cpu",type="hard",odh_federation_source="model-resources"}`, 3},
-		{`kube_resourcequota{resourcequota="cpu-quota-b",resource="cpu",type="used",odh_federation_source="model-resources"}`, 0.1},
-		{`kube_pod_container_resource_limits{pod="cpu-limit-fixture",container="fixture",resource="cpu",unit="core",odh_federation_source="model-resources"}`, 0.5},
+		{query: `kube_resourcequota{resourcequota="cpu-quota-a",resource="requests.cpu",type="hard",odh_federation_source="model-resources"}`, want: 2},
+		{query: `kube_resourcequota{resourcequota="cpu-quota-a",resource="requests.cpu",type="used",odh_federation_source="model-resources"}`, want: 0.1},
+		{query: `kube_resourcequota{resourcequota="cpu-quota-a",resource="limits.cpu",type="hard",odh_federation_source="model-resources"}`, want: 4},
+		{query: `kube_resourcequota{resourcequota="cpu-quota-a",resource="limits.cpu",type="used",odh_federation_source="model-resources"}`, want: 0.5},
+		{query: `kube_resourcequota{resourcequota="cpu-quota-b",resource="cpu",type="hard",odh_federation_source="model-resources"}`, want: 3},
+		{query: `kube_resourcequota{resourcequota="cpu-quota-b",resource="cpu",type="used",odh_federation_source="model-resources"}`, want: 0.1},
+		{
+			query: `kube_pod_container_resource_limits{pod="cpu-limit-fixture",container="fixture",resource="cpu",unit="core",odh_federation_source="model-resources"}`,
+			want:  0.5, podLabels: true,
+		},
+		{
+			query:         `node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate{pod="cpu-limit-fixture",container="fixture",odh_federation_source="model-resources"}`,
+			variableValue: true, podLabels: true,
+		},
 	}
 	for _, check := range checks {
 		tc.g.Eventually(func() error {
@@ -115,17 +124,23 @@ func (tc *MonitoringTestCtx) ValidateModelResourceFederation(t *testing.T) {
 				if result.Metric["namespace"] != namespace || len(result.Value) != 2 {
 					return fmt.Errorf("query %q returned invalid namespace or value", check.query)
 				}
+				if check.podLabels && (result.Metric["pod"] != podName || result.Metric["container"] != "fixture") {
+					return fmt.Errorf("query %q returned invalid pod or container", check.query)
+				}
 				valueText, ok := result.Value[1].(string)
 				if !ok {
 					return fmt.Errorf("query %q returned non-string value", check.query)
 				}
 				value, err := strconv.ParseFloat(valueText, 64)
-				if err != nil || math.IsNaN(value) || math.Abs(value-check.want) > 0.000001 {
+				if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+					return fmt.Errorf("query %q returned non-finite value %q", check.query, valueText)
+				}
+				if !check.variableValue && math.Abs(value-check.want) > 0.000001 {
 					return fmt.Errorf("query %q value %q, want %v", check.query, valueText, check.want)
 				}
 			}
 			return nil
-		}, 10*time.Minute, 15*time.Second).Should(Succeed(), "federated quota and limit values must reach the Data Science namespace proxy")
+		}, 10*time.Minute, 15*time.Second).Should(Succeed(), "federated resource series must reach the Data Science namespace proxy")
 
 		status, response, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, foreignViewer, foreignNamespace, check.query)
 		if err != nil || status != http.StatusOK || len(response.Data.Result) != 0 {

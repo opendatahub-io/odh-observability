@@ -122,7 +122,7 @@ func (tc *MonitoringTestCtx) ValidateCollectorNetworkPolicyContract(t *testing.T
 		"app.kubernetes.io/instance": "data-science-monitoringstack",
 		"app.kubernetes.io/name":     "prometheus",
 	}, collectorPolicy.Spec.Ingress[0].From[0].PodSelector.MatchLabels)
-	require.Equal(t, []int32{8889, 8890}, networkPolicyPorts(collectorPolicy.Spec.Ingress[0]))
+	require.Equal(t, []int32{8889, 8890, 8891}, networkPolicyPorts(collectorPolicy.Spec.Ingress[0]))
 	require.NotContains(t, networkPolicyPorts(collectorPolicy.Spec.Ingress[0]), int32(8888))
 	require.Len(t, collectorPolicy.Spec.Ingress[1].From, 2)
 	require.Equal(t, map[string]string{"app.kubernetes.io/part-of": "llminferenceservice"},
@@ -169,6 +169,7 @@ func (tc *MonitoringTestCtx) runCollectorNetworkPolicyProbes(t *testing.T, colle
 	collectorEndpoints := []string{
 		fmt.Sprintf("https://data-science-collector-prometheus.%s.svc.cluster.local:8889/metrics", tc.MonitoringNamespace),
 		fmt.Sprintf("https://data-science-collector-monitoring.%s.svc.cluster.local:8890/metrics", tc.MonitoringNamespace),
+		fmt.Sprintf("https://data-science-prometheus-resources.%s.svc.cluster.local:8891/metrics", tc.MonitoringNamespace),
 	}
 	prometheusLabels := map[string]string{
 		"app.kubernetes.io/name":       "prometheus",

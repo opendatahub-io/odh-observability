@@ -16,10 +16,10 @@ metadata:
     app.kubernetes.io/part-of: opentelemetry
 spec:
   ports:
-  - name: prometheus
-    port: 8889
+  - name: federation
+    port: 8891
     protocol: TCP
-    targetPort: 8889
+    targetPort: 8891
   selector:
     app.kubernetes.io/component: opentelemetry-collector
     app.kubernetes.io/instance: {{.Namespace}}.data-science-collector

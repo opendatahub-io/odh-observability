@@ -75,6 +75,9 @@ func TestCollectorServiceMonitorsPrometheusEndpointConfig(t *testing.T) { //noli
 
 	resourceSM := findRenderedResource(t, resources, "ServiceMonitor", "data-science-prometheus-resources-monitor")
 	resourceEndpoint := singleEndpoint(t, resourceSM)
+	if resourceEndpoint["port"] != "federation" {
+		t.Errorf("resource endpoint must select the dedicated federation port: %v", resourceEndpoint["port"])
+	}
 	if honorLabels, found, err := unstructured.NestedBool(resourceEndpoint, "honorLabels"); err != nil || !found || !honorLabels {
 		t.Errorf("resource endpoint must honor trusted federated labels: found=%t value=%t error=%v", found, honorLabels, err)
 	}
@@ -124,6 +127,14 @@ func TestResourcePrometheusServiceSelectsOnlyOrdinalZero(t *testing.T) {
 		"Namespace": "redhat-ods-monitoring",
 	})
 	service := findRenderedResource(t, resources, "Service", "data-science-prometheus-resources")
+	ports, found, err := unstructured.NestedSlice(service.Object, "spec", "ports")
+	if err != nil || !found || len(ports) != 1 {
+		t.Fatalf("resource service must have one port: found=%t ports=%v error=%v", found, ports, err)
+	}
+	port, ok := ports[0].(map[string]any)
+	if !ok || port["name"] != "federation" || port["port"] != int64(8891) || port["targetPort"] != int64(8891) {
+		t.Fatalf("resource service must target the dedicated federation exporter: %v", ports[0])
+	}
 	selector, found, err := unstructured.NestedStringMap(service.Object, "spec", "selector")
 	if err != nil || !found {
 		t.Fatalf("resource Prometheus service must have a selector: found=%t error=%v", found, err)

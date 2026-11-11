@@ -1054,7 +1054,7 @@ func rawBytesFrom(rawConfig runtime.RawExtension) []byte {
 }
 
 func isReservedName(n string) bool {
-	return n == "otlp/tempo" || n == "prometheus"
+	return n == "otlp/tempo" || n == "prometheus" || n == "prometheus/federation"
 }
 
 func isLocalServiceEndpoint(endpoint string) bool {
