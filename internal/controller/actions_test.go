@@ -4312,7 +4312,32 @@ func usageLogsCredentialSecret() *corev1.Secret {
 			Name:      "hub-usage-logs-auth",
 			Namespace: "test-ns",
 		},
-		Data: map[string][]byte{"token": []byte("not-a-real-token")},
+		Data: map[string][]byte{
+			"token":  []byte("not-a-real-token"),
+			"ca.crt": []byte("not-a-real-ca"),
+		},
+	}
+}
+
+func assertUsageLogsCredentialItems(t *testing.T, credentialVolume map[string]any) {
+	t.Helper()
+
+	items, found, err := unstructured.NestedSlice(credentialVolume, "secret", "items")
+	if err != nil || !found {
+		t.Fatalf("credential Secret projection missing: %v", err)
+	}
+	projected := make(map[string]string, len(items))
+	for _, rawItem := range items {
+		item, ok := rawItem.(map[string]any)
+		if !ok {
+			t.Fatalf("invalid credential Secret item: %v", rawItem)
+		}
+		key, _ := item["key"].(string)
+		path, _ := item["path"].(string)
+		projected[key] = path
+	}
+	if want := map[string]string{"token": "token", "ca.crt": "ca.crt"}; !maps.Equal(projected, want) {
+		t.Errorf("credential Secret projection: want %v, got %v", want, projected)
 	}
 }
 
@@ -4480,10 +4505,14 @@ func TestDeployUsageLogsCollector_RemoteExporters(t *testing.T) {
 	if name, _, _ := unstructured.NestedString(credentialVolume, "secret", "secretName"); name != "hub-usage-logs-auth" {
 		t.Errorf("volume does not reference the credential Secret: %v", credentialVolume)
 	}
+	assertUsageLogsCredentialItems(t, credentialVolume)
 	// The authenticator is attached by the controller, not written by the user:
 	// exporter configs are validated against an allowlist that excludes auth.
 	if a, _, _ := unstructured.NestedString(exporters, "otlphttp/hub", "auth", "authenticator"); a != "bearertokenauth/remote" {
 		t.Errorf("controller did not attach the authenticator to the exporter, got %q", a)
+	}
+	if caFile, _, _ := unstructured.NestedString(exporters, "otlphttp/hub", "tls", "ca_file"); caFile != "/var/run/secrets/usage-logs-remote/ca.crt" {
+		t.Errorf("remote exporter does not trust the mounted hub CA: %q", caFile)
 	}
 
 	// The local write must keep using the collector's own ServiceAccount token.
