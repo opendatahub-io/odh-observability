@@ -1627,6 +1627,7 @@ func TestDeployLokiStack_LogsOnlyNoUsageLogs(t *testing.T) {
 		LokiStackTemplate,
 		LokiStackNetworkPolicyTemplate,
 		LokiStackGatewayNetworkPolicyTemplate,
+		LokiApplicationLogsRBACTemplate,
 		ClusterLogForwarderTemplate,
 		ClusterLogForwarderRBACTemplate,
 		ClusterLogForwarderNetworkPolicyTemplate,
@@ -1769,6 +1770,7 @@ func TestDeployLokiStack_BothConfigured(t *testing.T) {
 		LokiStackTemplate,
 		LokiStackNetworkPolicyTemplate,
 		LokiStackGatewayNetworkPolicyTemplate,
+		LokiApplicationLogsRBACTemplate,
 		ClusterLogForwarderTemplate,
 		ClusterLogForwarderRBACTemplate,
 		ClusterLogForwarderNetworkPolicyTemplate,
@@ -3193,6 +3195,7 @@ func TestDeployLokiStack_UnobservableStateReportsUnknown(t *testing.T) {
 	assertTemplatePaths(t, sources, []string{
 		UsageLogsLokiStackTemplate, UsageLogsLokiStackNPTemplate,
 		LokiStackTemplate, LokiStackNetworkPolicyTemplate, LokiStackGatewayNetworkPolicyTemplate,
+		LokiApplicationLogsRBACTemplate,
 	})
 
 	// Both stacks are configured and both hit the same failure, so both
@@ -3304,6 +3307,7 @@ func TestDeployLokiStack_ReadinessNotFoundMarksFalse(t *testing.T) {
 				LokiStackTemplate,
 				LokiStackNetworkPolicyTemplate,
 				LokiStackGatewayNetworkPolicyTemplate,
+				LokiApplicationLogsRBACTemplate,
 				ClusterLogForwarderTemplate,
 				ClusterLogForwarderRBACTemplate,
 				ClusterLogForwarderNetworkPolicyTemplate,
@@ -3462,6 +3466,7 @@ func TestDeployLokiStack_OneStackFailingDoesNotPoisonTheOther(t *testing.T) {
 	assertTemplatePaths(t, sources, []string{
 		UsageLogsLokiStackTemplate, UsageLogsLokiStackNPTemplate,
 		LokiStackTemplate, LokiStackNetworkPolicyTemplate, LokiStackGatewayNetworkPolicyTemplate,
+		LokiApplicationLogsRBACTemplate,
 		ClusterLogForwarderTemplate, ClusterLogForwarderRBACTemplate, ClusterLogForwarderNetworkPolicyTemplate,
 	})
 

@@ -90,6 +90,7 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["clusterroles"]
     resourceNames:
+      - data-science-application-logs-view
       - data-science-collector-mlflow-trace-export
       - data-science-collector-tempo-trace-export
       - data-science-metrics-view

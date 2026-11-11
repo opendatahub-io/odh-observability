@@ -2101,6 +2101,7 @@ func TestStorageConflictShieldsLokiFromGarbageCollection(t *testing.T) {
 		labelled(controllergvk.LokiStack, ns, lokiStackResourceName, componentLokiLogs),
 		labelled(controllergvk.NetworkPolicy, ns, "data-science-lokistack-ingress", componentLokiLogs),
 		labelled(controllergvk.NetworkPolicy, ns, "data-science-lokistack-gateway-ingress", componentLokiLogs),
+		labelled(controllergvk.ClusterRole, "", "data-science-application-logs-view", componentLokiLogs),
 		labelled(controllergvk.ClusterLogForwarder, clusterLoggingNamespace, clusterLogForwarderResourceName, componentLokiLogs),
 		labelled(controllergvk.ServiceAccount, clusterLoggingNamespace, clusterLogForwarderResourceName+"-collector", componentLokiLogs),
 		labelled(controllergvk.NetworkPolicy, clusterLoggingNamespace, ClusterLogForwarderNetworkPolicyName, componentLokiLogs),
