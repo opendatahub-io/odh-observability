@@ -97,8 +97,12 @@ func TestModelResourceFederationScrapeIsNarrowAndAuthenticated(t *testing.T) {
 	if job == nil {
 		t.Fatal("model-resource federation scrape job must be present")
 	}
-	if !containsString(metricsPipelines(t, collector)["metrics/scrape"]["receivers"], "prometheus/cluster_resources") {
-		t.Fatal("metrics/scrape pipeline must include the model-resource federation receiver")
+	pipelines := metricsPipelines(t, collector)
+	if containsString(pipelines["metrics/scrape"]["receivers"], "prometheus/cluster_resources") {
+		t.Fatal("metrics/scrape pipeline must not include the model-resource federation receiver")
+	}
+	if !containsString(pipelines["metrics/federation"]["receivers"], "prometheus/cluster_resources") {
+		t.Fatal("metrics/federation pipeline must include the model-resource federation receiver")
 	}
 	metricRelabelConfigs, found, err := unstructured.NestedSlice(job, "metric_relabel_configs")
 	if err != nil || !found || len(metricRelabelConfigs) != 2 {
@@ -112,13 +116,32 @@ func TestModelResourceFederationScrapeIsNarrowAndAuthenticated(t *testing.T) {
 	if !ok || metricRelabelRule["action"] != "labeldrop" || metricRelabelRule["regex"] != "prometheus(_replica)?" {
 		t.Errorf("federation job must drop Prometheus replica identity labels: %v", metricRelabelConfigs[1])
 	}
+	assertAuthenticatedModelResourceFederationJob(t, job)
+
+	params, found, err := unstructured.NestedStringSlice(job, "params", "match[]")
+	if err != nil || !found || len(params) != 2 {
+		t.Fatalf("federation job must have exactly two metric matchers: found=%t params=%v error=%v", found, params, err)
+	}
+	for _, want := range []string{
+		`{__name__="node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate"}`,
+		`{__name__="kube_resourcequota", resource="limits.cpu", type="hard"}`,
+	} {
+		if !slices.Contains(params, want) {
+			t.Errorf("federation job is missing matcher %q: %v", want, params)
+		}
+	}
+}
+
+func assertAuthenticatedModelResourceFederationJob(t *testing.T, job map[string]any) {
+	t.Helper()
+
 	for key, want := range map[string]any{
-		"scrape_interval":   "30s",
-		"scrape_timeout":    "10s",
 		"scheme":            "https",
 		"metrics_path":      "/federate",
 		"bearer_token_file": "/var/run/secrets/kubernetes.io/serviceaccount/token",
 		"honor_labels":      true,
+		"scrape_interval":   "30s",
+		"scrape_timeout":    "10s",
 	} {
 		if got := job[key]; got != want {
 			t.Errorf("federation job %q: got %v, want %v", key, got, want)
@@ -144,19 +167,6 @@ func TestModelResourceFederationScrapeIsNarrowAndAuthenticated(t *testing.T) {
 	targets, ok := staticConfig["targets"].([]any)
 	if !ok || len(targets) != 1 || targets[0] != "prometheus-k8s.openshift-monitoring.svc:9091" {
 		t.Errorf("federation job must target OpenShift Prometheus web: targets=%v", staticConfig["targets"])
-	}
-
-	params, found, err := unstructured.NestedStringSlice(job, "params", "match[]")
-	if err != nil || !found || len(params) != 2 {
-		t.Fatalf("federation job must have exactly two metric matchers: found=%t params=%v error=%v", found, params, err)
-	}
-	for _, want := range []string{
-		`{__name__="node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate"}`,
-		`{__name__="kube_resourcequota", resource="limits.cpu", type="hard"}`,
-	} {
-		if !slices.Contains(params, want) {
-			t.Errorf("federation job is missing matcher %q: %v", want, params)
-		}
 	}
 }
 
@@ -359,9 +369,76 @@ func TestOpenTelemetryCollectorTemplateRendersValidGPUConfig(t *testing.T) {
 	}
 
 	for name, pipeline := range metricsPipelines(t, collector) {
+		if name == "metrics/federation" {
+			if containsString(pipeline["processors"], "transform/sanitize_k8s_labels") {
+				t.Error("metrics/federation pipeline must not invoke workload label sanitization")
+			}
+			continue
+		}
 		if !containsString(pipeline["processors"], "transform/gpu_metrics") {
 			t.Errorf("metrics pipeline %q must invoke the GPU metric transform processor", name)
 		}
+	}
+}
+
+func TestWorkloadPipelinesSanitizeSourceMarkers(t *testing.T) {
+	collector := renderCollectorTemplate(t)
+	processors := renderedProcessors(t, collector)
+	transform, found, err := unstructured.NestedMap(processors, "transform/sanitize_provenance_markers")
+	if err != nil || !found {
+		t.Fatalf("source marker sanitizer must be present: found=%t error=%v", found, err)
+	}
+	metricStatements, ok := transform["metric_statements"].([]any)
+	if !ok || len(metricStatements) != 2 {
+		t.Fatalf("source marker sanitizer must contain resource and datapoint blocks: %v", transform["metric_statements"])
+	}
+	blocks := statementBlocksByContext(t, metricStatements)
+	for _, context := range []string{"resource", "datapoint"} {
+		requireStatements(t, "source marker sanitizer "+context, blocks[context], []string{
+			`delete_key(attributes, "odh_federation_source")`,
+			`delete_key(attributes, "odh_dcgm_source")`,
+		})
+	}
+
+	pipelines := metricsPipelines(t, collector)
+	for _, name := range []string{"metrics/scrape", "metrics/otlp"} {
+		if !containsString(pipelines[name]["processors"], "transform/sanitize_provenance_markers") {
+			t.Errorf("%s pipeline must sanitize source markers", name)
+		}
+	}
+	if containsString(pipelines["metrics/federation"]["processors"], "transform/sanitize_provenance_markers") {
+		t.Error("metrics/federation pipeline must preserve its verified federation marker")
+	}
+}
+
+func TestDCGMSourceMarkerRequiresVerifiedScrapeIdentity(t *testing.T) {
+	collector := renderCollectorTemplate(t)
+	processors := renderedProcessors(t, collector)
+	transform, found, err := unstructured.NestedMap(processors, "transform/mark_verified_dcgm_source")
+	if err != nil || !found {
+		t.Fatalf("verified DCGM source marker transform must be present: found=%t error=%v", found, err)
+	}
+	metricStatements, ok := transform["metric_statements"].([]any)
+	if !ok || len(metricStatements) != 1 {
+		t.Fatalf("verified DCGM source marker must contain one datapoint block: %v", transform["metric_statements"])
+	}
+	blocks := statementBlocksByContext(t, metricStatements)
+	verifiedMarkerStatement := `set(attributes["odh_dcgm_source"], "verified") where IsMatch(metric.name, "^DCGM_FI_.*") and ` +
+		`resource.attributes["service.name"] == "rhoai-accelerator-metrics" and ` +
+		`(resource.attributes["k8s.namespace.name"] == "nvidia-gpu-operator" or attributes["component"] == "nvidia-dcgm-exporter")`
+	requireStatements(t, "verified DCGM source marker", blocks["datapoint"], []string{
+		verifiedMarkerStatement,
+	})
+
+	pipelines := metricsPipelines(t, collector)
+	if !containsString(pipelines["metrics/scrape"]["processors"], "transform/mark_verified_dcgm_source") {
+		t.Error("metrics/scrape pipeline must mark verified DCGM sources")
+	}
+	if containsString(pipelines["metrics/otlp"]["processors"], "transform/mark_verified_dcgm_source") {
+		t.Error("metrics/otlp pipeline must not mark client-pushed metrics as verified DCGM")
+	}
+	if containsString(pipelines["metrics/federation"]["processors"], "transform/mark_verified_dcgm_source") {
+		t.Error("metrics/federation pipeline must not mark resource metrics as DCGM")
 	}
 }
 
@@ -415,6 +492,12 @@ func TestCollectorStripsWorkloadSuppliedK8sLabelAttributes(t *testing.T) {
 	}
 
 	for name, pipeline := range metricsPipelines(t, collector) {
+		if name == "metrics/federation" {
+			if containsString(pipeline["processors"], "transform/sanitize_k8s_labels") {
+				t.Error("metrics/federation pipeline must not invoke workload label sanitization")
+			}
+			continue
+		}
 		pipelineProcessors, ok := pipeline["processors"].([]any)
 		if !ok {
 			t.Fatalf("metrics pipeline %q processors have unexpected type: %T", name, pipeline["processors"])
@@ -508,9 +591,9 @@ func TestSanitizeTransformExcludesDCGMExporterK8sLabels(t *testing.T) {
 	}
 }
 
-// metricsPipelines returns every rendered metrics pipeline keyed by its
-// configuration name, failing the test unless both the scrape and OTLP
-// pipelines exist.
+// metricsPipelines returns every rendered data metrics pipeline keyed by its
+// configuration name, failing the test unless both scrape and OTLP pipelines
+// exist. The collector's internal telemetry pipeline is excluded.
 func metricsPipelines(t *testing.T, collector unstructured.Unstructured) map[string]map[string]any {
 	t.Helper()
 
@@ -523,13 +606,21 @@ func metricsPipelines(t *testing.T, collector unstructured.Unstructured) map[str
 		t.Fatalf("service pipelines must be present in rendered resource: found=%t, error=%v", found, err)
 	}
 
-	result := make(map[string]map[string]any, 2)
-	for _, name := range []string{"metrics/scrape", "metrics/otlp"} {
-		pipeline, ok := pipelines[name].(map[string]any)
+	result := make(map[string]map[string]any, len(pipelines))
+	for name, rawPipeline := range pipelines {
+		if name == "metrics/internal" {
+			continue
+		}
+		pipeline, ok := rawPipeline.(map[string]any)
 		if !ok {
-			t.Fatalf("metrics pipeline %q must be present in rendered resource", name)
+			t.Fatalf("metrics pipeline %q has unexpected type: %T", name, rawPipeline)
 		}
 		result[name] = pipeline
+	}
+	for _, name := range []string{"metrics/scrape", "metrics/otlp"} {
+		if _, ok := result[name]; !ok {
+			t.Fatalf("metrics pipeline %q must be present in rendered resource", name)
+		}
 	}
 	return result
 }
@@ -635,7 +726,7 @@ func TestOTLPMetricsPipelineWiring(t *testing.T) {
 	collector := renderCollectorTemplate(t)
 
 	pipelines := metricsPipelines(t, collector)
-	scrapePipeline, otlpPipeline := pipelines["metrics/scrape"], pipelines["metrics/otlp"]
+	scrapePipeline, federationPipeline, otlpPipeline := pipelines["metrics/scrape"], pipelines["metrics/federation"], pipelines["metrics/otlp"]
 
 	otlpReceivers, ok := otlpPipeline["receivers"].([]any)
 	if !ok {
@@ -649,6 +740,16 @@ func TestOTLPMetricsPipelineWiring(t *testing.T) {
 	}
 	if containsString(scrapePipeline["receivers"], "otlp") {
 		t.Error("metrics/scrape pipeline must not receive OTLP: pushed metrics must not bypass the identity sanitizer")
+	}
+	federationReceivers, ok := federationPipeline["receivers"].([]any)
+	if !ok {
+		t.Fatalf("metrics/federation pipeline receivers have unexpected type: %T", federationPipeline["receivers"])
+	}
+	if !containsString(federationReceivers, "prometheus/cluster_resources") || len(federationReceivers) != 1 {
+		t.Errorf("metrics/federation pipeline must receive only the federation receiver, got %v", federationReceivers)
+	}
+	if containsString(federationPipeline["processors"], "transform/sanitize_provenance_markers") || containsString(federationPipeline["processors"], "transform/sanitize_k8s_labels") {
+		t.Errorf("metrics/federation pipeline must not apply workload sanitizers, got %v", federationPipeline["processors"])
 	}
 
 	otlpProcessors, ok := otlpPipeline["processors"].([]any)
@@ -684,8 +785,8 @@ func TestOTLPMetricsPipelineWiring(t *testing.T) {
 		t.Error("metrics/scrape pipeline must invoke the shared k8sattributes processor")
 	}
 
-	if !reflect.DeepEqual(scrapePipeline["exporters"], otlpPipeline["exporters"]) {
-		t.Errorf("metrics pipelines must share exporters, scrape=%v otlp=%v", scrapePipeline["exporters"], otlpPipeline["exporters"])
+	if !reflect.DeepEqual(scrapePipeline["exporters"], otlpPipeline["exporters"]) || !reflect.DeepEqual(scrapePipeline["exporters"], federationPipeline["exporters"]) {
+		t.Errorf("metrics pipelines must share exporters, scrape=%v federation=%v otlp=%v", scrapePipeline["exporters"], federationPipeline["exporters"], otlpPipeline["exporters"])
 	}
 }
 
@@ -952,6 +1053,7 @@ func TestDCGMScrapeJobRetainsDiscoveryAndRelabeling(t *testing.T) {
 }
 
 func renderedPrometheusScrapeJobs(t *testing.T, collector unstructured.Unstructured) map[string]map[string]any {
+	t.Helper()
 	return renderedPrometheusScrapeJobsForReceiver(t, collector, "prometheus")
 }
 

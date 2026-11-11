@@ -67,6 +67,9 @@ func TestCollectorServiceMonitorsPrometheusEndpointConfig(t *testing.T) {
 
 	resourceSM := findRenderedResource(t, resources, "ServiceMonitor", "data-science-prometheus-resources-monitor")
 	resourceEndpoint := singleEndpoint(t, resourceSM)
+	if honorLabels, found, err := unstructured.NestedBool(resourceEndpoint, "honorLabels"); err != nil || !found || !honorLabels {
+		t.Errorf("resource endpoint must honor trusted federated labels: found=%t value=%t error=%v", found, honorLabels, err)
+	}
 	resourceRelabels, found, err := unstructured.NestedSlice(resourceEndpoint, "metricRelabelings")
 	if err != nil || !found || len(resourceRelabels) != 1 {
 		t.Fatalf("resource endpoint must keep exactly the federated resource metrics: found=%t error=%v relabels=%v", found, err, resourceRelabels)
@@ -75,7 +78,8 @@ func TestCollectorServiceMonitorsPrometheusEndpointConfig(t *testing.T) {
 	if !ok || keepRule["action"] != "keep" || keepRule["regex"] != "model-resources" || !containsString(keepRule["sourceLabels"], "odh_federation_source") {
 		t.Errorf("resource endpoint must keep only federated resource metrics: %v", resourceRelabels[0])
 	}
-	if serverName, found, err := unstructured.NestedString(resourceEndpoint, "tlsConfig", "serverName"); err != nil || !found || serverName != "data-science-collector-prometheus.redhat-ods-monitoring.svc" {
+	serverName, found, err := unstructured.NestedString(resourceEndpoint, "tlsConfig", "serverName")
+	if err != nil || !found || serverName != "data-science-collector-prometheus.redhat-ods-monitoring.svc" {
 		t.Errorf("resource endpoint must verify the mounted collector serving certificate: found=%t value=%q error=%v", found, serverName, err)
 	}
 

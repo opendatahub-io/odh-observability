@@ -82,10 +82,14 @@ func TestAcceleratorRecordingRulesTemplateContract(t *testing.T) {
 			record string
 			expr   string
 		}{
-			{record: "accelerator_gpu_utilization", expr: `label_replace(label_replace(DCGM_FI_DEV_GPU_UTIL * 100, "namespace", "$1", "exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)")`},
-			{record: "accelerator_memory_used_bytes", expr: `label_replace(label_replace(DCGM_FI_DEV_FB_USED * 1024 * 1024, "namespace", "$1", "exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)")`},
-			{record: "accelerator_temperature_celsius", expr: `label_replace(label_replace(DCGM_FI_DEV_GPU_TEMP, "namespace", "$1", "exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)")`},
-			{record: "accelerator_power_usage_watts", expr: `label_replace(label_replace(DCGM_FI_DEV_POWER_USAGE, "namespace", "$1", "exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)")`},
+			{record: "accelerator_gpu_utilization", expr: `(label_replace(label_replace(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified"} * 100, "namespace", "$1", ` +
+				`"exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)") or DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source!="verified"} * 100)`},
+			{record: "accelerator_memory_used_bytes", expr: `(label_replace(label_replace(DCGM_FI_DEV_FB_USED{odh_dcgm_source="verified"} * 1024 * 1024, "namespace", "$1", ` +
+				`"exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)") or DCGM_FI_DEV_FB_USED{odh_dcgm_source!="verified"} * 1024 * 1024)`},
+			{record: "accelerator_temperature_celsius", expr: `(label_replace(label_replace(DCGM_FI_DEV_GPU_TEMP{odh_dcgm_source="verified"}, "namespace", "$1", ` +
+				`"exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)") or DCGM_FI_DEV_GPU_TEMP{odh_dcgm_source!="verified"})`},
+			{record: "accelerator_power_usage_watts", expr: `(label_replace(label_replace(DCGM_FI_DEV_POWER_USAGE{odh_dcgm_source="verified"}, "namespace", "$1", ` +
+				`"exported_namespace", "(.+)"), "pod", "$1", "exported_pod", "(.+)") or DCGM_FI_DEV_POWER_USAGE{odh_dcgm_source!="verified"})`},
 		}
 		if len(rules) != len(wantRules) {
 			t.Fatalf("expected %d accelerator recording rules, got %d", len(wantRules), len(rules))
