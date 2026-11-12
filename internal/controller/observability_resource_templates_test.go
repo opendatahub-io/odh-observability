@@ -1038,6 +1038,7 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		"--insecure-listen-address=127.0.0.1:9091",
 		"--upstream=https://prometheus-operated."+testMonitoringNamespace+".svc:9090",
 		"--label=namespace",
+		"--query-param=namespace",
 		"--enable-label-apis",
 		"--regex-match",
 	)
@@ -1251,11 +1252,13 @@ func TestDeployPersesPrometheusIntegrationSelectsDatasourceTemplates(t *testing.
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			assertTemplatePaths(t, sources, []string{
-				PersesDatasourcePrometheusTemplate,
+			wantPersesDatasources := []string{
 				PersesDatasourceClusterPrometheusTemplate,
 				PersesDatasourceClusterPrometheusTenancyTemplate,
-			})
+				PersesDatasourcePrometheusTemplate,
+			}
+			assertTemplatePaths(t, sources, wantPersesDatasources)
+			assertTemplateOrder(t, sources, wantPersesDatasources)
 			condition := findCondition(monitoring, conditions.ConditionPersesPrometheusDataSourceAvailable)
 			if condition == nil || condition.Status != metav1.ConditionTrue {
 				t.Fatalf("PersesPrometheusDataSourceAvailable should be True, got %v", condition)
@@ -1461,6 +1464,18 @@ func assertTemplatePaths(t *testing.T, sources []rendertemplate.TemplateSource, 
 	for _, path := range want {
 		if _, found := paths[path]; !found {
 			t.Errorf("templates do not include %q", path)
+		}
+	}
+}
+
+func assertTemplateOrder(t *testing.T, sources []rendertemplate.TemplateSource, want []string) {
+	t.Helper()
+	if len(sources) != len(want) {
+		t.Fatalf("expected %d templates, got %d", len(want), len(sources))
+	}
+	for i, path := range want {
+		if sources[i].Path != path {
+			t.Errorf("template %d: expected %q, got %q", i, path, sources[i].Path)
 		}
 	}
 }
