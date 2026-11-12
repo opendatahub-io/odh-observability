@@ -5,13 +5,19 @@ from __future__ import annotations
 import io
 import json
 import os
+import signal
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from argparse import Namespace
 from contextlib import redirect_stdout
 from http.client import HTTPException
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -45,6 +51,12 @@ def inventory(endpoint: dict | None = None) -> dict:
         "telemetry_ingest": [],
         "diagnostic_endpoints": [],
     }
+
+
+def no_auth_inventory() -> dict:
+    data = inventory()
+    data["query_endpoints"][0]["auth"] = "none"
+    return data
 
 
 class FakeResponse:
@@ -273,7 +285,7 @@ class QueryMetricsTests(unittest.TestCase):
                 altered[field] = value
                 with patch.object(query_metrics.discover_endpoints, "discover", return_value=inventory()):
                     with self.assertRaises(query_metrics.QueryError) as context:
-                        query_metrics.verify_bearer_endpoint(altered)
+                        query_metrics.verify_endpoint(altered)
                 self.assertEqual(context.exception.kind, "invalid_auth")
 
     def test_discovery_failure_and_ambiguous_or_stale_evidence_fail_closed(self) -> None:
@@ -288,11 +300,11 @@ class QueryMetricsTests(unittest.TestCase):
             with self.subTest(result=result):
                 with patch.object(query_metrics.discover_endpoints, "discover", return_value=result):
                     with self.assertRaises(query_metrics.QueryError) as context:
-                        query_metrics.verify_bearer_endpoint(endpoint)
+                        query_metrics.verify_endpoint(endpoint)
                 self.assertEqual(context.exception.kind, "invalid_auth")
         with patch.object(query_metrics.discover_endpoints, "discover", side_effect=query_metrics.discover_endpoints.OcError("permission denied")):
             with self.assertRaises(query_metrics.QueryError) as context:
-                query_metrics.verify_bearer_endpoint(endpoint)
+                query_metrics.verify_endpoint(endpoint)
         self.assertEqual(context.exception.kind, "invalid_auth")
 
     def test_cluster_service_must_also_match_live_discovery(self) -> None:
@@ -305,7 +317,7 @@ class QueryMetricsTests(unittest.TestCase):
         })
         endpoint.pop("route_admitted")
         with patch.object(query_metrics.discover_endpoints, "discover", return_value=inventory(endpoint)):
-            query_metrics.verify_bearer_endpoint(endpoint)
+            query_metrics.verify_endpoint(endpoint)
         forged = endpoint.copy()
         forged.update({
             "source": "Service/attacker/collector",
@@ -313,7 +325,7 @@ class QueryMetricsTests(unittest.TestCase):
         })
         with patch.object(query_metrics.discover_endpoints, "discover", return_value=inventory(endpoint)):
             with self.assertRaises(query_metrics.QueryError):
-                query_metrics.verify_bearer_endpoint(forged)
+                query_metrics.verify_endpoint(forged)
 
     @patch.dict(os.environ, {"METRICS_TOKEN": "test-token"})
     @patch("query_metrics.build_opener")
@@ -435,6 +447,178 @@ class QueryMetricsTests(unittest.TestCase):
         self.assertEqual(request.get_header("Authorization"), "Bearer test-token")
 
     @patch("query_metrics.build_opener")
+    def test_non_bearer_endpoints_require_matching_fresh_discovery(self, mock_build_opener: object) -> None:
+        data = no_auth_inventory()
+        endpoint = data["query_endpoints"][0]
+        args = Namespace(timeout=20, max_response_bytes=1024, ca_file=None)
+        changed_url = no_auth_inventory()
+        changed_url["query_endpoints"][0]["url"] = "https://other.example.test"
+        absent = no_auth_inventory()
+        absent["query_endpoints"] = []
+        for discovered in (inventory(), changed_url, absent, {}):
+            with self.subTest(discovered=discovered):
+                with patch.object(query_metrics.discover_endpoints, "discover", return_value=discovered):
+                    with self.assertRaises(query_metrics.QueryError) as context:
+                        query_metrics.request_metrics(endpoint["url"] + "/api/v1/query", {}, args, endpoint)
+                self.assertEqual(context.exception.kind, "invalid_auth")
+        with self.assertRaises(query_metrics.QueryError):
+            query_metrics.request_metrics(endpoint["url"], {}, args)
+        with self.assertRaises(query_metrics.QueryError):
+            query_metrics.request_metrics("https://other.example.test/api/v1/query", {}, args, endpoint)
+        mock_build_opener.assert_not_called()  # type: ignore[attr-defined]
+
+    @patch("query_metrics.build_opener")
+    def test_success_responses_reject_invalid_json_constants_and_warnings(self, mock_build_opener: object) -> None:
+        args = Namespace(timeout=20, max_response_bytes=1024, ca_file=None)
+        endpoint = no_auth_inventory()["query_endpoints"][0]
+        opener = mock_build_opener.return_value  # type: ignore[attr-defined]
+        baseline = {"status": "success", "data": {"resultType": "vector", "result": []}}
+        with patch.object(query_metrics.discover_endpoints, "discover", return_value=no_auth_inventory()):
+            for value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(constant=value):
+                    response = FakeResponse({**baseline, "extra": {"constant": value}})
+                    opener.open.return_value.__enter__.return_value = response
+                    with self.assertRaises(query_metrics.QueryError) as context:
+                        query_metrics.request_metrics(endpoint["url"], {}, args, endpoint)
+                    self.assertEqual(context.exception.kind, "invalid_response")
+            for warnings in (None, "bad", ["ok", 1], {"message": "bad"}):
+                with self.subTest(warnings=warnings):
+                    opener.open.return_value.__enter__.return_value = FakeResponse({**baseline, "warnings": warnings})
+                    with self.assertRaises(query_metrics.QueryError) as context:
+                        query_metrics.request_metrics(endpoint["url"], {}, args, endpoint)
+                    self.assertEqual(context.exception.kind, "invalid_response")
+            for warnings in ([], ["partial response"]):
+                opener.open.return_value.__enter__.return_value = FakeResponse({**baseline, "warnings": warnings})
+                self.assertEqual(query_metrics.request_metrics(endpoint["url"], {}, args, endpoint)["warnings"], warnings)
+            response = FakeResponse({"status": "success", "data": {"resultType": "scalar", "result": [1, "NaN"]}})
+            opener.open.return_value.__enter__.return_value = response
+            self.assertEqual(query_metrics.request_metrics(endpoint["url"], {}, args, endpoint)["data"]["result"], [1, "NaN"])
+
+    def test_deadline_interrupts_slow_headers_and_bodies(self) -> None:
+        class SlowHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                mode = self.path.rsplit("/", 1)[-1]
+                try:
+                    if mode == "headers":
+                        for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n":
+                            self.connection.sendall(bytes([byte]))
+                            time.sleep(0.04)
+                    else:
+                        time.sleep(0.13)
+                        self.send_response(500 if mode == "error" else 200)
+                        self.send_header("Content-Length", "1000")
+                        self.end_headers()
+                        for _ in range(1000):
+                            self.wfile.write(b"x")
+                            self.wfile.flush()
+                            time.sleep(0.04)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join)
+        self.addCleanup(server.shutdown)
+        endpoint = no_auth_inventory()["query_endpoints"][0]
+        endpoint.update({"url": f"http://127.0.0.1:{server.server_port}", "tls": "none"})
+        args = Namespace(timeout=0.25, max_response_bytes=2048, ca_file=None)
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        with patch.object(query_metrics.discover_endpoints, "discover", return_value=inventory(endpoint)):
+            for mode in ("headers", "body", "error"):
+                with self.subTest(mode=mode):
+                    start = time.monotonic()
+                    with self.assertRaises(query_metrics.QueryError) as context:
+                        query_metrics.request_metrics(endpoint["url"] + "/" + mode, {}, args, endpoint)
+                    self.assertEqual(context.exception.kind, "transport_error")
+                    self.assertIn("deadline exceeded", context.exception.message)
+                    self.assertLess(time.monotonic() - start, 1.5)
+                    self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+                    self.assertEqual(signal.getsignal(signal.SIGALRM), previous_handler)
+
+    def test_deadline_does_not_override_active_timer_or_run_in_worker_thread(self) -> None:
+        handler = signal.getsignal(signal.SIGALRM)
+        signal.setitimer(signal.ITIMER_REAL, 10)
+        try:
+            with self.assertRaises(query_metrics.QueryError):
+                with query_metrics.request_deadline(0.1):
+                    self.fail("an active timer must not be replaced")
+            self.assertGreater(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+            self.assertEqual(signal.getsignal(signal.SIGALRM), handler)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+
+        errors = []
+
+        def run_in_thread() -> None:
+            try:
+                with query_metrics.request_deadline(0.1):
+                    self.fail("a worker thread must not take over SIGALRM")
+            except query_metrics.QueryError as error:
+                errors.append(error.kind)
+
+        thread = threading.Thread(target=run_in_thread)
+        thread.start()
+        thread.join()
+        self.assertEqual(errors, ["transport_error"])
+
+    @patch("query_metrics.build_opener")
+    def test_response_limit_and_cli_validator(self, mock_build_opener: object) -> None:
+        data = no_auth_inventory()
+        endpoint = data["query_endpoints"][0]
+        args = Namespace(timeout=20, max_response_bytes=10, ca_file=None)
+        opener = mock_build_opener.return_value  # type: ignore[attr-defined]
+        payload = {"status": "success", "data": {"resultType": "vector", "result": []}, "warnings": ["partial"]}
+        with patch.object(query_metrics.discover_endpoints, "discover", return_value=data):
+            opener.open.return_value.__enter__.return_value = FakeResponse(payload)
+            with self.assertRaises(query_metrics.QueryError) as context:
+                query_metrics.request_metrics(endpoint["url"], {}, args, endpoint)
+            self.assertEqual(context.exception.kind, "response_too_large")
+            response = FakeResponse(payload)
+            response.headers = {}
+            opener.open.return_value.__enter__.return_value = response
+            with self.assertRaises(query_metrics.QueryError) as context:
+                query_metrics.request_metrics(endpoint["url"], {}, args, endpoint)
+            self.assertEqual(context.exception.kind, "response_too_large")
+
+            opener.open.return_value.__enter__.return_value = FakeResponse(payload)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as stream:
+                json.dump(data, stream)
+                stream.flush()
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    result = query_metrics.main([
+                        "--inventory", stream.name, "--query", "up", "--namespace", "team-a",
+                    ])
+            self.assertEqual(result, 0)
+            self.assertEqual(json.loads(output.getvalue())["warnings"], ["partial"])
+            self.assertIsNone(opener.open.call_args.args[0].get_header("Authorization"))
+            validated = subprocess.run(
+                [sys.executable, os.path.join(SCRIPT_DIR, "validate_result.py")],
+                input=output.getvalue(), text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(validated.returncode, 0, validated.stderr)
+
+    @patch("query_metrics.build_opener")
+    def test_preserves_http_error_message_and_warnings(self, mock_build_opener: object) -> None:
+        data = no_auth_inventory()
+        endpoint = data["query_endpoints"][0]
+        args = Namespace(timeout=20, max_response_bytes=1024, ca_file=None)
+        body = json.dumps({"error": "query failed", "warnings": ["partial"]}).encode()
+        opener = mock_build_opener.return_value  # type: ignore[attr-defined]
+        opener.open.side_effect = HTTPError(endpoint["url"], 400, "Bad Request", {}, io.BytesIO(body))
+        with patch.object(query_metrics.discover_endpoints, "discover", return_value=data):
+            with self.assertRaises(query_metrics.QueryError) as context:
+                query_metrics.request_metrics(endpoint["url"], {}, args, endpoint)
+        self.assertEqual(context.exception.kind, "http_error")
+        self.assertIn("query failed", context.exception.message)
+        self.assertEqual(context.exception.warnings, ["partial"])
+
+    @patch("query_metrics.build_opener")
     @patch("query_metrics.ssl.create_default_context")
     def test_adds_supplied_ca_to_default_context(
         self, mock_create_default_context: object, mock_build_opener: object
@@ -455,11 +639,13 @@ class QueryMetricsTests(unittest.TestCase):
             bearer_token_env=None,
         )
 
-        query_metrics.request_metrics(
-            "https://metrics.example.test/api/v1/query?query=up",
-            {"Accept": "application/json"},
-            args,
-        )
+        with patch.object(query_metrics.discover_endpoints, "discover", return_value=no_auth_inventory()):
+            query_metrics.request_metrics(
+                "https://metrics.example.test/api/v1/query?query=up",
+                {"Accept": "application/json"},
+                args,
+                endpoint=no_auth_inventory()["query_endpoints"][0],
+            )
 
         mock_create_default_context.assert_called_once_with()  # type: ignore[attr-defined]
         context.load_verify_locations.assert_called_once_with(  # type: ignore[attr-defined]
@@ -544,12 +730,14 @@ class QueryMetricsTests(unittest.TestCase):
         mock_opener = mock_build_opener.return_value  # type: ignore[attr-defined]
         mock_opener.open.return_value.__enter__.return_value = response
         args = Namespace(timeout=20, max_response_bytes=1024, ca_file=None)
-        with self.assertRaises(query_metrics.QueryError) as context:
-            query_metrics.request_metrics(
-                "https://metrics.example.test/api/v1/query?query=up",
-                {"Accept": "application/json"},
-                args,
-            )
+        with patch.object(query_metrics.discover_endpoints, "discover", return_value=no_auth_inventory()):
+            with self.assertRaises(query_metrics.QueryError) as context:
+                query_metrics.request_metrics(
+                    "https://metrics.example.test/api/v1/query?query=up",
+                    {"Accept": "application/json"},
+                    args,
+                    endpoint=no_auth_inventory()["query_endpoints"][0],
+                )
         self.assertEqual(context.exception.kind, "bad_data")
         self.assertEqual(context.exception.warnings, ["partial response"])
 
@@ -557,16 +745,18 @@ class QueryMetricsTests(unittest.TestCase):
     def test_converts_transport_exceptions_to_query_errors(self, mock_build_opener: object) -> None:
         args = Namespace(timeout=20, max_response_bytes=1024, ca_file=None)
         mock_opener = mock_build_opener.return_value  # type: ignore[attr-defined]
-        for exception in (HTTPException("connection failed"), ValueError("invalid request")):
-            with self.subTest(exception=type(exception).__name__):
-                mock_opener.open.side_effect = exception
-                with self.assertRaises(query_metrics.QueryError) as context:
-                    query_metrics.request_metrics(
-                        "https://metrics.example.test/api/v1/query?query=up",
-                        {"Accept": "application/json"},
-                        args,
-                    )
-                self.assertEqual(context.exception.kind, "transport_error")
+        with patch.object(query_metrics.discover_endpoints, "discover", return_value=no_auth_inventory()):
+            for exception in (HTTPException("connection failed"), ValueError("invalid request")):
+                with self.subTest(exception=type(exception).__name__):
+                    mock_opener.open.side_effect = exception
+                    with self.assertRaises(query_metrics.QueryError) as context:
+                        query_metrics.request_metrics(
+                            "https://metrics.example.test/api/v1/query?query=up",
+                            {"Accept": "application/json"},
+                            args,
+                            endpoint=no_auth_inventory()["query_endpoints"][0],
+                        )
+                    self.assertEqual(context.exception.kind, "transport_error")
 
 
 if __name__ == "__main__":

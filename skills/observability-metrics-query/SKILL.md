@@ -2,7 +2,7 @@
 name: observability-metrics-query
 description: Queries RHOAI Prometheus-compatible metrics through a ready endpoint returned by observability-endpoint-discovery. Use when an agent needs bounded instant or range PromQL results from RHOAI or OpenShift metrics without hardcoding endpoints, bypassing namespace isolation, or exposing credentials.
 license: Apache-2.0
-compatibility: Requires a validated observability-endpoint-discovery JSON inventory, Python 3.11+, network access to the selected endpoint, and caller-provided authentication when the endpoint requires a bearer token. Bearer authentication also requires oc access for fresh endpoint discovery.
+compatibility: Requires a validated observability-endpoint-discovery JSON inventory, Python 3.11+ on POSIX with interval timers, oc access for fresh endpoint discovery, network access to the selected endpoint, and caller-provided authentication when the endpoint requires a bearer token.
 metadata:
   issue: RHAI-15149
   version: "1.0"
@@ -39,22 +39,25 @@ credentials, or query an internal Prometheus or Thanos backend directly.
    proxies, pass `--namespace` and use the authorized workload namespace.
    Never put the namespace in a POST body or bypass the proxy.
 
-4. If the endpoint has `auth: caller-bearer`, provide a token through an
+4. Before every request, the script repeats endpoint discovery using the current
+   `oc` context and requires the selected ready endpoint and its security-relevant
+   fields, including URL and authentication, to match. A missing, stale,
+   ambiguous, or unverifiable endpoint fails closed. Run with the same trusted
+   cluster context and discovery permissions used to produce the inventory;
+   regenerate the inventory if the endpoint changes.
+
+   If the endpoint has `auth: caller-bearer`, provide a token through an
    explicitly populated uppercase environment variable name matching
    `[A-Z][A-Z0-9_]{0,63}` with `--bearer-token-env`. The name must refer to a
-   token for the selected endpoint. Before reading it, the script repeats
-   endpoint discovery using the current `oc` context and requires the selected
-   ready Route or Service and its security-relevant fields, including URL,
-   to match. A missing, stale, ambiguous, or unverifiable endpoint fails closed.
-   Run with the same trusted cluster context and discovery permissions used to
-   produce the inventory; regenerate the inventory if the endpoint changes.
+   token for the selected endpoint. The script verifies the ready Route or
+   Service before reading the token.
    The script uses the token only in the request and never prints, stores, or
    returns it. It does not obtain tokens or read Kubernetes Secrets.
 
 5. Run a bounded query:
 
    ```bash
-   python3 scripts/query_metrics.py \
+   python3 skills/observability-metrics-query/scripts/query_metrics.py \
      --inventory observability-endpoints.json \
      --endpoint data-science-thanos-route \
      --namespace <authorized-workload-namespace> \
@@ -62,13 +65,15 @@ credentials, or query an internal Prometheus or Thanos backend directly.
      --bearer-token-env RHOAI_METRICS_BEARER_TOKEN \
      --pretty \
      | tee metrics-result.json \
-     | python3 scripts/validate_result.py
+     | python3 skills/observability-metrics-query/scripts/validate_result.py
    ```
 
    Use `--start`, `--end`, and `--step` together for a range query. The
    helper enforces a 24-hour maximum range, a 15-second minimum step, a
-   20-second default request timeout (never more than 120 seconds), and a
-   5 MiB response limit.
+   20-second default wall-clock request timeout (never more than 120 seconds)
+   covering connection and response reads, and a 5 MiB response limit. Discovery
+   runs before the request deadline. The deadline requires the main thread and
+   fails closed if another `SIGALRM` timer is active.
 
 6. Treat a non-zero exit status or `status: "error"` as a failed query. Do not
    retry by selecting a raw backend, removing required query parameters,
@@ -113,7 +118,7 @@ The helper returns a deterministic JSON object with:
 Validate a saved result before handing it to another skill:
 
 ```bash
-python3 scripts/validate_result.py < metrics-result.json
+python3 skills/observability-metrics-query/scripts/validate_result.py < metrics-result.json
 ```
 
 For endpoint selection, readiness states, RBAC limitations, and service/route

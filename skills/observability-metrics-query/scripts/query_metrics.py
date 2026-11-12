@@ -8,8 +8,11 @@ import json
 import math
 import os
 import re
+import signal
 import ssl
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.client import HTTPException
 from pathlib import Path
@@ -130,7 +133,7 @@ def path_supported(endpoint: dict[str, Any], path: str) -> bool:
     return any(str(candidate).split("?", 1)[0].rstrip("/") == path for candidate in endpoint["paths"])
 
 
-def verify_bearer_endpoint(endpoint: dict[str, Any]) -> None:
+def verify_endpoint(endpoint: dict[str, Any]) -> None:
     """Bind inventory data to a fresh discovery using the current oc context."""
     try:
         discovered = discover_endpoints.discover()
@@ -143,12 +146,15 @@ def verify_bearer_endpoint(endpoint: dict[str, Any]) -> None:
         len(matches) != 1
         or matches[0].get("signal") != "metrics"
         or matches[0].get("state") != "ready"
-        or matches[0].get("auth") != "caller-bearer"
-        or matches[0].get("access") not in {"route", "cluster-service"}
+        or matches[0].get("auth") not in VALID_AUTH
+        or (
+            matches[0].get("auth") == "caller-bearer"
+            and matches[0].get("access") not in {"route", "cluster-service"}
+        )
         or any(matches[0].get(field) != endpoint.get(field) for field in VERIFIED_ENDPOINT_FIELDS)
     ):
         raise QueryError(
-            "invalid_auth", "caller-bearer endpoint does not match current discovery evidence", 3
+            "invalid_auth", "metrics endpoint does not match current discovery evidence", 3
         )
 
 
@@ -385,6 +391,38 @@ def read_limited(response: Any, maximum: int) -> bytes:
     return b"".join(chunks)
 
 
+@contextmanager
+def request_deadline(timeout: float) -> Iterator[None]:
+    """Interrupt even a slow-streaming socket read at the wall-clock deadline.
+
+    This CLI runs in the main thread on POSIX. Do not take over an active
+    process timer or silently fall back to per-socket timeouts.
+    """
+    if not hasattr(signal, "setitimer") or not hasattr(signal, "SIGALRM"):
+        raise QueryError("transport_error", "request deadlines require POSIX interval timers", 4)
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    if any(signal.getitimer(signal.ITIMER_REAL)):
+        raise QueryError("transport_error", "cannot use request deadline while another timer is active", 4)
+
+    def expire(signum: int, frame: Any) -> None:
+        raise TimeoutError("metrics request deadline exceeded")
+
+    try:
+        signal.signal(signal.SIGALRM, expire)
+    except ValueError as error:
+        raise QueryError("transport_error", "request deadlines require the main thread", 4) from error
+    try:
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
 def response_warnings(payload: dict[str, Any]) -> list[str]:
     warnings = payload.get("warnings", [])
     if not isinstance(warnings, list) or any(not isinstance(warning, str) for warning in warnings):
@@ -436,23 +474,29 @@ def request_metrics(
 ) -> dict[str, Any]:
     if any(key.lower() == "authorization" for key in headers):
         raise QueryError("invalid_auth", "authorization headers must not be supplied directly", 3)
-    if endpoint is not None and endpoint.get("auth") == "caller-bearer":
+    if endpoint is None:
+        raise QueryError("invalid_auth", "a discovered metrics endpoint is required", 3)
+    if endpoint.get("auth") not in VALID_AUTH:
+        raise QueryError("unsupported_auth", "unsupported metrics endpoint auth mode", 3)
+    if endpoint.get("auth") == "caller-bearer":
         validate_token_env_name(args.bearer_token_env)
-        try:
-            target = urlsplit(request_url)
-            target_port = target.port
-            target_origin = (target.scheme, target.hostname, 443 if target_port is None else target_port)
-        except ValueError as error:
-            raise QueryError("invalid_auth", "authorization target URL is malformed", 3) from error
-        parsed = parse_safe_url(endpoint.get("url"))
-        endpoint_origin = (parsed.scheme, parsed.hostname, 443 if parsed.port is None else parsed.port)
-        if target.scheme != "https" or endpoint_origin != target_origin:
-            raise QueryError(
-                "invalid_auth",
-                "caller-bearer authorization target is not trusted",
-                3,
-            )
-        verify_bearer_endpoint(endpoint)
+    try:
+        target = urlsplit(request_url)
+        target_port = target.port
+        if target_port is None:
+            target_port = 443 if target.scheme == "https" else 80
+        target_origin = (target.scheme, target.hostname, target_port)
+    except ValueError as error:
+        raise QueryError("invalid_auth", "request target URL is malformed", 3) from error
+    parsed = parse_safe_url(endpoint.get("url"))
+    endpoint_port = parsed.port
+    if endpoint_port is None:
+        endpoint_port = 443 if parsed.scheme == "https" else 80
+    endpoint_origin = (parsed.scheme, parsed.hostname, endpoint_port)
+    if endpoint_origin != target_origin or (endpoint.get("auth") == "caller-bearer" and target.scheme != "https"):
+        raise QueryError("invalid_auth", "metrics request target is not trusted", 3)
+    verify_endpoint(endpoint)
+    if endpoint.get("auth") == "caller-bearer":
         token = os.environ.get(args.bearer_token_env)
         if not token:
             raise QueryError("missing_auth", f"bearer token environment variable '{args.bearer_token_env}' is empty", 3)
@@ -468,38 +512,34 @@ def request_metrics(
     try:
         request = Request(request_url, headers=headers, method="GET")
         opener = build_opener(NoRedirectHandler(), HTTPSHandler(context=context))
-        with opener.open(request, timeout=args.timeout) as response:
-            raw = read_limited(response, args.max_response_bytes)
-    except HTTPError as error:
-        message = str(error.reason)
-        warnings: list[str] = []
-        try:
-            payload = json.loads(read_limited(error, args.max_response_bytes))
-            if isinstance(payload, dict):
-                message = str(payload.get("error") or message)
-                warnings = response_warnings(payload)
-        except (
-            QueryError,
-            HTTPException,
-            URLError,
-            TimeoutError,
-            OSError,
-            ValueError,
-            UnicodeDecodeError,
-            json.JSONDecodeError,
-        ):
-            pass
-        raise QueryError(
-            "http_error",
-            f"metrics endpoint returned HTTP {error.code}: {message}",
-            4,
-            warnings,
-        ) from error
+        with request_deadline(args.timeout):
+            try:
+                with opener.open(request, timeout=args.timeout) as response:
+                    raw = read_limited(response, args.max_response_bytes)
+            except HTTPError as error:
+                message = str(error.reason)
+                warnings: list[str] = []
+                try:
+                    with error:
+                        payload = json.loads(read_limited(error, args.max_response_bytes))
+                    if isinstance(payload, dict):
+                        message = str(payload.get("error") or message)
+                        warnings = response_warnings(payload)
+                except TimeoutError:
+                    raise
+                except (QueryError, HTTPException, URLError, OSError, ValueError):
+                    pass
+                raise QueryError(
+                    "http_error",
+                    f"metrics endpoint returned HTTP {error.code}: {message}",
+                    4,
+                    warnings,
+                ) from error
     except (HTTPException, URLError, TimeoutError, OSError, ValueError) as error:
         raise QueryError("transport_error", f"metrics request failed: {error}", 4) from error
     try:
-        payload = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        payload = json.loads(raw, parse_constant=reject_json_constant)
+    except (UnicodeDecodeError, ValueError) as error:
         raise QueryError("invalid_response", "metrics endpoint returned invalid JSON", 4) from error
     if not isinstance(payload, dict) or payload.get("status") not in {"success", "error"}:
         raise QueryError("invalid_response", "metrics endpoint returned an invalid Prometheus response", 4)
@@ -512,6 +552,7 @@ def request_metrics(
     except QueryError as error:
         error.warnings = response_warnings(payload)
         raise
+    response_warnings(payload)
     return payload
 
 

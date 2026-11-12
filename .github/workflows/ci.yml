@@ -13,6 +13,27 @@ concurrency:
 permissions: {}
 
 jobs:
+  skill-tests:
+    name: Python skill tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+
+      - name: Run skill tests
+        run: |
+          for test_dir in skills/*/tests; do
+            [ -d "$test_dir" ] || continue
+            python -m unittest discover -s "$test_dir" -p 'test_*.py' -v
+          done
+
   test:
     name: Test
     runs-on: ubuntu-latest
