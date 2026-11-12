@@ -77,8 +77,11 @@ def validate_endpoint(collection: str, index: int, endpoint: object) -> str | No
             return f"{collection}[{index}] uses an internal raw metrics backend"
     if state == "ready" and not url:
         return f"{collection}[{index}] is ready but has no URL"
-    if not isinstance(endpoint.get("paths"), list):
-        return f"{collection}[{index}] paths must be a list"
+    paths = endpoint.get("paths")
+    if not isinstance(paths, list) or any(
+        not isinstance(path, str) or not path for path in paths
+    ):
+        return f"{collection}[{index}] paths must contain non-empty strings"
     query_parameters = endpoint.get("query_parameters")
     if query_parameters is not None:
         if not isinstance(query_parameters, dict):
@@ -88,6 +91,31 @@ def validate_endpoint(collection: str, index: int, endpoint: object) -> str | No
                 return f"{collection}[{index}] query_parameters contains a sensitive key"
             if value != "<redacted>":
                 return f"{collection}[{index}] query_parameters values must be redacted"
+    required_parameters = endpoint.get("required_query_parameters", [])
+    if not isinstance(required_parameters, list) or any(
+        not isinstance(parameter, str) or not parameter for parameter in required_parameters
+    ):
+        return f"{collection}[{index}] required_query_parameters must contain non-empty strings"
+    return None
+
+
+def validate_inventory(inventory: object) -> str | None:
+    if not isinstance(inventory, dict):
+        return "top-level value must be an object"
+    if inventory.get("schema_version") != "1":
+        return "schema_version must be '1'"
+    for collection in ENDPOINT_COLLECTIONS:
+        if not isinstance(inventory.get(collection), list):
+            return f"{collection} must be a list"
+        for index, endpoint in enumerate(inventory[collection]):
+            error = validate_endpoint(collection, index, endpoint)
+            if error:
+                return error
+    monitoring = inventory.get("monitoring")
+    if not isinstance(monitoring, dict):
+        return "monitoring must be an object"
+    if monitoring.get("management_state") == "Managed" and not monitoring.get("namespace"):
+        return "managed monitoring must include a namespace"
     return None
 
 
@@ -96,22 +124,9 @@ def main() -> int:
         inventory = json.load(sys.stdin)
     except json.JSONDecodeError as error:
         return fail(f"invalid JSON: {error}")
-    if not isinstance(inventory, dict):
-        return fail("top-level value must be an object")
-    if inventory.get("schema_version") != "1":
-        return fail("schema_version must be '1'")
-    for collection in ENDPOINT_COLLECTIONS:
-        if not isinstance(inventory.get(collection), list):
-            return fail(f"{collection} must be a list")
-        for index, endpoint in enumerate(inventory[collection]):
-            error = validate_endpoint(collection, index, endpoint)
-            if error:
-                return fail(error)
-    monitoring = inventory.get("monitoring")
-    if not isinstance(monitoring, dict):
-        return fail("monitoring must be an object")
-    if monitoring.get("management_state") == "Managed" and not monitoring.get("namespace"):
-        return fail("managed monitoring must include a namespace")
+    error = validate_inventory(inventory)
+    if error:
+        return fail(error)
     print("inventory validation passed")
     return 0
 

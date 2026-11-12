@@ -103,6 +103,12 @@ class DiscoverEndpointsTests(unittest.TestCase):
             )
         )
 
+    @patch.object(discover_endpoints, "discover")
+    def test_dsci_unavailability_is_failure(self, mock_discover: object) -> None:
+        mock_discover.return_value = {"unavailable": [{"component": "dsci"}]}  # type: ignore[attr-defined]
+        with patch.object(sys, "argv", ["discover_endpoints.py"]), patch("builtins.print"):
+            self.assertEqual(discover_endpoints.main(), 2)
+
     def test_datasource_query_parameters_redact_values_and_sensitive_keys(self) -> None:
         self.assertEqual(
             discover_endpoints.sanitize_query_parameters(
