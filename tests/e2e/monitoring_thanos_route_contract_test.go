@@ -156,6 +156,11 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteNamespaceIsolation(t *tes
 
 	restricted := probeThanosRoute(t, rootCAs, routeHost, restrictedToken, tc.MonitoringNamespace, thanosRouteProbeQuery)
 	logThanosRouteEvidence(t, "restricted", restricted)
+	if restricted.HTTPStatus == http.StatusUnauthorized {
+		logThanosTokenReview(t, tc, "restricted", restrictedToken)
+		logThanosTokenReview(t, tc, "authorized", authorizedToken)
+		logThanosProxyAuthenticationEvidence(t, tc)
+	}
 	if restricted.HTTPStatus != http.StatusForbidden {
 		t.Fatalf("restricted Thanos route request must be forbidden for an unauthorized namespace, got %d", restricted.HTTPStatus)
 	}
@@ -402,7 +407,7 @@ func clusterIngressCAPool(t *testing.T, tc *MonitoringTestCtx) *x509.CertPool {
 
 // authorizedThanosProbeToken creates a namespace-scoped identity for Route
 // queries, independent of how the test runner authenticates to Kubernetes.
-func authorizedThanosProbeToken(t *testing.T, tc *MonitoringTestCtx, name string, bindView bool) string {
+func authorizedThanosProbeToken(t *testing.T, tc *MonitoringTestCtx, name string, bindMetrics bool) string {
 	t.Helper()
 	serviceAccount := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
 		Name: name, Namespace: tc.MonitoringNamespace,
@@ -416,11 +421,20 @@ func authorizedThanosProbeToken(t *testing.T, tc *MonitoringTestCtx, name string
 		}
 	})
 
-	if bindView {
+	if bindMetrics {
+		role := thanosProbeMetricsRole(name, tc.MonitoringNamespace)
+		if err := tc.Client().Create(tc.Context(), role); err != nil {
+			t.Fatalf("failed to create authorized probe metrics Role: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := tc.Client().Delete(tc.Context(), role); err != nil && !k8serr.IsNotFound(err) {
+				t.Logf("failed to clean up authorized probe metrics Role %s: %v", name, err)
+			}
+		})
 		roleBinding := &rbacv1.RoleBinding{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: tc.MonitoringNamespace},
 			RoleRef: rbacv1.RoleRef{
-				APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "view",
+				APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: role.Name,
 			},
 			Subjects: []rbacv1.Subject{{
 				Kind: "ServiceAccount", Name: name, Namespace: tc.MonitoringNamespace,
@@ -436,6 +450,29 @@ func authorizedThanosProbeToken(t *testing.T, tc *MonitoringTestCtx, name string
 		})
 	}
 	return serviceAccountToken(t, tc, name)
+}
+
+func thanosProbeMetricsRole(name, namespace string) *rbacv1.Role {
+	return &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{"metrics.k8s.io"},
+			Resources: []string{"pods"},
+			Verbs:     []string{"get"},
+		}},
+	}
+}
+
+func TestThanosProbeMetricsRole(t *testing.T) {
+	role := thanosProbeMetricsRole("test-probe", "test-namespace")
+	if role.Name != "test-probe" || role.Namespace != "test-namespace" || len(role.Rules) != 1 {
+		t.Fatalf("invalid probe role: %+v", role)
+	}
+	rule := role.Rules[0]
+	if !slices.Equal(rule.APIGroups, []string{"metrics.k8s.io"}) || !slices.Equal(rule.Resources, []string{"pods"}) ||
+		!slices.Equal(rule.Verbs, []string{"get"}) {
+		t.Fatalf("probe role must grant only the proxy's namespace authorization check: %+v", rule)
+	}
 }
 
 func serviceAccountToken(t *testing.T, tc *MonitoringTestCtx, serviceAccountName string) string {
@@ -461,6 +498,103 @@ func serviceAccountToken(t *testing.T, tc *MonitoringTestCtx, serviceAccountName
 		t.Fatalf("TokenRequest for probe ServiceAccount %q returned an empty token", serviceAccountName)
 	}
 	return tokenRequest.Status.Token
+}
+
+// Compare a failing Route probe with an API-server TokenReview of the same
+// token. This helps distinguish a rejected token from a Route/proxy-specific
+// failure without logging the credential or changing authorization assertions.
+func logThanosTokenReview(t *testing.T, tc *MonitoringTestCtx, persona, token string) {
+	t.Helper()
+	config, err := ctrlcfg.GetConfig()
+	if err != nil {
+		t.Logf("thanos token review persona=%s: could not load Kubernetes config", persona)
+		return
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		t.Logf("thanos token review persona=%s: could not create Kubernetes client", persona)
+		return
+	}
+	ctx, cancel := context.WithTimeout(tc.Context(), 15*time.Second)
+	defer cancel()
+	review, err := clientset.AuthenticationV1().TokenReviews().Create(ctx, &authenticationv1.TokenReview{
+		Spec: authenticationv1.TokenReviewSpec{Token: token},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Logf("thanos token review persona=%s: API request failed (check test runner TokenReview permissions)", persona)
+		return
+	}
+	t.Logf("thanos token review persona=%s authenticated=%t review_error=%t", persona, review.Status.Authenticated, review.Status.Error != "")
+}
+
+// Proxy authentication errors can differ from the test runner's TokenReview:
+// the proxy uses its own service account and may lack API access. Report only
+// classifications, not log lines or credentials; older lines may be unrelated.
+func logThanosProxyAuthenticationEvidence(t *testing.T, tc *MonitoringTestCtx) {
+	t.Helper()
+	config, err := ctrlcfg.GetConfig()
+	if err != nil {
+		t.Log("thanos proxy authentication evidence: could not load Kubernetes config")
+		return
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		t.Log("thanos proxy authentication evidence: could not create Kubernetes client")
+		return
+	}
+	ctx, cancel := context.WithTimeout(tc.Context(), 15*time.Second)
+	defer cancel()
+	pods, err := clientset.CoreV1().Pods(tc.MonitoringNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: "app=" + ThanosQuerierProxyName,
+	})
+	if err != nil || len(pods.Items) == 0 {
+		t.Log("thanos proxy authentication evidence: proxy pods unavailable")
+		return
+	}
+	for _, pod := range pods.Items {
+		lines := int64(100)
+		stream, err := clientset.CoreV1().Pods(tc.MonitoringNamespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+			Container: "kube-rbac-proxy", TailLines: &lines,
+		}).Stream(ctx)
+		if err != nil {
+			t.Logf("thanos proxy authentication evidence pod=%s: logs unavailable", pod.Name)
+			continue
+		}
+		contents, err := io.ReadAll(io.LimitReader(stream, 1<<20))
+		stream.Close()
+		if err != nil {
+			t.Logf("thanos proxy authentication evidence pod=%s: could not read logs", pod.Name)
+			continue
+		}
+		authError, forbidden, timeout := classifyThanosAuthenticationLog(string(contents))
+		t.Logf("thanos proxy recent log evidence pod=%s auth_error=%t forbidden=%t timeout=%t", pod.Name, authError, forbidden, timeout)
+	}
+}
+
+func classifyThanosAuthenticationLog(logs string) (bool, bool, bool) {
+	var authError, forbidden, timeout bool
+	for line := range strings.SplitSeq(logs, "\n") {
+		if !strings.Contains(line, "Unable to authenticate the request due to an error") {
+			continue
+		}
+		authError = true
+		line = strings.ToLower(line)
+		forbidden = forbidden || strings.Contains(line, "forbidden")
+		timeout = timeout || strings.Contains(line, "timeout") || strings.Contains(line, "deadline exceeded")
+	}
+	return authError, forbidden, timeout
+}
+
+func TestClassifyThanosAuthenticationLog(t *testing.T) {
+	authError, forbidden, timeout := classifyThanosAuthenticationLog(
+		"unrelated forbidden\nUnable to authenticate the request due to an error: tokenreviews forbidden\n")
+	if !authError || !forbidden || timeout {
+		t.Fatalf("unexpected authentication log classification: error=%t forbidden=%t timeout=%t", authError, forbidden, timeout)
+	}
+	authError, forbidden, timeout = classifyThanosAuthenticationLog("Unable to authenticate the request due to an error: context deadline exceeded")
+	if !authError || forbidden || !timeout {
+		t.Fatalf("unexpected timeout log classification: error=%t forbidden=%t timeout=%t", authError, forbidden, timeout)
+	}
 }
 
 func probeThanosRoute(t *testing.T, rootCAs *x509.CertPool, routeHost, token, namespace, promQL string) thanosRouteProbe {

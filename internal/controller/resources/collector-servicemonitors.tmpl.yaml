@@ -54,18 +54,35 @@ spec:
       # exporter's resource_to_telemetry_conversion exposes them as labels.
       # The transform/sanitize_k8s_labels processor strips workload-supplied
       # attributes with the same names and excludes the dcgm-exporter job,
-      # so only collector-derived workload values are promoted. Workload-
+      # so this first promotion uses collector-derived workload values. The
+      # separate verified-DCGM promotion below uses exporter workload labels.
+      # Workload-
       # supplied namespace/pod/job labels keep receiving the exported_ prefix
       # from this scrape, exactly as before (Korrel8r relies on
       # exported_namespace/exported_pod). Do NOT set honorLabels: it would
       # trust workload-supplied labels and drop those exported_ labels.
       metricRelabelings:
+        # Defense in depth: federation uses a separate exporter, and workload
+        # pipelines strip this marker even from similarly named metrics.
+        - sourceLabels: [odh_federation_source]
+          regex: model-resources
+          action: drop
         - sourceLabels: [k8s_namespace_name]
           regex: (.+)
           targetLabel: namespace
         - sourceLabels: [k8s_pod_name]
           regex: (.+)
           targetLabel: pod
+        # Only the isolated built-in receiver can set these labels. Require
+        # both workload identity fields before promoting either one.
+        - sourceLabels: [odh_dcgm_source, odh_dcgm_workload_namespace, odh_dcgm_workload_pod]
+          regex: 'verified;([^;]+);([^;]+)'
+          targetLabel: namespace
+          replacement: '$1'
+        - sourceLabels: [odh_dcgm_source, odh_dcgm_workload_namespace, odh_dcgm_workload_pod]
+          regex: 'verified;([^;]+);([^;]+)'
+          targetLabel: pod
+          replacement: '$2'
   namespaceSelector:
     matchNames:
       - {{.Namespace}}
@@ -75,5 +92,44 @@ spec:
       app.kubernetes.io/instance: {{.Namespace}}.data-science-collector
       app.kubernetes.io/managed-by: opentelemetry-operator
       app.kubernetes.io/name: data-science-collector-prometheus
+      app.kubernetes.io/part-of: opentelemetry
+{{- end }}
+---
+# Scrape federated CPU/quota metrics from exactly one collector replica.
+# The source labels already contain the workload namespace/pod and quota
+# identity; do not apply the workload identity promotion rules above.
+{{- if and .Metrics .MetricsStorage }}
+apiVersion: monitoring.rhobs/v1
+kind: ServiceMonitor
+metadata:
+  name: data-science-prometheus-resources-monitor
+  namespace: {{.Namespace}}
+  labels:
+    monitoring.opendatahub.io/scrape: "true"
+spec:
+  endpoints:
+    - port: federation
+      scheme: https
+      tlsConfig:
+        caFile: /etc/prometheus/secrets/prometheus-web-tls-ca/service-ca.crt
+        serverName: "data-science-collector-prometheus.{{.Namespace}}.svc"
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      # The federation receiver sets this marker and preserves the source
+      # namespace/pod labels. Keep those trusted labels when scraping the
+      # resource-only Service, after filtering to marked federation samples.
+      honorLabels: true
+      metricRelabelings:
+        - sourceLabels: [odh_federation_source]
+          regex: model-resources
+          action: keep
+  namespaceSelector:
+    matchNames:
+      - {{.Namespace}}
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: opentelemetry-collector
+      app.kubernetes.io/instance: {{.Namespace}}.data-science-collector
+      app.kubernetes.io/managed-by: opentelemetry-operator
+      app.kubernetes.io/name: data-science-prometheus-resources
       app.kubernetes.io/part-of: opentelemetry
 {{- end }}

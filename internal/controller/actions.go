@@ -49,12 +49,16 @@ const (
 	MonitoringStackTemplate                          = "resources/monitoring-stack.tmpl.yaml"
 	MonitoringAdmissionPoliciesTemplate              = "resources/monitoring-admission-policies.tmpl.yaml"
 	MonitoringStackAlertmanagerRBACTemplate          = "resources/monitoringstack-alertmanager-rbac.tmpl.yaml"
+	AlertmanagerProxyTemplate                        = "resources/data-science-alertmanager-proxy.tmpl.yaml"
+	AlertmanagerProxyNetworkPolicyTemplate           = "resources/data-science-alertmanager-proxy-network-policy.tmpl.yaml"
+	AlertmanagerRouteTemplate                        = "resources/alertmanager-route.tmpl.yaml"
 	TempoMonolithicTemplate                          = "resources/tempo-monolithic.tmpl.yaml"
 	TempoStackTemplate                               = "resources/tempo-stack.tmpl.yaml"
 	OpenTelemetryCollectorTemplate                   = "resources/opentelemetry-collector.tmpl.yaml"
 	CollectorServiceMonitorsTemplate                 = "resources/collector-servicemonitors.tmpl.yaml"
 	CollectorMonitorServiceTemplate                  = "resources/collector-monitor-service.tmpl.yaml"
 	CollectorPrometheusServiceTemplate               = "resources/collector-prometheus-service.tmpl.yaml"
+	CollectorResourcePrometheusServiceTemplate       = "resources/collector-resource-prometheus-service.tmpl.yaml"
 	CollectorMonitoringNetworkPolicyTemplate         = "resources/collector-monitoring-network-policy.tmpl.yaml"
 	CollectorTargetAllocatorNetworkPolicyTemplate    = "resources/collector-targetallocator-network-policy.tmpl.yaml"
 	CollectorRBACTemplate                            = "resources/collector-rbac.tmpl.yaml"
@@ -75,6 +79,7 @@ const (
 	ThanosQuerierTemplate                            = "resources/thanos-querier-cr.tmpl.yaml"
 	ThanosQuerierNetworkPolicyTemplate               = "resources/data-science-thanos-querier-network-policy.tmpl.yaml"
 	TempoMonolithicNetworkPolicyTemplate             = "resources/data-science-tempo-monolithic-network-policy.tmpl.yaml"
+	TempoRouteTemplate                               = "resources/tempo-route.tmpl.yaml"
 	ThanosQuerierRouteTemplate                       = "resources/thanos-querier-route.tmpl.yaml"
 	PersesTemplate                                   = "resources/perses.tmpl.yaml"
 	PersesTempoDatasourceTemplate                    = "resources/perses-tempo-datasource.tmpl.yaml"
@@ -195,6 +200,9 @@ func deployMonitoringStackWithQuerierAndRestrictions(
 		src(MonitoringStackTemplate),
 		src(PrometheusSelfServiceMonitorTemplate),
 		src(MonitoringStackAlertmanagerRBACTemplate),
+		src(AlertmanagerProxyTemplate),
+		src(AlertmanagerProxyNetworkPolicyTemplate),
+		src(AlertmanagerRouteTemplate),
 		src(AcceleratorRecordingRulesTemplate),
 		src(PrometheusRouteTemplate),
 		src(PrometheusServiceOverrideTemplate),
@@ -267,7 +275,7 @@ func deployTracingStack(
 	}
 
 	cm.MarkTrue(conditions.ConditionTempoAvailable)
-	*sources = append(*sources, src(tempoTemplate))
+	*sources = append(*sources, src(tempoTemplate), src(TempoRouteTemplate))
 	if tempoGVK == gvk.TempoMonolithic {
 		*sources = append(*sources, src(TempoMonolithicNetworkPolicyTemplate))
 	}
@@ -328,6 +336,7 @@ func deployOpenTelemetryCollector(
 		*sources = append(*sources,
 			src(CollectorServiceMonitorsTemplate),
 			src(CollectorPrometheusServiceTemplate),
+			src(CollectorResourcePrometheusServiceTemplate),
 		)
 	}
 
@@ -582,10 +591,15 @@ func deployPersesPrometheusIntegration(
 	cm.MarkTrue(conditions.ConditionPersesPrometheusDataSourceAvailable)
 	// Feature: default DS datasource → namespace-enforcing Thanos proxy :8443.
 	// Guardrail: cluster :9091 / tenancy :9092 use caller token (no shared SA).
+	// Upgrade dual-default safety: Perses must never see two default:true Prometheus
+	// datasources in one apply. deploy.WithApplyOrder() re-sorts by Kind/GVK/namespace/name
+	// (not this append order); the CR names are chosen so lexicographic order keeps
+	// cluster-prometheus-* (default:false) before data-science-prometheus-datasource
+	// (default:true). See TestPersesDatasourceApplyOrder_SortKeepsNonDefaultFirst.
 	*sources = append(*sources,
-		src(PersesDatasourcePrometheusTemplate),
 		src(PersesDatasourceClusterPrometheusTemplate),
 		src(PersesDatasourceClusterPrometheusTenancyTemplate),
+		src(PersesDatasourcePrometheusTemplate),
 	)
 	return nil
 }

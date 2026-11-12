@@ -16,6 +16,7 @@ func TestCollectorRBACAllowsTargetAllocatorSecretInformer(t *testing.T) {
 	}}, map[string]any{
 		"Namespace":                       "redhat-ods-monitoring",
 		"Metrics":                         true,
+		"MetricsStorage":                  true,
 		"TargetAllocatorServiceAccount":   targetAllocatorServiceAccountName,
 		"TargetAllocatorSecretNamespaces": []string{"redhat-ods-monitoring", "team-a"},
 	})
@@ -24,9 +25,11 @@ func TestCollectorRBACAllowsTargetAllocatorSecretInformer(t *testing.T) {
 	}
 
 	var clusterRole unstructured.Unstructured
+	var clusterPrometheusReaderRole unstructured.Unstructured
 	var targetAllocatorClusterRole unstructured.Unstructured
 	var targetAllocatorRole unstructured.Unstructured
 	var collectorBinding unstructured.Unstructured
+	var clusterPrometheusReaderBinding unstructured.Unstructured
 	var legacyTargetAllocatorBinding unstructured.Unstructured
 	var targetAllocatorDiscoveryBinding unstructured.Unstructured
 	var secretRoles int
@@ -40,10 +43,14 @@ func TestCollectorRBACAllowsTargetAllocatorSecretInformer(t *testing.T) {
 		switch {
 		case kind == "ClusterRole" && name == "generate-processors-role":
 			clusterRole = resource
+		case kind == "ClusterRole" && name == "generate-processors-cluster-prometheus-reader":
+			clusterPrometheusReaderRole = resource
 		case kind == "ClusterRole" && name == "generate-processors-targetallocator-role":
 			targetAllocatorClusterRole = resource
 		case kind == "ClusterRoleBinding" && name == "generate-processors-collector-rolebinding":
 			collectorBinding = resource
+		case kind == "ClusterRoleBinding" && name == "generate-processors-cluster-prometheus-reader":
+			clusterPrometheusReaderBinding = resource
 		case kind == "ClusterRoleBinding" && name == "generate-processors-targetallocator-rolebinding":
 			legacyTargetAllocatorBinding = resource
 		case kind == "ClusterRoleBinding" && name == "generate-processors-targetallocator-discovery-rolebinding":
@@ -60,6 +67,9 @@ func TestCollectorRBACAllowsTargetAllocatorSecretInformer(t *testing.T) {
 	}
 	if targetAllocatorClusterRole.Object == nil {
 		t.Fatal("TargetAllocator RBAC template must render a dedicated ClusterRole")
+	}
+	if clusterPrometheusReaderRole.Object == nil || clusterPrometheusReaderBinding.Object == nil {
+		t.Fatal("collector RBAC template must render the dedicated Prometheus federation role and binding")
 	}
 
 	rules, found, err := unstructured.NestedSlice(clusterRole.Object, "rules")
@@ -80,6 +90,26 @@ func TestCollectorRBACAllowsTargetAllocatorSecretInformer(t *testing.T) {
 
 	if hasSecretReadRule {
 		t.Error("collector ClusterRole must not grant Secret access")
+	}
+	clusterPrometheusReaderRules, found, err := unstructured.NestedSlice(clusterPrometheusReaderRole.Object, "rules")
+	if err != nil || !found || len(clusterPrometheusReaderRules) != 1 {
+		t.Fatalf("cluster Prometheus reader rules must contain one rule: found=%t error=%v rules=%v", found, err, clusterPrometheusReaderRules)
+	}
+	readerRule, ok := clusterPrometheusReaderRules[0].(map[string]any)
+	if !ok || !hasRBACRule(clusterPrometheusReaderRules, "monitoring.coreos.com", []string{"prometheuses/api"}, []string{"get"}) {
+		t.Fatalf("cluster Prometheus reader must allow get on prometheuses/api: %v", readerRule)
+	}
+	resourceNames, _ := readerRule["resourceNames"].([]any)
+	if !containsString(resourceNames, "k8s") {
+		t.Errorf("cluster Prometheus reader must be limited to the k8s Prometheus resource: %v", readerRule)
+	}
+	readerSubjects, found, err := unstructured.NestedSlice(clusterPrometheusReaderBinding.Object, "subjects")
+	if err != nil || !found || len(readerSubjects) != 1 {
+		t.Fatalf("cluster Prometheus reader binding must have one subject: found=%t error=%v subjects=%v", found, err, readerSubjects)
+	}
+	readerSubject, ok := readerSubjects[0].(map[string]any)
+	if !ok || readerSubject["kind"] != "ServiceAccount" || readerSubject["name"] != "data-science-collector-collector" || readerSubject["namespace"] != "redhat-ods-monitoring" {
+		t.Errorf("cluster Prometheus reader binding must target the collector service account: %v", readerSubject)
 	}
 	targetAllocatorRules, found, err := unstructured.NestedSlice(targetAllocatorClusterRole.Object, "rules")
 	if err != nil || !found {
@@ -188,8 +218,9 @@ func TestCollectorRBACOmitsTargetAllocatorResourcesWithoutMetrics(t *testing.T) 
 		FS:   resourcesFS,
 		Path: CollectorRBACTemplate,
 	}}, map[string]any{
-		"Namespace": "redhat-ods-monitoring",
-		"Metrics":   false,
+		"Namespace":      "redhat-ods-monitoring",
+		"Metrics":        false,
+		"MetricsStorage": false,
 	})
 	if err != nil {
 		t.Fatalf("collector RBAC template must render without metrics: %v", err)
@@ -197,11 +228,34 @@ func TestCollectorRBACOmitsTargetAllocatorResourcesWithoutMetrics(t *testing.T) 
 
 	for _, resource := range resources {
 		if resource.GetName() == targetAllocatorServiceAccountName ||
+			resource.GetName() == "generate-processors-cluster-prometheus-reader" ||
 			resource.GetName() == "generate-processors-targetallocator-rolebinding" ||
 			resource.GetName() == "generate-processors-targetallocator-discovery-rolebinding" ||
 			resource.GetName() == "generate-processors-targetallocator-role" ||
 			resource.GetName() == "data-science-collector-targetallocator-secrets" {
 			t.Errorf("TargetAllocator resource %s must not render without metrics", resource.GetName())
+		}
+	}
+}
+
+func TestCollectorRBACOmitsClusterPrometheusReaderWithoutStorage(t *testing.T) {
+	resources, err := rendertemplate.Render(context.Background(), nil, []rendertemplate.TemplateSource{{
+		FS:   resourcesFS,
+		Path: CollectorRBACTemplate,
+	}}, map[string]any{
+		"Namespace":                       "redhat-ods-monitoring",
+		"Metrics":                         true,
+		"MetricsStorage":                  false,
+		"TargetAllocatorServiceAccount":   targetAllocatorServiceAccountName,
+		"TargetAllocatorSecretNamespaces": []string{"redhat-ods-monitoring"},
+	})
+	if err != nil {
+		t.Fatalf("collector RBAC template must render without storage: %v", err)
+	}
+
+	for _, resource := range resources {
+		if resource.GetName() == "generate-processors-cluster-prometheus-reader" {
+			t.Errorf("cluster Prometheus reader resource %s must not render without metrics storage", resource.GetName())
 		}
 	}
 }

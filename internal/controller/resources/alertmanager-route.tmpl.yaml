@@ -1,0 +1,19 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: data-science-alertmanager-route
+  namespace: {{.Namespace}}
+  labels:
+    app.kubernetes.io/name: alertmanager
+    platform.opendatahub.io/part-of: monitoring
+spec:
+  to:
+    kind: Service
+    name: data-science-alertmanager-proxy
+    weight: 100
+  port:
+    targetPort: https
+  tls:
+    termination: reencrypt
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None

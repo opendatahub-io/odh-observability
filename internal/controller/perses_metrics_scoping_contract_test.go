@@ -21,7 +21,9 @@ import (
 	"testing"
 
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
+	pkgresources "github.com/opendatahub-io/odh-platform-utilities/pkg/resources"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
@@ -250,9 +252,55 @@ func TestPersesMetricsScopingContract_DeploySelectsOnlyScopedDatasources(t *test
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	assertTemplatePaths(t, sources, []string{
-		PersesDatasourcePrometheusTemplate,
+	// Non-default cluster/tenancy datasources first, then DS default — avoids Perses 400 dual-default.
+	wantPersesDatasources := []string{
 		PersesDatasourceClusterPrometheusTemplate,
 		PersesDatasourceClusterPrometheusTenancyTemplate,
-	})
+		PersesDatasourcePrometheusTemplate,
+	}
+	assertTemplatePaths(t, sources, wantPersesDatasources)
+	assertTemplateOrder(t, sources, wantPersesDatasources)
+}
+
+// TestPersesDatasourceApplyOrder_SortKeepsNonDefaultFirst locks the deploy-layer
+// contract: WithApplyOrder sorts same-GVK objects by name, and our CR names keep
+// default:false cluster/tenancy datasources before the default:true DS datasource.
+func TestPersesDatasourceApplyOrder_SortKeepsNonDefaultFirst(t *testing.T) {
+	t.Parallel()
+
+	mk := func(name string) unstructured.Unstructured {
+		u := unstructured.Unstructured{}
+		u.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   gvk.PersesDatasource.Group,
+			Version: gvk.PersesDatasource.Version,
+			Kind:    gvk.PersesDatasource.Kind,
+		})
+		u.SetNamespace("redhat-ods-monitoring")
+		u.SetName(name)
+		return u
+	}
+
+	// Reverse of the desired apply order — sort must still put cluster* first.
+	input := []unstructured.Unstructured{
+		mk("data-science-prometheus-datasource"),
+		mk("cluster-prometheus-tenancy-datasource"),
+		mk("cluster-prometheus-datasource"),
+	}
+	sorted, err := pkgresources.SortByApplyOrder(t.Context(), input)
+	if err != nil {
+		t.Fatalf("SortByApplyOrder: %v", err)
+	}
+	want := []string{
+		"cluster-prometheus-datasource",
+		"cluster-prometheus-tenancy-datasource",
+		"data-science-prometheus-datasource",
+	}
+	if len(sorted) != len(want) {
+		t.Fatalf("sorted len=%d, want %d", len(sorted), len(want))
+	}
+	for i, name := range want {
+		if sorted[i].GetName() != name {
+			t.Fatalf("sorted[%d]=%q, want %q", i, sorted[i].GetName(), name)
+		}
+	}
 }

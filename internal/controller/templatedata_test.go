@@ -440,6 +440,16 @@ func TestValidateExporters_ReservedNamePrometheus(t *testing.T) {
 	}
 }
 
+func TestValidateExporters_ReservedNameFederation(t *testing.T) {
+	exporters := map[string]runtime.RawExtension{
+		"prometheus/federation": rawExt(`endpoint: 0.0.0.0:8891`),
+	}
+	_, err := validateExporters(exporters)
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("federation exporter name must be reserved, got: %v", err)
+	}
+}
+
 func TestValidateExporters_ReservedNameOTLPTempo(t *testing.T) {
 	exporters := map[string]runtime.RawExtension{
 		"otlp/tempo": rawExt(`endpoint: https://example.com`),

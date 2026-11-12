@@ -1,0 +1,77 @@
+rule_files:
+  - rules.yaml
+evaluation_interval: 30s
+tests:
+  - interval: 30s
+    input_series:
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="attacker",pod="exporter",exported_namespace="victim",exported_pod="model"}'
+        values: '0.5 0.5'
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="monitoring",pod="dcgm",exported_namespace="team",exported_pod="model",odh_dcgm_source="verified"}'
+        values: '0.8 0.8'
+      - series: 'DCGM_FI_DEV_GPU_UTIL{node="gpu-node"}'
+        values: '0.2 0.2'
+      # Promoted by the ServiceMonitor only after both trusted fields exist.
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="team",pod="model",odh_dcgm_source="verified",odh_dcgm_workload_namespace="team",odh_dcgm_workload_pod="model"}'
+        values: '0.6 0.6'
+      # A trusted sample without a pod remains in the collector namespace.
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="monitoring",odh_dcgm_source="verified",odh_dcgm_workload_namespace="team"}'
+        values: '0.1 0.1'
+      - series: 'DCGM_FI_DEV_FB_USED{namespace="attacker",pod="exporter",exported_namespace="victim",exported_pod="model"}'
+        values: '2 2'
+      - series: 'DCGM_FI_DEV_FB_USED{namespace="monitoring",pod="dcgm",exported_namespace="team",exported_pod="model",odh_dcgm_source="verified"}'
+        values: '3 3'
+      - series: 'DCGM_FI_DEV_FB_USED{namespace="team",pod="model",odh_dcgm_source="verified"}'
+        values: '4 4'
+      - series: 'DCGM_FI_DEV_GPU_TEMP{namespace="attacker",pod="exporter",exported_namespace="victim",exported_pod="model"}'
+        values: '40 40'
+      - series: 'DCGM_FI_DEV_GPU_TEMP{namespace="monitoring",pod="dcgm",exported_namespace="team",exported_pod="model",odh_dcgm_source="verified"}'
+        values: '45 45'
+      - series: 'DCGM_FI_DEV_GPU_TEMP{namespace="team",pod="model",odh_dcgm_source="verified"}'
+        values: '50 50'
+      - series: 'DCGM_FI_DEV_POWER_USAGE{namespace="attacker",pod="exporter",exported_namespace="victim",exported_pod="model"}'
+        values: '70 70'
+      - series: 'DCGM_FI_DEV_POWER_USAGE{namespace="monitoring",pod="dcgm",exported_namespace="team",exported_pod="model",odh_dcgm_source="verified"}'
+        values: '75 75'
+      - series: 'DCGM_FI_DEV_POWER_USAGE{namespace="team",pod="model",odh_dcgm_source="verified"}'
+        values: '80 80'
+    promql_expr_test:
+      - expr: accelerator_gpu_utilization
+        eval_time: 30s
+        exp_samples:
+          - labels: 'accelerator_gpu_utilization{namespace="attacker",pod="exporter",exported_namespace="victim",exported_pod="model",vendor="nvidia"}'
+            value: 50
+          - labels: 'accelerator_gpu_utilization{namespace="monitoring",pod="dcgm",exported_namespace="team",exported_pod="model",odh_dcgm_source="verified",vendor="nvidia"}'
+            value: 80
+          - labels: 'accelerator_gpu_utilization{node="gpu-node",vendor="nvidia"}'
+            value: 20
+          - labels: 'accelerator_gpu_utilization{namespace="team",pod="model",odh_dcgm_source="verified",odh_dcgm_workload_namespace="team",odh_dcgm_workload_pod="model",vendor="nvidia"}'
+            value: 60
+          - labels: 'accelerator_gpu_utilization{namespace="monitoring",odh_dcgm_source="verified",odh_dcgm_workload_namespace="team",vendor="nvidia"}'
+            value: 10
+      - expr: accelerator_memory_used_bytes
+        eval_time: 30s
+        exp_samples:
+          - labels: 'accelerator_memory_used_bytes{namespace="attacker",pod="exporter",exported_namespace="victim",exported_pod="model",vendor="nvidia"}'
+            value: 2097152
+          - labels: 'accelerator_memory_used_bytes{namespace="monitoring",pod="dcgm",exported_namespace="team",exported_pod="model",odh_dcgm_source="verified",vendor="nvidia"}'
+            value: 3145728
+          - labels: 'accelerator_memory_used_bytes{namespace="team",pod="model",odh_dcgm_source="verified",vendor="nvidia"}'
+            value: 4194304
+      - expr: accelerator_temperature_celsius
+        eval_time: 30s
+        exp_samples:
+          - labels: 'accelerator_temperature_celsius{namespace="attacker",pod="exporter",exported_namespace="victim",exported_pod="model",vendor="nvidia"}'
+            value: 40
+          - labels: 'accelerator_temperature_celsius{namespace="monitoring",pod="dcgm",exported_namespace="team",exported_pod="model",odh_dcgm_source="verified",vendor="nvidia"}'
+            value: 45
+          - labels: 'accelerator_temperature_celsius{namespace="team",pod="model",odh_dcgm_source="verified",vendor="nvidia"}'
+            value: 50
+      - expr: accelerator_power_usage_watts
+        eval_time: 30s
+        exp_samples:
+          - labels: 'accelerator_power_usage_watts{namespace="attacker",pod="exporter",exported_namespace="victim",exported_pod="model",vendor="nvidia"}'
+            value: 70
+          - labels: 'accelerator_power_usage_watts{namespace="monitoring",pod="dcgm",exported_namespace="team",exported_pod="model",odh_dcgm_source="verified",vendor="nvidia"}'
+            value: 75
+          - labels: 'accelerator_power_usage_watts{namespace="team",pod="model",odh_dcgm_source="verified",vendor="nvidia"}'
+            value: 80

@@ -103,6 +103,17 @@ func TestOTLPSeriesIdentityChecks(t *testing.T) {
 			},
 			wantSanitizationError: true,
 		},
+		{
+			name: "normalized provenance marker rejected",
+			labels: map[string]string{
+				"namespace":             sender.Namespace,
+				"pod":                   sender.Name,
+				"k8s_namespace_name":    sender.Namespace,
+				"k8s_pod_name":          sender.Name,
+				"odh_federation_source": "model-resources",
+			},
+			wantSanitizationError: true,
+		},
 	}
 
 	for _, test := range tests {
