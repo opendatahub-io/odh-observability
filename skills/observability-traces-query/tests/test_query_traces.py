@@ -5,10 +5,15 @@ from __future__ import annotations
 import json
 import io
 import os
+import signal
 import sys
+import tempfile
+import threading
+import time
 import unittest
 from argparse import Namespace
 from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
@@ -125,6 +130,7 @@ class QueryTracesTests(unittest.TestCase):
 
         with patch.object(discover_endpoints, "run_oc", side_effect=fake_oc):
             discovered = discover_endpoints.discover()
+            query_traces.verify_endpoint(discovered["query_endpoints"][0])
 
         self.assertIsNone(query_traces.validate_discovery_inventory(discovered))
         for mode, args in (("search", search_args()), ("trace", trace_args())):
@@ -139,6 +145,27 @@ class QueryTracesTests(unittest.TestCase):
                 ))
                 self.assertEqual(headers["X-Scope-OrgID"], namespace)
                 self.assertEqual(headers["Authorization"], "Bearer test-token")
+
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as stream:
+            json.dump(discovered, stream)
+            stream.flush()
+            with patch.object(discover_endpoints, "run_oc", side_effect=fake_oc), patch("query_traces.build_opener") as opener:
+                for mode, options, payload in (
+                    ("search", ["--search", "--start", "1", "--end", "2"], {"traces": []}),
+                    ("trace", ["--trace-id", "0123456789abcdef"], {"batches": []}),
+                ):
+                    with self.subTest(mode=mode):
+                        opener.return_value.open.return_value.__enter__.return_value = FakeResponse(payload)
+                        output = io.StringIO()
+                        with redirect_stdout(output):
+                            result = query_traces.main([
+                                "--inventory", stream.name, "--endpoint", gateway,
+                                "--bearer-token-env", "TRACE_TOKEN", *options,
+                            ])
+                        self.assertEqual(result, 0)
+                        self.assertEqual(json.loads(output.getvalue())["status"], "success")
+                        request = opener.return_value.open.call_args.args[0]
+                        self.assertEqual(request.get_header("Authorization"), "Bearer test-token")
 
     def test_selects_ready_trace_endpoint(self) -> None:
         selected = query_traces.select_endpoint(inventory(), None, "search")
@@ -159,6 +186,101 @@ class QueryTracesTests(unittest.TestCase):
         with self.assertRaises(query_traces.QueryError) as context:
             query_traces.select_endpoint(inventory(endpoint), endpoint["name"], "trace")
         self.assertIs(context.exception.endpoint, endpoint)
+
+    def test_malformed_conditions_preserve_no_ready_endpoint(self) -> None:
+        for monitoring in (None, "invalid", {"conditions": "invalid"},
+                           {"conditions": {"TempoAvailable": "invalid"}},
+                           {"conditions": {"InstrumentationAvailable": [1]}}):
+            with self.subTest(monitoring=monitoring):
+                data = inventory()
+                data["monitoring"] = monitoring
+                data["query_endpoints"] = []
+                with self.assertRaises(query_traces.QueryError) as context:
+                    query_traces.select_endpoint(data, None, "search")
+                self.assertEqual(context.exception.kind, "no_ready_endpoint")
+        data["monitoring"] = {"conditions": {"TempoAvailable": {"status": "False", "reason": "NotReady"}}}
+        with self.assertRaises(query_traces.QueryError) as context:
+            query_traces.select_endpoint(data, None, "search")
+        self.assertIn("TempoAvailable: NotReady", context.exception.message)
+
+        for conditions in ("invalid", {"TempoAvailable": "invalid"}):
+            data = inventory()
+            data["query_endpoints"] = []
+            data["monitoring"]["conditions"] = conditions
+            output = io.StringIO()
+            with patch("query_traces.Path.open", return_value=io.StringIO(json.dumps(data))), redirect_stdout(output):
+                result = query_traces.main(["--inventory", "inventory.json", "--search", "--start", "1", "--end", "2"])
+            self.assertEqual(result, 3)
+            self.assertEqual(json.loads(output.getvalue())["error"]["type"], "no_ready_endpoint")
+
+    @patch.dict(os.environ, {"TRACE_TOKEN": "test-token"})
+    def test_forged_inventory_fails_before_reading_token_or_opening_connection(self) -> None:
+        forged = inventory()
+        forged["query_endpoints"][0]["url"] = (
+            "https://attacker.example.test:8080/api/traces/v1/redhat-ods-monitoring/tempo"
+        )
+        self.assertIsNone(query_traces.validate_discovery_inventory(forged))
+        output = io.StringIO()
+        with (
+            patch("query_traces.Path.open", return_value=io.StringIO(json.dumps(forged))),
+            patch.object(discover_endpoints, "discover", return_value=inventory()),
+            patch.object(os.environ, "get", wraps=os.environ.get) as get_env,
+            patch("query_traces.build_opener") as opener,
+            redirect_stdout(output),
+        ):
+            result = query_traces.main([
+                "--inventory", "inventory.json", "--trace-id", "0123456789abcdef",
+                "--bearer-token-env", "TRACE_TOKEN",
+            ])
+        self.assertEqual(result, 3)
+        self.assertEqual(json.loads(output.getvalue())["error"]["type"], "invalid_auth")
+        self.assertNotIn("test-token", output.getvalue())
+        self.assertNotIn("TRACE_TOKEN", [call.args[0] for call in get_env.call_args_list])
+        opener.assert_not_called()
+
+    def test_live_discovery_must_match_all_security_fields(self) -> None:
+        endpoint = inventory()["query_endpoints"][0]
+        changes = {
+            "url": "https://other.example.test:8080/api/traces/v1/redhat-ods-monitoring/tempo",
+            "source": "Service/other/other", "state": "pending", "access": "route",
+            "scope": "other", "auth": "none", "tls": "none", "paths": ["/api/search"],
+            "required_query_parameters": ["other"], "required_headers": ["X-Scope-OrgID: other"],
+            "tenant": "other", "service_port": 8443,
+        }
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                changed = endpoint.copy()
+                changed[field] = value
+                with patch.object(discover_endpoints, "discover", return_value=inventory()):
+                    with self.assertRaises(query_traces.QueryError) as context:
+                        query_traces.verify_endpoint(changed)
+                self.assertEqual(context.exception.kind, "invalid_auth")
+        for data in ({}, {**inventory(), "query_endpoints": []},
+                     {**inventory(), "query_endpoints": [endpoint, endpoint.copy()]},
+                     inventory({**endpoint, "state": "pending"})):
+            with self.subTest(data=data), patch.object(discover_endpoints, "discover", return_value=data):
+                with self.assertRaises(query_traces.QueryError) as context:
+                    query_traces.verify_endpoint(endpoint)
+                self.assertEqual(context.exception.kind, "invalid_auth")
+        with patch.object(discover_endpoints, "discover", side_effect=RuntimeError("secret")):
+            with self.assertRaises(query_traces.QueryError) as context:
+                query_traces.verify_endpoint(endpoint)
+        self.assertEqual(context.exception.kind, "invalid_auth")
+        self.assertNotIn("secret", context.exception.message)
+        with patch.object(discover_endpoints, "discover", return_value=inventory()):
+            query_traces.verify_endpoint(endpoint)
+        no_auth = {**endpoint, "auth": "none"}
+        with patch.object(discover_endpoints, "discover", return_value=inventory(no_auth)):
+            query_traces.verify_endpoint(no_auth)
+            with self.assertRaises(query_traces.QueryError):
+                query_traces.verify_endpoint({**no_auth, "url": endpoint["url"] + "?forged=1"})
+
+    def test_duplicate_named_endpoint_is_ambiguous(self) -> None:
+        data = inventory()
+        data["query_endpoints"].append(data["query_endpoints"][0].copy())
+        with self.assertRaises(query_traces.QueryError) as context:
+            query_traces.select_endpoint(data, data["query_endpoints"][0]["name"], "search")
+        self.assertEqual(context.exception.kind, "ambiguous_endpoint")
 
     @patch.dict(os.environ, {"TRACE_TOKEN": "test-token"})
     def test_builds_search_request_with_tenant_and_filters(self) -> None:
@@ -197,6 +319,28 @@ class QueryTracesTests(unittest.TestCase):
         with self.assertRaises(query_traces.QueryError) as context:
             query_traces.query_metadata(search_args(status="error", query="{ .http.status_code = 500 }"), "search")
         self.assertEqual(context.exception.kind, "invalid_argument")
+
+    def test_filters_reject_compound_traceql_without_changing_unfiltered_queries(self) -> None:
+        for query in ('{ .a = 1 } || { .b = 2 }', '{ .a = 1 || .b = 2 }',
+                      '{ .a = `x\\` || .b = `y` }',
+                      '({ .a = 1 } && { .b = 2 })', '{ .a = 1 } | count()'):
+            for option in ("service", "operation"):
+                with self.subTest(query=query, option=option):
+                    args = search_args(query=query, **{option: "checkout"})
+                    with self.assertRaises(query_traces.QueryError) as context:
+                        query_traces.build_traceql_query(args)
+                    self.assertEqual(context.exception.kind, "invalid_argument")
+                    self.assertIn("compound", context.exception.message)
+            self.assertEqual(query_traces.build_traceql_query(search_args(query=query)), query)
+        for query in ('{ .name = "a || } { b" }', '{ .name = `a || } { b` }',
+                      '{ .name = "a \\\" || b" }'):
+            with self.subTest(query=query):
+                result = query_traces.build_traceql_query(search_args(query=query, service="checkout"))
+                self.assertIn('&& resource.service.name = "checkout"', result)
+        self.assertEqual(
+            query_traces.build_traceql_query(search_args(query='{ .a = 1 }', operation="work")),
+            '{ .a = 1 && name = "work" }',
+        )
 
     @patch.dict(os.environ, {"TRACE_TOKEN": "test-token"})
     def test_builds_trace_lookup_request(self) -> None:
@@ -286,6 +430,84 @@ class QueryTracesTests(unittest.TestCase):
         request = opener.open.call_args.args[0]
         self.assertEqual(request.method, "GET")
         self.assertEqual(request.get_header("Authorization"), "Bearer test-token")
+
+    def test_deadline_interrupts_slow_headers_bodies_and_http_errors(self) -> None:
+        class SlowHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                mode = self.path.rsplit("/", 1)[-1]
+                try:
+                    if mode == "headers":
+                        for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n":
+                            self.connection.sendall(bytes([byte]))
+                            time.sleep(0.04)
+                    else:
+                        time.sleep(0.13)
+                        self.send_response(500 if mode == "error" else 200)
+                        self.send_header("Content-Length", "1000")
+                        self.end_headers()
+                        for _ in range(1000):
+                            self.wfile.write(b"x")
+                            self.wfile.flush()
+                            time.sleep(0.04)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join)
+        self.addCleanup(server.shutdown)
+        args = Namespace(timeout=0.25, max_response_bytes=2048, ca_file=None)
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        for mode in ("headers", "body", "error"):
+            with self.subTest(mode=mode):
+                start = time.monotonic()
+                with self.assertRaises(query_traces.QueryError) as context:
+                    query_traces.request_tempo(f"http://127.0.0.1:{server.server_port}/{mode}", {}, args, "search")
+                self.assertEqual(context.exception.kind, "transport_error")
+                self.assertIn("deadline exceeded", context.exception.message)
+                self.assertLess(time.monotonic() - start, 1.5)
+                self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+                self.assertEqual(signal.getsignal(signal.SIGALRM), previous_handler)
+
+    def test_deadline_preserves_existing_timer_and_rejects_worker_thread(self) -> None:
+        handler = signal.getsignal(signal.SIGALRM)
+        signal.setitimer(signal.ITIMER_REAL, 10)
+        try:
+            with self.assertRaises(query_traces.QueryError):
+                with query_traces.request_deadline(0.1):
+                    self.fail("active timer must not be replaced")
+            self.assertGreater(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+            self.assertEqual(signal.getsignal(signal.SIGALRM), handler)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        errors = []
+
+        def run() -> None:
+            try:
+                with query_traces.request_deadline(0.1):
+                    self.fail("worker thread must not take over SIGALRM")
+            except query_traces.QueryError as error:
+                errors.append(error.kind)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join()
+        self.assertEqual(errors, ["transport_error"])
+
+    def test_response_size_limit_remains_enforced(self) -> None:
+        response = FakeResponse({"traces": [{"large": "x" * 100}]})
+        with self.assertRaises(query_traces.QueryError) as context:
+            query_traces.read_limited(response, 10)
+        self.assertEqual(context.exception.kind, "response_too_large")
+        response.headers = {}
+        with self.assertRaises(query_traces.QueryError) as context:
+            query_traces.read_limited(response, 10)
+        self.assertEqual(context.exception.kind, "response_too_large")
 
     def test_rejects_raw_tempo_port(self) -> None:
         with self.assertRaises(query_traces.QueryError) as context:

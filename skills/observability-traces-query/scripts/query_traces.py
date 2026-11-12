@@ -8,9 +8,13 @@ import json
 import math
 import os
 import re
+import signal
 import ssl
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from http.client import HTTPException
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -24,6 +28,7 @@ DISCOVERY_SCRIPTS = Path(__file__).resolve().parents[2] / "observability-endpoin
 if str(DISCOVERY_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(DISCOVERY_SCRIPTS))
 
+import discover_endpoints  # noqa: E402
 from validate_inventory import validate_inventory as validate_discovery_inventory  # noqa: E402
 
 
@@ -52,6 +57,11 @@ SENSITIVE_QUERY_MARKERS = (
     "privatekey",
 )
 VALID_AUTH = {"none", "caller-bearer"}
+VERIFIED_ENDPOINT_FIELDS = (
+    "name", "signal", "url", "access", "scope", "auth", "tls", "paths",
+    "required_query_parameters", "required_headers", "tenant", "state", "source",
+    "route_admitted", "target_service", "service_port",
+)
 SEARCH_PATH = "/api/search"
 TRACE_PATH_TEMPLATE = "/api/traces/<trace-id>"
 TRACE_ID_PATTERN = re.compile(r"^(?:[0-9a-fA-F]{16}|[0-9a-fA-F]{32})$")
@@ -156,6 +166,27 @@ def trace_path_supported(endpoint: dict[str, Any]) -> bool:
     )
 
 
+def verify_endpoint(endpoint: dict[str, Any]) -> None:
+    """Bind the selected endpoint to fresh discovery before reading credentials."""
+    try:
+        discovered = discover_endpoints.discover()
+        error = validate_discovery_inventory(discovered)
+    except Exception as error:
+        raise QueryError("invalid_auth", "could not verify endpoint with discovery", 3) from error
+    if error:
+        raise QueryError("invalid_auth", "could not verify endpoint with discovery", 3)
+    matches = [item for item in discovered["query_endpoints"] if item.get("name") == endpoint.get("name")]
+    if (
+        len(matches) != 1
+        or matches[0].get("signal") != "traces"
+        or matches[0].get("state") != "ready"
+        or matches[0].get("auth") not in VALID_AUTH
+        or matches[0].get("access") not in {"route", "cluster-service"}
+        or any(matches[0].get(field) != endpoint.get(field) for field in VERIFIED_ENDPOINT_FIELDS)
+    ):
+        raise QueryError("invalid_auth", "trace endpoint does not match current discovery evidence", 3)
+
+
 def select_endpoint(
     inventory: dict[str, Any], endpoint_name: str | None, mode: str
 ) -> dict[str, Any]:
@@ -172,6 +203,8 @@ def select_endpoint(
         matches = [endpoint for endpoint in inventory["query_endpoints"] if endpoint.get("name") == endpoint_name]
         if not matches:
             raise QueryError("endpoint_not_found", f"trace endpoint '{endpoint_name}' was not found", 3)
+        if len(matches) != 1:
+            raise QueryError("ambiguous_endpoint", f"multiple endpoints named '{endpoint_name}'", 3)
         endpoint = matches[0]
         if endpoint.get("signal") != "traces":
             raise QueryError("invalid_endpoint", f"endpoint '{endpoint_name}' is not a traces endpoint", 3)
@@ -200,10 +233,13 @@ def select_endpoint(
         for item in inventory.get("unavailable", []):
             if isinstance(item, dict) and item.get("component") == "traces":
                 details.append(str(item.get("reason") or "trace component unavailable"))
-        conditions = (inventory.get("monitoring") or {}).get("conditions") or {}
+        monitoring = inventory.get("monitoring")
+        conditions = monitoring.get("conditions") if isinstance(monitoring, dict) else None
+        if not isinstance(conditions, dict):
+            conditions = {}
         for condition_name in ("TempoAvailable", "InstrumentationAvailable"):
-            condition = conditions.get(condition_name) or {}
-            if condition.get("status") == "False" and (condition.get("message") or condition.get("reason")):
+            condition = conditions.get(condition_name)
+            if isinstance(condition, dict) and condition.get("status") == "False" and (condition.get("message") or condition.get("reason")):
                 details.append(
                     f"{condition_name}: {condition.get('message') or condition.get('reason')}"
                 )
@@ -333,6 +369,37 @@ def traceql_string(value: str) -> str:
     return f'"{escaped}"'
 
 
+def traceql_filter_safe(query: str) -> bool:
+    """Allow one simple spanset, ignoring operators and braces inside strings."""
+    depth = 0
+    brace_count = 0
+    quote = None
+    escaped = False
+    for index, character in enumerate(query):
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\" and quote == '"':
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {'"', '`'}:
+            quote = character
+        elif character == "|":
+            return False
+        elif character == "{":
+            brace_count += 1
+            depth += 1
+            if depth != 1 or brace_count != 1 or index != 0:
+                return False
+        elif character == "}":
+            depth -= 1
+            if depth != 0 or index != len(query) - 1:
+                return False
+    return not quote and depth == 0
+
+
 def build_traceql_query(args: argparse.Namespace) -> str | None:
     if args.status is not None and args.query is not None:
         raise QueryError("invalid_argument", "--status cannot be combined with --query")
@@ -354,6 +421,10 @@ def build_traceql_query(args: argparse.Namespace) -> str | None:
         query = validate_filter_value(args.query, "--query")
         if not conditions:
             return query
+        if not traceql_filter_safe(query):
+            raise QueryError(
+                "invalid_argument", "--service and --operation cannot be combined with a compound --query"
+            )
         if query.startswith("{") and query.endswith("}"):
             inner = query[1:-1].strip()
             return "{ " + " && ".join([inner, *conditions]) + " }"
@@ -578,6 +649,30 @@ def read_limited(response: Any, maximum: int) -> bytes:
     return b"".join(chunks)
 
 
+@contextmanager
+def request_deadline(timeout: float) -> Iterator[None]:
+    """Bound the entire request, including slow headers and response bodies."""
+    if not hasattr(signal, "setitimer") or not hasattr(signal, "SIGALRM"):
+        raise QueryError("transport_error", "request deadlines require POSIX interval timers", 4)
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    if any(signal.getitimer(signal.ITIMER_REAL)):
+        raise QueryError("transport_error", "cannot use request deadline while another timer is active", 4)
+
+    def expire(signum: int, frame: Any) -> None:
+        raise TimeoutError("Tempo request deadline exceeded")
+
+    try:
+        signal.signal(signal.SIGALRM, expire)
+    except ValueError as error:
+        raise QueryError("transport_error", "request deadlines require the main thread", 4) from error
+    try:
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 def response_warnings(payload: dict[str, Any]) -> list[str]:
     warnings = payload.get("warnings", [])
     if (
@@ -621,20 +716,23 @@ def request_tempo(
     request = Request(request_url, headers=headers, method="GET")
     try:
         opener = build_opener(NoRedirectHandler(), HTTPSHandler(context=context))
-        with opener.open(request, timeout=args.timeout) as response:
-            raw = read_limited(response, args.max_response_bytes)
-    except HTTPError as error:
-        message = str(error.reason)
-        warnings: list[str] = []
-        try:
-            payload = json.loads(read_limited(error, args.max_response_bytes))
-            if isinstance(payload, dict):
-                message = response_message(payload.get("error") or payload.get("message") or message)
-                warnings = response_warnings(payload)
-        except (QueryError, UnicodeDecodeError, json.JSONDecodeError):
-            pass
-        raise QueryError("http_error", f"Tempo endpoint returned HTTP {error.code}: {message}", 4, warnings) from error
-    except (URLError, TimeoutError, OSError) as error:
+        with request_deadline(args.timeout):
+            try:
+                with opener.open(request, timeout=args.timeout) as response:
+                    raw = read_limited(response, args.max_response_bytes)
+            except HTTPError as error:
+                message = str(error.reason)
+                warnings: list[str] = []
+                try:
+                    with error:
+                        payload = json.loads(read_limited(error, args.max_response_bytes))
+                    if isinstance(payload, dict):
+                        message = response_message(payload.get("error") or payload.get("message") or message)
+                        warnings = response_warnings(payload)
+                except (QueryError, UnicodeDecodeError, json.JSONDecodeError):
+                    pass
+                raise QueryError("http_error", f"Tempo endpoint returned HTTP {error.code}: {message}", 4, warnings) from error
+    except (HTTPException, URLError, TimeoutError, OSError) as error:
         raise QueryError("transport_error", f"Tempo request failed: {error}", 4) from error
     try:
         payload = json.loads(raw)
@@ -759,6 +857,7 @@ def main(argv: list[str] | None = None) -> int:
         metadata = query_metadata(args, mode)
         inventory = load_inventory(args.inventory)
         endpoint = select_endpoint(inventory, args.endpoint, mode)
+        verify_endpoint(endpoint)
         request_url, headers = build_request(endpoint, args, metadata)
         response = request_tempo(request_url, headers, args, mode)
         payload = {

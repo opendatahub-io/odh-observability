@@ -2,7 +2,7 @@
 name: observability-traces-query
 description: Queries RHOAI Tempo traces through a ready endpoint returned by observability-endpoint-discovery. Use when an agent needs bounded trace searches or a specific trace from RHOAI without hardcoding Tempo endpoints, bypassing tenant authorization, or exposing credentials.
 license: Apache-2.0
-compatibility: Requires a validated observability-endpoint-discovery JSON inventory, Python 3.11+, network access to the selected Tempo gateway, and caller-provided authentication when the endpoint requires a bearer token.
+compatibility: Requires a validated observability-endpoint-discovery JSON inventory, Python 3.11+ on POSIX, the OpenShift CLI and cluster access for live discovery, network access to the selected Tempo gateway, and caller-provided authentication when the endpoint requires a bearer token.
 metadata:
   issue: RHAI-15150
   version: "1.0"
@@ -27,6 +27,7 @@ Tempo.
 The caller needs:
 
 - Python 3.11 or newer;
+- the OpenShift CLI, with access to the cluster for fresh endpoint discovery;
 - a validated inventory from `observability-endpoint-discovery`;
 - network access to the selected ready Tempo gateway;
 - an already-authorized bearer token when the inventory reports
@@ -56,32 +57,42 @@ through `--ca-file`. It never obtains credentials or disables TLS verification.
 3. Search a bounded time window or retrieve a trace by ID:
 
    ```bash
+   set -o pipefail
+   umask 077
+   trace_dir=$(mktemp -d "${TMPDIR:-/tmp}/observability-traces.XXXXXX") || exit 1
    python3 skills/observability-traces-query/scripts/query_traces.py \
      --inventory observability-endpoints.json \
      --endpoint tempo-data-science-tempomonolithic-gateway \
+     --search \
      --start 2026-01-01T00:00:00Z \
      --end 2026-01-01T00:05:00Z \
-      --service my-service \
-      --limit 100 \
-      --bearer-token-env RHOAI_TRACES_BEARER_TOKEN \
-      --ca-file /path/to/service-ca.crt \
-      --pretty \
-     | tee traces-result.json \
+     --service my-service \
+     --limit 100 \
+     --bearer-token-env RHOAI_TRACES_BEARER_TOKEN \
+     --ca-file /path/to/service-ca.crt \
+     --pretty \
+     | tee "$trace_dir/traces-result.json" \
      | python3 skills/observability-traces-query/scripts/validate_result.py
    ```
 
    Or retrieve one trace:
 
    ```bash
+   set -o pipefail
+   umask 077
+   trace_dir=$(mktemp -d "${TMPDIR:-/tmp}/observability-traces.XXXXXX") || exit 1
    python3 skills/observability-traces-query/scripts/query_traces.py \
      --inventory observability-endpoints.json \
-      --trace-id <hex-trace-id> \
-      --bearer-token-env RHOAI_TRACES_BEARER_TOKEN \
-      --ca-file /path/to/service-ca.crt \
-      --pretty \
-     | tee trace-result.json \
+     --trace-id 0123456789abcdef0123456789abcdef \
+     --bearer-token-env RHOAI_TRACES_BEARER_TOKEN \
+     --ca-file /path/to/service-ca.crt \
+     --pretty \
+     | tee "$trace_dir/trace-result.json" \
      | python3 skills/observability-traces-query/scripts/validate_result.py
    ```
+
+   The result is saved in the private directory named by `$trace_dir`; remove it
+   when no longer needed.
 
 4. Treat a non-zero exit status or `status: "error"` as a failed query. Do
    not retry by selecting a raw Tempo service, removing the tenant header,
@@ -97,7 +108,9 @@ through `--ca-file`. It never obtains credentials or disables TLS verification.
   tags, minimum/maximum duration, and a bounded result limit.
 - `--status` is represented in Tempo's TraceQL `q` expression and cannot be
   combined with `--query`. When a TraceQL query is used, service and operation
-  filters are included in that same expression so they are not lost.
+  filters are included in that same expression so they are not lost. Combining
+  those filters with compound queries or disjunctions is rejected; include the
+  filters explicitly in each branch instead.
 - `--service`, `--operation`, and `--tag KEY=VALUE` use Tempo's search filters
   when they are not incorporated into TraceQL. Tag pairs are logfmt encoded,
   separated by spaces, and values containing spaces, quotes, or backslashes are
@@ -109,12 +122,15 @@ through `--ca-file`. It never obtains credentials or disables TLS verification.
 - Requests use GET and the endpoint's discovered tenant header, normally
   `X-Scope-OrgID`. Caller bearer tokens are supplied only through an explicit
   environment variable.
-- The helper enforces a 120-second maximum timeout and a 5 MiB maximum
-  response by default. Search results are limited to at most 500 traces.
+- The helper enforces a wall-clock request deadline (20 seconds by default,
+  120 seconds maximum) and a 5 MiB maximum response. It requires POSIX interval
+  timers and the main thread. Search results are limited to at most 500 traces.
 
 ## Rules
 
 - Run and validate endpoint discovery before every trace query.
+- The helper re-runs discovery and checks the selected endpoint against current
+  cluster evidence before reading or sending a bearer token.
 - Use only a ready `signal: "traces"` query endpoint from the validated
   inventory. Do not invent or rewrite the endpoint URL.
 - Require the discovered tenant and required headers. Do not substitute a
@@ -152,7 +168,7 @@ The helper returns a deterministic JSON object with:
 Validate a saved result before handing it to another skill:
 
 ```bash
-python3 skills/observability-traces-query/scripts/validate_result.py < traces-result.json
+python3 skills/observability-traces-query/scripts/validate_result.py < "$trace_dir/traces-result.json"
 ```
 
 For endpoint selection, readiness states, tenant authorization, TLS, and
