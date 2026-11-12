@@ -26,9 +26,11 @@ import (
 	"os"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 
 	libconditions "github.com/opendatahub-io/odh-platform-utilities/pkg/controller/conditions"
+	odhLabels "github.com/opendatahub-io/odh-platform-utilities/pkg/metadata/labels"
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -36,6 +38,7 @@ import (
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -115,6 +118,28 @@ const (
 	legacyClusterPrometheusDatasourceSecret        = "cluster-prometheus-datasource-secret"
 	legacyClusterPrometheusTenancyDatasourceSecret = "cluster-prometheus-tenancy-datasource-secret"
 	legacyPersesDatasourceServiceAccount           = "data-science-prometheus-cluster-proxy"
+
+	// Desired Perses Prometheus default after scoping restore. Operator-managed
+	// legacy Prometheus datasources still marked default:true must be demoted
+	// and Perses-reconciled before this CR is applied, or Perses can reject the
+	// upgrade (dual-default).
+	persesDataSciencePrometheusDatasourceName = "data-science-prometheus-datasource"
+	persesPrometheusDatasourcePluginKind      = "PrometheusDatasource"
+	persesDatasourceAvailableConditionType    = "Available"
+	persesDemotionPendingReason               = "WaitingForPersesDemotion"
+	persesUserManagedDefaultConflictReason    = "UserManagedPrometheusDefaultConflict"
+	// Annotation set on an operator-managed datasource when this controller
+	// clears default:true. Sync wait only applies while this annotation is set,
+	// so an unrelated Available=False on an already non-default CR cannot block
+	// DS promotion forever.
+	persesPrometheusDemotionGenerationAnnotation = "platform.opendatahub.io/prometheus-default-demotion-generation"
+	// Shared literal for the Kubernetes default namespace and PersesDatasource
+	// spec.config.default field (goconst).
+	defaultName = "default"
+
+	// Operator-rendered Perses Prometheus datasources that must stay non-default.
+	persesClusterPrometheusDatasourceName        = "cluster-prometheus-datasource"
+	persesClusterPrometheusTenancyDatasourceName = "cluster-prometheus-tenancy-datasource"
 
 	PersesTempoDatasourceName = "tempo-datasource"
 	PersesTempoDashboardName  = "data-science-tempo-traces"
@@ -549,6 +574,8 @@ func deployPersesTempoIntegration(
 // built-in metrics storage is configured (Thanos Querier URL).
 // persesVersion and persesFound are pre-resolved by the reconciler to avoid
 // redundant API calls across the three Perses action functions.
+// withheld is true when templates are skipped so collectGarbage must shield
+// existing perses-prometheus resources (do not append default:true meanwhile).
 func deployPersesPrometheusIntegration(
 	ctx context.Context,
 	c client.Client,
@@ -557,35 +584,66 @@ func deployPersesPrometheusIntegration(
 	sources *[]rendertemplate.TemplateSource,
 	persesVersion string,
 	persesFound bool,
-) error {
+) (bool, error) {
 	if monitoring.Spec.Metrics == nil || monitoring.Spec.Metrics.Storage == nil {
 		cm.MarkNotConfigured(conditions.ConditionPersesPrometheusDataSourceAvailable,
 			conditions.MetricsNotConfiguredReason,
 			"Prometheus datasource requires metrics.storage to be configured")
-		return nil
+		return false, nil
 	}
 
 	if !persesFound {
 		cm.MarkFalse(conditions.ConditionPersesPrometheusDataSourceAvailable,
 			"PersesDatasourceCRDNotFoundReason",
 			"PersesDatasource CRD not found in any supported version")
-		return nil
+		return false, nil
 	}
 
 	_, datasourceGVK, _ := persesGVKs(persesVersion)
 	exists, err := hasCRD(ctx, c, datasourceGVK)
 	if err != nil {
-		return fmt.Errorf("checking PersesDatasource CRD: %w", err)
+		return false, fmt.Errorf("checking PersesDatasource CRD: %w", err)
 	}
 	if !exists {
 		cm.MarkFalse(conditions.ConditionPersesPrometheusDataSourceAvailable,
 			datasourceGVK.Kind+"CRDNotFoundReason",
 			fmt.Sprintf("%s CRD not found", datasourceGVK.Kind))
-		return nil
+		return false, nil
 	}
 
 	if err := cleanupLegacyPersesDatasourceSATokenSecrets(ctx, c, monitoring); err != nil {
-		return err
+		return false, err
+	}
+
+	// Demote operator-managed legacy Prometheus defaults, then wait for Perses
+	// to reconcile that demotion before promoting DS. Never mutate user-managed
+	// defaults (GitOps fight); surface them as an explicit conflict instead.
+	demoted, userConflicts, err := demoteOperatorManagedForeignDefaultPersesPrometheusDatasources(ctx, c, monitoring, datasourceGVK)
+	if err != nil {
+		return false, err
+	}
+	if len(userConflicts) > 0 {
+		cm.MarkFalse(conditions.ConditionPersesPrometheusDataSourceAvailable,
+			persesUserManagedDefaultConflictReason,
+			fmt.Sprintf("user-managed Prometheus PersesDatasource default(s) block promoting %s: %s; clear spec.config.default on those CRs",
+				persesDataSciencePrometheusDatasourceName, strings.Join(userConflicts, ", ")))
+		return true, nil
+	}
+	if demoted {
+		cm.MarkFalse(conditions.ConditionPersesPrometheusDataSourceAvailable,
+			persesDemotionPendingReason,
+			"Demoted operator-managed Prometheus default; waiting for Perses to reconcile before promoting data-science default")
+		return true, nil
+	}
+	synced, pendingName, err := operatorManagedPersesPrometheusDemotionSynced(ctx, c, monitoring, datasourceGVK)
+	if err != nil {
+		return false, err
+	}
+	if !synced {
+		cm.MarkFalse(conditions.ConditionPersesPrometheusDataSourceAvailable,
+			persesDemotionPendingReason,
+			fmt.Sprintf("Waiting for Perses to reconcile demoted datasource %s before promoting data-science default", pendingName))
+		return true, nil
 	}
 
 	cm.MarkTrue(conditions.ConditionPersesPrometheusDataSourceAvailable)
@@ -596,12 +654,200 @@ func deployPersesPrometheusIntegration(
 	// (not this append order); the CR names are chosen so lexicographic order keeps
 	// cluster-prometheus-* (default:false) before data-science-prometheus-datasource
 	// (default:true). See TestPersesDatasourceApplyOrder_SortKeepsNonDefaultFirst.
+	// Demotion + Perses Available sync above coordinate the live-object transition;
+	// apply order is defense in depth.
 	*sources = append(*sources,
 		src(PersesDatasourceClusterPrometheusTemplate),
 		src(PersesDatasourceClusterPrometheusTenancyTemplate),
 		src(PersesDatasourcePrometheusTemplate),
 	)
-	return nil
+	return false, nil
+}
+
+// demoteOperatorManagedForeignDefaultPersesPrometheusDatasources clears
+// spec.config.default on operator-managed legacy Prometheus PersesDatasources.
+// User-managed Prometheus defaults are returned by name and left untouched.
+// Non-Prometheus plugins keep their own default (Perses scopes defaults per kind).
+// demoted is true when at least one Update ran this reconcile (caller must not
+// promote until a later reconcile sees Perses sync).
+func demoteOperatorManagedForeignDefaultPersesPrometheusDatasources(
+	ctx context.Context,
+	c client.Client,
+	monitoring *v1alpha1.Monitoring,
+	datasourceGVK schema.GroupVersionKind,
+) (bool, []string, error) {
+	namespace := monitoringNamespace(monitoring)
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   datasourceGVK.Group,
+		Version: datasourceGVK.Version,
+		Kind:    datasourceGVK.Kind + "List",
+	})
+	if err := c.List(ctx, list, client.InNamespace(namespace)); err != nil {
+		return false, nil, fmt.Errorf("listing PersesDatasources for default demotion: %w", err)
+	}
+
+	log := logf.FromContext(ctx)
+	demoted := false
+	var userConflicts []string
+	for i := range list.Items {
+		ds := &list.Items[i]
+		if ds.GetName() == persesDataSciencePrometheusDatasourceName {
+			continue
+		}
+		pluginKind, _, err := unstructured.NestedString(ds.Object, "spec", "config", "plugin", "kind")
+		if err != nil {
+			return false, nil, fmt.Errorf("reading PersesDatasource %s/%s plugin kind: %w", namespace, ds.GetName(), err)
+		}
+		if pluginKind != persesPrometheusDatasourcePluginKind {
+			continue
+		}
+		isDefault, found, err := unstructured.NestedBool(ds.Object, "spec", "config", defaultName)
+		if err != nil {
+			return false, nil, fmt.Errorf("reading PersesDatasource %s/%s default: %w", namespace, ds.GetName(), err)
+		}
+		if !found || !isDefault {
+			continue
+		}
+		if !isOperatorManagedPersesPrometheusDatasource(ds) {
+			userConflicts = append(userConflicts, ds.GetName())
+			continue
+		}
+		if err := unstructured.SetNestedField(ds.Object, false, "spec", "config", defaultName); err != nil {
+			return false, nil, fmt.Errorf("clearing PersesDatasource %s/%s default: %w", namespace, ds.GetName(), err)
+		}
+		if err := c.Update(ctx, ds); err != nil {
+			return false, nil, fmt.Errorf("demoting PersesDatasource %s/%s default before promoting %s: %w",
+				namespace, ds.GetName(), persesDataSciencePrometheusDatasourceName, err)
+		}
+		// After Update, generation advanced; stamp that generation as the demotion we must wait for.
+		if err := c.Get(ctx, types.NamespacedName{Name: ds.GetName(), Namespace: namespace}, ds); err != nil {
+			return false, nil, fmt.Errorf("reloading demoted PersesDatasource %s/%s: %w", namespace, ds.GetName(), err)
+		}
+		annotations := ds.GetAnnotations()
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		annotations[persesPrometheusDemotionGenerationAnnotation] = strconv.FormatInt(ds.GetGeneration(), 10)
+		ds.SetAnnotations(annotations)
+		if err := c.Update(ctx, ds); err != nil {
+			return false, nil, fmt.Errorf("annotating demoted PersesDatasource %s/%s: %w", namespace, ds.GetName(), err)
+		}
+		demoted = true
+		log.Info("demoted operator-managed PersesDatasource default; waiting for Perses reconcile before promote",
+			"name", ds.GetName(), "namespace", namespace, "generation", ds.GetGeneration())
+	}
+	return demoted, userConflicts, nil
+}
+
+// operatorManagedPersesPrometheusDemotionSynced reports whether every existing
+// operator-managed legacy Prometheus datasource has default:false and a Perses
+// Available condition that covers the current generation. pendingName identifies
+// the first datasource still waiting when synced is false.
+func operatorManagedPersesPrometheusDemotionSynced(
+	ctx context.Context,
+	c client.Client,
+	monitoring *v1alpha1.Monitoring,
+	datasourceGVK schema.GroupVersionKind,
+) (bool, string, error) {
+	namespace := monitoringNamespace(monitoring)
+	for _, name := range []string{
+		persesClusterPrometheusDatasourceName,
+		persesClusterPrometheusTenancyDatasourceName,
+	} {
+		ds := &unstructured.Unstructured{}
+		ds.SetGroupVersionKind(datasourceGVK)
+		err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, ds)
+		if err != nil {
+			if k8serr.IsNotFound(err) {
+				continue
+			}
+			return false, name, fmt.Errorf("getting PersesDatasource %s/%s for demotion sync: %w", namespace, name, err)
+		}
+		if !isOperatorManagedPersesPrometheusDatasource(ds) {
+			continue
+		}
+		isDefault, found, err := unstructured.NestedBool(ds.Object, "spec", "config", defaultName)
+		if err != nil {
+			return false, name, fmt.Errorf("reading PersesDatasource %s/%s default: %w", namespace, name, err)
+		}
+		if found && isDefault {
+			return false, name, nil
+		}
+		// Only wait on CRs this controller demoted. An already non-default datasource
+		// with Available=False for an unrelated reason must not block promotion.
+		if ds.GetAnnotations()[persesPrometheusDemotionGenerationAnnotation] == "" {
+			continue
+		}
+		if !persesDatasourceAvailableCoversGeneration(ds) {
+			return false, name, nil
+		}
+		annotations := ds.GetAnnotations()
+		delete(annotations, persesPrometheusDemotionGenerationAnnotation)
+		ds.SetAnnotations(annotations)
+		if err := c.Update(ctx, ds); err != nil {
+			return false, name, fmt.Errorf("clearing demotion annotation on PersesDatasource %s/%s: %w", namespace, name, err)
+		}
+	}
+	return true, "", nil
+}
+
+func isOperatorManagedPersesPrometheusDatasource(ds metav1.Object) bool {
+	switch ds.GetName() {
+	case persesClusterPrometheusDatasourceName, persesClusterPrometheusTenancyDatasourceName:
+	default:
+		return false
+	}
+	if isNotManagedByODHOperator(ds) {
+		return false
+	}
+	return ds.GetLabels()[odhLabels.PlatformPartOf] == monitoringPartOf
+}
+
+// persesDatasourceAvailableCoversGeneration is true when Perses reports Available
+// with observedGeneration covering metadata.generation. A successful CR Update
+// alone is not enough — Perses may still serve the old default.
+func persesDatasourceAvailableCoversGeneration(ds *unstructured.Unstructured) bool {
+	rawConditions, found, err := unstructured.NestedSlice(ds.Object, "status", "conditions")
+	if err != nil || !found {
+		return false
+	}
+	generation := ds.GetGeneration()
+	for _, raw := range rawConditions {
+		cond, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if fmt.Sprint(cond["type"]) != persesDatasourceAvailableConditionType {
+			continue
+		}
+		if fmt.Sprint(cond["status"]) != string(metav1.ConditionTrue) {
+			return false
+		}
+		observed, hasObserved := int64FromUnstructured(cond["observedGeneration"])
+		// observedGeneration is optional on Condition, but without it we cannot
+		// prove Perses reconciled the demoted generation — treat as not synced.
+		if !hasObserved || observed <= 0 || observed < generation {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func int64FromUnstructured(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int64:
+		return n, true
+	case int32:
+		return int64(n), true
+	case int:
+		return int64(n), true
+	case float64:
+		return int64(n), true
+	default:
+		return 0, false
+	}
 }
 
 // cleanupLegacyPersesDatasourceSATokenSecrets removes operator-owned legacy

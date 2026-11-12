@@ -240,7 +240,7 @@ func TestPersesMetricsScopingContract_DeploySelectsOnlyScopedDatasources(t *test
 	conditionsManager := conditions.NewConditionsManager(monitoring, monitoring.Generation)
 	var sources []rendertemplate.TemplateSource
 
-	err := deployPersesPrometheusIntegration(
+	_, err := deployPersesPrometheusIntegration(
 		t.Context(),
 		fake.NewClientBuilder().WithScheme(scheme).Build(),
 		monitoring,
