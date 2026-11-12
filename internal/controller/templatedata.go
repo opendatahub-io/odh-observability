@@ -837,7 +837,9 @@ func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces,
 		templateData["Size"] = traces.Storage.Size
 	case v1alpha1.StorageBackendS3, v1alpha1.StorageBackendGCS:
 		templateData["TempoGatewayService"] = "tempo-data-science-tempostack-gateway"
-		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempostack-gateway.%s.svc.cluster.local:4317", namespace)
+		// TempoStack gateway Service exposes OTLP gRPC as grpc-public on 8090.
+		// Unlike TempoMonolithic, it does not alias the standard OTLP port 4317.
+		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempostack-gateway.%s.svc.cluster.local:8090", namespace)
 		templateData["TempoQueryEndpoint"] = fmt.Sprintf("https://tempo-data-science-tempostack-gateway.%s.svc.cluster.local:8080/api/traces/v1/%s/tempo", namespace, namespace)
 		templateData["Secret"] = traces.Storage.Secret
 	}

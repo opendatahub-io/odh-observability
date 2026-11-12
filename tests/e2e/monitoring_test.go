@@ -1979,6 +1979,20 @@ func (tc *MonitoringTestCtx) validateTempoStackCreation(t *testing.T, backend, s
 		WithEventuallyTimeout(15*time.Minute),
 		WithCustomErrorMsg("Monitoring should become Ready with %s traces storage", backend),
 	)
+
+	expectedOTLPEndpoint := fmt.Sprintf(
+		"tempo-data-science-tempostack-gateway.%s.svc.cluster.local:8090",
+		tc.MonitoringNamespace,
+	)
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+			Name:      OpenTelemetryCollectorName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.spec.config.exporters."otlp/tempo".endpoint == "%s"`, expectedOTLPEndpoint)),
+		WithCustomErrorMsg("collector must export TempoStack traces to gateway grpc-public :8090 (TempoStack has no :4317 Service port)"),
+	)
+
 	if backend == TracesStorageBackendGCS {
 		endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/storage/v1/", fakeGCSServiceName, tc.MonitoringNamespace, fakeGCSPort)
 		tc.EnsureResourceExists(
