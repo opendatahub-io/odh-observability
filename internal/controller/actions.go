@@ -49,6 +49,9 @@ const (
 	MonitoringStackTemplate                          = "resources/monitoring-stack.tmpl.yaml"
 	MonitoringAdmissionPoliciesTemplate              = "resources/monitoring-admission-policies.tmpl.yaml"
 	MonitoringStackAlertmanagerRBACTemplate          = "resources/monitoringstack-alertmanager-rbac.tmpl.yaml"
+	AlertmanagerProxyTemplate                        = "resources/data-science-alertmanager-proxy.tmpl.yaml"
+	AlertmanagerProxyNetworkPolicyTemplate           = "resources/data-science-alertmanager-proxy-network-policy.tmpl.yaml"
+	AlertmanagerRouteTemplate                        = "resources/alertmanager-route.tmpl.yaml"
 	TempoMonolithicTemplate                          = "resources/tempo-monolithic.tmpl.yaml"
 	TempoStackTemplate                               = "resources/tempo-stack.tmpl.yaml"
 	OpenTelemetryCollectorTemplate                   = "resources/opentelemetry-collector.tmpl.yaml"
@@ -75,6 +78,7 @@ const (
 	ThanosQuerierTemplate                            = "resources/thanos-querier-cr.tmpl.yaml"
 	ThanosQuerierNetworkPolicyTemplate               = "resources/data-science-thanos-querier-network-policy.tmpl.yaml"
 	TempoMonolithicNetworkPolicyTemplate             = "resources/data-science-tempo-monolithic-network-policy.tmpl.yaml"
+	TempoRouteTemplate                               = "resources/tempo-route.tmpl.yaml"
 	ThanosQuerierRouteTemplate                       = "resources/thanos-querier-route.tmpl.yaml"
 	PersesTemplate                                   = "resources/perses.tmpl.yaml"
 	PersesTempoDatasourceTemplate                    = "resources/perses-tempo-datasource.tmpl.yaml"
@@ -195,6 +199,9 @@ func deployMonitoringStackWithQuerierAndRestrictions(
 		src(MonitoringStackTemplate),
 		src(PrometheusSelfServiceMonitorTemplate),
 		src(MonitoringStackAlertmanagerRBACTemplate),
+		src(AlertmanagerProxyTemplate),
+		src(AlertmanagerProxyNetworkPolicyTemplate),
+		src(AlertmanagerRouteTemplate),
 		src(AcceleratorRecordingRulesTemplate),
 		src(PrometheusRouteTemplate),
 		src(PrometheusServiceOverrideTemplate),
@@ -267,7 +274,7 @@ func deployTracingStack(
 	}
 
 	cm.MarkTrue(conditions.ConditionTempoAvailable)
-	*sources = append(*sources, src(tempoTemplate))
+	*sources = append(*sources, src(tempoTemplate), src(TempoRouteTemplate))
 	if tempoGVK == gvk.TempoMonolithic {
 		*sources = append(*sources, src(TempoMonolithicNetworkPolicyTemplate))
 	}

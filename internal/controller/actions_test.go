@@ -355,8 +355,8 @@ func TestDeployTracingStack_PVBackend_CRDsPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 3 {
-		t.Errorf("expected 3 sources (TempoMonolithic + NetworkPolicy + Instrumentation), got %d", len(sources))
+	if len(sources) != 4 {
+		t.Errorf("expected 4 sources (TempoMonolithic + NetworkPolicy + Route + Instrumentation), got %d", len(sources))
 	}
 
 	tempoC := findCondition(m, conditions.ConditionTempoAvailable)
@@ -383,8 +383,8 @@ func TestDeployTracingStack_S3Backend_CRDsPresent(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if len(sources) != 2 {
-		t.Errorf("expected 2 sources (TempoStack + Instrumentation), got %d", len(sources))
+	if len(sources) != 3 {
+		t.Errorf("expected 3 sources (TempoStack + Route + Instrumentation), got %d", len(sources))
 	}
 }
 

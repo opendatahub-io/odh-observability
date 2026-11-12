@@ -1,0 +1,160 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: data-science-alertmanager-proxy
+  namespace: {{.Namespace}}
+  labels:
+    app: data-science-alertmanager-proxy
+    platform.opendatahub.io/part-of: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: data-science-alertmanager-proxy-auth-delegator
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: data-science-alertmanager-proxy
+    namespace: {{.Namespace}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: data-science-alertmanager-proxy-config
+  namespace: {{.Namespace}}
+  labels:
+    app: data-science-alertmanager-proxy
+    platform.opendatahub.io/part-of: monitoring
+data:
+  kube-rbac-proxy.yaml: |
+    authorization:
+      resourceAttributes:
+        apiGroup: monitoring.coreos.com
+        resource: alertmanagers
+        verb: get
+        namespace: {{.Namespace}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-science-alertmanager-proxy
+  namespace: {{.Namespace}}
+  labels:
+    app: data-science-alertmanager-proxy
+    platform.opendatahub.io/part-of: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: data-science-alertmanager-proxy
+  template:
+    metadata:
+      labels:
+        app: data-science-alertmanager-proxy
+    spec:
+      serviceAccountName: data-science-alertmanager-proxy
+      containers:
+        - name: kube-rbac-proxy
+          image: {{.KubeRBACProxyImage}}
+          args:
+            - --secure-listen-address=0.0.0.0:8443
+            - --upstream=http://127.0.0.1:9092/
+            - --config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml
+            - --tls-cert-file=/etc/tls/private/tls.crt
+            - --tls-private-key-file=/etc/tls/private/tls.key
+            - --tls-min-version={{.TLSMinVersion}}
+            {{- if .TLSCipherSuites}}
+            - --tls-cipher-suites={{.TLSCipherSuites}}
+            {{- end}}
+            {{- if .TLSCurvePreferences}}
+            - --tls-curve-preferences={{.TLSCurvePreferences}}
+            {{- end}}
+            - --logtostderr=true
+            - --v=2
+          ports:
+            - containerPort: 8443
+              name: https
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 100m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kube-rbac-proxy
+              readOnly: true
+            - name: tls
+              mountPath: /etc/tls/private
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+        - name: method-gate
+          image: {{.HTTPMethodGateImage}}
+          command:
+            - /manager
+            - method-gate
+            - --listen=127.0.0.1:9092
+            - --upstream=http://data-science-monitoringstack-alertmanager.{{.Namespace}}.svc.cluster.local:9093/
+          ports:
+            - containerPort: 9092
+              name: method-gate
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 100m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+      volumes:
+        - name: config
+          configMap:
+            name: data-science-alertmanager-proxy-config
+        - name: tls
+          secret:
+            secretName: data-science-alertmanager-proxy-tls
+      nodeSelector:
+        kubernetes.io/os: linux
+      securityContext:
+        runAsNonRoot: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: data-science-alertmanager-proxy
+  namespace: {{.Namespace}}
+  labels:
+    app: data-science-alertmanager-proxy
+    platform.opendatahub.io/part-of: monitoring
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: data-science-alertmanager-proxy-tls
+spec:
+  type: ClusterIP
+  ports:
+    - name: https
+      port: 8443
+      protocol: TCP
+      targetPort: https
+  selector:
+    app: data-science-alertmanager-proxy
