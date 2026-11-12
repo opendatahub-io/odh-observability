@@ -1468,6 +1468,10 @@ func (tc *MonitoringTestCtx) assertThanosPromQLResponds(t *testing.T, query stri
 			return err
 		}
 		if resp.StatusCode != http.StatusOK {
+			if resp.StatusCode == http.StatusUnauthorized {
+				logThanosTokenReview(t, tc, "baseline", token)
+				logThanosProxyAuthenticationEvidence(t, tc)
+			}
 			httpErr := fmt.Errorf("PromQL query %q returned HTTP %d (want 200)", query, resp.StatusCode)
 			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 				return httpErr

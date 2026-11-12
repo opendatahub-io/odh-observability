@@ -70,21 +70,19 @@ func (tc *MonitoringTestCtx) ValidateModelResourceFederation(t *testing.T) {
 		}, 2*time.Minute, 5*time.Second).Should(Succeed(), "quota accounting must initialize before creating the fixture pod")
 	}
 
-	const podName = "cpu-limit-fixture"
-	tc.createFixtureResource(t, gvk.Pod, &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace},
-		Spec: corev1.PodSpec{
-			SecurityContext: fixturePodSecurityContext(),
-			Containers: []corev1.Container{{
-				Name: "fixture", Image: tenantMetricsImage,
-				SecurityContext: fixtureContainerSecurityContext(),
-				Resources: corev1.ResourceRequirements{
-					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("64Mi")},
-					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("256Mi")},
-				},
-			}},
-		},
-	})
+	pod := modelResourceFixturePod(namespace)
+	podName := pod.Name
+	tc.createFixtureResource(t, gvk.Pod, pod)
+	tc.g.Eventually(func() error {
+		var current corev1.Pod
+		if err := tc.Client().Get(tc.Context(), types.NamespacedName{Name: podName, Namespace: namespace}, &current); err != nil {
+			return err
+		}
+		if !podIsReady(current) {
+			return fmt.Errorf("pod %s/%s is not ready: phase=%s container statuses=%+v", namespace, podName, current.Status.Phase, current.Status.ContainerStatuses)
+		}
+		return nil
+	}, 5*time.Minute, 5*time.Second).Should(Succeed(), "CPU usage requires a running fixture container")
 
 	viewer := tc.metricsViewerToken(t, "cpu-federation-viewer", namespace)
 	foreignViewer := tc.metricsViewerToken(t, "cpu-federation-foreign-viewer", foreignNamespace)
@@ -146,5 +144,39 @@ func (tc *MonitoringTestCtx) ValidateModelResourceFederation(t *testing.T) {
 		if err != nil || status != http.StatusOK || len(response.Data.Result) != 0 {
 			t.Fatalf("foreign namespace must not see query %q: HTTP %d, %d series, error=%v", check.query, status, len(response.Data.Result), err)
 		}
+	}
+}
+
+// The stock Prometheus image stores its TSDB in /prometheus, which is owned by
+// the image user. OpenShift's restricted SCC assigns a different UID and an
+// emptyDir is needed for the process to start (as with the tenant fixture).
+func modelResourceFixturePod(namespace string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "cpu-limit-fixture", Namespace: namespace},
+		Spec: corev1.PodSpec{
+			SecurityContext: fixturePodSecurityContext(),
+			Containers: []corev1.Container{{
+				Name: "fixture", Image: tenantMetricsImage,
+				SecurityContext: fixtureContainerSecurityContext(),
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("64Mi")},
+					Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("256Mi")},
+				},
+				VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/prometheus"}},
+			}},
+			Volumes: []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}},
+		},
+	}
+}
+
+func TestModelResourceFixturePod(t *testing.T) {
+	pod := modelResourceFixturePod("test-namespace")
+	if len(pod.Spec.Containers) != 1 || len(pod.Spec.Volumes) != 1 || pod.Spec.Volumes[0].EmptyDir == nil {
+		t.Fatalf("fixture must have one container and writable emptyDir: %+v", pod.Spec)
+	}
+	container := pod.Spec.Containers[0]
+	if len(container.VolumeMounts) != 1 || container.VolumeMounts[0].Name != pod.Spec.Volumes[0].Name ||
+		container.VolumeMounts[0].MountPath != "/prometheus" || container.VolumeMounts[0].ReadOnly {
+		t.Fatalf("fixture must mount the emptyDir at the Prometheus TSDB path: %+v", container.VolumeMounts)
 	}
 }
