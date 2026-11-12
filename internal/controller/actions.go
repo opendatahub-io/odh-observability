@@ -58,6 +58,7 @@ const (
 	CollectorServiceMonitorsTemplate                 = "resources/collector-servicemonitors.tmpl.yaml"
 	CollectorMonitorServiceTemplate                  = "resources/collector-monitor-service.tmpl.yaml"
 	CollectorPrometheusServiceTemplate               = "resources/collector-prometheus-service.tmpl.yaml"
+	CollectorResourcePrometheusServiceTemplate       = "resources/collector-resource-prometheus-service.tmpl.yaml"
 	CollectorMonitoringNetworkPolicyTemplate         = "resources/collector-monitoring-network-policy.tmpl.yaml"
 	CollectorTargetAllocatorNetworkPolicyTemplate    = "resources/collector-targetallocator-network-policy.tmpl.yaml"
 	CollectorRBACTemplate                            = "resources/collector-rbac.tmpl.yaml"
@@ -335,6 +336,7 @@ func deployOpenTelemetryCollector(
 		*sources = append(*sources,
 			src(CollectorServiceMonitorsTemplate),
 			src(CollectorPrometheusServiceTemplate),
+			src(CollectorResourcePrometheusServiceTemplate),
 		)
 	}
 

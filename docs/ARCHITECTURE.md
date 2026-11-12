@@ -57,9 +57,21 @@ Workload metrics are collected through eligible ServiceMonitor and PodMonitor re
 
 The TargetAllocator uses mTLS by default, with cert-manager provisioning its CA, serving, and client certificates. The collector is configured only with the HTTPS TargetAllocator endpoint. The upstream TargetAllocator may also expose its non-mTLS discovery port, but `allowInsecureAuthSecrets` remains disabled so authenticated ServiceMonitor credentials cannot be returned over plaintext HTTP.
 
-### HTTPS DCGM exporter scraping
+### DCGM exporter scraping and trusted attribution
 
-The built-in DCGM scrape uses unauthenticated HTTP on port 9400 by default. For clusters configured with a direct HTTPS DCGM endpoint, disable only that built-in job and select a ServiceMonitor or PodMonitor instead. Ensure the monitor's namespace is opted in with `monitoring.opendatahub.io/scrape=true`, label the monitor `monitoring.opendatahub.io/scrape: "true"`, and reference a CA Secret rather than a file path; the TargetAllocator has permission to read selected monitor Secrets in allowed namespaces, while `denyFSAccessThroughSMs` blocks file-backed credentials.
+The built-in DCGM scrape uses unauthenticated HTTP on port 9400 by default. For a direct HTTPS exporter on that port, an administrator can configure certificate-verified HTTPS on the built-in path. Create a Secret in the monitoring namespace containing the exporter's PEM CA as `ca.crt`, then set the following on the standalone `Monitoring` resource:
+
+```yaml
+spec:
+  metrics:
+    builtinDCGMTLS:
+      caSecretName: dcgm-exporter-ca
+      serverName: nvidia-dcgm-exporter.nvidia-gpu-operator.svc
+```
+
+The configured name must match the exporter certificate; the collector verifies the CA and hostname and does not follow redirects. Keep the built-in scrape enabled. The option does not configure client certificates or bearer tokens. When a parent operator owns the `Monitoring` resource, its API and reconciliation must also support forwarding this field; otherwise it cannot be reliably configured through that parent.
+
+Alternatively, disable the built-in job and select a ServiceMonitor or PodMonitor, including when exporter authentication is required. Monitor-based scrapes are not trusted for model attribution. Ensure the monitor's namespace is opted in with `monitoring.opendatahub.io/scrape=true`, label the monitor `monitoring.opendatahub.io/scrape: "true"`, and reference a CA Secret rather than a file path; the TargetAllocator has permission to read selected monitor Secrets in allowed namespaces, while `denyFSAccessThroughSMs` blocks file-backed credentials.
 
 TargetAllocator Prometheus CR discovery supports the `monitoring.coreos.com/v1` API group. The webhook also labels `monitoring.rhobs/v1` monitors, but those are not discovered by TargetAllocator.
 
@@ -106,9 +118,11 @@ spec:
           action: keep
 ```
 
-Set `spec.metrics.builtinDCGMScrapeEnabled: false` on a standalone `Monitoring` resource, or `spec.monitoring.metrics.builtinDCGMScrapeEnabled: false` on `DSCInitialization`, when this monitor scrapes the same DCGM targets. Omit the field (or set it to `true`) to retain built-in HTTP scraping. The namespace relabel supports namespace-proxy queries. The monitor keeps the `rhoai-accelerator-metrics` job identity, node/component labels, and DCGM metric filter expected by accelerator processing and recording rules. The collector suppresses exporter-pod attribution only for targets discovered in `nvidia-gpu-operator`; using this job label elsewhere does not disable namespace/pod attribution. Do not add a bearer token for the collector ServiceAccount: it is used for Kubernetes discovery, not DCGM authentication. If the exporter requires authentication, configure the monitor's Secret-backed `authorization` or `basicAuth`; TargetAllocator transfers those credentials only over mTLS. Never configure `insecureSkipVerify` or file-backed credential paths. The certificate must chain to the referenced CA and match `serverName`.
+Set `spec.metrics.builtinDCGMScrapeEnabled: false` on a standalone `Monitoring` resource, or `spec.monitoring.metrics.builtinDCGMScrapeEnabled: false` on `DSCInitialization`, when this monitor scrapes the same DCGM targets. Omit the field (or set it to `true`) to retain built-in scraping. The namespace relabel supports namespace-proxy queries. The monitor keeps the `rhoai-accelerator-metrics` job identity, node/component labels, and DCGM metric filter expected by accelerator processing and recording rules. The collector suppresses exporter-pod attribution only for targets discovered in `nvidia-gpu-operator`; using this job label elsewhere does not disable namespace/pod attribution. Do not add a bearer token for the collector ServiceAccount: it is used for Kubernetes discovery, not DCGM authentication. If the exporter requires authentication, configure the monitor's Secret-backed `authorization` or `basicAuth`; TargetAllocator transfers those credentials only over mTLS. Never configure `insecureSkipVerify` or file-backed credential paths. The certificate must chain to the referenced CA and match `serverName`.
 
-Prometheus follows redirects by default, so the built-in scrape keeps that behavior for compatibility. HTTPS-only DCGM endpoints should use a monitor with explicit TLS trust and hostname settings rather than relying on an HTTP-to-HTTPS redirect. Keep built-in scraping enabled only when it does not duplicate the monitor's target.
+Only the built-in job has trusted model attribution. An isolated receiver requests that job's targets for its own collector replica over TargetAllocator mTLS, checks the discovered GPU-operator namespace and pod name, and refuses redirects. It marks the samples and copies the DCGM exporter's workload namespace and pod; the MonitoringStack promotes them only when both are present. Selected monitors and OTLP inputs cannot set these reserved labels. The TargetAllocator-managed receiver still scrapes the built-in job to preserve allocation, but discards its samples; this costs an extra scrape per allocated target without exporting duplicate DCGM samples. The trust boundary assumes the `nvidia-gpu-operator` namespace, its exporter and the TargetAllocator are trusted; when using HTTP it also assumes a trusted network path. HTTPS monitors remain supported, but their workload attribution is not trusted: disabling the built-in job leaves model GPU attribution unavailable rather than accepting tenant-controlled relabelings. Missing workload labels likewise remain unattributed.
+
+**Migration:** the isolated built-in scrape does not follow redirects. For an exporter that previously redirected HTTP to HTTPS, configure direct HTTPS using `builtinDCGMTLS`, or use the HTTPS monitor above with the built-in scrape disabled. The latter keeps DCGM collection but does not provide trusted model attribution. Do not leave both enabled for the same target.
 
 ## Action Functions
 
@@ -224,7 +238,7 @@ Perses metrics access model (three lanes — pick by **where the series live**, 
 
 | Lane | Datasource | Backend | Gate | Owns |
 |------|------------|---------|------|------|
-| **DS namespace-scoped** | `data-science-prometheus-datasource` (default) | DS Thanos proxy `:8443` | `namespace=` + caller token + `metrics.k8s.io` SAR | Series in the Data Science MonitoringStack (e.g. raw `vllm:*`, DS `accelerator_*` recording rules from OTC/DCGM) |
+| **DS namespace-scoped** | `data-science-prometheus-datasource` (default) | DS Thanos proxy `:8443` | `namespace=` + caller token + `metrics.k8s.io` SAR | Series in the Data Science MonitoringStack (e.g. raw `vllm:*`, DS `accelerator_*` recording rules from OTC/DCGM, and model-resource series federated from OpenShift Monitoring) |
 | **OCP tenancy** | `cluster-prometheus-tenancy-datasource` | OpenShift Thanos `:9092` | `namespace=` + caller token | Namespaced OpenShift Monitoring series (`node_namespace_pod_container:*`, `kube_*`, OCP accelerator with `exported_namespace` / `exported_pod`) |
 | **OCP admin** | `cluster-prometheus-datasource` | OpenShift Thanos `:9091` | caller RBAC only (e.g. `cluster-monitoring-view`) | Cluster-wide admin views — **not** namespace tenancy |
 
@@ -235,9 +249,13 @@ Perses metrics access model (three lanes — pick by **where the series live**, 
 The [MaaS legacy usage dashboard](https://github.com/opendatahub-io/models-as-a-service/blob/main/deployment/components/observability/observability/dashboards/usage-dashboard.yaml) explicitly uses the DS datasource but has no `namespace` variable. It needs a compatible namespace selection and authorization design before this change can be rolled out; the Observe dashboard companion alone does not update it.
 
 **Metric ownership / dashboard pins (hard rule):** one PromQL query runs against **one** datasource. You cannot join DS Thanos series with OpenShift series in a single query. Observe dashboards (Dashboard repo) must pin explicitly after the DS default flip:
-- **Models:** raw `vllm:*` panels → `data-science-prometheus-datasource` (`:8443`). OCP GPU/CPU panels → `cluster-prometheus-tenancy-datasource` (`:9092`).
+- **Models:** raw `vllm:*`, model CPU usage and GPU panels → `data-science-prometheus-datasource` (`:8443`). The CPU percentage panel remains on the tenancy datasource pending a choice of quota or container-limit semantics. The collector federates the OpenShift CPU usage recording rule, per-container CPU limits, and `cpu`, `requests.cpu`, and `limits.cpu` ResourceQuota `used`/`hard` series into the Data Science MonitoringStack for that future choice. A dedicated exporter on `:8891` isolates federated metric families from workload-controlled metrics. The resource-only ServiceMonitor scrapes collector ordinal 0 so replicated collectors do not duplicate federation data; dashboard queries should also deduplicate by workload and quota identity defensively. Federated metrics are not sent to custom exporters. Model GPU attribution is available only via the built-in DCGM job when the exporter supplies both workload namespace and pod (see DCGM exporter scraping above).
 - **Cluster:** → `cluster-prometheus-datasource` (`:9091`).
-- **Datasource boundary:** GPU/CPU PromQL remains on the OpenShift tenancy datasource; raw `vllm:*` is used for model identity and serving metrics. Cross-stack joins must not move either datasource's resource queries into the other lane.
+- **Datasource boundary:** model queries migrated to the Data Science datasource must join only series available there. Cross-datasource PromQL joins remain unsupported; the deferred CPU percentage and cluster-wide/admin panels continue to use the OpenShift datasources.
+
+The federation reader is limited by RBAC to the OpenShift `k8s` Prometheus resource. Kubernetes RBAC does not distinguish `/federate` from other read-only Prometheus API paths, so the collector service account remains a trusted cluster-metrics reader; a stricter path-level boundary requires an authenticated federation proxy.
+
+ResourceQuota `used` is quota-accounted requests or limits, not measured CPU consumption. Compare `used` and `hard` for the same quota and resource without adding separate quota objects; `cpu` and `requests.cpu` are aliases in Kubernetes but remain distinct metric label values. Per-model CPU usage versus container limits is a different calculation: join usage and limits by namespace/pod/container, and leave it unavailable when the relevant limits are missing. Container limits do not represent pod-level resource limits or init-container semantics. The collector does not fabricate quota or limit series when OpenShift Monitoring lacks them.
 
 - Upgrade: the reconciler removes legacy Kubernetes SA-token Secrets with these datasource names only when they are owned by the current Monitoring resource and reference the old cluster-proxy service account. Perses operator manages separate Perses API secrets for the datasource TLS configuration.
 - Observe UI / gateway → Perses ingress is owned by Dashboard (`dashboard-perses-access`), not this operator.

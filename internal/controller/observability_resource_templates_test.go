@@ -82,10 +82,10 @@ func TestAcceleratorRecordingRulesTemplateContract(t *testing.T) {
 			record string
 			expr   string
 		}{
-			{record: "accelerator_gpu_utilization", expr: "DCGM_FI_DEV_GPU_UTIL * 100"},
-			{record: "accelerator_memory_used_bytes", expr: "DCGM_FI_DEV_FB_USED * 1024 * 1024"},
-			{record: "accelerator_temperature_celsius", expr: "DCGM_FI_DEV_GPU_TEMP"},
-			{record: "accelerator_power_usage_watts", expr: "DCGM_FI_DEV_POWER_USAGE"},
+			{record: "accelerator_gpu_utilization", expr: `DCGM_FI_DEV_GPU_UTIL * 100`},
+			{record: "accelerator_memory_used_bytes", expr: `DCGM_FI_DEV_FB_USED * 1024 * 1024`},
+			{record: "accelerator_temperature_celsius", expr: `DCGM_FI_DEV_GPU_TEMP`},
+			{record: "accelerator_power_usage_watts", expr: `DCGM_FI_DEV_POWER_USAGE`},
 		}
 		if len(rules) != len(wantRules) {
 			t.Fatalf("expected %d accelerator recording rules, got %d", len(wantRules), len(rules))

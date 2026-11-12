@@ -42,6 +42,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -151,6 +152,7 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		"Metrics":                  monitoring.Spec.Metrics != nil,
 		"MetricsStorage":           monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil,
 		"BuiltinDCGMScrapeEnabled": builtinDCGMScrapeEnabled(monitoring.Spec.Metrics),
+		"BuiltinDCGMTLS":           (*v1alpha1.DCGMTLS)(nil),
 		// Always set: templates use missingkey=error; metrics-only never calls addTracesTemplateData.
 		"TempoStorage":                    false,
 		"Logs":                            monitoring.Spec.Logs != nil,
@@ -599,6 +601,17 @@ func builtinDCGMScrapeEnabled(metrics *v1alpha1.Metrics) bool {
 }
 
 func addMetricsData(metrics *v1alpha1.Metrics, isSNO bool, templateData map[string]any) error {
+	if metrics.BuiltinDCGMTLS != nil {
+		if !builtinDCGMScrapeEnabled(metrics) {
+			return errors.New("builtinDCGMTLS requires the built-in DCGM scrape")
+		}
+		for name, value := range map[string]string{"caSecretName": metrics.BuiltinDCGMTLS.CASecretName, "serverName": metrics.BuiltinDCGMTLS.ServerName} {
+			if errs := validation.IsDNS1123Subdomain(value); len(errs) != 0 {
+				return fmt.Errorf("invalid builtinDCGMTLS.%s: %s", name, strings.Join(errs, ", "))
+			}
+		}
+		templateData["BuiltinDCGMTLS"] = metrics.BuiltinDCGMTLS
+	}
 	addStorageData(metrics, templateData)
 	addReplicasData(metrics, isSNO, templateData)
 	return addExportersData(metrics, templateData)
@@ -1043,7 +1056,7 @@ func rawBytesFrom(rawConfig runtime.RawExtension) []byte {
 }
 
 func isReservedName(n string) bool {
-	return n == "otlp/tempo" || n == "prometheus"
+	return n == "otlp/tempo" || n == "prometheus" || n == "prometheus/federation"
 }
 
 func isLocalServiceEndpoint(endpoint string) bool {

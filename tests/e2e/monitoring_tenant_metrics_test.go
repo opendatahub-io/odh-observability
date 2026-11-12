@@ -192,16 +192,20 @@ func (tc *MonitoringTestCtx) ValidateOTLPMetricIdentityCannotBeSpoofed(t *testin
 
 	metricName := otlpIdentitySpoofMetricPrefix + "_attack_" + runID
 	resourceAttributes := map[string]string{
-		"k8s.namespace.name": tenantMetricsNamespace,
-		"k8s.pod.name":       victim.Name,
-		"k8s.pod.uid":        string(victim.UID),
-		"k8s.pod.ip":         victim.IP,
-		"k8s_namespace_name": tenantMetricsNamespace,
-		"k8s_pod_name":       victim.Name,
-		"namespace":          tenantMetricsNamespace,
-		"pod":                victim.Name,
-		"exported_namespace": tenantMetricsNamespace,
-		"exported_pod":       victim.Name,
+		"k8s.namespace.name":    tenantMetricsNamespace,
+		"k8s.pod.name":          victim.Name,
+		"k8s.pod.uid":           string(victim.UID),
+		"k8s.pod.ip":            victim.IP,
+		"k8s_namespace_name":    tenantMetricsNamespace,
+		"k8s_pod_name":          victim.Name,
+		"k8s__namespace__name":  tenantMetricsNamespace,
+		"k8s__pod__name":        victim.Name,
+		"namespace":             tenantMetricsNamespace,
+		"pod":                   victim.Name,
+		"exported_namespace":    tenantMetricsNamespace,
+		"exported_pod":          victim.Name,
+		"odh.federation.source": "model-resources",
+		"odh.dcgm.source":       "verified",
 	}
 	observationWindow := 3 * scrapeInterval
 	pollInterval := max(time.Second, min(scrapeInterval/3, 10*time.Second))
@@ -212,13 +216,19 @@ func (tc *MonitoringTestCtx) ValidateOTLPMetricIdentityCannotBeSpoofed(t *testin
 	deadline := started.Add(observationWindow)
 	for attempt := 1; ; attempt++ {
 		datapointAttributes := map[string]string{
-			"namespace":          tenantMetricsNamespace,
-			"pod":                victim.Name,
-			"exported_namespace": tenantMetricsNamespace,
-			"exported_pod":       victim.Name,
-			"k8s_namespace_name": tenantMetricsNamespace,
-			"k8s_pod_name":       victim.Name,
-			"probe_attempt":      strconv.Itoa(attempt),
+			"namespace":                      tenantMetricsNamespace,
+			"pod":                            victim.Name,
+			"exported_namespace":             tenantMetricsNamespace,
+			"exported_pod":                   victim.Name,
+			"k8s_namespace_name":             tenantMetricsNamespace,
+			"k8s_pod_name":                   victim.Name,
+			"k8s__namespace__name":           tenantMetricsNamespace,
+			"k8s__pod__name":                 victim.Name,
+			"probe_attempt":                  strconv.Itoa(attempt),
+			"odh__federation__source":        "model-resources",
+			"odh__dcgm__source":              "verified",
+			"odh__dcgm__workload__namespace": tenantMetricsNamespace,
+			"odh__dcgm__workload__pod":       victim.Name,
 		}
 		payload, payloadErr := buildOTLPMetricsPayload(metricName, time.Now(), resourceAttributes, datapointAttributes)
 		if payloadErr != nil {
@@ -903,7 +913,7 @@ func otlpSeriesSanitizationError(series map[string]string, sender otlpPodIdentit
 	if err := otlpSeriesAttributionError(series, sender); err != nil {
 		return fmt.Errorf("identity labels were not replaced with the sender identity: %w", err)
 	}
-	for _, label := range []string{"exported_namespace", "exported_pod"} {
+	for _, label := range []string{"exported_namespace", "exported_pod", "odh_federation_source", "odh_dcgm_source", "odh_dcgm_workload_namespace", "odh_dcgm_workload_pod"} {
 		if got := series[label]; got != "" {
 			return fmt.Errorf("forbidden identity label %q remains on series", label)
 		}

@@ -13,7 +13,9 @@ spec:
       rules:
         # Align with OpenShift accelerator dashboard metric names on the data-science
         # MonitoringStack. Source series come from OTC DCGM scrape (canonical DCGM_FI_*
-        # names; GPU util is 0-1 after transform/gpu_metrics).
+        # names; GPU util is 0-1 after transform/gpu_metrics). The collector
+        # ServiceMonitor promotes workload identity only for the isolated
+        # built-in DCGM receiver; untrusted monitor labels stay unpromoted.
         - record: accelerator_gpu_utilization
           expr: DCGM_FI_DEV_GPU_UTIL * 100
           labels:

@@ -102,14 +102,15 @@ var lokiComponents = []string{componentLokiUsageLogs, componentLokiLogs}
 
 //nolint:goconst // Resource names intentionally mirror the rendered RBAC templates.
 var scopedClusterRoleNames = map[string]struct{}{
-	"data-science-collector-mlflow-trace-export": {},
-	"data-science-collector-tempo-trace-export":  {},
-	"data-science-metrics-view":                  {},
-	"data-science-usage-logs-processor":          {},
-	"generate-processors-role":                   {},
-	"generate-processors-targetallocator-role":   {},
-	"korrel8r-query":                             {},
-	"usage-logs-processor":                       {},
+	"data-science-collector-mlflow-trace-export":    {},
+	"data-science-collector-tempo-trace-export":     {},
+	"data-science-metrics-view":                     {},
+	"data-science-usage-logs-processor":             {},
+	"generate-processors-cluster-prometheus-reader": {},
+	"generate-processors-role":                      {},
+	"generate-processors-targetallocator-role":      {},
+	"korrel8r-query":                                {},
+	"usage-logs-processor":                          {},
 }
 
 //nolint:goconst // Resource names intentionally mirror the rendered RBAC templates.
@@ -127,6 +128,7 @@ var scopedClusterRoleBindingNames = map[string]struct{}{
 	"data-science-thanos-querier-proxy":                                   {},
 	"data-science-thanos-querier-proxy-auth-delegator":                    {},
 	"data-science-usage-logs-processor":                                   {},
+	"generate-processors-cluster-prometheus-reader":                       {},
 	"generate-processors-collector-rolebinding":                           {},
 	"generate-processors-targetallocator-discovery-rolebinding":           {},
 	"generate-processors-targetallocator-rolebinding":                     {},
@@ -165,8 +167,9 @@ type MonitoringReconciler struct {
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings;clusterroles;clusterrolebindings,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,resourceNames=data-science-collector-targetallocator-secrets,verbs=update;patch;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames=data-science-collector-mlflow-trace-export;data-science-collector-tempo-trace-export;data-science-metrics-view;data-science-usage-logs-processor;generate-processors-role;generate-processors-targetallocator-role;korrel8r-query,verbs=update;patch;delete
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,resourceNames=data-science-alertmanager-proxy-auth-delegator;data-science-cluster-log-forwarder-collector-collect-app-logs;data-science-cluster-log-forwarder-collector-loki-writer;data-science-collector-mlflow-trace-export;data-science-collector-tempo-trace-export;data-science-monitoringstack-alertmanager-prometheus-metrics-reader;data-science-prometheus-cluster-proxy;data-science-prometheus-cluster-proxy-auth-delegator;data-science-prometheus-namespace-proxy;data-science-prometheus-namespace-proxy-auth-delegator;data-science-thanos-querier-proxy;data-science-thanos-querier-proxy-auth-delegator;data-science-usage-logs-processor;generate-processors-collector-rolebinding;generate-processors-targetallocator-discovery-rolebinding;generate-processors-targetallocator-rolebinding;korrel8r-auth-delegator;korrel8r-query,verbs=update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames=data-science-collector-mlflow-trace-export;data-science-collector-tempo-trace-export;data-science-metrics-view;data-science-usage-logs-processor;generate-processors-cluster-prometheus-reader;generate-processors-role;generate-processors-targetallocator-role;korrel8r-query,verbs=update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,resourceNames=data-science-alertmanager-proxy-auth-delegator;data-science-cluster-log-forwarder-collector-collect-app-logs;data-science-cluster-log-forwarder-collector-loki-writer;data-science-collector-mlflow-trace-export;data-science-collector-tempo-trace-export;data-science-monitoringstack-alertmanager-prometheus-metrics-reader;data-science-prometheus-cluster-proxy;data-science-prometheus-cluster-proxy-auth-delegator;data-science-prometheus-namespace-proxy;data-science-prometheus-namespace-proxy-auth-delegator;data-science-thanos-querier-proxy;data-science-thanos-querier-proxy-auth-delegator;data-science-usage-logs-processor;generate-processors-cluster-prometheus-reader;generate-processors-collector-rolebinding;generate-processors-targetallocator-discovery-rolebinding;generate-processors-targetallocator-rolebinding;korrel8r-auth-delegator;korrel8r-query,verbs=update;patch;delete
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=prometheuses/api,resourceNames=k8s,verbs=get
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames=usage-logs-processor,verbs=delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,resourceNames=usage-logs-processor;usage-logs-loki-writer;data-science-usage-logs-loki-writer,verbs=delete
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=podmonitors;servicemonitors,verbs=*

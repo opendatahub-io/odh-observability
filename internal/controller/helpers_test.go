@@ -715,6 +715,7 @@ func TestIsReservedName(t *testing.T) {
 		want bool
 	}{
 		{"prometheus", true},
+		{"prometheus/federation", true},
 		{"otlp/tempo", true},
 		{"otlp/custom", false},
 		{"debug", false},
