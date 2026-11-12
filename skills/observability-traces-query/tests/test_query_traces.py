@@ -6,6 +6,7 @@ import json
 import io
 import os
 import signal
+import socket
 import sys
 import tempfile
 import threading
@@ -473,6 +474,77 @@ class QueryTracesTests(unittest.TestCase):
                 self.assertLess(time.monotonic() - start, 1.5)
                 self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
                 self.assertEqual(signal.getsignal(signal.SIGALRM), previous_handler)
+
+    def test_connection_deadline_does_not_retry_next_address(self) -> None:
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                requests.append(self.path)
+                body = b'{"traces": []}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join)
+        self.addCleanup(server.shutdown)
+
+        real_socket = socket.socket
+        addresses = [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("192.0.2.1", server.server_port)),
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", server.server_port)),
+        ]
+        args = Namespace(timeout=0.2, max_response_bytes=2048, ca_file=None)
+        url = f"http://127.0.0.1:{server.server_port}/api/search"
+
+        for stalled in (True, False):
+            with self.subTest(stalled=stalled):
+                attempts = []
+
+                class FirstSocket:
+                    def settimeout(self, timeout: float) -> None:
+                        pass
+
+                    def connect(self, address: tuple[str, int]) -> None:
+                        attempts.append(address)
+                        if stalled:
+                            time.sleep(1)
+                        else:
+                            raise OSError("first address unavailable")
+
+                    def close(self) -> None:
+                        pass
+
+                def socket_factory(*args: object, **kwargs: object) -> object:
+                    if not attempts and len(args) == 3 and "fileno" not in kwargs:
+                        return FirstSocket()
+                    return real_socket(*args, **kwargs)
+
+                with (
+                    patch.object(socket, "getaddrinfo", return_value=addresses),
+                    patch.object(socket, "socket", side_effect=socket_factory),
+                    patch.dict(os.environ, {"no_proxy": "127.0.0.1", "NO_PROXY": "127.0.0.1"}),
+                ):
+                    if stalled:
+                        start = time.monotonic()
+                        with self.assertRaises(query_traces.QueryError) as context:
+                            query_traces.request_tempo(url, {}, args, "search")
+                        self.assertEqual(context.exception.kind, "transport_error")
+                        self.assertIn("deadline exceeded", context.exception.message)
+                        self.assertLess(time.monotonic() - start, 1.0)
+                        self.assertEqual(requests, [])
+                    else:
+                        self.assertEqual(query_traces.request_tempo(url, {}, args, "search"), {"traces": []})
+                        self.assertEqual(requests, ["/api/search"])
+                self.assertEqual(attempts, [addresses[0][4]])
 
     def test_deadline_preserves_existing_timer_and_rejects_worker_thread(self) -> None:
         handler = signal.getsignal(signal.SIGALRM)

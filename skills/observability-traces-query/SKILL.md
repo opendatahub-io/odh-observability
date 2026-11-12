@@ -165,11 +165,20 @@ The helper returns a deterministic JSON object with:
 - `warnings`: server or client warnings; and
 - `error`: a typed error object on failure.
 
-Validate a saved result before handing it to another skill:
+Validate a saved search result before handing it to another skill:
 
 ```bash
 python3 skills/observability-traces-query/scripts/validate_result.py < "$trace_dir/traces-result.json"
 ```
+
+For a saved trace-ID result, use:
+
+```bash
+python3 skills/observability-traces-query/scripts/validate_result.py < "$trace_dir/trace-result.json"
+```
+
+Each example sets `trace_dir` to a new directory; retain its value if you need
+to access an earlier result.
 
 For endpoint selection, readiness states, tenant authorization, TLS, and
 service evidence, see the

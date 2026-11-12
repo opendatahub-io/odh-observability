@@ -99,6 +99,10 @@ class QueryError(RuntimeError):
         self.endpoint = endpoint
 
 
+class RequestDeadlineExceeded(Exception):
+    """A wall-clock deadline that connection retry logic must not swallow."""
+
+
 class NoRedirectHandler(HTTPRedirectHandler):
     """Prevent bearer tokens from being sent to an untrusted redirect target."""
 
@@ -659,7 +663,7 @@ def request_deadline(timeout: float) -> Iterator[None]:
         raise QueryError("transport_error", "cannot use request deadline while another timer is active", 4)
 
     def expire(signum: int, frame: Any) -> None:
-        raise TimeoutError("Tempo request deadline exceeded")
+        raise RequestDeadlineExceeded("Tempo request deadline exceeded")
 
     try:
         signal.signal(signal.SIGALRM, expire)
@@ -732,7 +736,7 @@ def request_tempo(
                 except (QueryError, UnicodeDecodeError, json.JSONDecodeError):
                     pass
                 raise QueryError("http_error", f"Tempo endpoint returned HTTP {error.code}: {message}", 4, warnings) from error
-    except (HTTPException, URLError, TimeoutError, OSError) as error:
+    except (RequestDeadlineExceeded, HTTPException, URLError, TimeoutError, OSError) as error:
         raise QueryError("transport_error", f"Tempo request failed: {error}", 4) from error
     try:
         payload = json.loads(raw)
