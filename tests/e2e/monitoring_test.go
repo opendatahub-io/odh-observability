@@ -1979,6 +1979,45 @@ func (tc *MonitoringTestCtx) validateTempoStackCreation(t *testing.T, backend, s
 		WithEventuallyTimeout(15*time.Minute),
 		WithCustomErrorMsg("Monitoring should become Ready with %s traces storage", backend),
 	)
+
+	expectedOTLPEndpoint := fmt.Sprintf(
+		"tempo-data-science-tempostack-gateway.%s.svc.cluster.local:4317",
+		tc.MonitoringNamespace,
+	)
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+			Name:      OpenTelemetryCollectorName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.spec.config.exporters."otlp/tempo".endpoint == "%s"`, expectedOTLPEndpoint)),
+		WithCustomErrorMsg("collector must keep TempoStack OTLP export on standard :4317"),
+	)
+	gatewayService := types.NamespacedName{
+		Name:      "tempo-data-science-tempostack-gateway",
+		Namespace: tc.MonitoringNamespace,
+	}
+	otlpPortPresent := jq.Match(
+		`.spec.ports | [.[] | select(.port == 4317 and .targetPort == "grpc-public")] | length == 1`,
+	)
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, gatewayService),
+		WithCondition(otlpPortPresent),
+		WithCustomErrorMsg("TempoStack gateway Service must expose OTLP gRPC :4317 → grpc-public"),
+	)
+
+	// Simulate Tempo Operator reconciling away the alias, then require the
+	// monitoring controller to put 4317 → grpc-public back.
+	tc.EventuallyResourcePatched(
+		WithMinimalObject(gvk.Service, gatewayService),
+		WithMutateFunc(jq.Transform(`.spec.ports |= [.[] | select(.port != 4317)]`)),
+	)
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.Service, gatewayService),
+		WithCondition(otlpPortPresent),
+		WithEventuallyTimeout(5*time.Minute),
+		WithCustomErrorMsg("controller must restore TempoStack gateway OTLP :4317 after Tempo Operator strips it"),
+	)
+
 	if backend == TracesStorageBackendGCS {
 		endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/storage/v1/", fakeGCSServiceName, tc.MonitoringNamespace, fakeGCSPort)
 		tc.EnsureResourceExists(

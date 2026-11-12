@@ -921,6 +921,9 @@ func TestAddTracesTemplateData_S3Backend(t *testing.T) {
 	if !ok || !strings.Contains(endpoint, "tempostack") {
 		t.Errorf("TempoEndpoint should reference tempostack for S3 backend, got: %v", data["TempoEndpoint"])
 	}
+	if !strings.HasSuffix(endpoint, ":4317") {
+		t.Errorf("TempoEndpoint should use standard OTLP gRPC port 4317, got: %v", data["TempoEndpoint"])
+	}
 	if data["Secret"] != "my-s3-secret" {
 		t.Errorf("Secret: want 'my-s3-secret', got %v", data["Secret"])
 	}
@@ -942,6 +945,9 @@ func TestAddTracesTemplateData_GCSBackend(t *testing.T) {
 	endpoint, ok := data["TempoEndpoint"].(string)
 	if !ok || !strings.Contains(endpoint, "tempostack") {
 		t.Errorf("TempoEndpoint should reference tempostack for GCS, got: %v", data["TempoEndpoint"])
+	}
+	if !strings.HasSuffix(endpoint, ":4317") {
+		t.Errorf("TempoEndpoint should use standard OTLP gRPC port 4317, got: %v", data["TempoEndpoint"])
 	}
 	if data["Secret"] != "my-gcs-secret" {
 		t.Errorf("Secret: want 'my-gcs-secret', got %v", data["Secret"])
