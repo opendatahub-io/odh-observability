@@ -172,9 +172,9 @@ func (tc *MonitoringTestCtx) ValidateTempoGatewayTenantConfiguration(t *testing.
 		WithMinimalObject(gvk.Service, types.NamespacedName{Name: gatewayServiceName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
 			jq.Match(`.spec.ports | [.[] | select(.port == 8080)] | length == 1`),
-			jq.Match(`.spec.ports | [.[] | select(.port == 4317)] | length == 1`),
+			jq.Match(`.spec.ports | [.[] | select(.port == 8090)] | length == 1`),
 		)),
-		WithCustomErrorMsg("Tempo gateway Service must expose authenticated query and OTLP ports"),
+		WithCustomErrorMsg("Tempo gateway Service must expose HTTP/query (8080) and OTLP gRPC grpc-public (8090)"),
 	)
 
 	tc.EnsureResourceExists(
@@ -189,9 +189,14 @@ func (tc *MonitoringTestCtx) ValidateTempoGatewayTenantConfiguration(t *testing.
 			jq.Match(`.spec.exporter.tls.ca_file == "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt"`),
 		)),
 	)
+	expectedTempoExportEndpoint := fmt.Sprintf(
+		"tempo-data-science-tempomonolithic-gateway.%s.svc.cluster.local:8090",
+		tc.MonitoringNamespace,
+	)
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{Name: OpenTelemetryCollectorName, Namespace: tc.MonitoringNamespace}),
 		WithCondition(And(
+			jq.Match(`.spec.config.exporters."otlp/tempo".endpoint == "%s"`, expectedTempoExportEndpoint),
 			jq.Match(`.spec.config.exporters."otlp/tempo".tls.ca_file == "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt"`),
 			jq.Match(`.spec.config.exporters."otlp/tempo".auth.authenticator == "bearertokenauth"`),
 			jq.Match(`.spec.config.exporters."otlp/tempo".headers."X-Scope-OrgID" == "%s"`, tc.MonitoringNamespace),
@@ -199,7 +204,7 @@ func (tc *MonitoringTestCtx) ValidateTempoGatewayTenantConfiguration(t *testing.
 			jq.Match(`.spec.config.service.pipelines.traces.processors | contains(["memory_limiter", "k8sattributes", "resourcedetection", "batch"])`),
 			jq.Match(`.spec.config.service.pipelines.traces.exporters | contains(["otlp/tempo"])`),
 		)),
-		WithCustomErrorMsg("trace collector must forward through the TLS Tempo gateway with the active tenant"),
+		WithCustomErrorMsg("trace collector must forward through the TLS Tempo gateway grpc-public port with the active tenant"),
 	)
 }
 

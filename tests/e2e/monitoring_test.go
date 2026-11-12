@@ -551,9 +551,11 @@ func (tc *MonitoringTestCtx) ValidateOpenTelemetryCollectorConfigurations(t *tes
 			},
 			monitoringCondition: jq.Match(`.spec.traces != null`),
 			validation: jq.Match(`
+				(.spec.config.exporters."otlp/tempo".endpoint == "tempo-data-science-tempomonolithic-gateway.%s.svc.cluster.local:8090") and
 				(.spec.config.exporters."otlp/tempo".tls.ca_file == "/var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt") and
-				(.spec.config.exporters."otlp/tempo".auth.authenticator == "bearertokenauth")
-			`),
+				(.spec.config.exporters."otlp/tempo".auth.authenticator == "bearertokenauth") and
+				(.spec.config.exporters."otlp/tempo".headers."X-Scope-OrgID" == "%s")
+			`, tc.MonitoringNamespace, tc.MonitoringNamespace),
 		},
 		{
 			name: "Custom Metrics Exporters",

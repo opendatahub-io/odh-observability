@@ -873,8 +873,9 @@ func TestAddTracesTemplateData_PVBackend(t *testing.T) {
 	}
 
 	endpoint, ok := data["TempoEndpoint"].(string)
-	if !ok || !strings.Contains(endpoint, "tempomonolithic") {
-		t.Errorf("TempoEndpoint should reference tempomonolithic for PV backend, got: %v", data["TempoEndpoint"])
+	wantEndpoint := "tempo-data-science-tempomonolithic-gateway.test-ns.svc.cluster.local:8090"
+	if !ok || endpoint != wantEndpoint {
+		t.Errorf("TempoEndpoint: want %q (gateway grpc-public), got: %v", wantEndpoint, data["TempoEndpoint"])
 	}
 	if data["Size"] != "10Gi" {
 		t.Errorf("Size: want '10Gi', got %v", data["Size"])
@@ -918,8 +919,9 @@ func TestAddTracesTemplateData_S3Backend(t *testing.T) {
 	}
 
 	endpoint, ok := data["TempoEndpoint"].(string)
-	if !ok || !strings.Contains(endpoint, "tempostack") {
-		t.Errorf("TempoEndpoint should reference tempostack for S3 backend, got: %v", data["TempoEndpoint"])
+	wantEndpoint := "tempo-data-science-tempostack-gateway.test-ns.svc.cluster.local:8090"
+	if !ok || endpoint != wantEndpoint {
+		t.Errorf("TempoEndpoint: want %q (gateway grpc-public), got: %v", wantEndpoint, data["TempoEndpoint"])
 	}
 	if data["Secret"] != "my-s3-secret" {
 		t.Errorf("Secret: want 'my-s3-secret', got %v", data["Secret"])
@@ -940,8 +942,9 @@ func TestAddTracesTemplateData_GCSBackend(t *testing.T) {
 	}
 
 	endpoint, ok := data["TempoEndpoint"].(string)
-	if !ok || !strings.Contains(endpoint, "tempostack") {
-		t.Errorf("TempoEndpoint should reference tempostack for GCS, got: %v", data["TempoEndpoint"])
+	wantEndpoint := "tempo-data-science-tempostack-gateway.my-ns.svc.cluster.local:8090"
+	if !ok || endpoint != wantEndpoint {
+		t.Errorf("TempoEndpoint: want %q (gateway grpc-public), got: %v", wantEndpoint, data["TempoEndpoint"])
 	}
 	if data["Secret"] != "my-gcs-secret" {
 		t.Errorf("Secret: want 'my-gcs-secret', got %v", data["Secret"])

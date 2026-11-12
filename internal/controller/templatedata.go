@@ -816,13 +816,16 @@ func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces,
 		templateData["TempoCAConfigMap"] = ""
 	}
 
+	// Tempo Operator gateway Services expose OTLP gRPC on grpc-public (8090)
+	// and HTTP/query on public (8080). Port 4317 is the distributor OTLP port,
+	// not a gateway Service port — do not target it here.
 	switch backend {
 	case v1alpha1.StorageBackendPV:
-		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempomonolithic-gateway.%s.svc.cluster.local:4317", namespace)
+		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempomonolithic-gateway.%s.svc.cluster.local:8090", namespace)
 		templateData["TempoQueryEndpoint"] = fmt.Sprintf("https://tempo-data-science-tempomonolithic-gateway.%s.svc.cluster.local:8080/api/traces/v1/%s/tempo", namespace, namespace)
 		templateData["Size"] = traces.Storage.Size
 	case v1alpha1.StorageBackendS3, v1alpha1.StorageBackendGCS:
-		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempostack-gateway.%s.svc.cluster.local:4317", namespace)
+		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempostack-gateway.%s.svc.cluster.local:8090", namespace)
 		templateData["TempoQueryEndpoint"] = fmt.Sprintf("https://tempo-data-science-tempostack-gateway.%s.svc.cluster.local:8080/api/traces/v1/%s/tempo", namespace, namespace)
 		templateData["Secret"] = traces.Storage.Secret
 	}
