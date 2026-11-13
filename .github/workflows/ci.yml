@@ -27,6 +27,13 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Set up envtest
+        run: |
+          go install sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.25.3-0.20261103101737-9603adbb18be
+          setup_envtest="$(go env GOPATH)/bin/setup-envtest"
+          assets="$("$setup_envtest" use 1.37.0 -p path)"
+          echo "KUBEBUILDER_ASSETS=${assets}" >> "$GITHUB_ENV"
+
       - name: Run tests
         run: make test
 
