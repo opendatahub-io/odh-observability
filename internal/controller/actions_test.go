@@ -938,7 +938,7 @@ func TestDeployPersesPrometheusIntegration_NoMetrics(t *testing.T) {
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
 
-	err := deployPersesPrometheusIntegration(context.Background(),
+	_, err := deployPersesPrometheusIntegration(context.Background(),
 		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources, "v1alpha2", true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -962,7 +962,7 @@ func TestDeployPersesPrometheusIntegration_CRDPresent(t *testing.T) {
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
 
-	err := deployPersesPrometheusIntegration(context.Background(),
+	_, err := deployPersesPrometheusIntegration(context.Background(),
 		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources, "v1alpha2", true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -984,6 +984,386 @@ func TestDeployPersesPrometheusIntegration_CRDPresent(t *testing.T) {
 	c := findCondition(m, conditions.ConditionPersesPrometheusDataSourceAvailable)
 	if c == nil || c.Status != metav1.ConditionTrue {
 		t.Error("PersesPrometheusDataSourceAvailable should be True")
+	}
+}
+
+func persesDatasourceUnstructured(t *testing.T, name, namespace string, isDefault bool) *unstructured.Unstructured {
+	t.Helper()
+	return persesDatasourceUnstructuredWithPlugin(t, name, namespace, isDefault, persesPrometheusDatasourcePluginKind)
+}
+
+func persesDatasourceUnstructuredWithPlugin(t *testing.T, name, namespace string, isDefault bool, pluginKind string) *unstructured.Unstructured {
+	t.Helper()
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(gvk.PersesDatasourceV1Alpha2)
+	u.SetName(name)
+	u.SetNamespace(namespace)
+	u.SetGeneration(1)
+	if err := unstructured.SetNestedMap(u.Object, map[string]any{
+		"default": isDefault,
+		"plugin": map[string]any{
+			"kind": pluginKind,
+		},
+	}, "spec", "config"); err != nil {
+		t.Fatalf("set config: %v", err)
+	}
+	return u
+}
+
+func markOperatorManagedPersesDatasource(ds *unstructured.Unstructured) {
+	ds.SetLabels(map[string]string{"platform.opendatahub.io/part-of": monitoringPartOf})
+}
+
+func setPersesDatasourceAvailable(t *testing.T, ds *unstructured.Unstructured, observedGeneration int64) {
+	t.Helper()
+	cond := map[string]any{
+		"type":   persesDatasourceAvailableConditionType,
+		"status": string(metav1.ConditionTrue),
+		"reason": "Reconciled",
+	}
+	if observedGeneration > 0 {
+		cond["observedGeneration"] = observedGeneration
+	}
+	if err := unstructured.SetNestedSlice(ds.Object, []any{cond}, "status", "conditions"); err != nil {
+		t.Fatalf("set Available condition: %v", err)
+	}
+}
+
+func TestDeployPersesPrometheusIntegration_DemotesThenWaitsBeforePromote(t *testing.T) {
+	t.Parallel()
+
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.PersesDatasourceV1Alpha2)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = "opendatahub"
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	// Pre-upgrade: operator-managed cluster Prometheus was the Perses default.
+	oldDefault := persesDatasourceUnstructured(t, persesClusterPrometheusDatasourceName, "opendatahub", true)
+	markOperatorManagedPersesDatasource(oldDefault)
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(oldDefault).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	withheld, err := deployPersesPrometheusIntegration(context.Background(), cli, m, cm, &sources, "v1alpha2", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !withheld {
+		t.Fatal("demotion wait must withhold Perses Prometheus templates from GC")
+	}
+	if len(sources) != 0 {
+		t.Fatalf("must not promote in the same reconcile as demotion Update, got %d sources", len(sources))
+	}
+	c := findCondition(m, conditions.ConditionPersesPrometheusDataSourceAvailable)
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != persesDemotionPendingReason {
+		t.Fatalf("expected WaitingForPersesDemotion, got %#v", c)
+	}
+
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(gvk.PersesDatasourceV1Alpha2)
+	if err := cli.Get(context.Background(), client.ObjectKeyFromObject(oldDefault), got); err != nil {
+		t.Fatalf("get demoted datasource: %v", err)
+	}
+	isDefault, found, err := unstructured.NestedBool(got.Object, "spec", "config", "default")
+	if err != nil || !found || isDefault {
+		t.Fatalf("old cluster default must be demoted: found=%v default=%v err=%v", found, isDefault, err)
+	}
+	if got.GetAnnotations()[persesPrometheusDemotionGenerationAnnotation] == "" {
+		t.Fatal("demotion must stamp prometheus-default-demotion-generation annotation")
+	}
+}
+
+func TestDeployPersesPrometheusIntegration_PromotesAfterPersesReconcilesDemotion(t *testing.T) {
+	t.Parallel()
+
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.PersesDatasourceV1Alpha2)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = "opendatahub"
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	// Later reconcile: demotion already persisted; Perses Available covers generation.
+	demoted := persesDatasourceUnstructured(t, persesClusterPrometheusDatasourceName, "opendatahub", false)
+	markOperatorManagedPersesDatasource(demoted)
+	demoted.SetGeneration(2)
+	demoted.SetAnnotations(map[string]string{persesPrometheusDemotionGenerationAnnotation: "2"})
+	setPersesDatasourceAvailable(t, demoted, 2)
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(demoted).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	withheld, err := deployPersesPrometheusIntegration(context.Background(), cli, m, cm, &sources, "v1alpha2", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if withheld {
+		t.Fatal("synced demotion must not withhold templates")
+	}
+	if len(sources) != 3 {
+		t.Fatalf("expected templates after Perses demotion sync, got %d", len(sources))
+	}
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(gvk.PersesDatasourceV1Alpha2)
+	if err := cli.Get(context.Background(), client.ObjectKeyFromObject(demoted), got); err != nil {
+		t.Fatalf("get synced datasource: %v", err)
+	}
+	if got.GetAnnotations()[persesPrometheusDemotionGenerationAnnotation] != "" {
+		t.Fatal("demotion annotation must be cleared after Perses sync")
+	}
+}
+
+func TestDeployPersesPrometheusIntegration_WaitsWhenPersesObservedGenerationStale(t *testing.T) {
+	t.Parallel()
+
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.PersesDatasourceV1Alpha2)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = "opendatahub"
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	// Spec demotion landed, but Perses status still observes the pre-demotion generation.
+	stale := persesDatasourceUnstructured(t, persesClusterPrometheusDatasourceName, "opendatahub", false)
+	markOperatorManagedPersesDatasource(stale)
+	stale.SetGeneration(2)
+	stale.SetAnnotations(map[string]string{persesPrometheusDemotionGenerationAnnotation: "2"})
+	setPersesDatasourceAvailable(t, stale, 1)
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(stale).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	withheld, err := deployPersesPrometheusIntegration(context.Background(), cli, m, cm, &sources, "v1alpha2", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !withheld {
+		t.Fatal("stale ObservedGeneration must withhold templates")
+	}
+	if len(sources) != 0 {
+		t.Fatalf("must wait for Perses ObservedGeneration, got %d sources", len(sources))
+	}
+	c := findCondition(m, conditions.ConditionPersesPrometheusDataSourceAvailable)
+	if c == nil || c.Reason != persesDemotionPendingReason {
+		t.Fatalf("expected WaitingForPersesDemotion, got %#v", c)
+	}
+}
+
+func TestDeployPersesPrometheusIntegration_WaitsWhenAvailableLacksObservedGeneration(t *testing.T) {
+	t.Parallel()
+
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.PersesDatasourceV1Alpha2)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = "opendatahub"
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	pending := persesDatasourceUnstructured(t, persesClusterPrometheusDatasourceName, "opendatahub", false)
+	markOperatorManagedPersesDatasource(pending)
+	pending.SetGeneration(2)
+	pending.SetAnnotations(map[string]string{persesPrometheusDemotionGenerationAnnotation: "2"})
+	setPersesDatasourceAvailable(t, pending, 0) // Available=True but no observedGeneration
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(pending).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	withheld, err := deployPersesPrometheusIntegration(context.Background(), cli, m, cm, &sources, "v1alpha2", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !withheld || len(sources) != 0 {
+		t.Fatalf("missing observedGeneration must withhold promote, withheld=%v sources=%d", withheld, len(sources))
+	}
+}
+
+func TestDeployPersesPrometheusIntegration_PromotesWhenNonDefaultHasUnrelatedUnavailable(t *testing.T) {
+	t.Parallel()
+
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.PersesDatasourceV1Alpha2)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = "opendatahub"
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	// Already non-default, never demoted by us, Available=False for unrelated reasons.
+	broken := persesDatasourceUnstructured(t, persesClusterPrometheusDatasourceName, "opendatahub", false)
+	markOperatorManagedPersesDatasource(broken)
+	broken.SetGeneration(3)
+	if err := unstructured.SetNestedSlice(broken.Object, []any{
+		map[string]any{
+			"type":   persesDatasourceAvailableConditionType,
+			"status": string(metav1.ConditionFalse),
+			"reason": "SomeOtherError",
+		},
+	}, "status", "conditions"); err != nil {
+		t.Fatalf("set Unavailable: %v", err)
+	}
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(broken).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	withheld, err := deployPersesPrometheusIntegration(context.Background(), cli, m, cm, &sources, "v1alpha2", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if withheld || len(sources) != 3 {
+		t.Fatalf("unrelated Available=False without demotion annotation must not block promote, withheld=%v sources=%d", withheld, len(sources))
+	}
+}
+
+func TestDeployPersesPrometheusIntegration_DemotionFailureBlocksPromote(t *testing.T) {
+	t.Parallel()
+
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.PersesDatasourceV1Alpha2)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = "opendatahub"
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	oldDefault := persesDatasourceUnstructured(t, persesClusterPrometheusDatasourceName, "opendatahub", true)
+	markOperatorManagedPersesDatasource(oldDefault)
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(oldDefault).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
+				return errors.New("simulated API failure demoting default")
+			},
+		}).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	_, err := deployPersesPrometheusIntegration(context.Background(), cli, m, cm, &sources, "v1alpha2", true)
+	if err == nil {
+		t.Fatal("expected demotion failure to block promote")
+	}
+	if !strings.Contains(err.Error(), "demoting PersesDatasource") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(sources) != 0 {
+		t.Fatalf("must not enqueue DS templates while foreign default demotion fails, got %d", len(sources))
+	}
+}
+
+func TestDeployPersesPrometheusIntegration_LeavesDesiredDefaultAlone(t *testing.T) {
+	t.Parallel()
+
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.PersesDatasourceV1Alpha2)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = "opendatahub"
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	dsDefault := persesDatasourceUnstructured(t, persesDataSciencePrometheusDatasourceName, "opendatahub", true)
+	cluster := persesDatasourceUnstructured(t, persesClusterPrometheusDatasourceName, "opendatahub", false)
+	markOperatorManagedPersesDatasource(cluster)
+	setPersesDatasourceAvailable(t, cluster, 1)
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(dsDefault, cluster).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	if _, err := deployPersesPrometheusIntegration(context.Background(), cli, m, cm, &sources, "v1alpha2", true); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(gvk.PersesDatasourceV1Alpha2)
+	if err := cli.Get(context.Background(), client.ObjectKeyFromObject(dsDefault), got); err != nil {
+		t.Fatalf("get DS datasource: %v", err)
+	}
+	isDefault, found, err := unstructured.NestedBool(got.Object, "spec", "config", "default")
+	if err != nil || !found || !isDefault {
+		t.Fatalf("desired DS default must remain true: found=%v default=%v err=%v", found, isDefault, err)
+	}
+}
+
+func TestDeployPersesPrometheusIntegration_PreservesNonPrometheusDefault(t *testing.T) {
+	t.Parallel()
+
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.PersesDatasourceV1Alpha2)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = "opendatahub"
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	oldPromDefault := persesDatasourceUnstructured(t, persesClusterPrometheusDatasourceName, "opendatahub", true)
+	markOperatorManagedPersesDatasource(oldPromDefault)
+	tempoDefault := persesDatasourceUnstructuredWithPlugin(t, PersesTempoDatasourceName, "opendatahub", true, "TempoDatasource")
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(oldPromDefault, tempoDefault).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	if _, err := deployPersesPrometheusIntegration(context.Background(), cli, m, cm, &sources, "v1alpha2", true); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	gotProm := &unstructured.Unstructured{}
+	gotProm.SetGroupVersionKind(gvk.PersesDatasourceV1Alpha2)
+	if err := cli.Get(context.Background(), client.ObjectKeyFromObject(oldPromDefault), gotProm); err != nil {
+		t.Fatalf("get Prometheus datasource: %v", err)
+	}
+	promDefault, found, err := unstructured.NestedBool(gotProm.Object, "spec", "config", "default")
+	if err != nil || !found || promDefault {
+		t.Fatalf("Prometheus foreign default must be demoted: found=%v default=%v err=%v", found, promDefault, err)
+	}
+
+	gotTempo := &unstructured.Unstructured{}
+	gotTempo.SetGroupVersionKind(gvk.PersesDatasourceV1Alpha2)
+	if err := cli.Get(context.Background(), client.ObjectKeyFromObject(tempoDefault), gotTempo); err != nil {
+		t.Fatalf("get Tempo datasource: %v", err)
+	}
+	tempoStillDefault, found, err := unstructured.NestedBool(gotTempo.Object, "spec", "config", "default")
+	if err != nil || !found || !tempoStillDefault {
+		t.Fatalf("TempoDatasource default must be preserved: found=%v default=%v err=%v", found, tempoStillDefault, err)
+	}
+}
+
+func TestDeployPersesPrometheusIntegration_DoesNotMutateUserManagedDefault(t *testing.T) {
+	t.Parallel()
+
+	s := newActionsTestScheme(t)
+	registerCRDs(s, gvk.PersesDatasourceV1Alpha2)
+
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Namespace = "opendatahub"
+	m.Spec.Metrics = &v1alpha1.Metrics{Storage: &v1alpha1.MetricsStorage{}}
+
+	userDefault := persesDatasourceUnstructured(t, "team-custom-prometheus", "opendatahub", true)
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(userDefault).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	withheld, err := deployPersesPrometheusIntegration(context.Background(), cli, m, cm, &sources, "v1alpha2", true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !withheld {
+		t.Fatal("user-managed conflict must withhold existing Perses Prometheus datasources from GC")
+	}
+	if len(sources) != 0 {
+		t.Fatalf("must not promote while user-managed default conflicts, got %d sources", len(sources))
+	}
+	c := findCondition(m, conditions.ConditionPersesPrometheusDataSourceAvailable)
+	if c == nil || c.Reason != persesUserManagedDefaultConflictReason {
+		t.Fatalf("expected UserManagedPrometheusDefaultConflict, got %#v", c)
+	}
+	if !strings.Contains(c.Message, "team-custom-prometheus") {
+		t.Fatalf("conflict message must name the user CR, got %q", c.Message)
+	}
+
+	got := &unstructured.Unstructured{}
+	got.SetGroupVersionKind(gvk.PersesDatasourceV1Alpha2)
+	if err := cli.Get(context.Background(), client.ObjectKeyFromObject(userDefault), got); err != nil {
+		t.Fatalf("get user datasource: %v", err)
+	}
+	isDefault, found, err := unstructured.NestedBool(got.Object, "spec", "config", "default")
+	if err != nil || !found || !isDefault {
+		t.Fatalf("user-managed default must be left untouched: found=%v default=%v err=%v", found, isDefault, err)
 	}
 }
 
@@ -1101,7 +1481,7 @@ func TestDeployPersesPrometheusIntegrationCleansSecretsInEffectiveNamespace(t *t
 	}, Type: corev1.SecretTypeServiceAccountToken}
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(secret).Build()
 	var sources []rendertemplate.TemplateSource
-	err := deployPersesPrometheusIntegration(context.Background(), cli, m,
+	_, err := deployPersesPrometheusIntegration(context.Background(), cli, m,
 		conditions.NewConditionsManager(m, m.Generation), &sources, "v1alpha2", true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

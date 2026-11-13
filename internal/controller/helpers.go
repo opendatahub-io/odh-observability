@@ -159,7 +159,7 @@ func isSystemNamespace(namespace *corev1.Namespace) bool {
 	}
 
 	switch namespace.Name {
-	case "", "default", kubeSystemNamespace, "kube-public", "kube-node-lease", "openshift", "openshift-infra", "openshift-node":
+	case "", defaultName, kubeSystemNamespace, "kube-public", "kube-node-lease", "openshift", "openshift-infra", "openshift-node":
 		return true
 	}
 

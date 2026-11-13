@@ -89,8 +89,9 @@ const (
 	// storage, separate conditions and separate endpoints, and withholding one
 	// from collection on the other's account would stop the user's deletion of
 	// it from taking effect for as long as the other kept failing.
-	componentLokiUsageLogs = "loki-usage-logs"
-	componentLokiLogs      = "loki-logs"
+	componentLokiUsageLogs    = "loki-usage-logs"
+	componentLokiLogs         = "loki-logs"
+	componentPersesPrometheus = "perses-prometheus"
 )
 
 // lokiComponents is every component value a LokiStack-owned resource can
@@ -428,7 +429,7 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	if requeueNeeded || usageLogsAwaitingCredential(monitoring) {
+	if requeueNeeded || usageLogsAwaitingCredential(monitoring) || persesPrometheusDemotionPending(monitoring) {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
@@ -598,14 +599,16 @@ func (r *MonitoringReconciler) renderMonitoringResources(
 			cm *conditions.ConditionsManager, sources *[]rendertemplate.TemplateSource) error {
 			return deployPersesTempoIntegration(ctx, c, m, cm, sources, persesVersion, persesFound)
 		},
-		func(ctx context.Context, c client.Client, m *v1alpha1.Monitoring,
-			cm *conditions.ConditionsManager, sources *[]rendertemplate.TemplateSource) error {
-			return deployPersesPrometheusIntegration(ctx, c, m, cm, sources, persesVersion, persesFound)
-		},
 	} {
 		if err := action(ctx, r.Client, monitoring, cm, &sources); err != nil {
 			return nil, nil, nil, err
 		}
+	}
+
+	persesPrometheusWithheld, err := deployPersesPrometheusIntegration(
+		ctx, r.Client, monitoring, cm, &sources, persesVersion, persesFound)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
 	// The storage gate runs ahead of every claimant it reports on. Its error
@@ -613,6 +616,12 @@ func (r *MonitoringReconciler) renderMonitoringResources(
 	// verdict on the spec, not a failure of the reconcile, so Deploy, the
 	// shielded sweep, the endpoints and the Ready aggregation all still run.
 	withheldComponents, storageErr := validateStorageIsolation(ctx, r.Client, monitoring, cm)
+	if withheldComponents == nil {
+		withheldComponents = map[string]struct{}{}
+	}
+	if persesPrometheusWithheld {
+		withheldComponents[componentPersesPrometheus] = struct{}{}
+	}
 
 	if err := deployLokiStacks(ctx, r.Client, monitoring, cm, &sources, withheldComponents); err != nil {
 		return nil, nil, nil, err
@@ -997,6 +1006,18 @@ func shouldCollectOwnedResource(
 		return false
 	}
 
+	// Perses Prometheus datasources created before componentLabel existed still
+	// need a shield while demotion/promotion is withheld, or GC deletes them
+	// (including the live DS datasource during a user-managed default conflict).
+	if _, persesWithheld := withheldComponents[componentPersesPrometheus]; persesWithheld {
+		switch obj.GetName() {
+		case persesDataSciencePrometheusDatasourceName,
+			persesClusterPrometheusDatasourceName,
+			persesClusterPrometheusTenancyDatasourceName:
+			return false
+		}
+	}
+
 	// A LokiStack created before componentLabel existed does not carry it, so an
 	// upgrade landing straight into a storage conflict would not be shielded by
 	// the label alone. LokiStack is the one resource here that cannot be
@@ -1220,6 +1241,20 @@ func usageLogsAwaitingCredential(monitoring *v1alpha1.Monitoring) bool {
 	return condition != nil &&
 		condition.Status == metav1.ConditionFalse &&
 		condition.Reason == conditions.CredentialNotFoundReason
+}
+
+// persesPrometheusDemotionPending is true while deployPersesPrometheusIntegration
+// withholds the DS default until Perses reconciles an operator-managed demotion.
+func persesPrometheusDemotionPending(monitoring *v1alpha1.Monitoring) bool {
+	for i := range monitoring.Status.Conditions {
+		condition := &monitoring.Status.Conditions[i]
+		if condition.Type == conditions.ConditionPersesPrometheusDataSourceAvailable &&
+			condition.Status == metav1.ConditionFalse &&
+			condition.Reason == persesDemotionPendingReason {
+			return true
+		}
+	}
+	return false
 }
 
 func isPrometheusWebTLSCASecret(obj client.Object) bool {

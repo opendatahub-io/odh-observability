@@ -344,7 +344,7 @@ func addKorrel8rAPIServerData(ctx context.Context, c client.Client, monitoring *
 
 	endpointSlices := &discoveryv1.EndpointSliceList{}
 	if err := c.List(ctx, endpointSlices,
-		client.InNamespace("default"),
+		client.InNamespace(defaultName),
 		client.MatchingLabels{discoveryv1.LabelServiceName: kubernetesServiceName},
 	); err != nil {
 		return fmt.Errorf("listing Kubernetes API EndpointSlices for Korrel8r: %w", err)
