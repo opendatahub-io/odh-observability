@@ -211,11 +211,20 @@ func main() {
 
 	mgrCtx := ctx
 	var webhookTLSReloadRequested atomic.Bool
+	var apiServerTLSReloadRequested atomic.Bool
 	if enableWebhook {
 		var err error
 		mgrCtx, err = registerWebhookTLSReload(ctx, mgr, webhookTLS, &webhookTLSReloadRequested, setupLog)
 		if err != nil {
 			setupLog.Error(err, "Unable to configure webhook TLS reload")
+			os.Exit(1)
+		}
+	}
+	if leaderElect {
+		var err error
+		mgrCtx, err = registerAPIServerTLSReload(mgrCtx, mgr, &apiServerTLSReloadRequested, setupLog)
+		if err != nil {
+			setupLog.Error(err, "Unable to configure APIServer TLS reload")
 			os.Exit(1)
 		}
 	}
@@ -225,8 +234,8 @@ func main() {
 		setupLog.Error(err, "Problem running manager")
 		os.Exit(1)
 	}
-	if webhookTLSReloadRequested.Load() {
-		setupLog.Info("exiting so kube restarts the process and reloads webhook TLS")
+	if webhookTLSReloadRequested.Load() || apiServerTLSReloadRequested.Load() {
+		setupLog.Info("exiting so kube restarts the process and reloads TLS")
 		os.Exit(0)
 	}
 }
@@ -273,7 +282,7 @@ func registerWebhookTLSReload(
 
 	mgrCtx, cancel := context.WithCancel(ctx)
 	mgrCancel := func() {
-		markWebhookTLSReloadRequested(reloadRequested, cancel)
+		markTLSReloadRequested(reloadRequested, cancel)
 	}
 
 	if webhookTLS.Degraded {

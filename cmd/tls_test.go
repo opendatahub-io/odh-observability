@@ -383,14 +383,14 @@ func TestNeedsWebhookTLSReload(t *testing.T) {
 		"degraded stand-in must register recovery even when Watchable is false")
 }
 
-func TestMarkWebhookTLSReloadRequested(t *testing.T) {
+func TestMarkTLSReloadRequested(t *testing.T) {
 	t.Parallel()
 
 	var reloadRequested atomic.Bool
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	markWebhookTLSReloadRequested(&reloadRequested, cancel)
+	markTLSReloadRequested(&reloadRequested, cancel)
 	assert.True(t, reloadRequested.Load())
 	assert.Equal(t, context.Canceled, cancelCtx.Err())
 }
