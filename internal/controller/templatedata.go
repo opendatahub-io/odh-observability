@@ -836,9 +836,11 @@ func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces,
 		templateData["TempoQueryEndpoint"] = fmt.Sprintf("https://tempo-data-science-tempomonolithic-gateway.%s.svc.cluster.local:8080/api/traces/v1/%s/tempo", namespace, namespace)
 		templateData["Size"] = traces.Storage.Size
 	case v1alpha1.StorageBackendS3, v1alpha1.StorageBackendGCS:
-		templateData["TempoGatewayService"] = "tempo-data-science-tempostack-gateway"
-		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempostack-gateway.%s.svc.cluster.local:4317", namespace)
-		templateData["TempoQueryEndpoint"] = fmt.Sprintf("https://tempo-data-science-tempostack-gateway.%s.svc.cluster.local:8080/api/traces/v1/%s/tempo", namespace, namespace)
+		templateData["TempoGatewayService"] = tempoStackGatewayServiceName
+		// Keep collector on standard OTLP :4317 (not gateway :8090). The Service
+		// alias is ensured by syncTempoStackGatewayOTLPPort.
+		templateData["TempoEndpoint"] = fmt.Sprintf("%s.%s.svc.cluster.local:4317", tempoStackGatewayServiceName, namespace)
+		templateData["TempoQueryEndpoint"] = fmt.Sprintf("https://%s.%s.svc.cluster.local:8080/api/traces/v1/%s/tempo", tempoStackGatewayServiceName, namespace, namespace)
 		templateData["Secret"] = traces.Storage.Secret
 	}
 

@@ -400,12 +400,28 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 		gcFailed = true
 	}
 
-	r.syncPostDeployResources(ctx, monitoring, cm)
+	return r.finalizeMonitoringReconcile(ctx, monitoring, cm, data, storageErr, caReady, gcFailed, &stampPlatform)
+}
+
+// finalizeMonitoringReconcile runs post-deploy sync and end-of-reconcile
+// requeue decisions after desired state is applied and GC has been attempted.
+func (r *MonitoringReconciler) finalizeMonitoringReconcile(
+	ctx context.Context,
+	monitoring *v1alpha1.Monitoring,
+	cm *conditions.ConditionsManager,
+	data map[string]any,
+	storageErr error,
+	caReady bool,
+	gcFailed bool,
+	stampPlatform *bool,
+) (ctrl.Result, error) {
+	otlpGatewayPending, err := r.syncPostDeployResources(ctx, monitoring, cm)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 
 	requeueNeeded := publishLokiEndpoints(monitoring, data)
-
 	setUsageLogsForwardingStatus(monitoring, data)
-
 	cm.AggregateReady()
 
 	// Surface the withheld storage configuration now that every other feature
@@ -420,12 +436,22 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 	// desired state without returning an error. Early exits (Removed,
 	// preconditions, configuration errors) and error returns leave the
 	// previous handshake value untouched.
-	stampPlatform = caReady
+	*stampPlatform = caReady
 
 	if !caReady {
+		msg := "Waiting for Prometheus CA Secret before applying MonitoringStack"
+		if otlpGatewayPending {
+			// Surface both waits — do not hide the OTLP gateway gap behind CA.
+			msg = msg + "; " + errTempoStackGatewayServiceNotFound.Error()
+			markTempoStackGatewayServiceNotFound(cm)
+		}
 		cm.MarkFalse(string(platformcommon.ConditionTypeProvisioningSucceeded),
-			"PrometheusCAUnavailable", "Waiting for Prometheus CA Secret before applying MonitoringStack")
+			"PrometheusCAUnavailable", msg)
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	if result, wait := requeueForTempoStackGatewayOTLP(cm, otlpGatewayPending); wait {
+		return result, nil
 	}
 
 	if requeueNeeded || usageLogsAwaitingCredential(monitoring) {
@@ -739,11 +765,14 @@ func publishLokiEndpoints(monitoring *v1alpha1.Monitoring, data map[string]any) 
 	return requeueNeeded
 }
 
+// syncPostDeployResources applies post-deploy fixes. The bool is true when
+// TempoStack traces need the gateway Service :4317 alias but it is not ready
+// yet — callers must requeue without treating that wait as a hard error.
 func (r *MonitoringReconciler) syncPostDeployResources(
 	ctx context.Context,
 	monitoring *v1alpha1.Monitoring,
 	cm *conditions.ConditionsManager,
-) {
+) (bool, error) {
 	log := logf.FromContext(ctx)
 
 	if err := syncThanosQuerierRouteDestinationCA(ctx, r.Client, monitoring); err != nil {
@@ -753,10 +782,52 @@ func (r *MonitoringReconciler) syncPostDeployResources(
 			fmt.Sprintf("Failed to sync Thanos Querier Route destination CA: %v", err))
 	}
 
+	otlpGatewayPending := false
+	// TempoStack keeps collector on :4317; patch failures are hard errors.
+	// Service NotFound is expected during Tempo rollout — pending only.
+	if syncErr := syncTempoStackGatewayOTLPPort(ctx, r.Client, monitoring); syncErr != nil {
+		if errors.Is(syncErr, errTempoStackGatewayServiceNotFound) {
+			log.Info("Waiting for TempoStack gateway Service before ensuring OTLP port", "error", syncErr)
+			otlpGatewayPending = true
+		} else {
+			return false, syncErr
+		}
+	}
+
 	// Populate status.url from the Thanos Querier route.
 	if err := syncStatusURL(ctx, r.Client, monitoring); err != nil {
 		log.Error(err, "Failed to sync status URL")
 	}
+	return otlpGatewayPending, nil
+}
+
+const tempoStackGatewayServiceNotFoundReason = "TempoStackGatewayServiceNotFound"
+
+// markTempoStackGatewayServiceNotFound records that TempoStack traces cannot
+// expose OTLP :4317 yet because the gateway Service is missing. Does not touch
+// TempoAvailable or Degraded.
+func markTempoStackGatewayServiceNotFound(cm *conditions.ConditionsManager) {
+	msg := errTempoStackGatewayServiceNotFound.Error()
+	cm.MarkFalse(string(platformcommon.ConditionTypeProvisioningSucceeded),
+		tempoStackGatewayServiceNotFoundReason, msg)
+	// Progressing, not FeatureUnavailable: Service creation is expected during
+	// TempoStack rollout. Avoid Ready=False flaps for a normal wait.
+	cm.MarkUnknown(string(platformcommon.ConditionTypeReady),
+		tempoStackGatewayServiceNotFoundReason, msg)
+}
+
+// requeueForTempoStackGatewayOTLP requeues while the TempoStack gateway Service
+// is missing. Runs after post-deploy status publishing so Loki/URL sync is not
+// aborted.
+func requeueForTempoStackGatewayOTLP(
+	cm *conditions.ConditionsManager,
+	otlpGatewayPending bool,
+) (ctrl.Result, bool) {
+	if !otlpGatewayPending {
+		return ctrl.Result{}, false
+	}
+	markTempoStackGatewayServiceNotFound(cm)
+	return ctrl.Result{RequeueAfter: 15 * time.Second}, true
 }
 
 // resourceKey identifies a Kubernetes resource for desired-set comparison.
@@ -1295,7 +1366,12 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.storageSecretRequests),
 			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{})).
-		Watches(&corev1.Service{}, toSingleton, builder.WithPredicates(managedPredicate)).
+		// Include the Tempo Operator-owned TempoStack gateway Service so we
+		// re-apply the OTLP :4317 → grpc-public alias when Tempo strips it.
+		Watches(&corev1.Service{}, toSingleton, builder.WithPredicates(predicate.Or(
+			managedPredicate,
+			predicate.NewPredicateFuncs(isTempoStackGatewayService),
+		))).
 		Watches(&discoveryv1.EndpointSlice{}, toSingleton, builder.WithPredicates(predicate.NewPredicateFuncs(isKorrel8rEndpointSlice))).
 		Watches(&corev1.ServiceAccount{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		// Namespace creation or deletion changes the TargetAllocator Secret Role allowlist.
