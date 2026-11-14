@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	"github.com/onsi/gomega"
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -42,7 +44,6 @@ var (
 		Version: "v1alpha2",
 		Kind:    "LLMInferenceService",
 	}
-
 	// gvk.DSCInitialization is v1; the inference prerequisites use v2.
 	gvkDSCInitializationV2 = schema.GroupVersionKind{
 		Group:   "dscinitialization.opendatahub.io",
@@ -260,11 +261,44 @@ fixture:
 
 expected:
   traces:
-    - traceql: '{ trace:id = "%s" && name = "llm_request" && resource.k8s.pod.name =~ "%s.*" && span:parentID = "%s" }'
+    - traceql: '{ trace:id = "%s" && name = "request" && span:parentID = "%s" }'
       count: ">= 1"
-`, tag, tag, traceHex, podNamePrefix, parentSpanID)
+    - traceql: '{ trace:id = "%s" && name = "llm_request" && resource.k8s.pod.name =~ "%s.*" && span:parentID != "0000000000000000" }'
+      count: ">= 1"
+`, tag, tag, traceHex, parentSpanID, traceHex, podNamePrefix)
 	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 	return path
+}
+
+const metricsServiceNamePlaceholder = "__LLM_INFERENCE_SERVICE_NAME__"
+
+func renderOatsMetricsCase(template, serviceName string) (string, error) {
+	if serviceName == "" {
+		return "", errors.New("LLMInferenceService name is required to scope metrics OATS queries")
+	}
+	if !strings.Contains(template, metricsServiceNamePlaceholder) {
+		return "", fmt.Errorf("metrics OATS template does not contain %q", metricsServiceNamePlaceholder)
+	}
+	return strings.ReplaceAll(template, metricsServiceNamePlaceholder, serviceName), nil
+}
+
+func writeOatsMetricsCaseFile(t *testing.T, projectRoot, serviceName string) string {
+	t.Helper()
+	templatePath := filepath.Join(projectRoot, "tests", "e2e", "oats", "vllm", "single-node-metrics", "oats-case.yaml")
+	template, err := os.ReadFile(templatePath)
+	require.NoError(t, err, "failed to read single-node metrics OATS template")
+	content, err := renderOatsMetricsCase(string(template), serviceName)
+	require.NoError(t, err, "failed to scope metrics OATS case to the current LLMInferenceService")
+
+	dir := filepath.Join(t.TempDir(), "single-node-metrics")
+	require.NoError(t, os.MkdirAll(dir, 0o750))
+	caseFile, err := os.CreateTemp(dir, "oats-case-*.yaml")
+	require.NoError(t, err, "failed to create run-specific metrics OATS case")
+	defer caseFile.Close()
+	_, err = caseFile.WriteString(content)
+	require.NoError(t, err, "failed to write run-specific metrics OATS case")
+	require.NoError(t, caseFile.Close(), "failed to close run-specific metrics OATS case")
+	return caseFile.Name()
 }
 
 const oatsGCXVersion = "1.2.0"
@@ -348,7 +382,7 @@ func assertTraceIDInTempo(ctx context.Context, t *testing.T, traceID string, oat
 	return lastErr
 }
 
-func sendCompletion(ctx context.Context, routeHost, ocToken string, rootCAs *x509.CertPool, traceparent ...string) error {
+func sendCompletionToEndpoint(ctx context.Context, endpoint, ocToken string, rootCAs *x509.CertPool, traceparent ...string) error {
 	payload := map[string]any{
 		"model":       "facebook/opt-125m",
 		"prompt":      "San Francisco is a",
@@ -367,7 +401,11 @@ func sendCompletion(ctx context.Context, routeHost, ocToken string, rootCAs *x50
 		}},
 		Timeout: 30 * time.Second,
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://"+routeHost+"/v1/completions", bytes.NewReader(body))
+	requestURL, err := url.JoinPath(endpoint, "v1", "completions")
+	if err != nil {
+		return fmt.Errorf("construct completions endpoint: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -492,6 +530,17 @@ func runOats(ctx context.Context, t *testing.T, oatsBin string, oatsEnv []string
 		return fmt.Errorf("OATS failed: %w\nOutput: %s", err, outBuf.String())
 	}
 	return nil
+}
+
+// llmInferenceOATSMode controls which independently tagged OATS cases the LLMISVC test runs.
+// The default keeps the existing all-in-one test behavior while allowing trace-only validation
+// when the metrics backend is unavailable.
+func llmInferenceOATSMode() string {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("LLM_OATS_MODE")))
+	if mode == "traces" || mode == "metrics" {
+		return mode
+	}
+	return "all"
 }
 
 func formatOatsCommand(env []string, args []string) string {
@@ -623,6 +672,252 @@ func randomServiceName(base string) (string, error) {
 	return name, nil
 }
 
+func findDefaultInferenceGateway(tc *TestContext) (string, string, error) {
+	gatewayConfigs := &unstructured.UnstructuredList{}
+	gatewayConfigs.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "services.platform.opendatahub.io", Version: "v1alpha1", Kind: "GatewayConfigList",
+	})
+	if err := tc.Client().List(tc.Context(), gatewayConfigs); err != nil {
+		return "", "", fmt.Errorf("list platform GatewayConfig resources: %w", err)
+	}
+	if len(gatewayConfigs.Items) != 1 {
+		return "", "", fmt.Errorf("expected one platform GatewayConfig, found %d", len(gatewayConfigs.Items))
+	}
+	gatewayConfig := &gatewayConfigs.Items[0]
+
+	additionalIngresses, _, err := unstructured.NestedSlice(gatewayConfig.Object, "spec", "additionalIngresses")
+	if err != nil {
+		return "", "", fmt.Errorf("read additional ingresses from GatewayConfig %s: %w", gatewayConfig.GetName(), err)
+	}
+	additionalGatewayNames := make(map[string]struct{}, len(additionalIngresses))
+	for _, ingress := range additionalIngresses {
+		entry, ok := ingress.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := entry["name"].(string)
+		if name != "" {
+			additionalGatewayNames[name] = struct{}{}
+		}
+	}
+
+	gateways := &unstructured.UnstructuredList{}
+	gateways.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "gateway.networking.k8s.io", Version: "v1", Kind: "GatewayList",
+	})
+	if err := tc.Client().List(tc.Context(), gateways); err != nil {
+		return "", "", fmt.Errorf("list Gateway resources: %w", err)
+	}
+	var defaultGateway *unstructured.Unstructured
+	for i := range gateways.Items {
+		gateway := &gateways.Items[i]
+		if _, isAdditional := additionalGatewayNames[gateway.GetName()]; isAdditional {
+			continue
+		}
+		for _, owner := range gateway.GetOwnerReferences() {
+			if owner.UID == gatewayConfig.GetUID() && owner.Kind == "GatewayConfig" {
+				if defaultGateway != nil {
+					return "", "", fmt.Errorf("multiple default Gateways are owned by GatewayConfig %s", gatewayConfig.GetName())
+				}
+				defaultGateway = gateway
+			}
+		}
+	}
+	if defaultGateway == nil {
+		return "", "", fmt.Errorf("no default Gateway is owned by GatewayConfig %s", gatewayConfig.GetName())
+	}
+
+	conditions, _, err := unstructured.NestedSlice(defaultGateway.Object, "status", "conditions")
+	if err != nil {
+		return "", "", fmt.Errorf("read status conditions for Gateway %s/%s: %w", defaultGateway.GetNamespace(), defaultGateway.GetName(), err)
+	}
+	for _, rawCondition := range conditions {
+		condition, ok := rawCondition.(map[string]any)
+		if !ok || condition["type"] != "Programmed" {
+			continue
+		}
+		if condition["status"] != "True" {
+			return "", "", fmt.Errorf("default Gateway %s/%s is not programmed", defaultGateway.GetNamespace(), defaultGateway.GetName())
+		}
+		return defaultGateway.GetName(), defaultGateway.GetNamespace(), nil
+	}
+	return "", "", fmt.Errorf("default Gateway %s/%s has no Programmed condition", defaultGateway.GetNamespace(), defaultGateway.GetName())
+}
+
+func findPlatformLLMTracingPreset(tc *TestContext, namespace string) (string, string, string, error) {
+	configs := &unstructured.UnstructuredList{}
+	configs.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "serving.kserve.io", Version: "v1alpha2", Kind: "LLMInferenceServiceConfigList",
+	})
+	if err := tc.Client().List(tc.Context(), configs, client.InNamespace(namespace)); err != nil {
+		return "", "", "", fmt.Errorf("list LLMInferenceServiceConfig resources: %w", err)
+	}
+	for _, config := range configs.Items {
+		previousName := config.GetAnnotations()["internal.config.kubernetes.io/previousNames"]
+		if previousName != "kserve-config-llm-tracing" && !strings.Contains(config.GetName(), "kserve-config-llm-tracing") {
+			continue
+		}
+		endpoint, found, err := unstructured.NestedString(config.Object, "spec", "tracing", "exporterEndpoint")
+		if err != nil {
+			return "", "", "", fmt.Errorf("read tracing endpoint from preset %s: %w", config.GetName(), err)
+		}
+		if !found || endpoint == "" {
+			return "", "", "", fmt.Errorf("platform tracing preset %s has no exporterEndpoint", config.GetName())
+		}
+		if _, ok := httpsEndpoint(endpoint); !ok {
+			return "", "", "", fmt.Errorf("platform tracing preset %s must use an HTTPS exporterEndpoint", config.GetName())
+		}
+		certificate, found, err := unstructured.NestedString(config.Object, "spec", "tracing", "exporterCertificate")
+		if err != nil {
+			return "", "", "", fmt.Errorf("read tracing certificate from preset %s: %w", config.GetName(), err)
+		}
+		if !found || certificate == "" {
+			return "", "", "", fmt.Errorf("platform tracing preset %s has no exporterCertificate", config.GetName())
+		}
+		return config.GetName(), endpoint, certificate, nil
+	}
+	return "", "", "", fmt.Errorf("platform LLM tracing preset was not found in namespace %s", namespace)
+}
+
+func llmInferenceServiceRoutedEndpoint(t *testing.T, tc *TestContext, nn types.NamespacedName) string {
+	t.Helper()
+	routes := &unstructured.UnstructuredList{}
+	routes.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "gateway.networking.k8s.io", Version: "v1", Kind: "HTTPRouteList",
+	})
+	require.NoError(t, tc.Client().List(tc.Context(), routes,
+		client.InNamespace(nn.Namespace),
+		client.MatchingLabels{
+			"app.kubernetes.io/name":    nn.Name,
+			"app.kubernetes.io/part-of": "llminferenceservice",
+		},
+	), "failed to list managed LLMInferenceService HTTPRoutes")
+	require.NotEmpty(t, routes.Items, "LLMInferenceService %s/%s should have a managed HTTPRoute", nn.Namespace, nn.Name)
+
+	parentRefs, found, err := unstructured.NestedSlice(routes.Items[0].Object, "spec", "parentRefs")
+	require.NoError(t, err, "failed to read HTTPRoute parentRefs")
+	require.True(t, found, "managed HTTPRoute should reference a Gateway")
+	require.NotEmpty(t, parentRefs, "managed HTTPRoute should reference a Gateway")
+	parentRef, ok := parentRefs[0].(map[string]any)
+	require.True(t, ok, "HTTPRoute parentRef should be an object")
+	gatewayName, _ := parentRef["name"].(string)
+	gatewayNamespace, _ := parentRef["namespace"].(string)
+	if gatewayNamespace == "" {
+		gatewayNamespace = nn.Namespace
+	}
+	require.NotEmpty(t, gatewayName, "HTTPRoute parentRef should name a Gateway")
+
+	gatewayRoute := tc.FetchResource(WithMinimalObject(gvk.Route, types.NamespacedName{
+		Name: gatewayName, Namespace: gatewayNamespace,
+	}))
+	host, found, err := unstructured.NestedString(gatewayRoute.Object, "spec", "host")
+	require.NoError(t, err, "failed to read OpenShift Route host for the LLM Gateway")
+	require.True(t, found, "OpenShift Route %s/%s should have a host", gatewayNamespace, gatewayName)
+	require.NotEmpty(t, host, "OpenShift Route %s/%s should have a host", gatewayNamespace, gatewayName)
+
+	// The LLMInferenceService status URL can be the Gateway's internal Service
+	// address, which is not resolvable from the test runner. Use the OpenShift
+	// Route host associated with the HTTPRoute's parent Gateway.
+	return fmt.Sprintf("https://%s/%s/%s", host, nn.Namespace, nn.Name)
+}
+
+func httpsEndpoint(endpoint string) (string, bool) {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return "", false
+	}
+	return endpoint, true
+}
+
+func requireLLMTracingEndpoint(t *testing.T, tc *TestContext, namespace, serviceName, expectedEndpoint, expectedCertificate string) {
+	t.Helper()
+	pods := &corev1.PodList{}
+	require.NoError(t, tc.Client().List(tc.Context(), pods,
+		client.InNamespace(namespace),
+		client.MatchingLabels{"app.kubernetes.io/name": serviceName, "app.kubernetes.io/part-of": "llminferenceservice"},
+	))
+	foundWorkload := false
+	foundScheduler := false
+	foundWorkloadCertificate := false
+	foundSchedulerCertificate := false
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		component := pod.Labels["app.kubernetes.io/component"]
+		for _, container := range pod.Spec.Containers {
+			hasEndpoint := false
+			certificatePath := ""
+			for _, env := range container.Env {
+				switch env.Name {
+				case "OTEL_EXPORTER_OTLP_ENDPOINT":
+					require.Equal(t, expectedEndpoint, env.Value,
+						"pod %s container %s should use the platform tracing endpoint", pod.Name, container.Name)
+					hasEndpoint = true
+				case "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE":
+					certificatePath = env.Value
+				}
+			}
+			if !hasEndpoint {
+				continue
+			}
+			require.NotEmpty(t, certificatePath,
+				"pod %s container %s should receive OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE", pod.Name, container.Name)
+			require.Equal(t, expectedCertificate, certificatePath,
+				"pod %s container %s should use the certificate configured by the platform tracing preset", pod.Name, container.Name)
+			require.True(t, hasReadOnlyServiceCAMount(pod, container, certificatePath),
+				"pod %s container %s should mount the service CA at %s read-only", pod.Name, container.Name, certificatePath)
+			if strings.HasPrefix(component, "llminferenceservice-workload") {
+				foundWorkload = true
+				foundWorkloadCertificate = true
+			}
+			if component == "llminferenceservice-router-scheduler" {
+				foundScheduler = true
+				foundSchedulerCertificate = true
+			}
+		}
+	}
+	require.True(t, foundWorkload, "a vLLM workload pod should receive OTEL_EXPORTER_OTLP_ENDPOINT")
+	require.True(t, foundScheduler, "the EPP scheduler pod should receive OTEL_EXPORTER_OTLP_ENDPOINT")
+	require.True(t, foundWorkloadCertificate,
+		"a vLLM workload pod should receive OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE and mount the service CA")
+	require.True(t, foundSchedulerCertificate,
+		"the EPP scheduler pod should receive OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE and mount the service CA")
+}
+
+func hasReadOnlyServiceCAMount(pod *corev1.Pod, container corev1.Container, certificatePath string) bool {
+	certificatePath = filepath.Clean(certificatePath)
+	volumes := make(map[string]corev1.Volume, len(pod.Spec.Volumes))
+	for _, volume := range pod.Spec.Volumes {
+		volumes[volume.Name] = volume
+	}
+
+	for _, mount := range container.VolumeMounts {
+		if !mount.ReadOnly {
+			continue
+		}
+		mountPath := filepath.Clean(mount.MountPath)
+		relativePath, err := filepath.Rel(mountPath, certificatePath)
+		if err != nil || relativePath == "." || relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(os.PathSeparator)) {
+			continue
+		}
+		volume, ok := volumes[mount.Name]
+		if !ok || volume.ConfigMap == nil || volume.ConfigMap.Name != "openshift-service-ca.crt" {
+			continue
+		}
+		if len(volume.ConfigMap.Items) == 0 {
+			if relativePath == "service-ca.crt" {
+				return true
+			}
+			continue
+		}
+		for _, item := range volume.ConfigMap.Items {
+			if item.Key == "service-ca.crt" && filepath.Clean(item.Path) == relativePath {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func discoverInferenceService(tc *TestContext, namespace, llmSvcName string) (string, int64, error) {
 	services := &unstructured.UnstructuredList{}
 	services.SetGroupVersionKind(schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ServiceList"})
@@ -734,6 +1029,7 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	cookieSecretName := proxyName + "-cookie"
 	saName := proxyName
 	bindingName := proxyName + "-auth-delegator"
+	oatsMode := llmInferenceOATSMode()
 	t.Logf("Starting %s topology with LLMInferenceService %s", topology, llmSvcNN)
 	if topology == "multi-node" {
 		checkCtx, cancel := context.WithTimeout(tc.Context(), 10*time.Second)
@@ -776,19 +1072,13 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 			"uri":  "hf://facebook/opt-125m",
 			"name": "facebook/opt-125m",
 		},
-		"tracing": map[string]any{
-			"exporterEndpoint": fmt.Sprintf("https://%s-headless.%s.svc.cluster.local:4317", OpenTelemetryCollectorServiceName, inferenceMonitoringNamespace()),
-			"sampler":          "always_on",
-		},
 		"replicas": int64(1),
 		"template": map[string]any{
-			"volumes": serviceCAVolumes(),
 			"containers": []map[string]any{
 				{
-					"name":         "main",
-					"image":        "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
-					"env":          inferenceContainerEnv(),
-					"volumeMounts": serviceCAVolumeMounts(),
+					"name":  "main",
+					"image": "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
+					"env":   inferenceContainerEnv(),
 					"resources": map[string]any{
 						"requests": map[string]any{"memory": memory},
 						"limits":   map[string]any{"memory": memory},
@@ -796,6 +1086,46 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 				},
 			},
 		},
+	}
+	var platformTracingEndpoint, platformTracingCertificate string
+	useGatewayPath := topology == "single-node" && oatsMode != "metrics"
+	traceEnabled := topology != "single-node" || oatsMode != "metrics"
+	if traceEnabled {
+		var presetName, gatewayName, gatewayNamespace string
+		g.Eventually(func() error {
+			var err error
+			presetName, platformTracingEndpoint, platformTracingCertificate, err = findPlatformLLMTracingPreset(tc, workloadNS)
+			if err != nil {
+				return err
+			}
+			if !useGatewayPath {
+				return nil
+			}
+			gatewayName, gatewayNamespace, err = findDefaultInferenceGateway(tc)
+			return err
+		}, 5*time.Minute, 5*time.Second).Should(gomega.Succeed(),
+			"platform tracing preset and required inference Gateway should become available")
+		spec["tracing"] = map[string]any{}
+		if useGatewayPath {
+			spec["router"] = map[string]any{
+				"route":     map[string]any{},
+				"scheduler": map[string]any{},
+				// Resolve the default Gateway from GatewayConfig ownership rather than
+				// relying on KServe's potentially stale built-in Gateway name.
+				"gateway": map[string]any{
+					"refs": []any{map[string]any{
+						"name":      gatewayName,
+						"namespace": gatewayNamespace,
+					}},
+				},
+			}
+			t.Logf("[%s] Using platform-managed tracing preset %s and default Gateway %s/%s",
+				topology, presetName, gatewayNamespace, gatewayName)
+		} else {
+			t.Logf("[%s] Using platform-managed tracing preset %s", topology, presetName)
+		}
+	} else {
+		t.Logf("[%s] Metrics-only mode; leaving tracing disabled", topology)
 	}
 
 	switch topology {
@@ -807,13 +1137,11 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		// it does not contain a nested template. Unknown fields are pruned by
 		// the API server, so keep the containers directly under worker.
 		spec["worker"] = map[string]any{
-			"volumes": serviceCAVolumes(),
 			"containers": []map[string]any{
 				{
-					"name":         "main",
-					"image":        "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
-					"env":          inferenceContainerEnv(),
-					"volumeMounts": serviceCAVolumeMounts(),
+					"name":  "main",
+					"image": "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
+					"env":   inferenceContainerEnv(),
 					"resources": map[string]any{
 						"requests": map[string]any{"memory": memory},
 						"limits":   map[string]any{"memory": memory},
@@ -824,13 +1152,11 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	case "disaggregated":
 		spec["prefill"] = map[string]any{
 			"template": map[string]any{
-				"volumes": serviceCAVolumes(),
 				"containers": []map[string]any{
 					{
-						"name":         "main",
-						"image":        "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
-						"env":          inferenceContainerEnv(),
-						"volumeMounts": serviceCAVolumeMounts(),
+						"name":  "main",
+						"image": "registry.redhat.io/rhaii/vllm-cpu-rhel9:3.4.1-1780356811",
+						"env":   inferenceContainerEnv(),
 						"resources": map[string]any{
 							"requests": map[string]any{"memory": memory},
 							"limits":   map[string]any{"memory": memory},
@@ -869,36 +1195,38 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	}
 	tc.EventuallyResourceCreatedOrPatched(llmSvcOpts...)
 
-	// 2. Discover the generated inference Service and expose it through OAuth.
-	// The generated Service is created before the workload becomes Ready, so this
-	// allows OAuth proxy provisioning to overlap with model startup.
-	t.Logf("[%s] Discovering cluster domain and generated inference Service", topology)
-	clusterDomain, err := getClusterDomain(tc)
-	require.NoError(t, err, "failed to discover cluster domain")
-	var inferenceService string
-	var inferencePort int64
-	g.Eventually(func() error {
-		var discoveryErr error
-		inferenceService, inferencePort, discoveryErr = discoverInferenceService(tc, workloadNS, llmSvcName)
-		return discoveryErr
-	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "generated inference Service should become discoverable")
-	t.Logf("[%s] Using inference Service %s on port %d", topology, inferenceService, inferencePort)
 	ocToken := getAuthToken(tc)
 	require.NotEmpty(t, ocToken, "Kubernetes bearer token is required for the OAuth proxy request")
+	var routeHost string
+	if !useGatewayPath {
+		// Metrics and non-single-node cases retain the direct workload OAuth
+		// proxy. Trace validation must instead traverse Gateway -> EPP -> vLLM.
+		t.Logf("[%s] Discovering cluster domain and generated inference Service", topology)
+		clusterDomain, err := getClusterDomain(tc)
+		require.NoError(t, err, "failed to discover cluster domain")
+		var inferenceService string
+		var inferencePort int64
+		g.Eventually(func() error {
+			var discoveryErr error
+			inferenceService, inferencePort, discoveryErr = discoverInferenceService(tc, workloadNS, llmSvcName)
+			return discoveryErr
+		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "generated inference Service should become discoverable")
+		t.Logf("[%s] Using inference Service %s on port %d", topology, inferenceService, inferencePort)
 
-	routeHost := llmSvcName + "." + clusterDomain
-	t.Logf("[%s] Creating OAuth proxy Deployment with upstream %s", topology, inferenceService)
-	upstream := fmt.Sprintf("https://%s.%s.svc.cluster.local:%d", inferenceService, workloadNS, inferencePort)
-	createOAuthProxy(t, tc, oauthProxyConfig{
-		namespace:          proxyNS,
-		proxyName:          proxyName,
-		serviceAccountName: saName,
-		bindingName:        bindingName,
-		tlsSecretName:      tlsSecretName,
-		cookieSecretName:   cookieSecretName,
-		routeHost:          routeHost,
-		upstream:           upstream,
-	})
+		routeHost = llmSvcName + "." + clusterDomain
+		t.Logf("[%s] Creating OAuth proxy Deployment with upstream %s", topology, inferenceService)
+		upstream := fmt.Sprintf("https://%s.%s.svc.cluster.local:%d", inferenceService, workloadNS, inferencePort)
+		createOAuthProxy(t, tc, oauthProxyConfig{
+			namespace:          proxyNS,
+			proxyName:          proxyName,
+			serviceAccountName: saName,
+			bindingName:        bindingName,
+			tlsSecretName:      tlsSecretName,
+			cookieSecretName:   cookieSecretName,
+			routeHost:          routeHost,
+			upstream:           upstream,
+		})
+	}
 
 	t.Logf("[%s] Waiting for LLMInferenceService Ready=True", topology)
 	tc.EnsureResourceConditionMet(
@@ -910,11 +1238,23 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	)
 	t.Logf("[%s] LLMInferenceService is Ready; sending authenticated completion request", topology)
 	routeCAs := ingressCAPool(t, tc.Context(), tc.Client())
-	send := func() error { return sendCompletion(tc.Context(), routeHost, ocToken, routeCAs) }
-	g.Eventually(send, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Should successfully send completion request through OAuth proxy")
+	completionEndpoint := "https://" + routeHost
+	completionPath := "OAuth proxy"
+	if useGatewayPath {
+		completionEndpoint = llmInferenceServiceRoutedEndpoint(t, tc, llmSvcNN)
+		completionPath = "LLMISVC Gateway/EPP route"
+	}
+	if traceEnabled {
+		requireLLMTracingEndpoint(t, tc, workloadNS, llmSvcName, platformTracingEndpoint, platformTracingCertificate)
+	}
+	send := func() error {
+		return sendCompletionToEndpoint(tc.Context(), completionEndpoint, ocToken, routeCAs)
+	}
+	g.Eventually(send, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(),
+		"Should successfully send completion request through %s", completionPath)
 	var tracedRequestTraceID string
 	var tracedRequestParentSpanID string
-	if topology == "single-node" {
+	if topology == "single-node" && oatsMode != "metrics" {
 		traceparent, err := newTestTraceparent()
 		require.NoError(t, err, "failed to generate randomized test trace context")
 		tracedRequestTraceID, err = traceIDFromTraceparent(traceparent)
@@ -923,33 +1263,18 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		require.NoError(t, err, "failed to parse parent span ID from traceparent")
 		t.Logf("[%s] Sending completion request with trace ID %s", topology, tracedRequestTraceID)
 		g.Eventually(func() error {
-			return sendCompletion(tc.Context(), routeHost, ocToken, routeCAs, traceparent)
-		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Should successfully send completion request with traceparent through OAuth proxy")
+			return sendCompletionToEndpoint(tc.Context(), completionEndpoint, ocToken, routeCAs, traceparent)
+		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(),
+			"Should successfully send completion request with traceparent through %s", completionPath)
 	}
 
-	// 3. Verification via OATS
-	t.Logf("[%s] Running OATS verification", topology)
-	g.Eventually(func() error {
-		if tracedRequestTraceID != "" {
-			casePath := writeOatsTraceCaseFile(t, topology, llmSvcName, tracedRequestTraceID, tracedRequestParentSpanID)
-			return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
-		}
-		return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
-	}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "OATS verification should succeed within 2 minutes")
-	if tracedRequestTraceID != "" {
-		// OATS prepares the platform-appropriate gcx binary before this direct
-		// trace lookup runs.
-		g.Eventually(func() error {
-			return assertTraceIDInTempo(tc.Context(), t, tracedRequestTraceID, oatsEnv)
-		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "injected trace ID should be retrievable from Tempo via gcx")
-		g.Eventually(func() error {
-			return assertVLLMSpanHasInjectedParent(tc.Context(), tracedRequestTraceID, tracedRequestParentSpanID, oatsEnv)
-		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "vLLM llm_request span should retain the injected parent span ID")
-	}
+	verifyLLMInferenceServiceOATS(t, tc, topology, projectRoot, oatsBin, oatsEnv, oatsMode,
+		llmSvcName, tracedRequestTraceID, tracedRequestParentSpanID)
 
-	// 4. Pod Termination & Scrape Recovery
-	if topology == "single-node" {
-		t.Logf("[%s] Trace validation complete; skipping metrics-only scrape recovery", topology)
+	// 4. Pod Termination & Scrape Recovery. Trace-only mode skips this metrics
+	// recovery check, but continues to the common explicit teardown below.
+	if topology == "single-node" && oatsMode == "traces" {
+		t.Logf("[%s] Trace-only mode; skipping metrics scrape-recovery check", topology)
 	} else {
 		t.Logf("[%s] Restarting vLLM pod for scrape recovery", topology)
 		restartVLLMPod(t, tc, workloadNS, llmSvcName)
@@ -960,6 +1285,10 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Second completion request should succeed after pod restart")
 
 		g.Eventually(func() error {
+			if topology == "single-node" {
+				casePath := writeOatsMetricsCaseFile(t, projectRoot, llmSvcName)
+				return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
+			}
 			return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
 		}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "Scrape recovery verification should succeed after pod restart")
 	}
@@ -987,29 +1316,48 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	}, 1*time.Minute, 2*time.Second).Should(gomega.BeTrue(), "Associated PodMonitor should be deleted within 1 reconciliation cycle of LLMInferenceService deletion")
 }
 
-func inferenceContainerEnv() []map[string]any {
-	return []map[string]any{
-		{"name": "VLLM_CPU_KVCACHE_SPACE", "value": "1"},
-		{"name": "OTEL_EXPORTER_OTLP_CERTIFICATE", "value": "/var/run/secrets/service-ca/service-ca.crt"},
+func verifyLLMInferenceServiceOATS(
+	t *testing.T,
+	tc *TestContext,
+	topology, projectRoot, oatsBin string,
+	oatsEnv []string,
+	oatsMode, llmSvcName, traceID, parentSpanID string,
+) {
+	t.Helper()
+	g := gomega.NewWithT(t)
+	t.Logf("[%s] Running OATS verification", topology)
+	if traceID != "" && oatsMode != "metrics" {
+		g.Eventually(func() error {
+			casePath := writeOatsTraceCaseFile(t, topology, llmSvcName, traceID, parentSpanID)
+			return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "trace OATS verification should succeed")
+		g.Eventually(func() error {
+			return assertTraceIDInTempo(tc.Context(), t, traceID, oatsEnv)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "injected trace ID should be retrievable from Tempo via gcx")
+		g.Eventually(func() error {
+			return assertAdapterSpanHasInjectedParent(tc.Context(), traceID, parentSpanID, oatsEnv)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "EPP request span should retain the injected parent span ID")
+		g.Eventually(func() error {
+			return assertAdapterVLLMSpanRelationship(tc.Context(), traceID, oatsEnv)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(),
+			"EPP request span should directly parent the vLLM llm_request span")
+	}
+	if topology == "single-node" && oatsMode != "traces" {
+		g.Eventually(func() error {
+			casePath := writeOatsMetricsCaseFile(t, projectRoot, llmSvcName)
+			return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "metrics OATS verification should succeed")
+	} else if topology != "single-node" {
+		g.Eventually(func() error {
+			return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
+		}, 5*time.Minute, 15*time.Second).Should(gomega.Succeed(), "OATS verification should succeed")
 	}
 }
 
-func serviceCAVolumeMounts() []map[string]any {
-	return []map[string]any{{
-		"name":      "service-ca",
-		"mountPath": "/var/run/secrets/service-ca",
-		"readOnly":  true,
-	}}
-}
-
-func serviceCAVolumes() []map[string]any {
-	return []map[string]any{{
-		"name": "service-ca",
-		"configMap": map[string]any{
-			"name":  "openshift-service-ca.crt",
-			"items": []map[string]any{{"key": "service-ca.crt", "path": "service-ca.crt"}},
-		},
-	}}
+func inferenceContainerEnv() []map[string]any {
+	return []map[string]any{
+		{"name": "VLLM_CPU_KVCACHE_SPACE", "value": "1"},
+	}
 }
 
 func logManualCleanupCommands(t *testing.T, topology, workloadNS, proxyNS, llmSvcName, bindingName string) {
@@ -1684,6 +2032,7 @@ func requireUsageLogsMonitoringReady(t *testing.T, tc *TestContext) {
 func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot string) {
 	t.Helper()
 	g := gomega.NewWithT(t)
+	traceOnlyRun := llmInferenceOATSMode() == "traces"
 
 	// The storage fixtures and the Loki S3 Secret must land where the operator creates the
 	// LokiStack, which dsci.yaml pins to spec.monitoring.namespace.
@@ -1805,8 +2154,16 @@ func setupInferencePrerequisites(t *testing.T, tc *TestContext, projectRoot stri
 		"Ready",
 	)
 
-	enableMaaSUsageLoggingPrerequisite(t, tc)
+	if !traceOnlyRun {
+		enableMaaSUsageLoggingPrerequisite(t, tc)
+	}
 
+	if traceOnlyRun {
+		t.Log("LLM_OATS_MODE=traces; skipping MaaS usage-logging setup")
+	}
+	// Trace validation sends inference through the platform Gateway, whose authentication
+	// policy is managed by Kuadrant. Keep this prerequisite for trace-only runs; only the
+	// unrelated MaaS usage-logging feature and its OATS case are skipped above.
 	for _, crd := range []string{
 		"kuadrants.kuadrant.io",
 		"authpolicies.kuadrant.io",
@@ -1909,14 +2266,20 @@ func TestLLMInferenceService(t *testing.T) {
 	setupInferencePrerequisites(t, tc, projectRoot)
 
 	// Runs before the OATS setup below: it needs neither the binary nor an LLMInferenceService.
-	t.Run("maas-usage-log-envoyfilter", func(t *testing.T) {
-		testMaaSUsageLogEnvoyFilter(t, tc)
-	})
+	if llmInferenceOATSMode() != "traces" {
+		t.Run("maas-usage-log-envoyfilter", func(t *testing.T) {
+			testMaaSUsageLogEnvoyFilter(t, tc)
+		})
+	}
 
 	oatsBin := ensureOatsBinary(t, projectRoot)
 	oatsEnv := buildOatsEnv(t, tc)
 
 	topologies := []string{"single-node", "multi-node", "disaggregated"}
+	if mode := llmInferenceOATSMode(); mode != "all" {
+		t.Logf("LLM_OATS_MODE=%s; limiting validation to the single-node topology", mode)
+		topologies = []string{"single-node"}
+	}
 
 	for _, topology := range topologies {
 		t.Run(topology, func(t *testing.T) {
