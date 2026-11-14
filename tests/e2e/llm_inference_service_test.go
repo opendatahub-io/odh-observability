@@ -1072,10 +1072,6 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 			"uri":  "hf://facebook/opt-125m",
 			"name": "facebook/opt-125m",
 		},
-		"tracing": map[string]any{
-			"exporterEndpoint": fmt.Sprintf("https://%s-headless.%s.svc.cluster.local:4317", OpenTelemetryCollectorServiceName, inferenceMonitoringNamespace()),
-			"sampler":          "always_on",
-		},
 		"replicas": int64(1),
 		"template": map[string]any{
 			"containers": []map[string]any{
@@ -1092,28 +1088,44 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 		},
 	}
 	var platformTracingEndpoint, platformTracingCertificate string
-	if topology == "single-node" && oatsMode != "metrics" {
-		presetName, endpoint, certificate, presetErr := findPlatformLLMTracingPreset(tc, workloadNS)
-		require.NoError(t, presetErr, "platform-managed LLM tracing preset is required for trace validation")
-		gatewayName, gatewayNamespace, gatewayErr := findDefaultInferenceGateway(tc)
-		require.NoError(t, gatewayErr, "the platform default inference Gateway is required for trace validation")
+	useGatewayPath := topology == "single-node" && oatsMode != "metrics"
+	traceEnabled := topology != "single-node" || oatsMode != "metrics"
+	if traceEnabled {
+		var presetName, gatewayName, gatewayNamespace string
+		g.Eventually(func() error {
+			var err error
+			presetName, platformTracingEndpoint, platformTracingCertificate, err = findPlatformLLMTracingPreset(tc, workloadNS)
+			if err != nil {
+				return err
+			}
+			if !useGatewayPath {
+				return nil
+			}
+			gatewayName, gatewayNamespace, err = findDefaultInferenceGateway(tc)
+			return err
+		}, 5*time.Minute, 5*time.Second).Should(gomega.Succeed(),
+			"platform tracing preset and required inference Gateway should become available")
 		spec["tracing"] = map[string]any{}
-		spec["router"] = map[string]any{
-			"route":     map[string]any{},
-			"scheduler": map[string]any{},
-			// Resolve the default Gateway from GatewayConfig ownership rather than
-			// relying on KServe's potentially stale built-in Gateway name.
-			"gateway": map[string]any{
-				"refs": []any{map[string]any{
-					"name":      gatewayName,
-					"namespace": gatewayNamespace,
-				}},
-			},
+		if useGatewayPath {
+			spec["router"] = map[string]any{
+				"route":     map[string]any{},
+				"scheduler": map[string]any{},
+				// Resolve the default Gateway from GatewayConfig ownership rather than
+				// relying on KServe's potentially stale built-in Gateway name.
+				"gateway": map[string]any{
+					"refs": []any{map[string]any{
+						"name":      gatewayName,
+						"namespace": gatewayNamespace,
+					}},
+				},
+			}
+			t.Logf("[%s] Using platform-managed tracing preset %s and default Gateway %s/%s",
+				topology, presetName, gatewayNamespace, gatewayName)
+		} else {
+			t.Logf("[%s] Using platform-managed tracing preset %s", topology, presetName)
 		}
-		platformTracingEndpoint = endpoint
-		platformTracingCertificate = certificate
-		t.Logf("[%s] Using platform-managed tracing preset %s and default Gateway %s/%s",
-			topology, presetName, gatewayNamespace, gatewayName)
+	} else {
+		t.Logf("[%s] Metrics-only mode; leaving tracing disabled", topology)
 	}
 
 	switch topology {
@@ -1185,7 +1197,6 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 
 	ocToken := getAuthToken(tc)
 	require.NotEmpty(t, ocToken, "Kubernetes bearer token is required for the OAuth proxy request")
-	useGatewayPath := topology == "single-node" && oatsMode != "metrics"
 	var routeHost string
 	if !useGatewayPath {
 		// Metrics and non-single-node cases retain the direct workload OAuth
@@ -1232,6 +1243,8 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	if useGatewayPath {
 		completionEndpoint = llmInferenceServiceRoutedEndpoint(t, tc, llmSvcNN)
 		completionPath = "LLMISVC Gateway/EPP route"
+	}
+	if traceEnabled {
 		requireLLMTracingEndpoint(t, tc, workloadNS, llmSvcName, platformTracingEndpoint, platformTracingCertificate)
 	}
 	send := func() error {
@@ -1258,26 +1271,27 @@ func runLLMInferenceServiceTopologyTest(t *testing.T, tc *TestContext, topology,
 	verifyLLMInferenceServiceOATS(t, tc, topology, projectRoot, oatsBin, oatsEnv, oatsMode,
 		llmSvcName, tracedRequestTraceID, tracedRequestParentSpanID)
 
-	// 4. Pod Termination & Scrape Recovery
+	// 4. Pod Termination & Scrape Recovery. Trace-only mode skips this metrics
+	// recovery check, but continues to the common explicit teardown below.
 	if topology == "single-node" && oatsMode == "traces" {
 		t.Logf("[%s] Trace-only mode; skipping metrics scrape-recovery check", topology)
-		return
+	} else {
+		t.Logf("[%s] Restarting vLLM pod for scrape recovery", topology)
+		restartVLLMPod(t, tc, workloadNS, llmSvcName)
+
+		t.Logf("[%s] Sending completion request after pod restart", topology)
+		g.Eventually(func() error {
+			return send()
+		}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Second completion request should succeed after pod restart")
+
+		g.Eventually(func() error {
+			if topology == "single-node" {
+				casePath := writeOatsMetricsCaseFile(t, projectRoot, llmSvcName)
+				return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
+			}
+			return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
+		}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "Scrape recovery verification should succeed after pod restart")
 	}
-	t.Logf("[%s] Restarting vLLM pod for scrape recovery", topology)
-	restartVLLMPod(t, tc, workloadNS, llmSvcName)
-
-	t.Logf("[%s] Sending completion request after pod restart", topology)
-	g.Eventually(func() error {
-		return send()
-	}, 2*time.Minute, 5*time.Second).Should(gomega.Succeed(), "Second completion request should succeed after pod restart")
-
-	g.Eventually(func() error {
-		if topology == "single-node" {
-			casePath := writeOatsMetricsCaseFile(t, projectRoot, llmSvcName)
-			return runOatsCaseFile(tc.Context(), t, oatsBin, casePath, oatsEnv, projectRoot)
-		}
-		return runOatsCase(tc.Context(), t, oatsBin, topology, oatsEnv, projectRoot)
-	}, 2*time.Minute, 10*time.Second).Should(gomega.Succeed(), "Scrape recovery verification should succeed after pod restart")
 
 	// 5. Teardown & PodMonitor Cleanup
 	if noCleanup {
