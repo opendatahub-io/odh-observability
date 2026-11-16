@@ -534,7 +534,8 @@ class QueryTracesTests(unittest.TestCase):
         args = Namespace(timeout=0.25, max_response_bytes=2048, ca_file=None)
         previous_handler = signal.getsignal(signal.SIGALRM)
         for mode in ("headers", "body", "error"):
-            with self.subTest(mode=mode):
+            with (self.subTest(mode=mode),
+                  patch.dict(os.environ, {"no_proxy": "127.0.0.1", "NO_PROXY": "127.0.0.1"})):
                 start = time.monotonic()
                 with self.assertRaises(query_traces.QueryError) as context:
                     query_traces.request_tempo(f"http://127.0.0.1:{server.server_port}/{mode}", {}, args, "search")
