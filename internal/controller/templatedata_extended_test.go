@@ -1115,7 +1115,7 @@ func TestAddImageURLs_Defaults(t *testing.T) {
 
 func TestAddImageURLs_OverriddenByEnv(t *testing.T) {
 	t.Setenv("RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE", "custom-proxy:latest")
-	t.Setenv("RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE", "quay.io/prometheuscommunity/prom-label-proxy:v0.16.2")
+	t.Setenv("RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE", "custom-prom-proxy:latest")
 	t.Setenv("OPERATOR_IMAGE", "custom-method-gate:latest")
 
 	data := make(map[string]any)
@@ -1126,54 +1126,11 @@ func TestAddImageURLs_OverriddenByEnv(t *testing.T) {
 	if data["KubeRBACProxyImage"] != "custom-proxy:latest" {
 		t.Errorf("KubeRBACProxyImage: want custom-proxy:latest, got %v", data["KubeRBACProxyImage"])
 	}
-	if data["PromLabelProxyImage"] != "quay.io/prometheuscommunity/prom-label-proxy:v0.16.2" {
-		t.Errorf("PromLabelProxyImage: want v0.16.2 tag, got %v", data["PromLabelProxyImage"])
+	if data["PromLabelProxyImage"] != "custom-prom-proxy:latest" {
+		t.Errorf("PromLabelProxyImage: want custom-prom-proxy:latest, got %v", data["PromLabelProxyImage"])
 	}
 	if data["HTTPMethodGateImage"] != "custom-method-gate:latest" {
 		t.Errorf("HTTPMethodGateImage: want custom-method-gate:latest, got %v", data["HTTPMethodGateImage"])
-	}
-}
-
-func TestAddImageURLs_RejectsOldPromLabelProxyOverride(t *testing.T) {
-	t.Setenv("RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE", "")
-	t.Setenv("RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE", "quay.io/prometheuscommunity/prom-label-proxy:v0.15.0")
-	t.Setenv("OPERATOR_IMAGE", "custom-method-gate:latest")
-
-	err := addImageURLs(make(map[string]any))
-	if err == nil || !strings.Contains(err.Error(), "older than v0.16.2") {
-		t.Fatalf("expected reject of pre-0.16.2 prom-label-proxy override, got %v", err)
-	}
-}
-
-func TestValidatePromLabelProxyImageSupportsQueryParamOnly(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name    string
-		image   string
-		wantErr bool
-	}{
-		{name: "default digest", image: defaultPromLabelProxyImage},
-		{name: "custom digest", image: "registry.example.com/prom-label-proxy@sha256:deadbeef"},
-		{name: "compatible tag", image: "quay.io/prometheuscommunity/prom-label-proxy:v0.16.2"},
-		{name: "newer tag", image: "quay.io/prometheuscommunity/prom-label-proxy:v0.17.0"},
-		{name: "unversioned latest", image: "custom-prom-proxy:latest", wantErr: true},
-		{name: "floating main", image: "quay.io/prometheuscommunity/prom-label-proxy:main", wantErr: true},
-		{name: "prerelease rc", image: "quay.io/prometheuscommunity/prom-label-proxy:v0.16.2-rc1", wantErr: true},
-		{name: "build metadata", image: "quay.io/prometheuscommunity/prom-label-proxy:v0.16.2+build", wantErr: true},
-		{name: "old patch", image: "quay.io/prometheuscommunity/prom-label-proxy:v0.16.1", wantErr: true},
-		{name: "old minor", image: "registry.example.com/prom-label-proxy:0.15.9", wantErr: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			err := validatePromLabelProxyImageSupportsQueryParamOnly(tc.image)
-			if tc.wantErr && err == nil {
-				t.Fatalf("expected error for %q", tc.image)
-			}
-			if !tc.wantErr && err != nil {
-				t.Fatalf("unexpected error for %q: %v", tc.image, err)
-			}
-		})
 	}
 }
 

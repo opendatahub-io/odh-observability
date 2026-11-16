@@ -60,60 +60,54 @@ func TestWebhookTLSWatcherRunsOnLeaderAndFollower(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: commonTLS.APIServerName},
 		Spec: configv1.APIServerSpec{
 			TLSSecurityProfile: &configv1.TLSSecurityProfile{Type: configv1.TLSProfileIntermediateType},
-			TLSAdherence:       configv1.TLSAdherencePolicyNoOpinion,
+			TLSAdherence:       configv1.TLSAdherencePolicyStrictAllComponents,
 		},
 	}
 	require.NoError(t, apiClient.Create(ctx, apiServer))
 
 	initialProfile := *configv1.TLSProfiles[configv1.TLSProfileIntermediateType]
 	managers := []*tlsWatcherTestManager{
-		startTLSWatcherTestManager(t, cfg, initialProfile, configv1.TLSAdherencePolicyNoOpinion),
-		startTLSWatcherTestManager(t, cfg, initialProfile, configv1.TLSAdherencePolicyNoOpinion),
+		startTLSWatcherTestManager(t, cfg, initialProfile, configv1.TLSAdherencePolicyStrictAllComponents),
+		startTLSWatcherTestManager(t, cfg, initialProfile, configv1.TLSAdherencePolicyStrictAllComponents),
 	}
 	for _, running := range managers {
 		require.True(t, running.manager.GetCache().WaitForCacheSync(ctx))
 	}
+	leaderIndex := -1
 	require.Eventually(t, func() bool {
 		leaders := 0
-		for _, running := range managers {
+		leaderIndex = -1
+		for i, running := range managers {
 			select {
 			case <-running.manager.Elected():
 				leaders++
+				leaderIndex = i
 			default:
 			}
 		}
 		return leaders == 1
 	}, 15*time.Second, 50*time.Millisecond)
+	require.NotEqual(t, -1, leaderIndex)
+	follower := managers[1-leaderIndex]
 
 	require.NoError(t, apiClient.Get(ctx, client.ObjectKey{Name: commonTLS.APIServerName}, apiServer))
 	apiServer.Spec.TLSSecurityProfile = &configv1.TLSSecurityProfile{Type: configv1.TLSProfileModernType}
 	require.NoError(t, apiClient.Update(ctx, apiServer))
-	for _, running := range managers {
-		require.Eventually(t, func() bool {
-			observed := &configv1.APIServer{}
-			if err := running.manager.GetClient().Get(ctx, client.ObjectKey{Name: commonTLS.APIServerName}, observed); err != nil {
-				return false
-			}
-			return observed.Spec.TLSSecurityProfile != nil &&
-				observed.Spec.TLSSecurityProfile.Type == configv1.TLSProfileModernType
-		}, 10*time.Second, 50*time.Millisecond)
+	require.Eventually(t, follower.reloadRequested.Load, 10*time.Second, 50*time.Millisecond)
+	select {
+	case <-follower.manager.Elected():
+		t.Fatal("follower was elected before requesting a TLS reload")
+	default:
 	}
-	require.Never(t, func() bool {
-		for _, running := range managers {
-			if running.reloadRequested.Load() || running.stopped() {
-				return true
-			}
-		}
-		return false
-	}, 500*time.Millisecond, 10*time.Millisecond)
-
-	require.NoError(t, apiClient.Get(ctx, client.ObjectKey{Name: commonTLS.APIServerName}, apiServer))
-	apiServer.Spec.TLSAdherence = configv1.TLSAdherencePolicyStrictAllComponents
-	require.NoError(t, apiClient.Update(ctx, apiServer))
 	for _, running := range managers {
+		require.Eventually(t, running.reloadRequested.Load, 10*time.Second, 50*time.Millisecond)
 		require.Eventually(t, running.stopped, 10*time.Second, 50*time.Millisecond)
-		require.True(t, running.reloadRequested.Load())
 		require.NoError(t, running.startErr)
+	}
+	select {
+	case <-follower.manager.Elected():
+		t.Fatal("follower took leadership during the reload assertion")
+	default:
 	}
 }
 
@@ -134,6 +128,9 @@ func startTLSWatcherTestManager(
 	t.Helper()
 
 	skipNameValidation := true
+	leaseDuration := 60 * time.Second
+	renewDeadline := 40 * time.Second
+	retryPeriod := 10 * time.Second
 	mgr, err := ctrl.NewManager(rest.CopyConfig(cfg), ctrl.Options{
 		Scheme:                        newWebhookTLSScheme(t),
 		Metrics:                       metricsserver.Options{BindAddress: "0"},
@@ -141,7 +138,10 @@ func startTLSWatcherTestManager(
 		LeaderElection:                true,
 		LeaderElectionID:              tlsWatcherTestLeaderID,
 		LeaderElectionNamespace:       tlsWatcherTestNamespace,
-		LeaderElectionReleaseOnCancel: true,
+		LeaderElectionReleaseOnCancel: false,
+		LeaseDuration:                 &leaseDuration,
+		RenewDeadline:                 &renewDeadline,
+		RetryPeriod:                   &retryPeriod,
 		Controller: config.Controller{
 			SkipNameValidation: &skipNameValidation,
 		},

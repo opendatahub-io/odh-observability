@@ -1277,7 +1277,6 @@ func (tc *MonitoringTestCtx) ValidateThanosQuerierRouteAuthorizationBoundary(t *
 			jq.Match(`.spec.template.spec.containers | map(.name) | contains(["kube-rbac-proxy", "prom-label-proxy"])`),
 			// Perses Project=All sends namespace=a&namespace=b; --regex-match rejects that.
 			jq.Match(`[.spec.template.spec.containers[]? | select(.name == "prom-label-proxy") | select(.args | index("--regex-match"))] | length == 0`),
-			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--query-param-only"])`),
 		)),
 		WithCustomErrorMsg("Thanos Querier proxy deployment should be ready with both authorization containers"),
 	)
@@ -1469,6 +1468,10 @@ func (tc *MonitoringTestCtx) assertThanosPromQLResponds(t *testing.T, query stri
 			return err
 		}
 		if resp.StatusCode != http.StatusOK {
+			if resp.StatusCode == http.StatusUnauthorized {
+				logThanosTokenReview(t, tc, "baseline", token)
+				logThanosProxyAuthenticationEvidence(t, tc)
+			}
 			httpErr := fmt.Errorf("PromQL query %q returned HTTP %d (want 200)", query, resp.StatusCode)
 			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 				return httpErr
@@ -2733,6 +2736,9 @@ func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 		t.Run("Prometheus secure proxy authentication", tc.ValidatePrometheusSecureProxyAuthentication)
 		t.Run("Monitoring proxy TLS profile rollout", tc.ValidateMonitoringProxyTLSProfileRollout)
 		t.Run("Tenant workload metrics namespace restriction", tc.ValidateTenantWorkloadMetricsNamespaceRestriction)
+		t.Run("Model CPU resource federation", tc.ValidateModelResourceFederation)
+		t.Run("Trusted DCGM workload attribution", tc.ValidateTrustedDCGMAttribution)
+		t.Run("Trusted DCGM HTTPS workload attribution", tc.ValidateTrustedDCGMTLSAttribution)
 		t.Run("Built-in DCGM opt-out with verified HTTPS monitor", tc.ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMonitor)
 		t.Run("OTLP metric identity cannot be spoofed", tc.ValidateOTLPMetricIdentityCannotBeSpoofed)
 		t.Run("Node metrics endpoint deployment", tc.ValidateNodeMetricsEndpointDeployment)
@@ -3308,7 +3314,6 @@ func (tc *MonitoringTestCtx) ValidateNamespaceIsolationPostFormBypass(t *testing
 		}),
 		WithCondition(And(
 			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--query-param=namespace"])`),
-			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--query-param-only"])`),
 			jq.Match(`.spec.template.spec.containers[] | select(.name == "prom-label-proxy") | .args | contains(["--error-on-replace"])`),
 			// Defense-in-depth: a method gate rejects non-GET/HEAD before prom-label-proxy,
 			// and kube-rbac-proxy forwards to it (:9092) rather than to prom-label-proxy (:9091).

@@ -82,10 +82,10 @@ func TestAcceleratorRecordingRulesTemplateContract(t *testing.T) {
 			record string
 			expr   string
 		}{
-			{record: "accelerator_gpu_utilization", expr: "DCGM_FI_DEV_GPU_UTIL * 100"},
-			{record: "accelerator_memory_used_bytes", expr: "DCGM_FI_DEV_FB_USED * 1024 * 1024"},
-			{record: "accelerator_temperature_celsius", expr: "DCGM_FI_DEV_GPU_TEMP"},
-			{record: "accelerator_power_usage_watts", expr: "DCGM_FI_DEV_POWER_USAGE"},
+			{record: "accelerator_gpu_utilization", expr: `DCGM_FI_DEV_GPU_UTIL * 100`},
+			{record: "accelerator_memory_used_bytes", expr: `DCGM_FI_DEV_FB_USED * 1024 * 1024`},
+			{record: "accelerator_temperature_celsius", expr: `DCGM_FI_DEV_GPU_TEMP`},
+			{record: "accelerator_power_usage_watts", expr: `DCGM_FI_DEV_POWER_USAGE`},
 		}
 		if len(rules) != len(wantRules) {
 			t.Fatalf("expected %d accelerator recording rules, got %d", len(wantRules), len(rules))
@@ -160,6 +160,9 @@ func TestDeployMonitoringStackWithQuerierIncludesTelemetryResources(t *testing.T
 		MonitoringStackTemplate,
 		PrometheusSelfServiceMonitorTemplate,
 		MonitoringStackAlertmanagerRBACTemplate,
+		AlertmanagerProxyTemplate,
+		AlertmanagerProxyNetworkPolicyTemplate,
+		AlertmanagerRouteTemplate,
 		AcceleratorRecordingRulesTemplate,
 		PrometheusRouteTemplate,
 		PrometheusServiceOverrideTemplate,
@@ -175,6 +178,205 @@ func TestDeployMonitoringStackWithQuerierIncludesTelemetryResources(t *testing.T
 		ThanosQuerierRouteTemplate,
 	}
 	assertTemplatePaths(t, sources, wantSources)
+}
+
+func TestTempoRouteTargetsTheSecureGateway(t *testing.T) {
+	for _, gatewayService := range []string{
+		"tempo-data-science-tempomonolithic-gateway",
+		"tempo-data-science-tempostack-gateway",
+	} {
+		t.Run(gatewayService, func(t *testing.T) {
+			resources := renderObservabilityTemplate(t, TempoRouteTemplate, map[string]any{
+				"Namespace":           testMonitoringNamespace,
+				"TempoGatewayService": gatewayService,
+			})
+
+			route := findRenderedResource(t, resources, "Route", "data-science-tempo-route")
+			target, found, err := unstructured.NestedString(route.Object, "spec", "to", "name")
+			if err != nil || !found || target != gatewayService {
+				t.Fatalf("Tempo Route must target the secure gateway: found=%t value=%q error=%v", found, target, err)
+			}
+			targetPort, found, err := unstructured.NestedString(route.Object, "spec", "port", "targetPort")
+			if err != nil || !found || targetPort != "public" {
+				t.Fatalf("Tempo Route must target the gateway public port: found=%t value=%q error=%v", found, targetPort, err)
+			}
+			termination, found, err := unstructured.NestedString(route.Object, "spec", "tls", "termination")
+			if err != nil || !found || termination != "reencrypt" {
+				t.Fatalf("Tempo Route must re-encrypt to the TLS gateway: found=%t value=%q error=%v", found, termination, err)
+			}
+		})
+	}
+}
+
+func TestAlertmanagerProxyTemplateContract(t *testing.T) {
+	resources := renderObservabilityTemplate(t, AlertmanagerProxyTemplate, proxyTemplateData())
+
+	assertClusterRoleBinding(
+		t,
+		findRenderedResource(t, resources, "ClusterRoleBinding", "data-science-alertmanager-proxy-auth-delegator"),
+		"system:auth-delegator",
+		"data-science-alertmanager-proxy",
+		testMonitoringNamespace,
+	)
+
+	configMap := findRenderedResource(t, resources, "ConfigMap", "data-science-alertmanager-proxy-config")
+	config, found, err := unstructured.NestedString(configMap.Object, "data", "kube-rbac-proxy.yaml")
+	if err != nil || !found {
+		t.Fatalf("Alertmanager proxy authorization config is missing: found=%t error=%v", found, err)
+	}
+	for _, expected := range []string{
+		"apiGroup: monitoring.coreos.com",
+		"resource: alertmanagers",
+		"verb: get",
+		"namespace: " + testMonitoringNamespace,
+	} {
+		if !strings.Contains(config, expected) {
+			t.Errorf("Alertmanager proxy config must contain %q, got %q", expected, config)
+		}
+	}
+
+	deployment := findRenderedResource(t, resources, "Deployment", "data-science-alertmanager-proxy")
+	containers := nestedSliceAt(t, deployment, "spec", "template", "spec", "containers")
+	if len(containers) != 2 {
+		t.Fatalf("Alertmanager proxy must have kube-rbac-proxy and method-gate containers, got %d", len(containers))
+	}
+	assertContainerArgs(t, findContainer(t, containers, "kube-rbac-proxy"),
+		"--secure-listen-address=0.0.0.0:8443",
+		"--upstream=http://127.0.0.1:9092/",
+		"--config-file=/etc/kube-rbac-proxy/kube-rbac-proxy.yaml",
+	)
+
+	gate := findContainer(t, containers, "method-gate")
+	gateCommand, ok := gate["command"].([]any)
+	if !ok {
+		t.Fatalf("Alertmanager method-gate command has unexpected type %T", gate["command"])
+	}
+	for _, expected := range []string{
+		"/manager",
+		"method-gate",
+		"--listen=127.0.0.1:9092",
+		"--upstream=http://data-science-monitoringstack-alertmanager." + testMonitoringNamespace + ".svc.cluster.local:9093/",
+	} {
+		if !containsString(gateCommand, expected) {
+			t.Errorf("Alertmanager method-gate command must contain %q, got %v", expected, gateCommand)
+		}
+	}
+
+	service := findRenderedResource(t, resources, "Service", "data-science-alertmanager-proxy")
+	certSecret, found, err := unstructured.NestedString(
+		service.Object, "metadata", "annotations", "service.beta.openshift.io/serving-cert-secret-name",
+	)
+	if err != nil || !found || certSecret != "data-science-alertmanager-proxy-tls" {
+		t.Fatalf("Alertmanager proxy Service must request a serving certificate: found=%t value=%q error=%v", found, certSecret, err)
+	}
+}
+
+func TestAlertmanagerRouteUsesAuthorizedProxy(t *testing.T) {
+	route := findRenderedResource(t, renderObservabilityTemplate(t, AlertmanagerRouteTemplate, proxyTemplateData()), "Route", "data-science-alertmanager-route")
+	if target, found, err := unstructured.NestedString(route.Object, "spec", "to", "name"); err != nil || !found || target != "data-science-alertmanager-proxy" {
+		t.Fatalf("Alertmanager Route must target the authorized proxy: found=%t value=%q error=%v", found, target, err)
+	}
+	if targetPort, found, err := unstructured.NestedString(route.Object, "spec", "port", "targetPort"); err != nil || !found || targetPort != "https" {
+		t.Fatalf("Alertmanager Route must target the proxy HTTPS port: found=%t value=%q error=%v", found, targetPort, err)
+	}
+	if termination, found, err := unstructured.NestedString(route.Object, "spec", "tls", "termination"); err != nil || !found || termination != "reencrypt" {
+		t.Fatalf("Alertmanager Route must re-encrypt to the proxy: found=%t value=%q error=%v", found, termination, err)
+	}
+}
+
+func TestAlertmanagerNetworkPoliciesAllowOnlyRequiredIngress(t *testing.T) {
+	proxyPolicy := findRenderedResource(t,
+		renderObservabilityTemplate(t, AlertmanagerProxyNetworkPolicyTemplate, proxyTemplateData()),
+		"NetworkPolicy", "data-science-alertmanager-proxy-ingress")
+	selector, found, err := unstructured.NestedString(proxyPolicy.Object, "spec", "podSelector", "matchLabels", "app")
+	if err != nil || !found || selector != "data-science-alertmanager-proxy" {
+		t.Fatalf("Alertmanager proxy NetworkPolicy must select proxy pods: found=%t value=%q error=%v", found, selector, err)
+	}
+	proxyIngress := nestedSlice(t, proxyPolicy, "spec", "ingress")
+	if len(proxyIngress) != 1 {
+		t.Fatalf("Alertmanager proxy NetworkPolicy must have one router ingress rule, got %d", len(proxyIngress))
+	}
+	proxyRule := asMap(t, proxyIngress[0])
+	proxyPeers := nestedSliceAt(t, unstructured.Unstructured{Object: proxyRule}, "from")
+	proxyNamespaceLabels := asMap(t, asMap(t, proxyPeers[0])["namespaceSelector"])["matchLabels"]
+	if labels := asMap(t, proxyNamespaceLabels); len(labels) != 1 || labels["policy-group.network.openshift.io/ingress"] != "" {
+		t.Fatalf("Alertmanager proxy NetworkPolicy must allow only OpenShift ingress: %#v", labels)
+	}
+	proxyPorts := nestedSliceAt(t, unstructured.Unstructured{Object: proxyRule}, "ports")
+	if len(proxyPorts) != 1 || asMap(t, proxyPorts[0])["protocol"] != "TCP" || asMap(t, proxyPorts[0])["port"] != int64(8443) {
+		t.Fatalf("Alertmanager proxy NetworkPolicy must allow only TCP/8443: %#v", proxyPorts)
+	}
+
+	alertmanagerPolicy := findRenderedResource(t,
+		renderObservabilityTemplate(t, AlertmanagerNetworkPolicyTemplate, map[string]any{"Namespace": testMonitoringNamespace}),
+		"NetworkPolicy", "data-science-alertmanager-ingress")
+	alertmanagerIngress := nestedSlice(t, alertmanagerPolicy, "spec", "ingress")
+	wantAlertmanagerIngress := []struct {
+		name      string
+		podLabels map[string]any
+		ports     map[string]int64
+	}{
+		{
+			name:      "authenticated proxy",
+			podLabels: map[string]any{"app": "data-science-alertmanager-proxy"},
+			ports:     map[string]int64{"TCP": 9093},
+		},
+		{
+			name: "Prometheus",
+			podLabels: map[string]any{
+				"app.kubernetes.io/name":     "prometheus",
+				"app.kubernetes.io/instance": "data-science-monitoringstack",
+			},
+			ports: map[string]int64{"TCP": 9093},
+		},
+		{
+			name: "Alertmanager gossip",
+			podLabels: map[string]any{
+				"app.kubernetes.io/part-of":   "data-science-monitoringstack",
+				"app.kubernetes.io/component": "alertmanager",
+			},
+			ports: map[string]int64{"TCP": 9094, "UDP": 9094},
+		},
+	}
+	if len(alertmanagerIngress) != len(wantAlertmanagerIngress) {
+		t.Fatalf("Alertmanager NetworkPolicy must have exactly %d ingress rules, got %d", len(wantAlertmanagerIngress), len(alertmanagerIngress))
+	}
+	for i, want := range wantAlertmanagerIngress {
+		rule := asMap(t, alertmanagerIngress[i])
+		peers := nestedSliceAt(t, unstructured.Unstructured{Object: rule}, "from")
+		if len(peers) != 1 {
+			t.Fatalf("Alertmanager NetworkPolicy %s rule must have one source, got %#v", want.name, peers)
+		}
+		peer := asMap(t, peers[0])
+		if len(peer) != 1 {
+			t.Fatalf("Alertmanager NetworkPolicy %s rule must not include an unrestricted peer: %#v", want.name, peer)
+		}
+		labels := asMap(t, asMap(t, peer["podSelector"])["matchLabels"])
+		if !reflect.DeepEqual(labels, want.podLabels) {
+			t.Fatalf("Alertmanager NetworkPolicy %s source mismatch: want %#v, got %#v", want.name, want.podLabels, labels)
+		}
+
+		ports := nestedSliceAt(t, unstructured.Unstructured{Object: rule}, "ports")
+		if len(ports) != len(want.ports) {
+			t.Fatalf("Alertmanager NetworkPolicy %s rule must have %d ports, got %#v", want.name, len(want.ports), ports)
+		}
+		gotPorts := make(map[string]int64, len(ports))
+		for _, rawPort := range ports {
+			port := asMap(t, rawPort)
+			protocol, ok := port["protocol"].(string)
+			if !ok {
+				t.Fatalf("Alertmanager NetworkPolicy %s port protocol has unexpected type %T", want.name, port["protocol"])
+			}
+			portNumber, ok := port["port"].(int64)
+			if !ok {
+				t.Fatalf("Alertmanager NetworkPolicy %s port has unexpected type %T", want.name, port["port"])
+			}
+			gotPorts[protocol] = portNumber
+		}
+		if !reflect.DeepEqual(gotPorts, want.ports) {
+			t.Fatalf("Alertmanager NetworkPolicy %s ports mismatch: want %#v, got %#v", want.name, want.ports, gotPorts)
+		}
+	}
 }
 
 func TestThanosQuerierProxyTemplateContract(t *testing.T) {
@@ -240,7 +442,6 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		"--upstream=http://thanos-querier-data-science-thanos-querier."+testMonitoringNamespace+".svc.cluster.local:10902",
 		"--label=namespace",
 		"--query-param=namespace",
-		"--query-param-only",
 		"--error-on-replace",
 		"--enable-label-apis",
 	)
@@ -460,15 +661,18 @@ func TestGatewayNetworkPolicyTemplatesUseDeploymentGatewayNamespace(t *testing.T
 
 			data := proxyTemplateData()
 			data["GatewayNamespace"] = variant.gatewayNamespace
-			for _, template := range []string{
-				PrometheusNamespaceProxyNetworkPolicyTemplate,
-				ThanosQuerierProxyNetworkPolicyTemplate,
+			for _, policyContract := range []struct {
+				template   string
+				policyName string
+				port       int64
+			}{
+				{PrometheusNamespaceProxyNetworkPolicyTemplate, "data-science-prometheus-proxy-ingress", 8443},
+				{ThanosQuerierProxyNetworkPolicyTemplate, "data-science-thanos-querier-proxy-ingress", 8443},
+				{AlertmanagerProxyNetworkPolicyTemplate, "data-science-alertmanager-proxy-ingress", 8443},
+				{TempoMonolithicNetworkPolicyTemplate, "data-science-tempomonolithic-ingress", 8080},
 			} {
-				resources := renderObservabilityTemplate(t, template, data)
-				policyName := "data-science-prometheus-proxy-ingress"
-				if template == ThanosQuerierProxyNetworkPolicyTemplate {
-					policyName = "data-science-thanos-querier-proxy-ingress"
-				}
+				resources := renderObservabilityTemplate(t, policyContract.template, data)
+				policyName := policyContract.policyName
 				policy := findRenderedResource(t, resources, "NetworkPolicy", policyName)
 				ingress := nestedSlice(t, policy, "spec", "ingress")
 				if len(ingress) == 0 {
@@ -499,11 +703,37 @@ func TestGatewayNetworkPolicyTemplatesUseDeploymentGatewayNamespace(t *testing.T
 					t.Fatalf("%s gateway rule must have one port, got %#v", policyName, ports)
 				}
 				port := asMap(t, ports[0])
-				if port["protocol"] != "TCP" || port["port"] != int64(8443) {
-					t.Fatalf("%s gateway rule must allow only TCP/8443, got %#v", policyName, port)
+				if port["protocol"] != "TCP" || port["port"] != policyContract.port {
+					t.Fatalf("%s gateway rule must allow only TCP/%d, got %#v", policyName, policyContract.port, port)
 				}
 			}
 		})
+	}
+}
+
+func TestTempoMonolithicNetworkPolicyUsesOpenShiftIngressByDefault(t *testing.T) {
+	policy := findRenderedResource(t,
+		renderObservabilityTemplate(t, TempoMonolithicNetworkPolicyTemplate, proxyTemplateData()),
+		"NetworkPolicy", "data-science-tempomonolithic-ingress")
+	ingress := nestedSlice(t, policy, "spec", "ingress")
+	if len(ingress) == 0 {
+		t.Fatal("Tempo monolithic NetworkPolicy must have a gateway ingress rule")
+	}
+
+	firstRule := asMap(t, ingress[0])
+	fromValues, ok := firstRule["from"].([]any)
+	if !ok || len(fromValues) != 1 {
+		t.Fatalf("Tempo monolithic gateway ingress must have one source, got %#v", firstRule["from"])
+	}
+	from := asMap(t, fromValues[0])
+	if len(from) != 1 {
+		t.Fatalf("Tempo monolithic gateway ingress must not include an unrestricted peer: %#v", from)
+	}
+	namespaceSelector := asMap(t, from["namespaceSelector"])
+	matchLabels := asMap(t, namespaceSelector["matchLabels"])
+	wantLabels := map[string]any{"policy-group.network.openshift.io/ingress": ""}
+	if !reflect.DeepEqual(matchLabels, wantLabels) {
+		t.Fatalf("Tempo monolithic gateway ingress must select OpenShift ingress by default: want %#v, got %#v", wantLabels, matchLabels)
 	}
 }
 
@@ -1040,7 +1270,6 @@ func TestPrometheusNamespaceProxyTemplateContract(t *testing.T) {
 		"--upstream=https://prometheus-operated."+testMonitoringNamespace+".svc:9090",
 		"--label=namespace",
 		"--query-param=namespace",
-		"--query-param-only",
 		"--enable-label-apis",
 		"--regex-match",
 	)
@@ -1406,6 +1635,7 @@ func TestProxyTemplatesTLS13OmitCipherRestriction(t *testing.T) {
 		{template: PrometheusNamespaceProxyTemplate, deploymentName: "data-science-prometheus-namespace-proxy"},
 		{template: PrometheusClusterProxyTemplate, deploymentName: "data-science-prometheus-cluster-proxy"},
 		{template: ThanosQuerierProxyTemplate, deploymentName: "data-science-thanos-querier-proxy"},
+		{template: AlertmanagerProxyTemplate, deploymentName: "data-science-alertmanager-proxy"},
 	}
 
 	for _, proxy := range proxyTemplates {

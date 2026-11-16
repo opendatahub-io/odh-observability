@@ -42,6 +42,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -151,6 +152,7 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		"Metrics":                  monitoring.Spec.Metrics != nil,
 		"MetricsStorage":           monitoring.Spec.Metrics != nil && monitoring.Spec.Metrics.Storage != nil,
 		"BuiltinDCGMScrapeEnabled": builtinDCGMScrapeEnabled(monitoring.Spec.Metrics),
+		"BuiltinDCGMTLS":           (*v1alpha1.DCGMTLS)(nil),
 		// Always set: templates use missingkey=error; metrics-only never calls addTracesTemplateData.
 		"TempoStorage":                    false,
 		"Logs":                            monitoring.Spec.Logs != nil,
@@ -599,6 +601,17 @@ func builtinDCGMScrapeEnabled(metrics *v1alpha1.Metrics) bool {
 }
 
 func addMetricsData(metrics *v1alpha1.Metrics, isSNO bool, templateData map[string]any) error {
+	if metrics.BuiltinDCGMTLS != nil {
+		if !builtinDCGMScrapeEnabled(metrics) {
+			return errors.New("builtinDCGMTLS requires the built-in DCGM scrape")
+		}
+		for name, value := range map[string]string{"caSecretName": metrics.BuiltinDCGMTLS.CASecretName, "serverName": metrics.BuiltinDCGMTLS.ServerName} {
+			if errs := validation.IsDNS1123Subdomain(value); len(errs) != 0 {
+				return fmt.Errorf("invalid builtinDCGMTLS.%s: %s", name, strings.Join(errs, ", "))
+			}
+		}
+		templateData["BuiltinDCGMTLS"] = metrics.BuiltinDCGMTLS
+	}
 	addStorageData(metrics, templateData)
 	addReplicasData(metrics, isSNO, templateData)
 	return addExportersData(metrics, templateData)
@@ -818,10 +831,12 @@ func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces,
 
 	switch backend {
 	case v1alpha1.StorageBackendPV:
+		templateData["TempoGatewayService"] = "tempo-data-science-tempomonolithic-gateway"
 		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempomonolithic-gateway.%s.svc.cluster.local:4317", namespace)
 		templateData["TempoQueryEndpoint"] = fmt.Sprintf("https://tempo-data-science-tempomonolithic-gateway.%s.svc.cluster.local:8080/api/traces/v1/%s/tempo", namespace, namespace)
 		templateData["Size"] = traces.Storage.Size
 	case v1alpha1.StorageBackendS3, v1alpha1.StorageBackendGCS:
+		templateData["TempoGatewayService"] = "tempo-data-science-tempostack-gateway"
 		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempostack-gateway.%s.svc.cluster.local:4317", namespace)
 		templateData["TempoQueryEndpoint"] = fmt.Sprintf("https://tempo-data-science-tempostack-gateway.%s.svc.cluster.local:8080/api/traces/v1/%s/tempo", namespace, namespace)
 		templateData["Secret"] = traces.Storage.Secret
@@ -840,24 +855,15 @@ func addImageTLSAndKorrel8rData(ctx context.Context, c client.Client, monitoring
 	return addKorrel8rAPIServerData(ctx, c, monitoring, templateData)
 }
 
-// Default prom-label-proxy image (v0.16.2+) required for --query-param-only on both
-// namespace proxies. RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE may override it, but a
-// parseable tag older than v0.16.2 is rejected so the sidecar cannot crash-loop on
-// an unknown flag.
-const defaultPromLabelProxyImage = "quay.io/prometheuscommunity/prom-label-proxy@sha256:9812cce38fa78c39250c9c59c78bbe75895ef9126952a098cd44adef2e21dbc5"
-
-var promLabelProxySemverTag = regexp.MustCompile(`:v?(\d+)\.(\d+)(?:\.(\d+))?(?:[-:@]|$)`)
-
 func addImageURLs(templateData map[string]any) error {
 	templateData["KubeRBACProxyImage"] = getEnvOrDefault(
 		"RELATED_IMAGE_ODH_KUBE_RBAC_PROXY_IMAGE",
 		"quay.io/opendatahub/odh-kube-rbac-proxy@sha256:69c4b767117b9dab040070ca3cd6a4d08f87c197f92c2e9d7637101a39018a7d",
 	)
-	promLabelProxyImage, err := resolvePromLabelProxyImage()
-	if err != nil {
-		return err
-	}
-	templateData["PromLabelProxyImage"] = promLabelProxyImage
+	templateData["PromLabelProxyImage"] = getEnvOrDefault(
+		"RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE",
+		"quay.io/prometheuscommunity/prom-label-proxy@sha256:28f81efb6574556011e7914851faaccce4a64b1b72a338aaaf3cc9d45e66fd96",
+	)
 	// HTTPMethodGateImage runs the "method-gate" subcommand of this operator binary
 	// as a sidecar. There is no digest fallback: an image built before that
 	// subcommand treats "method-gate" as a non-flag and starts the manager,
@@ -869,82 +875,6 @@ func addImageURLs(templateData map[string]any) error {
 	}
 	templateData["HTTPMethodGateImage"] = image
 	return nil
-}
-
-func resolvePromLabelProxyImage() (string, error) {
-	image := getEnvOrDefault("RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE", defaultPromLabelProxyImage)
-	if err := validatePromLabelProxyImageSupportsQueryParamOnly(image); err != nil {
-		return "", err
-	}
-	return image, nil
-}
-
-// validatePromLabelProxyImageSupportsQueryParamOnly gates RELATED_IMAGE overrides
-// for both namespace proxies (Prometheus + Thanos), which always pass
-// --query-param-only (prom-label-proxy v0.16.2+).
-//
-// Allowed:
-//   - digest-pinned refs (@sha256:…), including the default — release pipelines own digests
-//   - tags with a parseable stable semver >= v0.16.2 (no prerelease / build metadata)
-//
-// Rejected:
-//   - tags with a parseable semver < v0.16.2
-//   - prerelease / build tags (:v0.16.2-rc1, :v0.16.2+build) — not treated as >= stable
-//   - floating / unversioned tags (:latest, :main, …) — cannot prove flag support
-func validatePromLabelProxyImageSupportsQueryParamOnly(image string) error {
-	if strings.Contains(image, "@sha256:") {
-		return nil
-	}
-	major, minor, patch, ok := parsePromLabelProxySemverTag(image)
-	if !ok {
-		return fmt.Errorf(
-			"RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE %q must be digest-pinned or tagged >= v0.16.2 (required for --query-param-only)",
-			image,
-		)
-	}
-	if major > 0 || minor > 16 || (minor == 16 && patch >= 2) {
-		return nil
-	}
-	return fmt.Errorf(
-		"RELATED_IMAGE_OSE_PROM_LABEL_PROXY_IMAGE %q is older than v0.16.2 required for --query-param-only",
-		image,
-	)
-}
-
-func parsePromLabelProxySemverTag(image string) (int, int, int, bool) {
-	// Prefer the tag after the last '/', so registry paths with dotted hostnames
-	// are not mistaken for versions.
-	ref := image
-	if i := strings.LastIndex(image, "/"); i >= 0 {
-		ref = image[i+1:]
-	}
-	tag := ref
-	if i := strings.LastIndex(ref, ":"); i >= 0 {
-		tag = ref[i+1:]
-	}
-	// Prerelease / build metadata must not satisfy ">= v0.16.2" (e.g. v0.16.2-rc1).
-	ver := strings.TrimPrefix(tag, "v")
-	if strings.ContainsAny(ver, "-+") {
-		return 0, 0, 0, false
-	}
-	match := promLabelProxySemverTag.FindStringSubmatch(ref)
-	if match == nil {
-		return 0, 0, 0, false
-	}
-	major, errMajor := strconv.Atoi(match[1])
-	minor, errMinor := strconv.Atoi(match[2])
-	if errMajor != nil || errMinor != nil {
-		return 0, 0, 0, false
-	}
-	patch := 0
-	if match[3] != "" {
-		var errPatch error
-		patch, errPatch = strconv.Atoi(match[3])
-		if errPatch != nil {
-			return 0, 0, 0, false
-		}
-	}
-	return major, minor, patch, true
 }
 
 // getKorrel8rImage returns the pinned Korrel8r image, allowing release
@@ -1126,7 +1056,7 @@ func rawBytesFrom(rawConfig runtime.RawExtension) []byte {
 }
 
 func isReservedName(n string) bool {
-	return n == "otlp/tempo" || n == "prometheus"
+	return n == "otlp/tempo" || n == "prometheus" || n == "prometheus/federation"
 }
 
 func isLocalServiceEndpoint(endpoint string) bool {

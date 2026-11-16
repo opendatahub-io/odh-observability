@@ -151,6 +151,7 @@ func TestMonitoring_DeepCopy(t *testing.T) {
 			Metrics: &Metrics{
 				Replicas:                 2,
 				BuiltinDCGMScrapeEnabled: &builtinDCGMScrapeEnabled,
+				BuiltinDCGMTLS:           &DCGMTLS{CASecretName: "ca", ServerName: "dcgm.example.test"},
 			},
 		},
 		Status: MonitoringStatus{
@@ -190,6 +191,10 @@ func TestMonitoring_DeepCopy(t *testing.T) {
 	*copy.Spec.Metrics.BuiltinDCGMScrapeEnabled = true
 	if *m.Spec.Metrics.BuiltinDCGMScrapeEnabled {
 		t.Error("DeepCopy should produce an independent built-in DCGM scrape setting")
+	}
+	copy.Spec.Metrics.BuiltinDCGMTLS.ServerName = "other.example.test"
+	if m.Spec.Metrics.BuiltinDCGMTLS.ServerName != "dcgm.example.test" {
+		t.Error("DeepCopy should produce an independent built-in DCGM TLS setting")
 	}
 
 	copy.Status.Status.Conditions[0].Status = metav1.ConditionFalse
