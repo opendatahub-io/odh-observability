@@ -171,6 +171,12 @@ application namespace. Configure the token required by the receiving Loki
 gateway, its read permissions, and TLS trust through the MaaS deployment.
 The proxy stays disabled when the endpoint is absent.
 
+Do not point the OpenShift console logging view at this gateway. Project
+Stage-1 RBAC plus namespace-only Stage-2 would let a project viewer query usage
+logs directly and skip the proxy's organization/user filters. The usage
+LokiStack NetworkPolicy admits the collector, Perses, and the usage-tenancy-proxy
+only.
+
 For the locally managed store in `redhat-ods-monitoring`, the read base URL is:
 
 ```text

@@ -32,26 +32,13 @@ spec:
     ports:
     - protocol: TCP
       port: 8080
-  # The usage tenancy proxy reads usage logs through the gateway.
+  # The usage tenancy proxy reads usage logs through the gateway (MaaS org/user
+  # filters). Do not admit openshift-console: project Stage-1 aggregation plus
+  # OPA's namespace-only Stage-2 would let a project viewer bypass that proxy.
   - from:
     - podSelector:
         matchLabels:
           app: usage-tenancy-proxy
-    ports:
-    - protocol: TCP
-      port: 8080
-  # The OpenShift console's logging view. For a UIPlugin of type Logging, COO
-  # points the ConsolePlugin proxy at this gateway, and the console backend
-  # forwards the browser's queries there with the user's token, so the console
-  # pods - not the plugin pods - are the peer across the namespace boundary.
-  - from:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: openshift-console
-      podSelector:
-        matchLabels:
-          app: console
-          component: ui
     ports:
     - protocol: TCP
       port: 8080
