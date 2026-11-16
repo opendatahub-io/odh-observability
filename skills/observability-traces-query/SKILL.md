@@ -111,10 +111,16 @@ through `--ca-file`. It never obtains credentials or disables TLS verification.
   filters are included in that same expression so they are not lost. Combining
   those filters with compound queries or disjunctions is rejected; include the
   filters explicitly in each branch instead.
-- `--service`, `--operation`, and `--tag KEY=VALUE` use Tempo's search filters
-  when they are not incorporated into TraceQL. Tag pairs are logfmt encoded,
-  separated by spaces, and values containing spaces, quotes, or backslashes are
-  quoted and escaped. Commas in values are valid.
+- `--tag KEY=VALUE` cannot be combined with `--status` or `--query`: Tempo
+  rejects requests containing both `tags` and TraceQL `q`. To use these
+  filters together, write them in a single `--query` expression. Tag-based
+  search uses case-insensitive substring matching, which differs from TraceQL
+  equality; choose the desired matching semantics explicitly. For example,
+  `--query '{ status = error && .http.method = "GET" }'` uses exact equality.
+- `--service` and `--operation` use Tempo's tag-based search filters when not
+  combined with TraceQL; `--tag KEY=VALUE` always uses those filters. Tag pairs
+  are logfmt encoded, separated by spaces, and values containing spaces, quotes,
+  or backslashes are quoted and escaped. Commas in values are valid.
 - Duration filters use Go duration units: `ns`, `us`, `µs`, `ms`, `s`, `m`, or
   `h`. Endpoint-specific non-Tempo parameters use `--param KEY=VALUE`.
 - Trace IDs must be 16- or 32-character hexadecimal values. Trace lookup does

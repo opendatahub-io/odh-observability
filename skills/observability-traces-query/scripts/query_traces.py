@@ -404,9 +404,17 @@ def traceql_filter_safe(query: str) -> bool:
     return not quote and depth == 0
 
 
-def build_traceql_query(args: argparse.Namespace) -> str | None:
+def validate_filter_combinations(args: argparse.Namespace) -> None:
     if args.status is not None and args.query is not None:
         raise QueryError("invalid_argument", "--status cannot be combined with --query")
+    if args.tag and (args.status is not None or args.query is not None):
+        raise QueryError(
+            "invalid_argument", "--tag cannot be combined with --status or --query; include filters in --query instead"
+        )
+
+
+def build_traceql_query(args: argparse.Namespace) -> str | None:
+    validate_filter_combinations(args)
     if args.query is None and args.status is None:
         return None
     conditions: list[str] = []
@@ -425,13 +433,16 @@ def build_traceql_query(args: argparse.Namespace) -> str | None:
         query = validate_filter_value(args.query, "--query")
         if not conditions:
             return query
+        query = query.strip()
+        if not query:
+            raise QueryError("invalid_argument", "--query must not be blank")
         if not traceql_filter_safe(query):
             raise QueryError(
                 "invalid_argument", "--service and --operation cannot be combined with a compound --query"
             )
         if query.startswith("{") and query.endswith("}"):
             inner = query[1:-1].strip()
-            return "{ " + " && ".join([inner, *conditions]) + " }"
+            return "{ " + " && ".join([inner, *conditions] if inner else conditions) + " }"
         return f"({query}) && {{ {' && '.join(conditions)} }}"
     if not conditions:
         return None
@@ -460,6 +471,7 @@ def query_metadata(args: argparse.Namespace, mode: str) -> dict[str, Any]:
     if args.limit < 1 or args.limit > MAX_SEARCH_LIMIT:
         raise QueryError("invalid_argument", f"--limit must be between 1 and {MAX_SEARCH_LIMIT}")
 
+    validate_filter_combinations(args)
     filters: dict[str, Any] = {"limit": args.limit}
     if args.query is not None:
         filters["query"] = validate_filter_value(args.query, "--query")
@@ -468,8 +480,6 @@ def query_metadata(args: argparse.Namespace, mode: str) -> dict[str, Any]:
     if args.operation is not None:
         filters["operation"] = validate_tag_component(args.operation, "--operation")
     if args.status is not None:
-        if args.query is not None:
-            raise QueryError("invalid_argument", "--status cannot be combined with --query")
         status = validate_filter_value(args.status, "--status").lower()
         if status not in {"ok", "error", "unset"}:
             raise QueryError("invalid_argument", "--status must be one of ok, error, or unset")
@@ -814,7 +824,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--service", help="service.name search filter")
     parser.add_argument("--operation", help="span name search filter")
     parser.add_argument("--status", help="trace status: ok, error, or unset")
-    parser.add_argument("--tag", action="append", default=[], help="Tempo tag filter KEY=VALUE; may be repeated")
+    parser.add_argument(
+        "--tag", action="append", default=[],
+        help="Tempo tag filter KEY=VALUE; repeatable, but cannot be combined with --status or --query",
+    )
     parser.add_argument("--param", action="append", default=[], help="additional endpoint parameter KEY=VALUE")
     parser.add_argument("--min-duration", help="minimum trace duration, for example 100ms")
     parser.add_argument("--max-duration", help="maximum trace duration, for example 5s")
