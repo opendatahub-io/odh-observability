@@ -37,17 +37,20 @@ import (
 
 // Constants for monitoring resource names.
 const (
-	MonitoringStackName                    = "data-science-monitoringstack"
-	OpenTelemetryCollectorName             = "data-science-collector"
-	OpenTelemetryCollectorServiceName      = OpenTelemetryCollectorName + "-collector"
-	TargetAllocatorDeploymentName          = "data-science-collector-targetallocator"
-	TargetAllocatorCACertificateName       = OpenTelemetryCollectorName + "-ca-cert"
-	TargetAllocatorClientCertificateName   = OpenTelemetryCollectorName + "-ta-client-cert"
-	TargetAllocatorServerCertificateName   = OpenTelemetryCollectorName + "-ta-server-cert"
-	CollectorServiceAccount                = "data-science-collector-collector"
-	TargetAllocatorServiceAccount          = "data-science-collector-targetallocator"
-	TempoMonolithicName                    = "data-science-tempomonolithic"
-	TempoStackName                         = "data-science-tempostack"
+	MonitoringStackName                  = "data-science-monitoringstack"
+	OpenTelemetryCollectorName           = "data-science-collector"
+	OpenTelemetryCollectorServiceName    = OpenTelemetryCollectorName + "-collector"
+	TargetAllocatorDeploymentName        = "data-science-collector-targetallocator"
+	TargetAllocatorCACertificateName     = OpenTelemetryCollectorName + "-ca-cert"
+	TargetAllocatorClientCertificateName = OpenTelemetryCollectorName + "-ta-client-cert"
+	TargetAllocatorServerCertificateName = OpenTelemetryCollectorName + "-ta-server-cert"
+	CollectorServiceAccount              = "data-science-collector-collector"
+	TargetAllocatorServiceAccount        = "data-science-collector-targetallocator"
+	TempoMonolithicName                  = "data-science-tempomonolithic"
+	TempoStackName                       = "data-science-tempostack"
+	// Must match templatedata.go TempoStack gateway OTLP target.
+	TempoStackGatewayServiceName           = "tempo-" + TempoStackName + "-gateway"
+	TempoStackGatewayOTLPPort              = 8090
 	InstrumentationName                    = "data-science-instrumentation"
 	ThanosQuerierName                      = "data-science-thanos-querier"
 	ThanosQuerierRouteName                 = "data-science-thanos-querier-route"

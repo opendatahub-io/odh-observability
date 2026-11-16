@@ -83,6 +83,11 @@ const (
 	defaultTempoCPURequest    = "100m"
 	defaultTempoMemoryRequest = "256Mi"
 
+	tempoMonolithicGatewayServiceName = "tempo-data-science-tempomonolithic-gateway"
+	tempoMonolithicGatewayOTLPPort    = 4317
+	tempoStackGatewayServiceName      = "tempo-data-science-tempostack-gateway"
+	tempoStackGatewayOTLPPort         = 8090
+
 	defaultKorrel8rCPURequest         = "50m"
 	defaultKorrel8rMemoryRequest      = "64Mi"
 	defaultKorrel8rCPULimit           = "200m"
@@ -831,14 +836,18 @@ func addTracesTemplateData(templateData map[string]any, traces *v1alpha1.Traces,
 
 	switch backend {
 	case v1alpha1.StorageBackendPV:
-		templateData["TempoGatewayService"] = "tempo-data-science-tempomonolithic-gateway"
-		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempomonolithic-gateway.%s.svc.cluster.local:4317", namespace)
-		templateData["TempoQueryEndpoint"] = fmt.Sprintf("https://tempo-data-science-tempomonolithic-gateway.%s.svc.cluster.local:8080/api/traces/v1/%s/tempo", namespace, namespace)
+		templateData["TempoGatewayService"] = tempoMonolithicGatewayServiceName
+		templateData["TempoEndpoint"] = fmt.Sprintf("%s.%s.svc.cluster.local:%d",
+			tempoMonolithicGatewayServiceName, namespace, tempoMonolithicGatewayOTLPPort)
+		templateData["TempoQueryEndpoint"] = fmt.Sprintf("https://%s.%s.svc.cluster.local:8080/api/traces/v1/%s/tempo",
+			tempoMonolithicGatewayServiceName, namespace, namespace)
 		templateData["Size"] = traces.Storage.Size
 	case v1alpha1.StorageBackendS3, v1alpha1.StorageBackendGCS:
-		templateData["TempoGatewayService"] = "tempo-data-science-tempostack-gateway"
-		templateData["TempoEndpoint"] = fmt.Sprintf("tempo-data-science-tempostack-gateway.%s.svc.cluster.local:4317", namespace)
-		templateData["TempoQueryEndpoint"] = fmt.Sprintf("https://tempo-data-science-tempostack-gateway.%s.svc.cluster.local:8080/api/traces/v1/%s/tempo", namespace, namespace)
+		templateData["TempoGatewayService"] = tempoStackGatewayServiceName
+		templateData["TempoEndpoint"] = fmt.Sprintf("%s.%s.svc.cluster.local:%d",
+			tempoStackGatewayServiceName, namespace, tempoStackGatewayOTLPPort)
+		templateData["TempoQueryEndpoint"] = fmt.Sprintf("https://%s.%s.svc.cluster.local:8080/api/traces/v1/%s/tempo",
+			tempoStackGatewayServiceName, namespace, namespace)
 		templateData["Secret"] = traces.Storage.Secret
 	}
 

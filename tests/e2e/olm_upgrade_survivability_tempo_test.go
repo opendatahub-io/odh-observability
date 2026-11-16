@@ -112,30 +112,65 @@ func (tc *MonitoringTestCtx) probeTempoTraceRoundTrip(t *testing.T, gatewayName,
 	t.Cleanup(func() {
 		tc.DeleteResource(WithMinimalObject(gvk.Namespace, types.NamespacedName{Name: probeNamespace}), WithIgnoreNotFound(true))
 	})
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.ConfigMap, types.NamespacedName{Name: "openshift-service-ca.crt", Namespace: probeNamespace}),
+		WithCondition(jq.Match(`.data."service-ca.crt" != null`)),
+		WithEventuallyTimeout(2*time.Minute),
+		WithCustomErrorMsg("%s: probe namespace missing openshift-service-ca.crt", failureMsg),
+	)
 
 	now := time.Now().UnixNano()
 	payload := tempoTracePayload(traceID, spanID, now, now+1_000_000)
-	collectorEndpoint := fmt.Sprintf("http://data-science-collector-collector.%s.svc.cluster.local:4318/v1/traces", tc.MonitoringNamespace)
+	// Headless Service owns the service-ca serving cert; verify with the cluster CA (no -k).
+	collectorEndpoint := fmt.Sprintf(
+		"https://%s-headless.%s.svc.cluster.local:4318/v1/traces",
+		OpenTelemetryCollectorServiceName, tc.MonitoringNamespace,
+	)
+	// Retry budget must fit under the Succeeded wait below:
+	// 18 × (max-time 10 + sleep 5) ≈ 270s worst case.
 	ingestScript := fmt.Sprintf(`set -eu
-status=$(curl --noproxy '*' -sS -o /tmp/response -w '%%{http_code}' \
-  -H 'Content-Type: application/json' --data-binary %q %q)
-cat /tmp/response
-test "$status" = 200`, payload, collectorEndpoint)
+status=000
+for attempt in $(seq 1 18); do
+  if status=$(curl --noproxy '*' -sS --cacert /var/run/secrets/service-ca/service-ca.crt \
+    --connect-timeout 5 --max-time 10 \
+    -o /tmp/response -w '%%{http_code}' \
+    -H 'Content-Type: application/json' --data-binary %q %q); then
+    if [ "$status" = 200 ]; then
+      cat /tmp/response
+      exit 0
+    fi
+  else
+    status=connection-error
+  fi
+  sleep 5
+done
+printf 'last HTTP status=%%s\n' "$status"
+[ ! -f /tmp/response ] || cat /tmp/response
+exit 1`, payload, collectorEndpoint)
 	ingestPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "ingest", Namespace: probeNamespace, Labels: otlpCallerNetworkPolicyLabels("llminferenceservice-workload")},
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyNever, AutomountServiceAccountToken: new(false), SecurityContext: fixturePodSecurityContext(),
 			Containers: []corev1.Container{{
 				Name: "curl", Image: fakeGCSClientImage, Command: []string{"/bin/sh", "-c"}, Args: []string{ingestScript},
+				VolumeMounts: []corev1.VolumeMount{
+					{Name: "service-ca", MountPath: "/var/run/secrets/service-ca", ReadOnly: true},
+				},
 				SecurityContext: fixtureContainerSecurityContext(), TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 			}},
+			Volumes: []corev1.Volume{
+				{Name: "service-ca", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "openshift-service-ca.crt"},
+					Items:                []corev1.KeyToPath{{Key: "service-ca.crt", Path: "service-ca.crt"}},
+				}}},
+			},
 		},
 	}
 	tc.createFixtureResource(t, gvk.Pod, ingestPod)
 	tc.EnsureResourceExists(
 		WithMinimalObject(gvk.Pod, types.NamespacedName{Name: ingestPod.Name, Namespace: ingestPod.Namespace}),
 		WithCondition(jq.Match(`.status.phase == "Succeeded"`)),
-		WithEventuallyTimeout(5*time.Minute),
+		WithEventuallyTimeout(6*time.Minute),
 		WithCustomErrorMsg("%s: OTLP trace ingestion probe failed", failureMsg),
 	)
 

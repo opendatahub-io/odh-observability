@@ -1979,6 +1979,23 @@ func (tc *MonitoringTestCtx) validateTempoStackCreation(t *testing.T, backend, s
 		WithEventuallyTimeout(15*time.Minute),
 		WithCustomErrorMsg("Monitoring should become Ready with %s traces storage", backend),
 	)
+
+	expectedOTLPEndpoint := fmt.Sprintf("%s.%s.svc.cluster.local:%d",
+		TempoStackGatewayServiceName, tc.MonitoringNamespace, TempoStackGatewayOTLPPort)
+	tc.EnsureResourceExists(
+		WithMinimalObject(gvk.OpenTelemetryCollector, types.NamespacedName{
+			Name:      OpenTelemetryCollectorName,
+			Namespace: tc.MonitoringNamespace,
+		}),
+		WithCondition(jq.Match(`.spec.config.exporters."otlp/tempo".endpoint == "%s"`, expectedOTLPEndpoint)),
+		WithCustomErrorMsg("collector must export TempoStack traces to gateway :%d", TempoStackGatewayOTLPPort),
+	)
+	// One live round-trip (S3). GCS shares the same TempoEndpoint template.
+	if backend == TracesStorageBackendS3 {
+		tc.probeTempoTraceRoundTrip(t, TempoStackGatewayServiceName,
+			fmt.Sprintf("TempoStack OTLP export via gateway :%d", TempoStackGatewayOTLPPort))
+	}
+
 	if backend == TracesStorageBackendGCS {
 		endpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/storage/v1/", fakeGCSServiceName, tc.MonitoringNamespace, fakeGCSPort)
 		tc.EnsureResourceExists(
