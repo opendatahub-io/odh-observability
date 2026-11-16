@@ -1631,6 +1631,7 @@ func TestDeployLokiStack_LogsOnlyNoUsageLogs(t *testing.T) {
 		LokiStackTemplate,
 		LokiStackNetworkPolicyTemplate,
 		LokiStackGatewayNetworkPolicyTemplate,
+		LokiApplicationLogsRBACTemplate,
 		ClusterLogForwarderTemplate,
 		ClusterLogForwarderRBACTemplate,
 		ClusterLogForwarderNetworkPolicyTemplate,
@@ -1773,6 +1774,7 @@ func TestDeployLokiStack_BothConfigured(t *testing.T) {
 		LokiStackTemplate,
 		LokiStackNetworkPolicyTemplate,
 		LokiStackGatewayNetworkPolicyTemplate,
+		LokiApplicationLogsRBACTemplate,
 		ClusterLogForwarderTemplate,
 		ClusterLogForwarderRBACTemplate,
 		ClusterLogForwarderNetworkPolicyTemplate,
@@ -3197,6 +3199,7 @@ func TestDeployLokiStack_UnobservableStateReportsUnknown(t *testing.T) {
 	assertTemplatePaths(t, sources, []string{
 		UsageLogsLokiStackTemplate, UsageLogsLokiStackNPTemplate,
 		LokiStackTemplate, LokiStackNetworkPolicyTemplate, LokiStackGatewayNetworkPolicyTemplate,
+		LokiApplicationLogsRBACTemplate,
 	})
 
 	// Both stacks are configured and both hit the same failure, so both
@@ -3308,6 +3311,7 @@ func TestDeployLokiStack_ReadinessNotFoundMarksFalse(t *testing.T) {
 				LokiStackTemplate,
 				LokiStackNetworkPolicyTemplate,
 				LokiStackGatewayNetworkPolicyTemplate,
+				LokiApplicationLogsRBACTemplate,
 				ClusterLogForwarderTemplate,
 				ClusterLogForwarderRBACTemplate,
 				ClusterLogForwarderNetworkPolicyTemplate,
@@ -3466,6 +3470,7 @@ func TestDeployLokiStack_OneStackFailingDoesNotPoisonTheOther(t *testing.T) {
 	assertTemplatePaths(t, sources, []string{
 		UsageLogsLokiStackTemplate, UsageLogsLokiStackNPTemplate,
 		LokiStackTemplate, LokiStackNetworkPolicyTemplate, LokiStackGatewayNetworkPolicyTemplate,
+		LokiApplicationLogsRBACTemplate,
 		ClusterLogForwarderTemplate, ClusterLogForwarderRBACTemplate, ClusterLogForwarderNetworkPolicyTemplate,
 	})
 
@@ -3889,12 +3894,12 @@ func assertUsageLogsNetworkPolicies(t *testing.T, peers usageLogsNetworkPolicyPe
 		got["app.kubernetes.io/instance"] != peers.lokiStackName {
 		t.Errorf("LokiStack NetworkPolicy must select the %q gateway pods, got %v", peers.lokiStackName, got)
 	}
-	// Four peers reach the gateway: the collector on the write path, the Perses
-	// server whose Loki datasource proxies through it on the read path, the
-	// usage tenancy proxy, and the OpenShift console backend behind the
-	// console's usage logs view.
-	if len(lokiStack.Spec.Ingress) != 4 {
-		t.Fatalf("expected the collector, Perses, tenancy proxy and console ingress rules on the LokiStack NetworkPolicy, got %d", len(lokiStack.Spec.Ingress))
+	// Three peers reach the gateway: collector (write), Perses (operator
+	// dashboards), and usage-tenancy-proxy (MaaS org/user-filtered reads).
+	// openshift-console is intentionally excluded so project Stage-1 cannot
+	// bypass the tenancy proxy.
+	if len(lokiStack.Spec.Ingress) != 3 {
+		t.Fatalf("expected the collector, Perses, and tenancy proxy ingress rules on the LokiStack NetworkPolicy, got %d", len(lokiStack.Spec.Ingress))
 	}
 	admitted := map[string]bool{}
 	for _, rule := range lokiStack.Spec.Ingress {
@@ -3905,24 +3910,16 @@ func assertUsageLogsNetworkPolicies(t *testing.T, peers usageLogsNetworkPolicyPe
 			t.Fatalf("every ingress rule must declare exactly one pod peer, got %#v", rule.From)
 		}
 		peer := rule.From[0]
-		if peer.NamespaceSelector == nil {
-			name := peer.PodSelector.MatchLabels["app.kubernetes.io/name"]
-			if name == "" {
-				name = peer.PodSelector.MatchLabels["app"]
-			}
-			admitted[name] = true
-			continue
+		if peer.NamespaceSelector != nil {
+			t.Fatalf("usage-logs gateway must not admit cross-namespace peers (e.g. console), got %#v", peer)
 		}
-		if peer.PodSelector.MatchLabels["app"] != "console" ||
-			peer.PodSelector.MatchLabels["component"] != "ui" {
-			t.Errorf("console peer must select the console backend pods, got %#v", peer.PodSelector)
+		name := peer.PodSelector.MatchLabels["app.kubernetes.io/name"]
+		if name == "" {
+			name = peer.PodSelector.MatchLabels["app"]
 		}
-		if !namespaceSelectorAdmits(peer.NamespaceSelector, "openshift-console") {
-			t.Errorf("console peer must admit the openshift-console namespace, got %#v", peer.NamespaceSelector)
-		}
-		admitted["console"] = true
+		admitted[name] = true
 	}
-	for _, peer := range []string{peers.collectorPodName, "data-science-perses", "usage-tenancy-proxy", "console"} {
+	for _, peer := range []string{peers.collectorPodName, "data-science-perses", "usage-tenancy-proxy"} {
 		if !admitted[peer] {
 			t.Errorf("LokiStack NetworkPolicy does not admit its %s peer, got %#v", peer, admitted)
 		}
@@ -4239,12 +4236,6 @@ func networkPolicyAllowsEgress(policy *networkingv1.NetworkPolicy, cidr string, 
 		}
 	}
 	return false
-}
-
-// namespaceSelectorAdmits reports whether the selector matches the named
-// namespace through the kubernetes.io/metadata.name label.
-func namespaceSelectorAdmits(selector *metav1.LabelSelector, namespace string) bool {
-	return selector != nil && selector.MatchLabels["kubernetes.io/metadata.name"] == namespace
 }
 
 func networkPolicyAllowsPort(rule networkingv1.NetworkPolicyEgressRule, port int32) bool {

@@ -101,8 +101,9 @@ func (tc *MonitoringTestCtx) runUsageLogsCollectionTests(t *testing.T) {
 		}
 		t.Run("Validate log forwarding LokiStack deployment", tc.ValidateLogsLokiStackDeployment)
 		t.Run("Validate log forwarding LokiStack configuration", tc.ValidateLogsLokiStackConfiguration)
+		t.Run("Validate application logs project RBAC", tc.ValidateApplicationLogsProjectRBAC)
 		t.Run("Validate optional ClusterLogForwarder and Vector contract", tc.ValidateClusterLogForwarderContract)
-		t.Run("Validate log forwarding LokiStack removal", tc.ValidateLogsLokiStackRemoved)
+		t.Run("Validate log forwarding LokiStack lifecycle", tc.ValidateLogsLokiStackLifecycle)
 		t.Run("Test Usage Logs Collector serving certificate rotation", tc.ValidateUsageLogsCollectorServingCertificateRotation)
 
 		// Lifecycle removes the collector and LokiStack, so it runs last.
@@ -684,10 +685,9 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorNetworkPolicies(t *testin
 			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/component" == "lokistack-gateway"`),
 			jq.Match(`.spec.podSelector.matchLabels."app.kubernetes.io/instance" == "%s"`, UsageLogsLokiStackName),
 			jq.Match(`.spec.policyTypes == ["Ingress"]`),
-			// Exactly four peers may reach the gateway: the usage logs collector
-			// (writes), Perses and the usage tenancy proxy (read the dashboards),
-			// and the OpenShift console backend (logging view).
-			jq.Match(`.spec.ingress | length == 4`),
+			// Exactly three peers: collector (writes), Perses, usage-tenancy-proxy.
+			// Console is excluded so project Stage-1 cannot bypass MaaS org/user filters.
+			jq.Match(`.spec.ingress | length == 3`),
 			jq.Match(`
 				[.spec.ingress[] | select(.from[0].podSelector.matchLabels."app.kubernetes.io/name" == "%s")] | length == 1
 			`, UsageLogsCollectorName+"-collector"),
@@ -699,16 +699,14 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsCollectorNetworkPolicies(t *testin
 			`),
 			jq.Match(`
 				[.spec.ingress[] | select(
-					.from[0].namespaceSelector.matchLabels."kubernetes.io/metadata.name" == "openshift-console" and
-					.from[0].podSelector.matchLabels.app == "console" and
-					.from[0].podSelector.matchLabels.component == "ui"
-				)] | length == 1
+					.from[0].namespaceSelector.matchLabels."kubernetes.io/metadata.name" == "openshift-console"
+				)] | length == 0
 			`),
 			jq.Match(`
 				[.spec.ingress[].ports[] | select(.protocol == "TCP") | .port] | unique == [8080]
 			`),
 		)),
-		WithCustomErrorMsg("LokiStack gateway NetworkPolicy should admit exactly the usage logs collector, Perses, the usage tenancy proxy, and the OpenShift console on 8080"),
+		WithCustomErrorMsg("LokiStack gateway NetworkPolicy should admit exactly the usage logs collector, Perses, and the usage tenancy proxy on 8080"),
 	)
 }
 
