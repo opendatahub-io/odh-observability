@@ -29,40 +29,40 @@ const (
 )
 
 func TestWebhookTLSWatcherRunsOnLeaderAndFollower(t *testing.T) {
-	ctx, apiClient, apiServer, managers, follower := startTLSWatcherHA(
+	ctx, state := startTLSWatcherHA(
 		t,
 		configv1.TLSProfileIntermediateType,
 		configv1.TLSAdherencePolicyStrictAllComponents,
 	)
-	require.NoError(t, apiClient.Get(ctx, client.ObjectKey{Name: commonTLS.APIServerName}, apiServer))
-	apiServer.Spec.TLSSecurityProfile = &configv1.TLSSecurityProfile{Type: configv1.TLSProfileModernType}
-	require.NoError(t, apiClient.Update(ctx, apiServer))
-	assertTLSWatcherReloaded(t, managers, follower)
+	require.NoError(t, state.apiClient.Get(ctx, client.ObjectKey{Name: commonTLS.APIServerName}, state.apiServer))
+	state.apiServer.Spec.TLSSecurityProfile = &configv1.TLSSecurityProfile{Type: configv1.TLSProfileModernType}
+	require.NoError(t, state.apiClient.Update(ctx, state.apiServer))
+	assertTLSWatcherReloaded(t, state.managers, state.follower)
 }
 
 func TestWebhookTLSAdherenceWatcherRunsOnLeaderAndFollower(t *testing.T) {
-	ctx, apiClient, apiServer, managers, follower := startTLSWatcherHA(
+	ctx, state := startTLSWatcherHA(
 		t,
 		configv1.TLSProfileIntermediateType,
 		configv1.TLSAdherencePolicyStrictAllComponents,
 	)
-	require.NoError(t, apiClient.Get(ctx, client.ObjectKey{Name: commonTLS.APIServerName}, apiServer))
-	apiServer.Spec.TLSAdherence = configv1.TLSAdherencePolicyNoOpinion
-	require.NoError(t, apiClient.Update(ctx, apiServer))
-	assertTLSWatcherReloaded(t, managers, follower)
+	require.NoError(t, state.apiClient.Get(ctx, client.ObjectKey{Name: commonTLS.APIServerName}, state.apiServer))
+	state.apiServer.Spec.TLSAdherence = configv1.TLSAdherencePolicyNoOpinion
+	require.NoError(t, state.apiClient.Update(ctx, state.apiServer))
+	assertTLSWatcherReloaded(t, state.managers, state.follower)
 }
 
 func TestWebhookTLSWatcherIgnoresProfileChangesUnderNoOpinion(t *testing.T) {
-	ctx, apiClient, apiServer, managers, _ := startTLSWatcherHA(
+	ctx, state := startTLSWatcherHA(
 		t,
 		configv1.TLSProfileIntermediateType,
 		configv1.TLSAdherencePolicyNoOpinion,
 	)
-	require.NoError(t, apiClient.Get(ctx, client.ObjectKey{Name: commonTLS.APIServerName}, apiServer))
-	apiServer.Spec.TLSSecurityProfile = &configv1.TLSSecurityProfile{Type: configv1.TLSProfileModernType}
-	require.NoError(t, apiClient.Update(ctx, apiServer))
+	require.NoError(t, state.apiClient.Get(ctx, client.ObjectKey{Name: commonTLS.APIServerName}, state.apiServer))
+	state.apiServer.Spec.TLSSecurityProfile = &configv1.TLSSecurityProfile{Type: configv1.TLSProfileModernType}
+	require.NoError(t, state.apiClient.Update(ctx, state.apiServer))
 
-	for _, running := range managers {
+	for _, running := range state.managers {
 		require.Eventually(t, func() bool {
 			observed := &configv1.APIServer{}
 			err := running.manager.GetClient().Get(ctx, client.ObjectKey{Name: commonTLS.APIServerName}, observed)
@@ -71,14 +71,21 @@ func TestWebhookTLSWatcherIgnoresProfileChangesUnderNoOpinion(t *testing.T) {
 		}, 10*time.Second, 50*time.Millisecond)
 	}
 
-	assertTLSWatcherRemainsRunning(t, managers, 2*time.Second)
+	assertTLSWatcherRemainsRunning(t, state.managers, 2*time.Second)
+}
+
+type tlsWatcherHAState struct {
+	apiClient client.Client
+	apiServer *configv1.APIServer
+	managers  []*tlsWatcherTestManager
+	follower  *tlsWatcherTestManager
 }
 
 func startTLSWatcherHA(
 	t *testing.T,
 	profileType configv1.TLSProfileType,
 	adherence configv1.TLSAdherencePolicy,
-) (context.Context, client.Client, *configv1.APIServer, []*tlsWatcherTestManager, *tlsWatcherTestManager) {
+) (context.Context, tlsWatcherHAState) {
 	t.Helper()
 	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
 		t.Skip("set KUBEBUILDER_ASSETS to run the envtest HA regression")
@@ -139,7 +146,12 @@ func startTLSWatcherHA(
 		return leaders == 1
 	}, 15*time.Second, 50*time.Millisecond)
 	require.NotEqual(t, -1, leaderIndex)
-	return ctx, apiClient, apiServer, managers, managers[1-leaderIndex]
+	return ctx, tlsWatcherHAState{
+		apiClient: apiClient,
+		apiServer: apiServer,
+		managers:  managers,
+		follower:  managers[1-leaderIndex],
+	}
 }
 
 func assertTLSWatcherReloaded(t *testing.T, managers []*tlsWatcherTestManager, follower *tlsWatcherTestManager) {
