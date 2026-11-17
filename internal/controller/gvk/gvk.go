@@ -197,6 +197,13 @@ var (
 		Kind:    "ClusterLogForwarder",
 	}
 
+	// Infrastructure (config.openshift.io/v1), singleton named "cluster".
+	Infrastructure = schema.GroupVersionKind{
+		Group:   "config.openshift.io",
+		Version: "v1",
+		Kind:    "Infrastructure",
+	}
+
 	// ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1).
 	ValidatingAdmissionPolicy = schema.GroupVersionKind{
 		Group:   "admissionregistration.k8s.io",
