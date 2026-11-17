@@ -67,6 +67,16 @@ spec:
         - sourceLabels: [odh_federation_source]
           regex: model-resources
           action: drop
+        # Reserve the recording-rule output names. Workload exposition and
+        # OTLP pushes are tenant-controlled, and a seeded accelerator_*
+        # series would be summed alongside rule output by the aggregation
+        # rules and tenant queries. Recording rules are evaluated inside
+        # Prometheus and never traverse this scrape, and the trusted DCGM
+        # receiver only admits DCGM_FI_* names, so no legitimate series
+        # matches this drop.
+        - sourceLabels: [__name__]
+          regex: accelerator_.*
+          action: drop
         - sourceLabels: [k8s_namespace_name]
           regex: (.+)
           targetLabel: namespace
