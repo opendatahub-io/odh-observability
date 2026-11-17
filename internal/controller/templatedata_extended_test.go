@@ -25,7 +25,10 @@ import (
 	"time"
 
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
+	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
 )
 
 func TestMain(m *testing.M) {
@@ -96,6 +100,52 @@ func registerClusterExtension(s *kruntime.Scheme) {
 	s.AddKnownTypeWithName(schema.GroupVersionKind{
 		Group: "olm.operatorframework.io", Version: "v1", Kind: "ClusterExtensionList",
 	}, &unstructured.UnstructuredList{})
+}
+
+// TestClusterNamePreservesIdentityAcrossLookupFailure pins the
+// success → temporary failure → recovery sequence for the cluster identity:
+// an unavailable API is not a failed observation, so the established name
+// stands until the lookup recovers, while a confirmed absence of the
+// Infrastructure CR legitimately unsets the label. Deliberately not
+// parallel: clusterName caches the last observed identity at package scope.
+func TestClusterNamePreservesIdentityAcrossLookupFailure(t *testing.T) {
+	t.Setenv("CLUSTER_NAME", "")
+	rememberClusterName("")
+	t.Cleanup(func() { rememberClusterName("") })
+
+	s := kruntime.NewScheme()
+	s.AddKnownTypeWithName(gvk.Infrastructure, &unstructured.Unstructured{})
+	s.AddKnownTypeWithName(gvk.Infrastructure.GroupVersion().WithKind("InfrastructureList"), &unstructured.UnstructuredList{})
+
+	infrastructure := func(name string) *unstructured.Unstructured {
+		infra := &unstructured.Unstructured{}
+		infra.SetGroupVersionKind(gvk.Infrastructure)
+		infra.SetName("cluster")
+		require.NoError(t, unstructured.SetNestedField(infra.Object, name, "status", "infrastructureName"))
+		return infra
+	}
+
+	// Success: the identity is established.
+	established := fake.NewClientBuilder().WithScheme(s).WithObjects(infrastructure("prod-a")).Build()
+	assert.Equal(t, "prod-a", clusterName(context.Background(), established))
+
+	// Temporary failure: the API is unavailable, not absent — the
+	// established identity stands instead of unlabeling published series.
+	unavailable := fake.NewClientBuilder().WithScheme(s).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				return k8serr.NewServiceUnavailable("apiserver restarting")
+			},
+		}).Build()
+	assert.Equal(t, "prod-a", clusterName(context.Background(), unavailable))
+
+	// Recovery: the lookup works again, and a changed name is adopted.
+	recovered := fake.NewClientBuilder().WithScheme(s).WithObjects(infrastructure("prod-b")).Build()
+	assert.Equal(t, "prod-b", clusterName(context.Background(), recovered))
+
+	// Confirmed absence: the CR is gone, so the label is legitimately unset.
+	absent := fake.NewClientBuilder().WithScheme(s).Build()
+	assert.Empty(t, clusterName(context.Background(), absent))
 }
 
 func newOperatorCondition(name string) *unstructured.Unstructured {

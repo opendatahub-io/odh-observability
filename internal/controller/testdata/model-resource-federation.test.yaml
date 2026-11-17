@@ -33,6 +33,16 @@ tests:
         values: '100 100'
       - series: 'kube_pod_container_resource_limits{namespace="team",pod="model",container="inference",resource="cpu",unit="wrong"}'
         values: '100 100'
+      # Kueue-managed pod labels: selected for the GPU-hours attribution join.
+      - series: 'kube_pod_labels{namespace="team",pod="model",label_kueue_x_k8s_io_cluster_queue_name="cq-a",label_kueue_x_k8s_io_local_queue_name="lq-a"}'
+        values: '1 1'
+      # Queueless pod labels: must NOT match the Kueue-filtered matcher.
+      - series: 'kube_pod_labels{namespace="other",pod="plain",label_app="x"}'
+        values: '1 1'
+      - series: 'kube_pod_owner{namespace="team",pod="model",owner_kind="Job",owner_name="train",owner_is_controller="true"}'
+        values: '1 1'
+      - series: 'kube_pod_owner{namespace="other",pod="irrelevant",owner_kind="ReplicaSet",owner_name="rs-1"}'
+        values: '1 1'
     promql_expr_test:
       - expr: '@@CPU_USAGE_MATCHER@@'
         eval_time: 30s
@@ -62,4 +72,18 @@ tests:
           - labels: 'kube_pod_container_resource_limits{namespace="team",pod="model",container="inference",resource="cpu",unit="core"}'
             value: 2
           - labels: 'kube_pod_container_resource_limits{namespace="team",pod="model",container="sidecar",resource="cpu",unit="core"}'
+            value: 1
+      # Only Kueue-managed pod labels are federated; queueless pods stay out.
+      - expr: '@@POD_LABELS_MATCHER@@'
+        eval_time: 30s
+        exp_samples:
+          - labels: 'kube_pod_labels{namespace="team",pod="model",label_kueue_x_k8s_io_cluster_queue_name="cq-a",label_kueue_x_k8s_io_local_queue_name="lq-a"}'
+            value: 1
+      # Pod ownership is federated cluster-wide; recording rules scope it.
+      - expr: '@@POD_OWNER_MATCHER@@'
+        eval_time: 30s
+        exp_samples:
+          - labels: 'kube_pod_owner{namespace="team",pod="model",owner_kind="Job",owner_name="train",owner_is_controller="true"}'
+            value: 1
+          - labels: 'kube_pod_owner{namespace="other",pod="irrelevant",owner_kind="ReplicaSet",owner_name="rs-1"}'
             value: 1

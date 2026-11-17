@@ -20,8 +20,8 @@ func TestModelResourceFederationSelectorsPromQL(t *testing.T) {
 	collector := renderCollectorTemplate(t)
 	job := renderedPrometheusScrapeJobsForReceiver(t, collector, "prometheus/cluster_resources")["cluster-prometheus-model-resources"]
 	matchers, found, err := unstructured.NestedStringSlice(job, "params", "match[]")
-	if err != nil || !found || len(matchers) != 3 {
-		t.Fatalf("expected three federation matchers: found=%t matchers=%v error=%v", found, matchers, err)
+	if err != nil || !found || len(matchers) != 5 {
+		t.Fatalf("expected five federation matchers: found=%t matchers=%v error=%v", found, matchers, err)
 	}
 	testData, err := os.ReadFile("testdata/model-resource-federation.test.yaml")
 	if err != nil {
@@ -31,6 +31,8 @@ func TestModelResourceFederationSelectorsPromQL(t *testing.T) {
 		"@@CPU_USAGE_MATCHER@@", matchers[0],
 		"@@QUOTA_MATCHER@@", matchers[1],
 		"@@CONTAINER_LIMIT_MATCHER@@", matchers[2],
+		"@@POD_LABELS_MATCHER@@", matchers[3],
+		"@@POD_OWNER_MATCHER@@", matchers[4],
 	)
 	path := filepath.Join(t.TempDir(), "test.yaml")
 	if err := os.WriteFile(path, []byte(replacer.Replace(string(testData))), 0o600); err != nil { // #nosec G703 -- path is under t.TempDir.
