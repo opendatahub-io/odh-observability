@@ -8,7 +8,7 @@ metadata:
 spec:
   display:
     name: "RHOAI GPU Health"
-    description: "NVIDIA DCGM device health for the cluster. Every query reads the accelerator recording rules through the cluster-wide Data Science Prometheus datasource, because those series are not namespaced by GPU workload: the only namespace label they carry is the collector's own, added by its ServiceMonitor scrape, so the namespace-scoped datasource cannot serve them; the capacity panel reads kube-state-metrics from OpenShift Monitoring instead, because the Data Science stack does not scrape it. The panels describe node-level GPU health. Per-project attribution comes from the DCGM exporter's Kubernetes pod mapping, so it covers pods holding a device and cannot split a device shared by several pods."
+    description: "NVIDIA DCGM device health for the cluster. Every accelerator query reads the recording rules through the cluster-wide Data Science Prometheus datasource, because the default namespace label identifies the collector target rather than the GPU workload, while workload attribution is carried by exported_namespace and exported_pod; the namespace-scoped datasource cannot serve them. The capacity panel reads kube-state-metrics from OpenShift Monitoring instead, because the Data Science stack does not scrape it. The panels describe node-level GPU health. Per-project attribution comes from the DCGM exporter's Kubernetes pod mapping, so it covers pods holding a device and cannot split a device shared by several pods."
   duration: "1h"
   layouts:
     - kind: Grid
@@ -109,14 +109,14 @@ spec:
                   datasource:
                     kind: PrometheusDatasource
                     name: data-science-cluster-prometheus-datasource
-                  query: count(count by (node, gpu) (accelerator_gpu_utilization))
+                  query: count(count by (node, gpu) (accelerator_gpu_utilization)) or vector(0)
                   seriesNameFormat: Reporting
     gpusAdvertised:
       kind: Panel
       spec:
         display:
           name: "GPUs advertised"
-          description: "Capacity the cluster advertises (sum of the nvidia.com/gpu extended resource, from kube-state-metrics in OpenShift Monitoring). A gap against GPUs reporting means part of the fleet is not exporting metrics, for example a node whose GPU Operator pod is not Ready."
+          description: "Capacity the cluster advertises (sum of the nvidia.com/gpu extended resource, from kube-state-metrics in OpenShift Monitoring). A gap against GPUs reporting means part of the fleet is not exporting metrics, for example a node whose GPU Operator pod is not Ready. If kube-state-metrics is not publishing capacity, this panel displays Unavailable rather than zero."
         plugin:
           kind: StatChart
           spec:
@@ -124,6 +124,12 @@ spec:
             format:
               unit: decimal
               decimalPlaces: 0
+            mappings:
+              - kind: Value
+                spec:
+                  value: "-1"
+                  result:
+                    value: "Unavailable"
         queries:
           - kind: TimeSeriesQuery
             spec:
@@ -135,7 +141,7 @@ spec:
                   datasource:
                     kind: PrometheusDatasource
                     name: cluster-prometheus-datasource
-                  query: sum(kube_node_status_capacity{resource="nvidia_com_gpu"})
+                  query: sum(kube_node_status_capacity{resource="nvidia_com_gpu"}) or vector(-1)
                   seriesNameFormat: Advertised
     meanUtilization:
       kind: Panel
@@ -183,7 +189,7 @@ spec:
                   datasource:
                     kind: PrometheusDatasource
                     name: data-science-cluster-prometheus-datasource
-                  query: count(accelerator_temperature_celsius > 80) or vector(0)
+                  query: count(accelerator_temperature_celsius > 80) or on() (count(accelerator_temperature_celsius) * 0)
                   seriesNameFormat: Hot
     gpuUtilization:
       kind: Panel
@@ -217,7 +223,7 @@ spec:
                     kind: PrometheusDatasource
                     name: data-science-cluster-prometheus-datasource
                   query: accelerator_gpu_utilization
-                  seriesNameFormat: 'GPU {{ "{{" }}gpu{{ "}}" }}'
+                  seriesNameFormat: '{{ "{{" }}node{{ "}}" }} / GPU {{ "{{" }}gpu{{ "}}" }}'
     gpuFramebuffer:
       kind: Panel
       spec:
@@ -250,7 +256,7 @@ spec:
                     kind: PrometheusDatasource
                     name: data-science-cluster-prometheus-datasource
                   query: accelerator_memory_used_bytes
-                  seriesNameFormat: 'GPU {{ "{{" }}gpu{{ "}}" }}'
+                  seriesNameFormat: '{{ "{{" }}node{{ "}}" }} / GPU {{ "{{" }}gpu{{ "}}" }}'
     gpuTemperature:
       kind: Panel
       spec:
@@ -271,7 +277,7 @@ spec:
               lineWidth: 1.5
             yAxis:
               format:
-                unit: celsius
+                unit: decimal
               min: 0
         queries:
           - kind: TimeSeriesQuery
@@ -283,7 +289,7 @@ spec:
                     kind: PrometheusDatasource
                     name: data-science-cluster-prometheus-datasource
                   query: accelerator_temperature_celsius
-                  seriesNameFormat: 'GPU {{ "{{" }}gpu{{ "}}" }}'
+                  seriesNameFormat: '{{ "{{" }}node{{ "}}" }} / GPU {{ "{{" }}gpu{{ "}}" }}'
           - kind: TimeSeriesQuery
             spec:
               plugin:
@@ -314,7 +320,7 @@ spec:
               lineWidth: 1.5
             yAxis:
               format:
-                unit: watts
+                unit: decimal
               min: 0
         queries:
           - kind: TimeSeriesQuery
@@ -326,13 +332,13 @@ spec:
                     kind: PrometheusDatasource
                     name: data-science-cluster-prometheus-datasource
                   query: accelerator_power_usage_watts
-                  seriesNameFormat: 'GPU {{ "{{" }}gpu{{ "}}" }}'
+                  seriesNameFormat: '{{ "{{" }}node{{ "}}" }} / GPU {{ "{{" }}gpu{{ "}}" }}'
     gpuByProject:
       kind: Panel
       spec:
         display:
           name: "Utilization by project"
-          description: "Utilization summed per consuming namespace. The DCGM exporter maps each device to the pod holding it through the kubelet pod-resources API, so exported_namespace is the workload's namespace and the exporter's own namespace is excluded; a device no pod holds is absent rather than counted under an unnamed project."
+          description: "Utilization summed per consuming namespace, deduplicated per device within each project. The DCGM exporter maps each device to pods through the kubelet pod-resources API. A device shared by multiple pods in one project is counted once; a device shared across projects appears under each project, so project values are not additive across projects."
         plugin:
           kind: TimeSeriesChart
           spec:
@@ -359,5 +365,5 @@ spec:
                   datasource:
                     kind: PrometheusDatasource
                     name: data-science-cluster-prometheus-datasource
-                  query: sum by (exported_namespace) (accelerator_gpu_utilization{exported_namespace=~".+", exported_namespace!="nvidia-gpu-operator"})
+                  query: sum by (exported_namespace) (max by (exported_namespace, node, gpu) (accelerator_gpu_utilization{exported_namespace=~".+", exported_namespace!="nvidia-gpu-operator"}))
                   seriesNameFormat: '{{ "{{" }}exported_namespace{{ "}}" }}'

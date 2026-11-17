@@ -61,15 +61,16 @@ data:
         namespace: "{{ "{{ .Value }}" }}"
   kube-rbac-proxy-admin.yaml: |
     # Cluster-wide lane (port 8444). The caller proves access to cluster-level
-    # metrics instead of to one namespace, then the query is forwarded
-    # unmodified -- there is no namespace to rewrite and prom-label-proxy is not
-    # in this path. Needed because accelerator_* series are not namespaced by
-    # GPU workload (their only namespace label is the collector's), so the
-    # namespace-enforcing lane can never serve them.
+    # metrics before the query is forwarded unmodified. Node metrics access is
+    # not sufficient here: unlike the /metrics-only cluster proxy, this lane
+    # exposes PromQL. Require the same explicit OpenShift metrics permission
+    # that cluster-monitoring-view grants on the k8s Prometheus API.
     authorization:
       resourceAttributes:
-        apiGroup: metrics.k8s.io
-        resource: nodes
+        apiGroup: monitoring.coreos.com
+        resource: prometheuses
+        subresource: api
+        name: k8s
         verb: get
 ---
 # REQUIRED QUERY FORMAT: /api/v1/query?query=<promql>&namespace=<namespace-name>

@@ -3,6 +3,10 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -14,14 +18,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/yaml"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
 )
 
 // The GPU panels read accelerator_* through the cluster-wide Data Science lane:
-// those series are not workload-namespaced (their only namespace label is the
-// collector's own), so the namespace-scoped datasource cannot serve them, and
+// the default namespace label identifies the collector target rather than the
+// GPU workload, so the namespace-scoped datasource cannot serve them, and
 // OpenShift Thanos never sees the Data Science recording rules.
 const clusterPrometheusDatasourceName = "data-science-cluster-prometheus-datasource"
 
@@ -113,20 +118,20 @@ func TestPersesGPUHealthDashboardTemplateContract(t *testing.T) {
 
 	// Panel queries read the accelerator recording rules, which this dashboard
 	// can only reach through the Data Science cluster-wide datasource: the
-	// namespace proxy injects namespace= and the collector strips Kubernetes
-	// identity from accelerator series, so a scoped datasource never matches.
-	ocpLaneQueries := []string{`sum(kube_node_status_capacity{resource="nvidia_com_gpu"})`}
+	// namespace proxy injects namespace= while accelerator series carry the
+	// collector target's default namespace, so a scoped datasource never matches.
+	ocpLaneQueries := []string{`sum(kube_node_status_capacity{resource="nvidia_com_gpu"}) or vector(-1)`}
 	wantQueries := []string{
-		"count(count by (node, gpu) (accelerator_gpu_utilization))",
-		`sum(kube_node_status_capacity{resource="nvidia_com_gpu"})`,
+		"count(count by (node, gpu) (accelerator_gpu_utilization)) or vector(0)",
+		`sum(kube_node_status_capacity{resource="nvidia_com_gpu"}) or vector(-1)`,
 		"avg(accelerator_gpu_utilization)",
-		"count(accelerator_temperature_celsius > 80) or vector(0)",
+		"count(accelerator_temperature_celsius > 80) or on() (count(accelerator_temperature_celsius) * 0)",
 		"accelerator_gpu_utilization",
 		"accelerator_memory_used_bytes",
 		"accelerator_temperature_celsius",
 		"vector(83)",
 		"accelerator_power_usage_watts",
-		`sum by (exported_namespace) (accelerator_gpu_utilization{exported_namespace=~".+", exported_namespace!="nvidia-gpu-operator"})`,
+		`sum by (exported_namespace) (max by (exported_namespace, node, gpu) (accelerator_gpu_utilization{exported_namespace=~".+", exported_namespace!="nvidia-gpu-operator"}))`,
 	}
 	wantPanels := []string{
 		"gpusReporting", "gpusAdvertised", "meanUtilization", "hotGpus",
@@ -198,6 +203,9 @@ func TestPersesGPUHealthDashboardTemplateContract(t *testing.T) {
 				}
 			}
 
+			assertGPUDashboardCapacityUnavailableMapping(t, panels)
+			validateGPUDashboardFormatSchema(t, dashboard.Object)
+
 			// Series names are the one place the dashboard needs Prometheus'
 			// {{label}} syntax, which the template engine would otherwise eat.
 			utilization, ok := panels["gpuUtilization"].(map[string]any)
@@ -210,8 +218,9 @@ func TestPersesGPUHealthDashboardTemplateContract(t *testing.T) {
 				t.Fatalf("gpuUtilization query has unexpected type %T", rawQueries[0])
 			}
 			format, _, _ := unstructured.NestedString(first, "spec", "plugin", "spec", "seriesNameFormat")
-			if format != "GPU {{gpu}}" {
-				t.Errorf("series name format: want %q, got %q", "GPU {{gpu}}", format)
+			wantFormat := "{{node}} / GPU {{gpu}}"
+			if format != wantFormat {
+				t.Errorf("series name format: want %q, got %q", wantFormat, format)
 			}
 
 			// The by-project panel is populated from the DCGM exporter's pod
@@ -223,6 +232,110 @@ func TestPersesGPUHealthDashboardTemplateContract(t *testing.T) {
 			description, _, _ := unstructured.NestedString(correlation, "spec", "display", "description")
 			if !strings.Contains(description, "pod-resources") {
 				t.Errorf("by-project panel must name the pod-mapping source, got %q", description)
+			}
+			if !strings.Contains(description, "not additive") {
+				t.Errorf("by-project panel must explain shared-device attribution, got %q", description)
+			}
+		})
+	}
+}
+
+func assertGPUDashboardCapacityUnavailableMapping(t *testing.T, panels map[string]any) {
+	t.Helper()
+
+	// An empty capacity result cannot distinguish zero GPUs from
+	// kube-state-metrics being unavailable. The sentinel and supported
+	// StatChart mapping make that distinction explicit in the UI.
+	advertised, ok := panels["gpusAdvertised"].(map[string]any)
+	if !ok {
+		t.Fatalf("gpusAdvertised has unexpected type %T", panels["gpusAdvertised"])
+	}
+	mappings, found, err := unstructured.NestedSlice(advertised, "spec", "plugin", "spec", "mappings")
+	if err != nil || !found || len(mappings) != 1 {
+		t.Fatalf("gpusAdvertised must define an unavailable mapping: found=%t error=%v", found, err)
+	}
+	mapping, ok := mappings[0].(map[string]any)
+	if !ok {
+		t.Fatalf("gpusAdvertised mapping has unexpected type %T", mappings[0])
+	}
+	mappingKind, _, _ := unstructured.NestedString(mapping, "kind")
+	mappingValue, _, _ := unstructured.NestedString(mapping, "spec", "value")
+	mappingResult, _, _ := unstructured.NestedString(mapping, "spec", "result", "value")
+	if mappingKind != "Value" || mappingValue != "-1" || mappingResult != "Unavailable" {
+		t.Errorf("gpusAdvertised unavailable mapping: got kind=%q value=%q result=%q",
+			mappingKind, mappingValue, mappingResult)
+	}
+}
+
+func validateGPUDashboardFormatSchema(t *testing.T, node any) {
+	t.Helper()
+
+	switch value := node.(type) {
+	case map[string]any:
+		if format, ok := value["format"].(map[string]any); ok {
+			unit, _, _ := unstructured.NestedString(format, "unit")
+			// Both target API versions support this common format set. In
+			// particular, v1alpha1 predates celsius and Perses never supported
+			// watts, so those units must not enter either dashboard template.
+			switch unit {
+			case "decimal", "percent", "bytes":
+			default:
+				t.Errorf("unsupported Perses format unit %q", unit)
+			}
+		}
+		for _, child := range value {
+			validateGPUDashboardFormatSchema(t, child)
+		}
+	case []any:
+		for _, child := range value {
+			validateGPUDashboardFormatSchema(t, child)
+		}
+	}
+}
+
+func TestPersesGPUHealthDashboardPromQL(t *testing.T) {
+	promtool, err := exec.LookPath("promtool")
+	if err != nil {
+		t.Skip("promtool is not installed")
+	}
+
+	for _, path := range []string{
+		PersesGPUHealthDashboardV1Alpha1Template,
+		PersesGPUHealthDashboardV1Alpha2Template,
+	} {
+		t.Run(path, func(t *testing.T) {
+			resources := renderObservabilityTemplate(t, path, map[string]any{
+				"Namespace": testMonitoringNamespace,
+			})
+			if len(resources) != 1 {
+				t.Fatalf("expected one dashboard, got %d", len(resources))
+			}
+			configPath := []string{"spec"}
+			if path == PersesGPUHealthDashboardV1Alpha2Template {
+				configPath = []string{"spec", "config"}
+			}
+
+			rules := make([]map[string]any, 0)
+			for index, query := range gpuDashboardQueries(t, resources[0], configPath...) {
+				rules = append(rules, map[string]any{
+					"record": fmt.Sprintf("gpu_dashboard_query_%d", index),
+					"expr":   query.query,
+				})
+			}
+			document, err := yaml.Marshal(map[string]any{
+				"groups": []any{map[string]any{"name": "gpu-dashboard", "rules": rules}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			rulesPath := filepath.Join(t.TempDir(), "rules.yaml")
+			if err := os.WriteFile(rulesPath, document, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.CommandContext(t.Context(), promtool, "check", "rules", "--lint=none", rulesPath)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("promtool check rules: %v\n%s", err, output)
 			}
 		})
 	}

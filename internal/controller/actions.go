@@ -611,9 +611,9 @@ func deployPersesPrometheusIntegration(
 // deployPersesGPUHealthDashboard deploys the GPU health dashboard when built-in
 // metrics storage is configured and Perses is installed. Every query reads the
 // accelerator recording rules, which exist exactly where metrics.storage does,
-// through the cluster-scoped Prometheus datasource: the namespace-enforcing
-// datasource cannot serve them because the proxy injects namespace= and the
-// collector strips Kubernetes identity from accelerator series.
+// through the cluster-wide Data Science datasource: the namespace-enforcing
+// datasource cannot serve them because the proxy injects namespace= while the
+// series' default namespace identifies the collector target, not the workload.
 //
 // The dashboard is best-effort and reports no condition of its own: the rules
 // it reads are covered by MonitoringStackAvailable and the datasource it pins

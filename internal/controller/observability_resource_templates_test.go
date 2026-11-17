@@ -421,8 +421,10 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		t.Fatalf("Thanos proxy cluster-wide authorization config is missing: found=%t error=%v", found, err)
 	}
 	for _, expected := range []string{
-		"resource: nodes",
-		"apiGroup: metrics.k8s.io",
+		"apiGroup: monitoring.coreos.com",
+		"resource: prometheuses",
+		"subresource: api",
+		"name: k8s",
 		"verb: get",
 	} {
 		if !strings.Contains(adminConfig, expected) {
@@ -489,6 +491,35 @@ func TestThanosQuerierProxyTemplateContract(t *testing.T) {
 		asMap(t, ports[0])["port"] != int64(8443) || asMap(t, ports[0])["targetPort"] != "https" ||
 		asMap(t, ports[1])["port"] != int64(8444) || asMap(t, ports[1])["targetPort"] != "https-admin" {
 		t.Fatalf("Thanos proxy Service must expose HTTPS 8443 (scoped) and 8444 (cluster-wide): %#v", ports)
+	}
+}
+
+func TestThanosQuerierClusterWideLaneRequiresExplicitMetricsAccess(t *testing.T) {
+	resources := renderObservabilityTemplate(t, ThanosQuerierProxyTemplate, proxyTemplateData())
+	configMap := findRenderedResource(t, resources, "ConfigMap", "data-science-thanos-querier-proxy-config")
+	adminConfig, found, err := unstructured.NestedString(configMap.Object, "data", "kube-rbac-proxy-admin.yaml")
+	if err != nil || !found {
+		t.Fatalf("Thanos proxy cluster-wide authorization config is missing: found=%t error=%v", found, err)
+	}
+
+	// A caller allowed to read node metrics must not thereby gain arbitrary
+	// Data Science PromQL access. The lane requires the explicit OpenShift
+	// cluster-metrics permission granted by cluster-monitoring-view.
+	for _, forbidden := range []string{"apiGroup: metrics.k8s.io", "resource: nodes"} {
+		if strings.Contains(adminConfig, forbidden) {
+			t.Fatalf("cluster-wide lane must not authorize node-metrics-only callers with %q:\n%s", forbidden, adminConfig)
+		}
+	}
+	for _, required := range []string{
+		"apiGroup: monitoring.coreos.com",
+		"resource: prometheuses",
+		"subresource: api",
+		"name: k8s",
+		"verb: get",
+	} {
+		if !strings.Contains(adminConfig, required) {
+			t.Fatalf("cluster-wide lane must require explicit metrics access %q:\n%s", required, adminConfig)
+		}
 	}
 }
 

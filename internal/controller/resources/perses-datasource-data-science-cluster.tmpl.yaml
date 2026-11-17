@@ -1,13 +1,14 @@
 # Cluster-wide view of the DATA SCIENCE stack (proxy :8444), not OCP monitoring.
 # Caller token, no shared SA. default:false so the namespace-scoped DS proxy
-# remains the default. Authorized against cluster-level metrics access
-# (metrics.k8s.io/nodes), matching data-science-prometheus-cluster-proxy.
+# remains the default. Authorized by explicit cluster-wide metrics access to
+# the OpenShift k8s Prometheus API, not by node-metrics access alone.
 #
 # This lane exists for series the namespace-scoped proxy cannot serve:
-# accelerator_* is recorded from node-level DCGM scrapes, and the only namespace
-# label it keeps is the collector target's (redhat-ods-monitoring), added by the
-# collector's ServiceMonitor scrape, not a workload namespace. prom-label-proxy's
-# namespace=<selected> projection therefore drops it for every workload.
+# accelerator_* is recorded from DCGM scrapes whose default namespace label
+# identifies the collector target, not the GPU workload. The exporter's
+# per-device workload mapping is exposed separately as exported_namespace and
+# exported_pod. prom-label-proxy's namespace=<selected> projection therefore
+# drops accelerator_* for every workload namespace.
 apiVersion: perses.dev/{{.PersesAPIVersion}}
 kind: PersesDatasource
 metadata:
