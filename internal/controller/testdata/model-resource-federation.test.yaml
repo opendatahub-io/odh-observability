@@ -1,0 +1,65 @@
+rule_files: []
+evaluation_interval: 30s
+tests:
+  - interval: 30s
+    input_series:
+      - series: 'node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate{namespace="team",pod="model",container="inference"}'
+        values: '0.5 0.5'
+      - series: 'kube_resourcequota{namespace="team",resourcequota="quota-a",resource="requests.cpu",type="hard"}'
+        values: '8 8'
+      - series: 'kube_resourcequota{namespace="team",resourcequota="quota-a",resource="requests.cpu",type="used"}'
+        values: '2 2'
+      - series: 'kube_resourcequota{namespace="team",resourcequota="quota-a",resource="limits.cpu",type="hard"}'
+        values: '16 16'
+      - series: 'kube_resourcequota{namespace="team",resourcequota="quota-a",resource="limits.cpu",type="used"}'
+        values: '4 4'
+      - series: 'kube_resourcequota{namespace="team",resourcequota="quota-b",resource="cpu",type="hard"}'
+        values: '12 12'
+      - series: 'kube_resourcequota{namespace="team",resourcequota="quota-b",resource="cpu",type="used"}'
+        values: '3 3'
+      - series: 'kube_resourcequota{namespace="team",resourcequota="quota-c",resource="requests.cpu",type="hard"}'
+        values: '6 6'
+      - series: 'kube_resourcequota{namespace="team",resourcequota="quota-a",resource="requests.memory",type="hard"}'
+        values: '100 100'
+      - series: 'kube_resourcequota{namespace="team",resourcequota="quota-a",resource="requestsXcpu",type="hard"}'
+        values: '100 100'
+      - series: 'kube_resourcequota{namespace="team",resourcequota="quota-a",resource="cpu",type="other"}'
+        values: '100 100'
+      - series: 'kube_pod_container_resource_limits{namespace="team",pod="model",container="inference",resource="cpu",unit="core"}'
+        values: '2 2'
+      - series: 'kube_pod_container_resource_limits{namespace="team",pod="model",container="sidecar",resource="cpu",unit="core"}'
+        values: '1 1'
+      - series: 'kube_pod_container_resource_limits{namespace="team",pod="model",container="inference",resource="memory",unit="byte"}'
+        values: '100 100'
+      - series: 'kube_pod_container_resource_limits{namespace="team",pod="model",container="inference",resource="cpu",unit="wrong"}'
+        values: '100 100'
+    promql_expr_test:
+      - expr: '@@CPU_USAGE_MATCHER@@'
+        eval_time: 30s
+        exp_samples:
+          - labels: 'node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate{namespace="team",pod="model",container="inference"}'
+            value: 0.5
+      - expr: '@@QUOTA_MATCHER@@'
+        eval_time: 30s
+        exp_samples:
+          - labels: 'kube_resourcequota{namespace="team",resourcequota="quota-a",resource="requests.cpu",type="hard"}'
+            value: 8
+          - labels: 'kube_resourcequota{namespace="team",resourcequota="quota-a",resource="requests.cpu",type="used"}'
+            value: 2
+          - labels: 'kube_resourcequota{namespace="team",resourcequota="quota-a",resource="limits.cpu",type="hard"}'
+            value: 16
+          - labels: 'kube_resourcequota{namespace="team",resourcequota="quota-a",resource="limits.cpu",type="used"}'
+            value: 4
+          - labels: 'kube_resourcequota{namespace="team",resourcequota="quota-b",resource="cpu",type="hard"}'
+            value: 12
+          - labels: 'kube_resourcequota{namespace="team",resourcequota="quota-b",resource="cpu",type="used"}'
+            value: 3
+          - labels: 'kube_resourcequota{namespace="team",resourcequota="quota-c",resource="requests.cpu",type="hard"}'
+            value: 6
+      - expr: '@@CONTAINER_LIMIT_MATCHER@@'
+        eval_time: 30s
+        exp_samples:
+          - labels: 'kube_pod_container_resource_limits{namespace="team",pod="model",container="inference",resource="cpu",unit="core"}'
+            value: 2
+          - labels: 'kube_pod_container_resource_limits{namespace="team",pod="model",container="sidecar",resource="cpu",unit="core"}'
+            value: 1

@@ -1,0 +1,27 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: data-science-alertmanager-proxy-ingress
+  namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      app: data-science-alertmanager-proxy
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+      {{ if .GatewayNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{.GatewayNamespace}}
+      {{ else }}
+        - namespaceSelector:
+            matchLabels:
+              policy-group.network.openshift.io/ingress: ""
+      {{ end }}
+      ports:
+        - protocol: TCP
+          port: 8443

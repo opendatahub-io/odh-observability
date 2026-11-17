@@ -13,6 +13,27 @@ concurrency:
 permissions: {}
 
 jobs:
+  skill-tests:
+    name: Python skill tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+
+      - name: Run skill tests
+        run: |
+          for test_dir in skills/*/tests; do
+            [ -d "$test_dir" ] || continue
+            python -m unittest discover -s "$test_dir" -p 'test_*.py' -v
+          done
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -26,6 +47,23 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+
+      - name: Install promtool
+        working-directory: ${{ runner.temp }}
+        env:
+          PROMETHEUS_VERSION: 3.16.0
+          PROMETHEUS_SHA256: 68727009472a2c02e1ff7f062fd5b3e637285bffc8fc2d340c76fb449d6e0f34
+        run: |
+          set -euo pipefail
+          archive="prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$archive" \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/${archive}"
+          printf '%s  %s\n' "$PROMETHEUS_SHA256" "$archive" | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" --strip-components=1 \
+            "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool"
+          sudo install -m 0755 promtool /usr/local/bin/promtool
+          promtool --version
 
       - name: Run tests
         run: make test

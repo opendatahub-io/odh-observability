@@ -1468,6 +1468,10 @@ func (tc *MonitoringTestCtx) assertThanosPromQLResponds(t *testing.T, query stri
 			return err
 		}
 		if resp.StatusCode != http.StatusOK {
+			if resp.StatusCode == http.StatusUnauthorized {
+				logThanosTokenReview(t, tc, "baseline", token)
+				logThanosProxyAuthenticationEvidence(t, tc)
+			}
 			httpErr := fmt.Errorf("PromQL query %q returned HTTP %d (want 200)", query, resp.StatusCode)
 			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 				return httpErr
@@ -2732,6 +2736,9 @@ func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 		t.Run("Prometheus secure proxy authentication", tc.ValidatePrometheusSecureProxyAuthentication)
 		t.Run("Monitoring proxy TLS profile rollout", tc.ValidateMonitoringProxyTLSProfileRollout)
 		t.Run("Tenant workload metrics namespace restriction", tc.ValidateTenantWorkloadMetricsNamespaceRestriction)
+		t.Run("Model CPU resource federation", tc.ValidateModelResourceFederation)
+		t.Run("Trusted DCGM workload attribution", tc.ValidateTrustedDCGMAttribution)
+		t.Run("Trusted DCGM HTTPS workload attribution", tc.ValidateTrustedDCGMTLSAttribution)
 		t.Run("Built-in DCGM opt-out with verified HTTPS monitor", tc.ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMonitor)
 		t.Run("OTLP metric identity cannot be spoofed", tc.ValidateOTLPMetricIdentityCannotBeSpoofed)
 		t.Run("Node metrics endpoint deployment", tc.ValidateNodeMetricsEndpointDeployment)

@@ -38,6 +38,8 @@ spec:
         items:
           - key: token
             path: token
+          - key: ca.crt
+            path: ca.crt
 {{ end }}
 
   config:
@@ -240,6 +242,8 @@ spec:
         # name is an implementation detail of the mount below.
         auth:
           authenticator: bearertokenauth/remote
+        tls:
+          ca_file: "/var/run/secrets/usage-logs-remote/ca.crt"
 {{- end }}
 {{- end }}
 

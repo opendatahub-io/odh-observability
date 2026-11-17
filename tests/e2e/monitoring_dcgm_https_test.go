@@ -33,6 +33,8 @@ const (
 	dcgmHTTPSTLSSecret    = "dcgm-https-tls"
 	dcgmHTTPSCASecret     = "dcgm-https-ca"
 	dcgmHTTPSServicePort  = int32(9090)
+	dcgmSpoofedNamespace  = "dcgm-spoof-victim"
+	dcgmSpoofedPod        = "dcgm-spoofed-pod"
 	dcgmHTTPSMetricFilter = "(DCGM_FI_DEV_GPU_TEMP|DCGM_FI_DEV_GPU_UTIL|DCGM_FI_PROF_GR_ENGINE_ACTIVE|" +
 		"DCGM_FI_DEV_MEM_COPY_UTIL|DCGM_FI_DEV_FB_USED|DCGM_FI_DEV_FB_FREE|DCGM_FI_DEV_POWER_USAGE|" +
 		"DCGM_FI_DEV_SM_CLOCK|DCGM_FI_DEV_MEM_CLOCK)"
@@ -41,11 +43,12 @@ const (
 // ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMonitor proves the opt-out
 // leaves TargetAllocator monitor discovery active, a selected HTTPS PodMonitor
 // in a workload namespace can scrape a DCGM-shaped metric under its
-// namespace-scoped query label, and a hostname mismatch makes the scrape fail.
+// namespace-scoped query label, forged attribution is not trusted, and a
+// hostname mismatch makes the scrape fail.
 // The Prometheus fixture's build-info metric is renamed to a canonical DCGM
 // name by the test-only monitor relabeling, so no GPU hardware or NVIDIA
 // exporter is required.
-func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMonitor(t *testing.T) {
+func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMonitor(t *testing.T) { //nolint:maintidx // Keep the TLS and spoofing checks in one fixture.
 	t.Helper()
 	tc = tc.WithT(t)
 	tc.setupMetrics(t)
@@ -144,11 +147,39 @@ func (tc *MonitoringTestCtx) ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMon
 			if result.Metric["exported_job"] == "rhoai-accelerator-metrics" &&
 				result.Metric["node"] != "" &&
 				result.Metric["component"] == "nvidia-dcgm-exporter" {
+				if result.Metric["odh_dcgm_source"] != "" || result.Metric["odh_dcgm_workload_namespace"] != "" || result.Metric["odh_dcgm_workload_pod"] != "" {
+					return fmt.Errorf("tenant monitor forged DCGM provenance: %v", result.Metric)
+				}
+				if result.Metric["exported_namespace"] != dcgmSpoofedNamespace || result.Metric["exported_pod"] != dcgmSpoofedPod {
+					return fmt.Errorf("expected forged workload labels on raw metric: %v", result.Metric)
+				}
 				return nil
 			}
 		}
 		return errors.New("no HTTPS-scraped DCGM metric with expected namespace/node/component/job labels yet")
 	}, 10*time.Minute, 15*time.Second).Should(Succeed(), "selected HTTPS PodMonitor must deliver DCGM-shaped metrics with expected labels")
+
+	// The monitor impersonates the DCGM job/component and supplies a verified
+	// marker plus another workload's labels. Recording rules must retain the
+	// actual source namespace rather than promote those forged labels.
+	recordQuery := fmt.Sprintf(`accelerator_gpu_utilization{namespace=%q,exported_job="rhoai-accelerator-metrics",`+
+		`component="nvidia-dcgm-exporter",exported_namespace=%q,exported_pod=%q}`,
+		namespace, dcgmSpoofedNamespace, dcgmSpoofedPod)
+	tc.g.Eventually(func() error {
+		status, response, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, routeHost, viewerToken, namespace, recordQuery)
+		if err != nil {
+			return err
+		}
+		if status != 200 || len(response.Data.Result) == 0 {
+			return fmt.Errorf("untrusted GPU recording rule not available under source namespace: HTTP %d results=%d", status, len(response.Data.Result))
+		}
+		for _, result := range response.Data.Result {
+			if result.Metric["namespace"] != namespace || result.Metric["pod"] == dcgmSpoofedPod || result.Metric["odh_dcgm_source"] != "" {
+				return fmt.Errorf("untrusted labels were promoted by the GPU recording rule: %v", result.Metric)
+			}
+		}
+		return nil
+	}, 10*time.Minute, 15*time.Second).Should(Succeed(), "tenant monitor must not forge recorded GPU workload attribution")
 
 	// Keep the CA trusted but break the certificate identity. Prometheus should
 	// expose up == 0 for this target, proving hostname verification is enforced.
@@ -371,6 +402,11 @@ func dcgmHTTPSExporterPodMonitor(namespace, serverName string) *unstructured.Uns
 						"sourceLabels": []any{"__name__"},
 						"regex":        dcgmHTTPSMetricFilter,
 					},
+					map[string]any{"action": "replace", "targetLabel": "odh__dcgm__source", "replacement": "verified"},
+					map[string]any{"action": "replace", "targetLabel": "odh__dcgm__workload__namespace", "replacement": dcgmSpoofedNamespace},
+					map[string]any{"action": "replace", "targetLabel": "odh__dcgm__workload__pod", "replacement": dcgmSpoofedPod},
+					map[string]any{"action": "replace", "targetLabel": "exported_namespace", "replacement": dcgmSpoofedNamespace},
+					map[string]any{"action": "replace", "targetLabel": "exported_pod", "replacement": dcgmSpoofedPod},
 				},
 			}},
 		},

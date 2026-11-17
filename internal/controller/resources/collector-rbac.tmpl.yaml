@@ -65,6 +65,38 @@ subjects:
   name: data-science-collector-collector
   namespace: {{.Namespace}}
 {{ if .Metrics }}
+{{ if .MetricsStorage }}
+---
+# The model-resource federation receiver reads only the Prometheus API. Keep
+# this separate from the TargetAllocator discovery role so that the
+# TargetAllocator service account does not receive Prometheus query access.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: generate-processors-cluster-prometheus-reader
+rules:
+- apiGroups:
+  - monitoring.coreos.com
+  resourceNames:
+  - k8s
+  resources:
+  - prometheuses/api
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: generate-processors-cluster-prometheus-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: generate-processors-cluster-prometheus-reader
+subjects:
+- kind: ServiceAccount
+  name: data-science-collector-collector
+  namespace: {{.Namespace}}
+{{ end }}
 ---
 # Keep this legacy binding and roleRef. ClusterRoleBinding.roleRef is immutable,
 # so changing it would break upgrades of installations created before the

@@ -39,6 +39,7 @@ func TestCollectorNetworkPolicyTemplateRestrictsIngress(t *testing.T) {
 	require.Equal(t, []networkingv1.NetworkPolicyPort{
 		tcpNetworkPolicyPort(8889),
 		tcpNetworkPolicyPort(8890),
+		tcpNetworkPolicyPort(8891),
 	}, scrapeRule.Ports)
 
 	otlpRule := collector.Spec.Ingress[1]

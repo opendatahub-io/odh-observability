@@ -1677,10 +1677,12 @@ func TestScopedClusterRBACGarbageCollection(t *testing.T) {
 	otherOwnerReference.UID = types.UID("other-monitoring")
 
 	staleRole := clusterRole("data-science-collector-mlflow-trace-export")
+	staleFederationRole := clusterRole("generate-processors-cluster-prometheus-reader")
 	desiredRole := clusterRole("generate-processors-role")
 	otherOwnerRole := clusterRole("data-science-collector-tempo-trace-export")
 	unknownRole := clusterRole("unrelated-owned-role")
 	staleBinding := clusterRoleBinding("data-science-collector-mlflow-trace-export")
+	staleFederationBinding := clusterRoleBinding("generate-processors-cluster-prometheus-reader")
 	desiredBinding := clusterRoleBinding("generate-processors-collector-rolebinding")
 	managedFalseRole := clusterRole("data-science-metrics-view")
 	withheldRole := clusterRole("data-science-usage-logs-processor")
@@ -1694,7 +1696,8 @@ func TestScopedClusterRBACGarbageCollection(t *testing.T) {
 	reconciler := &MonitoringReconciler{
 		Client: fake.NewClientBuilder().WithScheme(scheme).
 			WithObjects(
-				staleRole, desiredRole, otherOwnerRole, unknownRole, staleBinding, desiredBinding,
+				staleRole, staleFederationRole, desiredRole, otherOwnerRole, unknownRole,
+				staleBinding, staleFederationBinding, desiredBinding,
 				managedFalseRole, withheldRole,
 			).
 			Build(),
@@ -1713,14 +1716,16 @@ func TestScopedClusterRBACGarbageCollection(t *testing.T) {
 	}
 
 	for name, exists := range map[string]bool{
-		staleRole.Name:        false,
-		staleBinding.Name:     false,
-		desiredRole.Name:      true,
-		desiredBinding.Name:   true,
-		otherOwnerRole.Name:   true,
-		unknownRole.Name:      true,
-		managedFalseRole.Name: true,
-		withheldRole.Name:     true,
+		staleRole.Name:              false,
+		staleFederationRole.Name:    false,
+		staleBinding.Name:           false,
+		staleFederationBinding.Name: false,
+		desiredRole.Name:            true,
+		desiredBinding.Name:         true,
+		otherOwnerRole.Name:         true,
+		unknownRole.Name:            true,
+		managedFalseRole.Name:       true,
+		withheldRole.Name:           true,
 	} {
 		role := &rbacv1.ClusterRole{}
 		roleErr := reconciler.Get(context.Background(), types.NamespacedName{Name: name}, role)

@@ -48,6 +48,11 @@ spec:
   - name: otlp-tls-certs
     mountPath: /etc/otel-collector/otlp-tls
     readOnly: true
+  {{- if and .Metrics .BuiltinDCGMTLS }}
+  - name: dcgm-ca
+    mountPath: /etc/otel-collector/dcgm-tls
+    readOnly: true
+  {{- end }}
   {{- if .MetricsStorage }}
   - name: tls-certs
     mountPath: /etc/otel-collector/tls
@@ -60,6 +65,11 @@ spec:
   - name: otlp-tls-certs
     secret:
       secretName: data-science-collector-collector-headless-tls
+  {{- if and .Metrics .BuiltinDCGMTLS }}
+  - name: dcgm-ca
+    secret:
+      secretName: {{ printf "%q" .BuiltinDCGMTLS.CASecretName }}
+  {{- end }}
   {{- if .MetricsStorage }}
   - name: tls-certs
     secret:
@@ -83,7 +93,14 @@ spec:
         config:
           scrape_configs:
             - job_name: 'dcgm-exporter-accelerator-metrics'
+              {{- if .BuiltinDCGMTLS }}
+              scheme: https
+              tls_config:
+                ca_file: /etc/otel-collector/dcgm-tls/ca.crt
+                server_name: {{ printf "%q" .BuiltinDCGMTLS.ServerName }}
+              {{- else }}
               scheme: http
+              {{- end }}
               kubernetes_sd_configs:
                 - role: pod
                   namespaces:
@@ -106,15 +123,76 @@ spec:
                   source_labels: [__meta_kubernetes_pod_label_app]
                   target_label: component
                 - action: replace
-                  replacement: 'rhoai-accelerator-metrics'
+                  replacement: 'rhoai-accelerator-discovery'
+                  target_label: job
+              # This job supplies discovery and allocation only. The shared
+              # receiver still scrapes it, but must not export its samples:
+              # the isolated receiver below exports the same assigned target.
+              metric_relabel_configs:
+                - source_labels: [__name__]
+                  regex: '.+'
+                  action: drop
+              scrape_interval: 30s
+              scrape_timeout: 10s
+      # Consume only this collector's allocation for the operator-owned job.
+      # A monitor can relabel its own job but cannot change this job ID or the
+      # Kubernetes discovery metadata returned by the mTLS TargetAllocator.
+      prometheus/trusted_dcgm:
+        config:
+          scrape_configs:
+            - job_name: 'trusted-dcgm-exporter'
+              {{- if .BuiltinDCGMTLS }}
+              scheme: https
+              tls_config:
+                ca_file: /etc/otel-collector/dcgm-tls/ca.crt
+                server_name: {{ printf "%q" .BuiltinDCGMTLS.ServerName }}
+              {{- else }}
+              scheme: http
+              {{- end }}
+              follow_redirects: false
+              metrics_path: /metrics
+              scrape_interval: 30s
+              scrape_timeout: 10s
+              http_sd_configs:
+                - url: 'https://data-science-collector-targetallocator.{{.Namespace}}.svc:443/jobs/dcgm-exporter-accelerator-metrics/targets?collector_id=${env:POD_NAME}'
+                  refresh_interval: 30s
+                  tls_config:
+                    ca_file: /tls/ca.crt
+                    cert_file: /tls/tls.crt
+                    key_file: /tls/tls.key
+              relabel_configs:
+                - source_labels: [__meta_kubernetes_namespace]
+                  regex: nvidia-gpu-operator
+                  action: keep
+                - source_labels: [__meta_kubernetes_pod_name]
+                  regex: '^nvidia-dcgm-exporter.*$'
+                  action: keep
+                - source_labels: [__address__]
+                  regex: '([^:]+)(?::\d+)?'
+                  replacement: '$$1:9400'
+                  target_label: __address__
+                - source_labels: [__meta_kubernetes_pod_node_name]
+                  target_label: node
+                - source_labels: [__meta_kubernetes_pod_label_app]
+                  target_label: component
+                - replacement: 'rhoai-accelerator-metrics'
                   target_label: job
               metric_relabel_configs:
-                # Preserve canonical DCGM names for compatibility with NVIDIA dashboards and queries.
                 - source_labels: [__name__]
                   regex: '(DCGM_FI_DEV_GPU_TEMP|DCGM_FI_DEV_GPU_UTIL|DCGM_FI_PROF_GR_ENGINE_ACTIVE|DCGM_FI_DEV_MEM_COPY_UTIL|DCGM_FI_DEV_FB_USED|DCGM_FI_DEV_FB_FREE|DCGM_FI_DEV_POWER_USAGE|DCGM_FI_DEV_SM_CLOCK|DCGM_FI_DEV_MEM_CLOCK)'
                   action: keep
-              scrape_interval: 30s
-              scrape_timeout: 10s
+                # Do not let the exporter set internal labels, including when
+                # the actual workload namespace or pod is missing.
+                - action: labeldrop
+                  regex: 'odh[^a-zA-Z0-9]+dcgm[^a-zA-Z0-9]+.*'
+                - source_labels: [namespace]
+                  regex: '(.+)'
+                  target_label: odh_dcgm_workload_namespace
+                - source_labels: [pod]
+                  regex: '(.+)'
+                  target_label: odh_dcgm_workload_pod
+                - target_label: odh_dcgm_source
+                  replacement: verified
       {{- else }}
       # TargetAllocator supplies selected monitor scrapes. Leave its receiver
       # config absent; a present config block requires scrape_configs. The
@@ -122,6 +200,50 @@ spec:
       prometheus:
         target_allocator: {}
       {{- end }}
+      {{- end }}
+      {{- if .MetricsStorage }}
+      # Federate only the model-resource series that are already collected by
+      # OpenShift Monitoring. Keeping this in a separate receiver avoids
+      # coupling the static federation scrape to TargetAllocator-managed
+      # workload monitors. The collector's service account is authorized for
+      # the Prometheus API by collector-rbac.tmpl.yaml.
+      prometheus/cluster_resources:
+        config:
+          scrape_configs:
+            - job_name: 'cluster-prometheus-model-resources'
+              scrape_interval: 30s
+              scrape_timeout: 10s
+              scheme: https
+              metrics_path: /federate
+              params:
+                'match[]':
+                  - '{__name__="node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate"}'
+                  # Namespace quota accounting (requests and limits) is not
+                  # runtime CPU usage or an individual container's CPU limit.
+                  - '{__name__="kube_resourcequota", resource=~"cpu|requests[.]cpu|limits[.]cpu", type=~"hard|used"}'
+                  - '{__name__="kube_pod_container_resource_limits", resource="cpu", unit="core"}'
+              bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+              tls_config:
+                ca_file: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
+                server_name: prometheus-k8s.openshift-monitoring.svc
+              honor_labels: true
+              metric_relabel_configs:
+                # Mark the static receiver so the ordinal-0 ServiceMonitor
+                # cannot accidentally retain a user workload metric that
+                # happens to reuse one of the federated metric names.
+                - action: replace
+                  target_label: odh_federation_source
+                  replacement: model-resources
+                # The service can load-balance between Prometheus replicas.
+                # Drop source replica identity so it does not become another
+                # aggregation dimension. Models dashboard queries also max
+                # over the workload/quota identity to tolerate replicated
+                # federation scrapes.
+                - action: labeldrop
+                  regex: 'prometheus(_replica)?'
+              static_configs:
+                - targets:
+                    - prometheus-k8s.openshift-monitoring.svc:9091
       {{- end }}
       otlp:
         protocols:
@@ -140,8 +262,9 @@ spec:
     processors:
       memory_limiter:
         check_interval: 1s
-        spike_limit_mib: 800
-        limit_mib: 4000
+        # Keep the heap hard limit below the default 256 MiB container limit.
+        spike_limit_mib: 50
+        limit_mib: 200
       batch:
         send_batch_size: 10000
       k8sattributes: {}
@@ -163,6 +286,23 @@ spec:
             statements:
               - set(datapoint.value_double, datapoint.value_double / 100) where metric.name == "DCGM_FI_DEV_GPU_UTIL"
               - set(datapoint.value_double, datapoint.value_double / 100) where metric.name == "DCGM_FI_DEV_MEM_COPY_UTIL"
+      # Source markers are internal trust-boundary labels. Remove any marker
+      # supplied by workload scrapes or OTLP clients before export. Match
+      # alternate spellings too: the Prometheus exporter normalizes characters
+      # such as '.' and '-' to '_' and may collapse repeated separators. The
+      # federation pipeline deliberately does not use this processor. Escape
+      # $ for collector config expansion.
+      transform/sanitize_provenance_markers:
+        error_mode: propagate
+        metric_statements:
+          - context: resource
+            statements:
+              - delete_matching_keys(attributes, "^odh[^a-zA-Z0-9]+federation[^a-zA-Z0-9]+source$$")
+              - delete_matching_keys(attributes, "^odh[^a-zA-Z0-9]+dcgm[^a-zA-Z0-9]+.*$$")
+          - context: datapoint
+            statements:
+              - delete_matching_keys(attributes, "^odh[^a-zA-Z0-9]+federation[^a-zA-Z0-9]+source$$")
+              - delete_matching_keys(attributes, "^odh[^a-zA-Z0-9]+dcgm[^a-zA-Z0-9]+.*$$")
       # Workloads control their exposition labels and pushed metric
       # attributes, so a datapoint attribute named k8s_namespace_name or
       # k8s_pod_name must never be trusted: the collector ServiceMonitor
@@ -177,8 +317,8 @@ spec:
         metric_statements:
           - context: datapoint
             statements:
-              - delete_key(attributes, "k8s_namespace_name")
-              - delete_key(attributes, "k8s_pod_name")
+              - delete_matching_keys(attributes, "^k8s[^a-zA-Z0-9]+namespace[^a-zA-Z0-9]+name$$")
+              - delete_matching_keys(attributes, "^k8s[^a-zA-Z0-9]+pod[^a-zA-Z0-9]+name$$")
       # Monitor relabelings can set the job target label, which the Prometheus
       # receiver maps to service.name; that name alone is not trusted. Only
       # exclude exporter identity when Kubernetes enrichment identifies the
@@ -230,6 +370,8 @@ spec:
               - delete_key(attributes, "container.id")
               - delete_key(attributes, "k8s_namespace_name")
               - delete_key(attributes, "k8s_pod_name")
+              - delete_matching_keys(attributes, "^k8s[^a-zA-Z0-9]+namespace[^a-zA-Z0-9]+name$$")
+              - delete_matching_keys(attributes, "^k8s[^a-zA-Z0-9]+pod[^a-zA-Z0-9]+name$$")
               - delete_key(attributes, "namespace")
               - delete_key(attributes, "pod")
               - delete_key(attributes, "exported_namespace")
@@ -255,6 +397,15 @@ spec:
           key_file: "/etc/otel-collector/tls/tls.key"
         resource_to_telemetry_conversion:
           enabled: true # by default resource attributes are dropped
+      # A separate registry prevents workload-controlled metric descriptors
+      # from colliding with the trusted federated metric families.
+      prometheus/federation:
+        endpoint: 0.0.0.0:8891
+        tls:
+          cert_file: "/etc/otel-collector/tls/tls.crt"
+          key_file: "/etc/otel-collector/tls/tls.key"
+        resource_to_telemetry_conversion:
+          enabled: true
       {{- end }}
       {{- if .MetricsExporterNames }}
       {{- range .MetricsExporterNames }}
@@ -307,8 +458,22 @@ spec:
       {{- if .Metrics }}
         metrics/scrape:
           receivers: [prometheus]
+          processors: [memory_limiter, k8sattributes, transform/sanitize_provenance_markers, transform/sanitize_k8s_labels, transform/exclude_dcgm_k8s_labels, resourcedetection, transform/gpu_metrics, batch]
+          exporters: [{{- if .MetricsStorage }}prometheus{{- if .MetricsExporterNames }}, {{ end }}{{- end }}{{- range $i, $name := .MetricsExporterNames }}{{- if $i }}, {{ end }}{{ $name }}{{- end }}]
+      {{- if and .AcceleratorMetrics .BuiltinDCGMScrapeEnabled }}
+        metrics/trusted_dcgm:
+          receivers: [prometheus/trusted_dcgm]
           processors: [memory_limiter, k8sattributes, transform/sanitize_k8s_labels, transform/exclude_dcgm_k8s_labels, resourcedetection, transform/gpu_metrics, batch]
           exporters: [{{- if .MetricsStorage }}prometheus{{- if .MetricsExporterNames }}, {{ end }}{{- end }}{{- range $i, $name := .MetricsExporterNames }}{{- if $i }}, {{ end }}{{ $name }}{{- end }}]
+      {{- end }}
+      {{- if .MetricsStorage }}
+        metrics/federation:
+          receivers: [prometheus/cluster_resources]
+          processors: [memory_limiter, batch]
+          # Every replica federates; only the ordinal-0 MonitoringStack scrape
+          # deduplicates these samples. Do not send them to custom exporters.
+          exporters: [prometheus/federation]
+      {{- end }}
         # OTLP metrics enter through a dedicated pipeline so client-supplied
         # identity attributes can be stripped before trusted, connection-based
         # enrichment (see transform/sanitize_otlp_identity and
@@ -316,6 +481,6 @@ spec:
         # sanitizer, and pushed metrics must not bypass it.
         metrics/otlp:
           receivers: [otlp]
-          processors: [memory_limiter, transform/sanitize_otlp_identity, k8sattributes/otlp, transform/sanitize_k8s_labels, resourcedetection, transform/gpu_metrics, batch]
+          processors: [memory_limiter, transform/sanitize_otlp_identity, transform/sanitize_provenance_markers, k8sattributes/otlp, transform/sanitize_k8s_labels, resourcedetection, transform/gpu_metrics, batch]
           exporters: [{{- if .MetricsStorage }}prometheus{{- if .MetricsExporterNames }}, {{ end }}{{- end }}{{- range $i, $name := .MetricsExporterNames }}{{- if $i }}, {{ end }}{{ $name }}{{- end }}]
       {{- end }}

@@ -73,14 +73,18 @@ type MonitoringSpec struct {
 // Built-in MonitoringStack requires storage; exporters-only configs (external backends) omit storage.
 // +kubebuilder:validation:XValidation:rule="has(self.storage) || (has(self.exporters) && size(self.exporters) > 0)",message="metrics requires storage and/or at least one exporter"
 // +kubebuilder:validation:XValidation:rule="has(self.storage) || !has(self.replicas) || self.replicas == 0",message="Non-zero replicas require metrics.storage to be configured"
+// +kubebuilder:validation:XValidation:rule="!has(self.builtinDCGMTLS) || !has(self.builtinDCGMScrapeEnabled) || self.builtinDCGMScrapeEnabled",message="builtinDCGMTLS requires the built-in DCGM scrape"
 type Metrics struct {
 	// Storage configures the built-in MonitoringStack backend. Omit when using exporters only (external observability).
 	// +optional
 	Storage *MetricsStorage `json:"storage,omitempty"`
-	// BuiltinDCGMScrapeEnabled controls the built-in HTTP scrape for DCGM exporter metrics.
+	// BuiltinDCGMScrapeEnabled controls the built-in scrape for DCGM exporter metrics.
 	// It defaults to enabled; set false when collecting DCGM through a ServiceMonitor or PodMonitor instead.
 	// +optional
 	BuiltinDCGMScrapeEnabled *bool `json:"builtinDCGMScrapeEnabled,omitempty"`
+	// BuiltinDCGMTLS enables certificate-verified HTTPS for the built-in DCGM scrape.
+	// +optional
+	BuiltinDCGMTLS *DCGMTLS `json:"builtinDCGMTLS,omitempty"`
 	// Replicas specifies the number of replicas in the MonitoringStack.
 	// +kubebuilder:validation:Minimum=0
 	Replicas int32 `json:"replicas,omitempty"`
@@ -93,6 +97,22 @@ type Metrics struct {
 	// +kubebuilder:validation:XValidation:rule="!('otlp/tempo' in self)",message="exporter name 'otlp/tempo' is reserved and cannot be used"
 	// +kubebuilder:validation:XValidation:rule="size(self) <= 10",message="maximum 10 exporters allowed"
 	Exporters map[string]runtime.RawExtension `json:"exporters,omitempty"`
+}
+
+// DCGMTLS identifies the trusted CA and certificate name for the built-in
+// DCGM exporter. The Secret must be in the monitoring namespace and contain
+// a PEM certificate under ca.crt.
+type DCGMTLS struct {
+	// CASecretName is the name of the CA Secret in the monitoring namespace.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	CASecretName string `json:"caSecretName"`
+	// ServerName is the DNS name verified against the exporter's certificate.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	ServerName string `json:"serverName"`
 }
 
 // MetricsStorage defines the storage configuration for the MonitoringStack.
