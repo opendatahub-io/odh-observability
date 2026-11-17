@@ -258,8 +258,8 @@ func (r *MonitoringReconciler) reconcile(ctx context.Context, monitoring *v1alph
 
 	defer func() {
 		result = requeueForCOOVersionRefresh(result, cooCompatibilityConfigured, reconcileErr)
-		result = requeueForDCGMExporterRefresh(result, monitoring, reconcileErr)
 		result = requeueForCollectorReadiness(result, monitoring, reconcileErr)
+		result = requeueForDCGMExporterRefresh(result, monitoring, reconcileErr)
 		if reconcileErr != nil {
 			message := reconcileErr.Error()
 			cm.MarkFalse(string(platformcommon.ConditionTypeReady), "ReconcileFailed", message)
@@ -483,13 +483,11 @@ func dcgmExporterCheckPending(monitoring *v1alpha1.Monitoring) bool {
 		conditions.ConditionDCGMExporterAvailable, metav1.ConditionUnknown)
 }
 
-// requeueForDCGMExporterRefresh schedules a bounded refresh while the exporter
-// verdict is not True. Installing the GPU Operator with the exporter disabled
-// creates no exporter Service, so no watched object changes and an
-// exporters-only configuration would report the operator as missing forever;
-// removing the operator has the mirror problem when the Service is already gone.
-// A True verdict needs no refresh: the Service watch already covers the exporter
-// being disabled or removed afterwards.
+// requeueForDCGMExporterRefresh schedules a bounded refresh for every verdict.
+// Installing the GPU Operator with the exporter disabled creates no exporter
+// Service, so no watched object changes and an exporters-only configuration
+// would report the operator as missing forever. Uninstalling the operator can
+// leave its Service behind, so a True verdict also needs periodic reevaluation.
 func requeueForDCGMExporterRefresh(
 	result ctrl.Result,
 	monitoring *v1alpha1.Monitoring,
@@ -499,9 +497,6 @@ func requeueForDCGMExporterRefresh(
 		return result
 	}
 	if !builtinDCGMScrapeEnabled(monitoring.Spec.Metrics) {
-		return result
-	}
-	if libconditions.IsStatusConditionTrue(monitoring, conditions.ConditionDCGMExporterAvailable) {
 		return result
 	}
 

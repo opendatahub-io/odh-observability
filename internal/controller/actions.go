@@ -402,35 +402,70 @@ func deployDCGMExporterDependency(
 		return nil
 	}
 
-	// A cluster where OLM itself is absent cannot answer the question. That is
-	// "not installed", not a detection failure.
-	if _, err := olm.OperatorExists(ctx, c, gpuOperatorPackageName); err != nil {
-		if errors.Is(err, olm.ErrOperatorNotInstalled) || meta.IsNoMatchError(err) {
-			cm.MarkWarning(conditions.ConditionDCGMExporterAvailable,
-				conditions.MissingOperatorReason, conditions.GPUOperatorMissingMessage)
-			return nil
-		}
-		markDCGMExporterUnobservable(ctx, cm,
-			"Cannot determine whether the NVIDIA GPU Operator is installed", err)
-		return nil
-	}
-
-	// The operator can be installed with the exporter disabled, which reads as
-	// healthy at the operator level and leaves the scrape with no target.
 	svc := &corev1.Service{}
 	err := c.Get(ctx, types.NamespacedName{Namespace: dcgmExporterNamespace, Name: dcgmExporterService}, svc)
-	switch {
-	case k8serr.IsNotFound(err):
+	if err != nil {
+		if !k8serr.IsNotFound(err) {
+			markDCGMExporterUnobservable(ctx, cm,
+				"Cannot determine whether the DCGM exporter Service exists", err)
+			return nil
+		}
+
+		// The Service is the direct dependency. When it is absent, OLM is
+		// consulted only to distinguish an absent operator from an operator
+		// installed with the exporter disabled.
+		if _, olmErr := olm.OperatorExists(ctx, c, gpuOperatorPackageName); olmErr != nil {
+			if errors.Is(olmErr, olm.ErrOperatorNotInstalled) || meta.IsNoMatchError(olmErr) {
+				cm.MarkWarning(conditions.ConditionDCGMExporterAvailable,
+					conditions.MissingOperatorReason, conditions.GPUOperatorMissingMessage)
+				return nil
+			}
+			markDCGMExporterUnobservable(ctx, cm,
+				"Cannot determine whether the NVIDIA GPU Operator is installed", olmErr)
+			return nil
+		}
+
 		cm.MarkWarning(conditions.ConditionDCGMExporterAvailable,
 			conditions.DCGMExporterServiceNotFoundReason,
 			fmt.Sprintf(conditions.DCGMExporterServiceMissingMessage, dcgmExporterNamespace, dcgmExporterService))
-	case err != nil:
-		markDCGMExporterUnobservable(ctx, cm,
-			"Cannot determine whether the DCGM exporter Service exists", err)
-	default:
-		cm.MarkTrue(conditions.ConditionDCGMExporterAvailable)
+		return nil
 	}
+
+	ready, err := dcgmExporterReady(ctx, c)
+	if err != nil {
+		markDCGMExporterUnobservable(ctx, cm, "Cannot determine whether the DCGM exporter is ready", err)
+		return nil
+	}
+	if ready {
+		cm.MarkTrue(conditions.ConditionDCGMExporterAvailable)
+		return nil
+	}
+
+	cm.MarkWarning(conditions.ConditionDCGMExporterAvailable,
+		conditions.DCGMExporterNotReadyReason,
+		fmt.Sprintf(conditions.DCGMExporterNotReadyMessage, dcgmExporterNamespace, dcgmExporterService))
 	return nil
+}
+
+// dcgmExporterReady reports whether the exporter Service has at least one ready
+// endpoint. This intentionally does not depend on OLM: the GPU Operator can
+// also be installed by Helm, and a Service left behind by an uninstall is not
+// evidence that the exporter is still serving.
+func dcgmExporterReady(ctx context.Context, c client.Client) (bool, error) {
+	endpointSlices := &discoveryv1.EndpointSliceList{}
+	if err := c.List(ctx, endpointSlices,
+		client.InNamespace(dcgmExporterNamespace),
+		client.MatchingLabels{discoveryv1.LabelServiceName: dcgmExporterService}); err != nil {
+		return false, fmt.Errorf("listing DCGM exporter endpoint slices: %w", err)
+	}
+	for _, endpointSlice := range endpointSlices.Items {
+		for _, endpoint := range endpointSlice.Endpoints {
+			if endpoint.Conditions.Ready != nil && *endpoint.Conditions.Ready {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 // markDCGMExporterUnobservable records a failed lookup and lets the reconcile

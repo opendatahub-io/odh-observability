@@ -469,12 +469,12 @@ func TestRequeueForDCGMExporterRefresh(t *testing.T) {
 			want: 0,
 		},
 		{
-			name: "healthy exporter is already kept fresh by the Service watch",
+			name: "healthy exporter is refreshed because an uninstall can leave the Service behind",
 			configure: func(m *v1alpha1.Monitoring) {
 				m.Spec.Metrics = &v1alpha1.Metrics{}
 				conditions.NewConditionsManager(m, m.Generation).MarkTrue(conditions.ConditionDCGMExporterAvailable)
 			},
-			want: 0,
+			want: 5 * time.Minute,
 		},
 		{
 			name: "Removed state does not schedule refreshes",
@@ -515,6 +515,23 @@ func TestRequeueForDCGMExporterRefresh(t *testing.T) {
 				t.Fatalf("RequeueAfter = %s, want %s", result.RequeueAfter, tt.want)
 			}
 		})
+	}
+}
+
+func TestRequeueForDCGMExporterRefresh_PreservesCollectorRetry(t *testing.T) {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	m.Status.Conditions = []platformcommon.Condition{{
+		Type:   conditions.ConditionOpenTelemetryCollectorAvailable,
+		Status: metav1.ConditionFalse,
+	}}
+	conditions.NewConditionsManager(m, m.Generation).MarkTrue(conditions.ConditionDCGMExporterAvailable)
+
+	result := requeueForCollectorReadiness(reconcile.Result{}, m, nil)
+	result = requeueForDCGMExporterRefresh(result, m, nil)
+
+	if result.RequeueAfter != 30*time.Second {
+		t.Fatalf("collector readiness retry must win, got %s", result.RequeueAfter)
 	}
 }
 

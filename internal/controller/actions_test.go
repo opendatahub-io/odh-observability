@@ -4793,6 +4793,7 @@ func TestDeployDCGMExporterDependency_Available(t *testing.T) {
 			Name:      dcgmExporterService,
 			Namespace: dcgmExporterNamespace,
 		}},
+		dcgmExporterEndpointSlice(true),
 	)
 
 	var sources []rendertemplate.TemplateSource
@@ -4806,6 +4807,71 @@ func TestDeployDCGMExporterDependency_Available(t *testing.T) {
 	}
 }
 
+func TestDeployDCGMExporterDependency_HelmInstalledExporter(t *testing.T) {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	cli := dcgmTestClient(t,
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{
+			Name:      dcgmExporterService,
+			Namespace: dcgmExporterNamespace,
+		}},
+		dcgmExporterEndpointSlice(true),
+	)
+
+	var sources []rendertemplate.TemplateSource
+	if err := deployDCGMExporterDependency(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	c := mustFindCondition(t, m, conditions.ConditionDCGMExporterAvailable)
+	if c.Status != metav1.ConditionTrue {
+		t.Fatalf("a Helm-installed exporter with ready endpoints must be available, got %s/%s", c.Status, c.Reason)
+	}
+}
+
+func TestDeployDCGMExporterDependency_ServiceWithoutReadyEndpoints(t *testing.T) {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	cli := dcgmTestClient(t,
+		newOperatorCondition("gpu-operator-certified.v25.3.4"),
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{
+			Name:      dcgmExporterService,
+			Namespace: dcgmExporterNamespace,
+		}},
+		dcgmExporterEndpointSlice(false),
+	)
+
+	var sources []rendertemplate.TemplateSource
+	if err := deployDCGMExporterDependency(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	c := mustFindCondition(t, m, conditions.ConditionDCGMExporterAvailable)
+	if c.Status != metav1.ConditionFalse || c.Reason != conditions.DCGMExporterNotReadyReason {
+		t.Fatalf("expected False/%s, got %s/%s", conditions.DCGMExporterNotReadyReason, c.Status, c.Reason)
+	}
+}
+
+func TestDeployDCGMExporterDependency_UnknownDoesNotAffectReady(t *testing.T) {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	cm.MarkUnknown(conditions.ConditionDCGMExporterAvailable,
+		conditions.DCGMExporterCheckFailedReason, "lookup failed")
+
+	cm.MarkTrue(conditions.ConditionMonitoringDependenciesReady)
+	cm.AggregateReady()
+
+	ready := mustFindCondition(t, m, string(platformcommon.ConditionTypeReady))
+	if ready.Status != metav1.ConditionTrue {
+		t.Fatalf("an unknown optional exporter condition must not make Monitoring NotReady, got %s/%s", ready.Status, ready.Reason)
+	}
+}
+
 // serviceGetFails models an apiserver that cannot answer a single Service read,
 // the other half of the fail-closed paths.
 func serviceGetFails() interceptor.Funcs {
@@ -4815,6 +4881,34 @@ func serviceGetFails() interceptor.Funcs {
 				return k8serr.NewInternalError(errors.New("apiserver unavailable"))
 			}
 			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+}
+
+func dcgmExporterEndpointSlice(ready bool) *discoveryv1.EndpointSlice {
+	readyValue := ready
+	return &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      dcgmExporterService + "-abcde",
+			Namespace: dcgmExporterNamespace,
+			Labels:    map[string]string{discoveryv1.LabelServiceName: dcgmExporterService},
+		},
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses: []string{"10.0.0.1"},
+			Conditions: discoveryv1.EndpointConditions{
+				Ready: &readyValue,
+			},
+		}},
+	}
+}
+
+func endpointSliceListFails() interceptor.Funcs {
+	return interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*discoveryv1.EndpointSliceList); ok {
+				return k8serr.NewInternalError(errors.New("apiserver unavailable"))
+			}
+			return c.List(ctx, list, opts...)
 		},
 	}
 }
@@ -4856,6 +4950,31 @@ func TestDeployDCGMExporterDependency_ServiceLookupFailureStaysUnknown(t *testin
 	cm := conditions.NewConditionsManager(m, m.Generation)
 
 	cli := dcgmTestClientWith(t, serviceGetFails(), newOperatorCondition("gpu-operator-certified.v25.3.4"))
+
+	var sources []rendertemplate.TemplateSource
+	if err := deployDCGMExporterDependency(context.Background(), cli, m, cm, &sources); err != nil {
+		t.Fatalf("an optional dependency check must not fail the round: %v", err)
+	}
+
+	c := mustFindCondition(t, m, conditions.ConditionDCGMExporterAvailable)
+	if c.Status != metav1.ConditionUnknown || c.Reason != conditions.DCGMExporterCheckFailedReason {
+		t.Errorf("expected Unknown/%s, got %s/%s", conditions.DCGMExporterCheckFailedReason, c.Status, c.Reason)
+	}
+}
+
+func TestDeployDCGMExporterDependency_EndpointLookupFailureStaysUnknown(t *testing.T) {
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{}
+	cm := conditions.NewConditionsManager(m, m.Generation)
+
+	cli := dcgmTestClientWith(t,
+		endpointSliceListFails(),
+		newOperatorCondition("gpu-operator-certified.v25.3.4"),
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{
+			Name:      dcgmExporterService,
+			Namespace: dcgmExporterNamespace,
+		}},
+	)
 
 	var sources []rendertemplate.TemplateSource
 	if err := deployDCGMExporterDependency(context.Background(), cli, m, cm, &sources); err != nil {
