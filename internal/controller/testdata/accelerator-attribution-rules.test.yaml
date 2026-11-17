@@ -1,0 +1,266 @@
+rule_files:
+  - rules.yaml
+evaluation_interval: 15s
+tests:
+  # Input series arrive on the 30s scrape lattice the DS MonitoringStack sees;
+  # the rule groups evaluate at their own 15s interval. eval_times past 5m
+  # exercise the instant-query lookback: the stopped series' last recorded
+  # sample (tick 90s) is still visible at 120s and gone by 480s.
+  - interval: 30s
+    input_series:
+      # Trusted and fully attributed: value 0 the whole time — zero utilization
+      # still means the device is allocated.
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="team",pod="model",modelName="A100-SXM4-40GB",UUID="GPU-aaa",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
+        values: '0 0x20'
+      - series: 'DCGM_FI_PROF_GR_ENGINE_ACTIVE{namespace="team",pod="model",modelName="A100-SXM4-40GB",UUID="GPU-aaa",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
+        values: '0.5 0.5x20'
+      # Attacker forging workload attribution: no verified marker, so the
+      # rules must not count it, for the attacker or for the victim.
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="attacker",pod="exporter",exported_namespace="victim",exported_pod="model",modelName="A100-SXM4-40GB",UUID="GPU-evil",gpu="0",Hostname="gpu-node-1",node="gpu-node-1"}'
+        values: '0.9 0.9x20'
+      # A forged odh_dcgm_source marker: only the isolated trusted receiver
+      # can stamp "verified" in production.
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="attacker",pod="exporter",modelName="A100-SXM4-40GB",UUID="GPU-forged",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="forged"}'
+        values: '0.9 0.9x20'
+      # Trusted but unattributed (no workload pod): stays in the monitoring
+      # namespace, counted for reconciliation.
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="redhat-ods-monitoring",modelName="A30",UUID="GPU-free",gpu="2",Hostname="gpu-node-2",node="gpu-node-2",odh_dcgm_source="verified"}'
+        values: '0 0x20'
+      # Trusted series that stops mid-fixture: recorded output must go stale
+      # (absent by eval_time 480s, more than one lookback after tick 90s).
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="team",pod="stopped",modelName="A100-SXM4-40GB",UUID="GPU-stopped",gpu="1",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
+        values: '0 0x2'
+      # Queueless tenant workload: must stay counted, without queue labels.
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="other",pod="plain",modelName="H100",UUID="GPU-bbb",gpu="0",Hostname="gpu-node-3",node="gpu-node-3",odh_dcgm_source="verified"}'
+        values: '0 0x20'
+      # kube-state-metrics, federated from platform Prometheus: only the
+      # trusted federation receiver stamps odh_federation_source, so the
+      # legitimate series carry the marker the Tier 2 selectors require.
+      - series: 'kube_pod_labels{namespace="team",pod="model",label_kueue_x_k8s_io_cluster_queue_name="cq-a",label_kueue_x_k8s_io_local_queue_name="lq-a",odh_federation_source="model-resources"}'
+        values: '1 1x20'
+      - series: 'kube_pod_labels{namespace="other",pod="plain",label_app="x",odh_federation_source="model-resources"}'
+        values: '1 1x20'
+      - series: 'kube_pod_owner{namespace="team",pod="model",owner_kind="Job",owner_name="train",owner_is_controller="true",odh_federation_source="model-resources"}'
+        values: '1 1x20'
+      # Owner of a non-GPU pod: must not appear in the scoped owner map.
+      - series: 'kube_pod_owner{namespace="other",pod="irrelevant",owner_kind="ReplicaSet",owner_name="rs-1",odh_federation_source="model-resources"}'
+        values: '1 1x20'
+      # Forged attribution metadata, exposed by a workload without the
+      # federation provenance marker: must not redirect queue attribution
+      # for team/model to the forged queue, and must not duplicate the
+      # join right-hand side (which would fail rule evaluation).
+      - series: 'kube_pod_labels{namespace="team",pod="model",label_kueue_x_k8s_io_cluster_queue_name="forged-cq",label_kueue_x_k8s_io_local_queue_name="forged-lq"}'
+        values: '1 1x20'
+      # Forged owner for a GPU-attributed pod: must not enter the owner map.
+      - series: 'kube_pod_owner{namespace="team",pod="model",owner_kind="Job",owner_name="evil-job"}'
+        values: '1 1x20'
+      # The collector's scrape report for the trusted DCGM job, as forwarded
+      # through the collector and scraped by the DS Prometheus.
+      - series: 'up{exported_job="rhoai-accelerator-metrics",namespace="redhat-ods-monitoring",node="gpu-node-1",component="nvidia-dcgm-exporter",instance="collector-0"}'
+        values: '1 1 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    promql_expr_test:
+      # Tier 1: only verified series, zero value still counts as allocated,
+      # attribution labels kept, provenance and forgeable labels dropped.
+      # The stopped series is still visible at 120s via the instant-query
+      # lookback; its absence is asserted at 480s below.
+      - expr: accelerator_gpu_hours_allocated
+        eval_time: 120s
+        exp_samples:
+          - labels: 'accelerator_gpu_hours_allocated{namespace="team",pod="model",modelName="A100-SXM4-40GB",UUID="GPU-aaa",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",vendor="nvidia"}'
+            value: 1
+          - labels: 'accelerator_gpu_hours_allocated{namespace="team",pod="stopped",modelName="A100-SXM4-40GB",UUID="GPU-stopped",gpu="1",Hostname="gpu-node-1",node="gpu-node-1",vendor="nvidia"}'
+            value: 1
+          - labels: 'accelerator_gpu_hours_allocated{namespace="other",pod="plain",modelName="H100",UUID="GPU-bbb",gpu="0",Hostname="gpu-node-3",node="gpu-node-3",vendor="nvidia"}'
+            value: 1
+          - labels: 'accelerator_gpu_hours_allocated{namespace="redhat-ods-monitoring",modelName="A30",UUID="GPU-free",gpu="2",Hostname="gpu-node-2",node="gpu-node-2",vendor="nvidia"}'
+            value: 1
+      # Forged attribution (exported_namespace) and forged markers produce no
+      # billing output for either the attacker or the victim.
+      - expr: accelerator_gpu_hours_allocated{namespace="victim"}
+        eval_time: 120s
+        exp_samples: []
+      - expr: accelerator_gpu_hours_allocated{UUID=~"GPU-evil|GPU-forged"}
+        eval_time: 120s
+        exp_samples: []
+      # Tier 1: utilization is the time-integral input, 0-1 occupancy.
+      - expr: accelerator_gpu_hours_utilized
+        eval_time: 120s
+        exp_samples:
+          - labels: 'accelerator_gpu_hours_utilized{namespace="team",pod="model",modelName="A100-SXM4-40GB",UUID="GPU-aaa",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",vendor="nvidia"}'
+            value: 0.5
+      # Tier 2: Kueue-labeled pods gain queue labels...
+      - expr: accelerator_gpu_hours_allocated_kueue{pod="model"}
+        eval_time: 120s
+        exp_samples:
+          - labels: 'accelerator_gpu_hours_allocated_kueue{namespace="team",pod="model",modelName="A100-SXM4-40GB",UUID="GPU-aaa",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",label_kueue_x_k8s_io_cluster_queue_name="cq-a",label_kueue_x_k8s_io_local_queue_name="lq-a",vendor="nvidia"}'
+            value: 1
+      # ...while queueless pods pass through unlabeled, not zeroed or dropped.
+      - expr: accelerator_gpu_hours_allocated_kueue{pod="plain"}
+        eval_time: 120s
+        exp_samples:
+          - labels: 'accelerator_gpu_hours_allocated_kueue{namespace="other",pod="plain",modelName="H100",UUID="GPU-bbb",gpu="0",Hostname="gpu-node-3",node="gpu-node-3",vendor="nvidia"}'
+            value: 1
+      # Forged queue metadata without the federation marker is ignored.
+      - expr: accelerator_gpu_hours_allocated_kueue{label_kueue_x_k8s_io_cluster_queue_name="forged-cq"}
+        eval_time: 120s
+        exp_samples: []
+      # Tier 2: owner map scoped to GPU-attributed pods only.
+      - expr: accelerator_pod_owner
+        eval_time: 120s
+        exp_samples:
+          - labels: 'accelerator_pod_owner{namespace="team",pod="model",owner_kind="Job",owner_name="train"}'
+            value: 1
+      # Forged owner metadata without the federation marker is ignored.
+      - expr: accelerator_pod_owner{owner_name="evil-job"}
+        eval_time: 120s
+        exp_samples: []
+      # Tier 3: Shape 2 — primary billing metric. At 120s the stopped series
+      # still contributes to team via the lookback.
+      - expr: accelerator_gpu_hours_allocated_by_namespace
+        eval_time: 120s
+        exp_samples:
+          - labels: 'accelerator_gpu_hours_allocated_by_namespace{namespace="team",vendor="nvidia"}'
+            value: 2
+          - labels: 'accelerator_gpu_hours_allocated_by_namespace{namespace="other",vendor="nvidia"}'
+            value: 1
+          - labels: 'accelerator_gpu_hours_allocated_by_namespace{namespace="redhat-ods-monitoring",vendor="nvidia"}'
+            value: 1
+      # Tier 3: Shape 3 — cluster total.
+      - expr: accelerator_gpu_hours_allocated_by_cluster
+        eval_time: 120s
+        exp_samples:
+          - labels: 'accelerator_gpu_hours_allocated_by_cluster{vendor="nvidia"}'
+            value: 4
+      # Tier 3: Shape 6 — per GPU family.
+      - expr: accelerator_gpu_hours_allocated_by_model
+        eval_time: 120s
+        exp_samples:
+          - labels: 'accelerator_gpu_hours_allocated_by_model{modelName="A100-SXM4-40GB",vendor="nvidia"}'
+            value: 2
+          - labels: 'accelerator_gpu_hours_allocated_by_model{modelName="H100",vendor="nvidia"}'
+            value: 1
+          - labels: 'accelerator_gpu_hours_allocated_by_model{modelName="A30",vendor="nvidia"}'
+            value: 1
+      # Tier 3: Shape 7 — per device (pod dropped, UUID kept).
+      - expr: accelerator_gpu_hours_allocated_by_device
+        eval_time: 120s
+        exp_samples:
+          - labels: 'accelerator_gpu_hours_allocated_by_device{namespace="team",modelName="A100-SXM4-40GB",UUID="GPU-aaa",vendor="nvidia"}'
+            value: 1
+          - labels: 'accelerator_gpu_hours_allocated_by_device{namespace="team",modelName="A100-SXM4-40GB",UUID="GPU-stopped",vendor="nvidia"}'
+            value: 1
+          - labels: 'accelerator_gpu_hours_allocated_by_device{namespace="other",modelName="H100",UUID="GPU-bbb",vendor="nvidia"}'
+            value: 1
+          - labels: 'accelerator_gpu_hours_allocated_by_device{namespace="redhat-ods-monitoring",modelName="A30",UUID="GPU-free",vendor="nvidia"}'
+            value: 1
+      # Tier 3: Kueue slice of Shape 2.
+      - expr: accelerator_gpu_hours_allocated_by_namespace_queue{label_kueue_x_k8s_io_cluster_queue_name="cq-a"}
+        eval_time: 120s
+        exp_samples:
+          - labels: 'accelerator_gpu_hours_allocated_by_namespace_queue{namespace="team",label_kueue_x_k8s_io_cluster_queue_name="cq-a",vendor="nvidia"}'
+            value: 1
+      # Tier 3: utilization per namespace.
+      - expr: accelerator_gpu_hours_utilized_by_namespace
+        eval_time: 120s
+        exp_samples:
+          - labels: 'accelerator_gpu_hours_utilized_by_namespace{namespace="team",vendor="nvidia"}'
+            value: 0.5
+      # Health: pass-through of the collector's DCGM scrape report.
+      - expr: accelerator_dcgm_scrape_up
+        eval_time: 150s
+        exp_samples:
+          - labels: 'accelerator_dcgm_scrape_up{exported_job="rhoai-accelerator-metrics",namespace="redhat-ods-monitoring",node="gpu-node-1",component="nvidia-dcgm-exporter",instance="collector-0",vendor="nvidia"}'
+            value: 1
+      # Health: 3m availability — window (0s,90s] holds samples 1,1,0,0.
+      - expr: accelerator_dcgm_scrape_availability
+        eval_time: 90s
+        exp_samples:
+          - labels: 'accelerator_dcgm_scrape_availability{node="gpu-node-1",component="nvidia-dcgm-exporter",vendor="nvidia"}'
+            value: 0.5
+      # Staleness: the stopped series' last recorded sample (tick 90s) is
+      # beyond the 5m instant-query lookback at 480s, so allocation ends.
+      - expr: accelerator_gpu_hours_allocated{UUID="GPU-stopped"}
+        eval_time: 480s
+        exp_samples: []
+      - expr: accelerator_gpu_hours_allocated_by_namespace
+        eval_time: 480s
+        exp_samples:
+          - labels: 'accelerator_gpu_hours_allocated_by_namespace{namespace="team",vendor="nvidia"}'
+            value: 1
+          - labels: 'accelerator_gpu_hours_allocated_by_namespace{namespace="other",vendor="nvidia"}'
+            value: 1
+          - labels: 'accelerator_gpu_hours_allocated_by_namespace{namespace="redhat-ods-monitoring",vendor="nvidia"}'
+            value: 1
+  # Release-and-reassignment at the timing boundary: while the previous pod's
+  # samples are still inside the 45s presence window, the timestamp freshness
+  # guard must keep only the assignment carrying the device's newest sample,
+  # so one GPU is never billed to two pods at once. The guard's effect is on
+  # the recorded sample stream (what sum_over_time integrates), not on instant
+  # queries, whose 5m lookback still shows the last record — hence the
+  # sum_over_time assertions. Pod old's raw samples end at tick 30s; pod new
+  # starts at tick 60s on the same device; without the guard, old would also
+  # be recorded at rule eval 60s (its window (15s,60s] still holds tick 30s).
+  - interval: 30s
+    input_series:
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="team",pod="old",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
+        values: '0 0'
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="team",pod="new",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
+        values: '_ _ 0 0x3'
+      - series: 'DCGM_FI_PROF_GR_ENGINE_ACTIVE{namespace="team",pod="old",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
+        values: '0.25 0.25'
+      - series: 'DCGM_FI_PROF_GR_ENGINE_ACTIVE{namespace="team",pod="new",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
+        values: '_ _ 0.75 0.75x3'
+      # Simultaneous time-sliced sharers: equal sample timestamps, so the
+      # freshness guard must keep both counted.
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="shared",pod="slice-a",modelName="H100",UUID="GPU-slice",gpu="1",Hostname="gpu-node-2",node="gpu-node-2",odh_dcgm_source="verified"}'
+        values: '0 0x6'
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="shared",pod="slice-b",modelName="H100",UUID="GPU-slice",gpu="1",Hostname="gpu-node-2",node="gpu-node-2",odh_dcgm_source="verified"}'
+        values: '0 0x6'
+    promql_expr_test:
+      # Mid-handoff, before new reports: old is allocated.
+      - expr: accelerator_gpu_hours_allocated{pod="old"}
+        eval_time: 45s
+        exp_samples:
+          - labels: 'accelerator_gpu_hours_allocated{namespace="team",pod="old",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",vendor="nvidia"}'
+            value: 1
+      # After the handoff, old's recorded allocation is exactly the four
+      # pre-handoff rule evals (0s..45s); the overlap eval at 60s is dropped.
+      - expr: sum_over_time(accelerator_gpu_hours_allocated{pod="old"}[11m])
+        eval_time: 600s
+        exp_samples:
+          - labels: '{namespace="team",pod="old",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",vendor="nvidia"}'
+            value: 4
+      # new's allocation runs from the first post-handoff eval (60s) through
+      # the last eval whose window holds its final tick 180s (eval 210s):
+      # eleven samples.
+      - expr: sum_over_time(accelerator_gpu_hours_allocated{pod="new"}[11m])
+        eval_time: 600s
+        exp_samples:
+          - labels: '{namespace="team",pod="new",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",vendor="nvidia"}'
+            value: 11
+      # Utilization follows the same handoff discipline: old recorded 0.25 at
+      # each of its four evals, new 0.75 at each of its eleven.
+      - expr: sum_over_time(accelerator_gpu_hours_utilized{pod="old"}[11m])
+        eval_time: 600s
+        exp_samples:
+          - labels: '{namespace="team",pod="old",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",vendor="nvidia"}'
+            value: 1
+      - expr: sum_over_time(accelerator_gpu_hours_utilized{pod="new"}[11m])
+        eval_time: 600s
+        exp_samples:
+          - labels: '{namespace="team",pod="new",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",vendor="nvidia"}'
+            value: 8.25
+      # Time-sliced sharers stay counted, and the per-device shape reflects
+      # both assignments of the one device.
+      - expr: accelerator_gpu_hours_allocated{UUID="GPU-slice"}
+        eval_time: 120s
+        exp_samples:
+          - labels: 'accelerator_gpu_hours_allocated{namespace="shared",pod="slice-a",modelName="H100",UUID="GPU-slice",gpu="1",Hostname="gpu-node-2",node="gpu-node-2",vendor="nvidia"}'
+            value: 1
+          - labels: 'accelerator_gpu_hours_allocated{namespace="shared",pod="slice-b",modelName="H100",UUID="GPU-slice",gpu="1",Hostname="gpu-node-2",node="gpu-node-2",vendor="nvidia"}'
+            value: 1
+      - expr: accelerator_gpu_hours_allocated_by_device{UUID="GPU-slice"}
+        eval_time: 120s
+        exp_samples:
+          - labels: 'accelerator_gpu_hours_allocated_by_device{namespace="shared",modelName="H100",UUID="GPU-slice",vendor="nvidia"}'
+            value: 2

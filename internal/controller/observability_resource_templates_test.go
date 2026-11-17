@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -135,6 +136,286 @@ func TestAcceleratorRecordingRulesTemplateContract(t *testing.T) {
 	})
 }
 
+type attributionRuleSpec struct {
+	record  string
+	expr    string
+	labels  map[string]string
+	noLabel bool
+}
+
+type attributionGroupSpec struct {
+	name  string
+	rules []attributionRuleSpec
+}
+
+// expectedLabels returns the static labels a rendered rule must carry, or nil
+// when it must carry no labels block at all. A cluster name adds the cluster
+// label to every rule, including the otherwise unlabeled pod-owner map.
+func (s attributionRuleSpec) expectedLabels(clusterName string) map[string]string {
+	want := map[string]string{}
+	if !s.noLabel {
+		maps.Copy(want, s.labels)
+	}
+	if clusterName != "" {
+		want["cluster"] = clusterName
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	return want
+}
+
+// wantAttributionGroups pins the accelerator attribution rule contract: the
+// group names, the 15s evaluation interval (per the epic), and the exact
+// expression of every recording rule.
+func wantAttributionGroups() []attributionGroupSpec {
+	return []attributionGroupSpec{
+		{
+			name: "rhoai.accelerator.attribution",
+			rules: []attributionRuleSpec{
+				{
+					record: "accelerator_gpu_hours_allocated",
+					expr: `max by (namespace, pod, modelName, UUID, gpu, Hostname, node) ` +
+						`((count_over_time(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified"}[45s]) > bool 0) ` +
+						`and (timestamp(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified"}) ` +
+						`== on (UUID, gpu, Hostname, node) group_left ` +
+						`max by (UUID, gpu, Hostname, node) (timestamp(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified"}))))`,
+					labels: map[string]string{"vendor": "nvidia"},
+				},
+				{
+					record: "accelerator_gpu_hours_utilized",
+					expr: `max by (namespace, pod, modelName, UUID, gpu, Hostname, node) ` +
+						`(avg_over_time(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified"}[45s]) ` +
+						`and (timestamp(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified"}) ` +
+						`== on (UUID, gpu, Hostname, node) group_left ` +
+						`max by (UUID, gpu, Hostname, node) (timestamp(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified"}))))`,
+					labels: map[string]string{"vendor": "nvidia"},
+				},
+			},
+		},
+		{
+			name: "rhoai.accelerator.attribution_enrichment",
+			rules: []attributionRuleSpec{
+				{
+					record: "accelerator_gpu_hours_allocated_kueue",
+					expr: `(accelerator_gpu_hours_allocated * on (namespace, pod) group_left ` +
+						`(label_kueue_x_k8s_io_cluster_queue_name, label_kueue_x_k8s_io_local_queue_name) ` +
+						`kube_pod_labels{odh_federation_source="model-resources", ` +
+						`label_kueue_x_k8s_io_cluster_queue_name=~".+"}) or ` +
+						`(accelerator_gpu_hours_allocated unless on (namespace, pod) ` +
+						`kube_pod_labels{odh_federation_source="model-resources", ` +
+						`label_kueue_x_k8s_io_cluster_queue_name=~".+"})`,
+					labels: map[string]string{"vendor": "nvidia"},
+				},
+				{
+					record: "accelerator_pod_owner",
+					expr: `sum by (namespace, pod, owner_kind, owner_name) ` +
+						`(kube_pod_owner{odh_federation_source="model-resources"} ` +
+						`and on (namespace, pod) (count by (namespace, pod) (accelerator_gpu_hours_allocated)))`,
+					noLabel: true,
+				},
+			},
+		},
+		{
+			name: "rhoai.accelerator.allocation",
+			rules: []attributionRuleSpec{
+				{
+					record: "accelerator_gpu_hours_allocated_by_namespace",
+					expr:   `sum by (namespace) (accelerator_gpu_hours_allocated)`,
+					labels: map[string]string{"vendor": "nvidia"},
+				},
+				{
+					record: "accelerator_gpu_hours_allocated_by_cluster",
+					expr:   `sum(accelerator_gpu_hours_allocated)`,
+					labels: map[string]string{"vendor": "nvidia"},
+				},
+				{
+					record: "accelerator_gpu_hours_allocated_by_model",
+					expr:   `sum by (modelName) (accelerator_gpu_hours_allocated)`,
+					labels: map[string]string{"vendor": "nvidia"},
+				},
+				{
+					record: "accelerator_gpu_hours_allocated_by_device",
+					expr:   `sum by (namespace, modelName, UUID) (accelerator_gpu_hours_allocated)`,
+					labels: map[string]string{"vendor": "nvidia"},
+				},
+				{
+					record: "accelerator_gpu_hours_allocated_by_namespace_queue",
+					expr:   `sum by (namespace, label_kueue_x_k8s_io_cluster_queue_name) (accelerator_gpu_hours_allocated_kueue)`,
+					labels: map[string]string{"vendor": "nvidia"},
+				},
+				{
+					record: "accelerator_gpu_hours_utilized_by_namespace",
+					expr:   `sum by (namespace) (accelerator_gpu_hours_utilized)`,
+					labels: map[string]string{"vendor": "nvidia"},
+				},
+			},
+		},
+		{
+			name: "rhoai.accelerator.scrape_health",
+			rules: []attributionRuleSpec{
+				{
+					record: "accelerator_dcgm_scrape_up",
+					expr:   `up{exported_job="rhoai-accelerator-metrics"}`,
+					labels: map[string]string{"vendor": "nvidia"},
+				},
+				{
+					record: "accelerator_dcgm_scrape_availability",
+					expr:   `max by (node, component) (avg_over_time(up{exported_job="rhoai-accelerator-metrics"}[3m]))`,
+					labels: map[string]string{"vendor": "nvidia"},
+				},
+			},
+		},
+	}
+}
+
+// attributionRulesByName flattens the rendered PrometheusRule groups into a
+// map keyed by recording rule name.
+func attributionRulesByName(t *testing.T, resource unstructured.Unstructured) map[string]map[string]any {
+	t.Helper()
+	groups, found, err := unstructured.NestedSlice(resource.Object, "spec", "groups")
+	if err != nil || !found {
+		t.Fatalf("PrometheusRule must carry spec.groups: found=%t error=%v", found, err)
+	}
+	rulesByName := make(map[string]map[string]any)
+	for _, rawGroup := range groups {
+		group, ok := rawGroup.(map[string]any)
+		if !ok {
+			t.Fatalf("PrometheusRule group has unexpected type %T", rawGroup)
+		}
+		groupRules, ok := group["rules"].([]any)
+		if !ok {
+			t.Fatalf("PrometheusRule group %q has unexpected rules type %T", group["name"], group["rules"])
+		}
+		for _, rawRule := range groupRules {
+			rule, ok := rawRule.(map[string]any)
+			if !ok {
+				t.Fatalf("recording rule has unexpected type %T", rawRule)
+			}
+			record, ok := rule["record"].(string)
+			if !ok {
+				t.Fatalf("recording rule has unexpected record type %T", rule["record"])
+			}
+			rulesByName[record] = rule
+		}
+	}
+	return rulesByName
+}
+
+// assertAttributionRuleGroups verifies a rendered attribution PrometheusRule
+// against wantAttributionGroups, including the optional static cluster label.
+func assertAttributionRuleGroups(t *testing.T, resources []unstructured.Unstructured, clusterName string) {
+	t.Helper()
+	if len(resources) != 1 {
+		t.Fatalf("expected one PrometheusRule, got %d resources", len(resources))
+	}
+	resource := resources[0]
+	if resource.GetAPIVersion() != "monitoring.rhobs/v1" || resource.GetKind() != "PrometheusRule" {
+		t.Fatalf("unexpected resource identity: apiVersion=%q kind=%q", resource.GetAPIVersion(), resource.GetKind())
+	}
+	if resource.GetName() != "data-science-accelerator-attribution-rules" || resource.GetNamespace() != testMonitoringNamespace {
+		t.Fatalf("unexpected PrometheusRule metadata: name=%q namespace=%q", resource.GetName(), resource.GetNamespace())
+	}
+	if labels := resource.GetLabels(); len(labels) != 1 || labels["platform.opendatahub.io/part-of"] != "monitoring" {
+		t.Fatalf("unexpected PrometheusRule labels: %#v", labels)
+	}
+
+	wantGroups := wantAttributionGroups()
+	groups, found, err := unstructured.NestedSlice(resource.Object, "spec", "groups")
+	if err != nil || !found || len(groups) != len(wantGroups) {
+		t.Fatalf("expected %d PrometheusRule groups: found=%t error=%v groups=%v", len(wantGroups), found, err, groups)
+	}
+	for i, wantGroup := range wantGroups {
+		group, ok := groups[i].(map[string]any)
+		if !ok {
+			t.Fatalf("PrometheusRule group has unexpected type %T", groups[i])
+		}
+		if group["name"] != wantGroup.name || group["interval"] != "15s" {
+			t.Fatalf("unexpected PrometheusRule group: %#v", group)
+		}
+		groupRules, ok := group["rules"].([]any)
+		if !ok {
+			t.Fatalf("PrometheusRule rules have unexpected type %T", group["rules"])
+		}
+		if len(groupRules) != len(wantGroup.rules) {
+			t.Fatalf("group %q: expected %d rules, got %d", wantGroup.name, len(wantGroup.rules), len(groupRules))
+		}
+	}
+
+	actualRules := attributionRulesByName(t, resource)
+	for _, wantGroup := range wantGroups {
+		for _, want := range wantGroup.rules {
+			rule, found := actualRules[want.record]
+			if !found {
+				t.Errorf("group %q: recording rule %q is missing", wantGroup.name, want.record)
+				continue
+			}
+			if rule["expr"] != want.expr {
+				t.Errorf("recording rule %q: want expr=%q, got %#v", want.record, want.expr, rule["expr"])
+			}
+			wantLabels := want.expectedLabels(clusterName)
+			rawLabels, hasLabels := rule["labels"]
+			if wantLabels == nil {
+				if hasLabels {
+					t.Errorf("recording rule %q must carry no static labels, got %#v", want.record, rawLabels)
+				}
+				continue
+			}
+			labels, ok := rawLabels.(map[string]any)
+			if !ok || !reflect.DeepEqual(labels, stringMap(wantLabels)) {
+				t.Errorf("recording rule %q: want labels=%#v, got %#v", want.record, wantLabels, rawLabels)
+			}
+		}
+	}
+}
+
+func TestAcceleratorAttributionRulesTemplateContract(t *testing.T) {
+	renderData := func(clusterName string) map[string]any {
+		return map[string]any{
+			"AcceleratorMetrics":       true,
+			"BuiltinDCGMScrapeEnabled": true,
+			"ClusterName":              clusterName,
+			"Namespace":                testMonitoringNamespace,
+		}
+	}
+
+	t.Run("renders the attribution rules when the built-in DCGM scrape is enabled", func(t *testing.T) {
+		resources := renderObservabilityTemplate(t, AcceleratorAttributionRulesTemplate, renderData(""))
+		assertAttributionRuleGroups(t, resources, "")
+	})
+
+	t.Run("adds the cluster label to every rule when a cluster name is set", func(t *testing.T) {
+		resources := renderObservabilityTemplate(t, AcceleratorAttributionRulesTemplate, renderData("hub-spoke-1"))
+		assertAttributionRuleGroups(t, resources, "hub-spoke-1")
+	})
+
+	t.Run("does not render rules when accelerator metrics are disabled", func(t *testing.T) {
+		data := renderData("")
+		data["AcceleratorMetrics"] = false
+		resources := renderObservabilityTemplate(t, AcceleratorAttributionRulesTemplate, data)
+		if len(resources) != 0 {
+			t.Fatalf("expected no PrometheusRule resources when accelerator metrics are disabled, got %d", len(resources))
+		}
+	})
+
+	t.Run("does not render rules when the built-in DCGM scrape is disabled", func(t *testing.T) {
+		data := renderData("")
+		data["BuiltinDCGMScrapeEnabled"] = false
+		resources := renderObservabilityTemplate(t, AcceleratorAttributionRulesTemplate, data)
+		if len(resources) != 0 {
+			t.Fatalf("expected no PrometheusRule resources when the built-in DCGM scrape is disabled, got %d", len(resources))
+		}
+	})
+}
+
+func stringMap(in map[string]string) map[string]any {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
 func TestDeployMonitoringStackWithQuerierIncludesTelemetryResources(t *testing.T) {
 	scheme := newActionsTestScheme(t)
 	registerCRDs(scheme, gvk.MonitoringStack, gvk.ThanosQuerier)
@@ -164,6 +445,7 @@ func TestDeployMonitoringStackWithQuerierIncludesTelemetryResources(t *testing.T
 		AlertmanagerProxyNetworkPolicyTemplate,
 		AlertmanagerRouteTemplate,
 		AcceleratorRecordingRulesTemplate,
+		AcceleratorAttributionRulesTemplate,
 		PrometheusRouteTemplate,
 		PrometheusServiceOverrideTemplate,
 		PrometheusNetworkPolicyTemplate,
@@ -178,6 +460,46 @@ func TestDeployMonitoringStackWithQuerierIncludesTelemetryResources(t *testing.T
 		ThanosQuerierRouteTemplate,
 	}
 	assertTemplatePaths(t, sources, wantSources)
+}
+
+func TestMonitoringStackExternalLabelsFollowClusterName(t *testing.T) {
+	renderData := func(clusterName string) map[string]any {
+		return map[string]any{
+			"Namespace":        testMonitoringNamespace,
+			"StorageSize":      "5Gi",
+			"Replicas":         int64(2),
+			"StorageRetention": "90d",
+			"CPULimit":         "1",
+			"MemoryLimit":      "512Mi",
+			"CPURequest":       "100m",
+			"MemoryRequest":    "256Mi",
+			"ClusterName":      clusterName,
+		}
+	}
+
+	t.Run("adds the cluster external label when a cluster name is set", func(t *testing.T) {
+		resources := renderObservabilityTemplate(t, MonitoringStackTemplate, renderData("hub-spoke-1"))
+		if len(resources) != 1 {
+			t.Fatalf("expected one MonitoringStack, got %d resources", len(resources))
+		}
+		external, found, err := unstructured.NestedMap(resources[0].Object, "spec", "prometheusConfig", "externalLabels")
+		if err != nil || !found {
+			t.Fatalf("MonitoringStack must carry externalLabels: found=%t error=%v", found, err)
+		}
+		if external["cluster"] != "hub-spoke-1" {
+			t.Fatalf("unexpected externalLabels: %#v", external)
+		}
+	})
+
+	t.Run("omits externalLabels when no cluster name is set", func(t *testing.T) {
+		resources := renderObservabilityTemplate(t, MonitoringStackTemplate, renderData(""))
+		if len(resources) != 1 {
+			t.Fatalf("expected one MonitoringStack, got %d resources", len(resources))
+		}
+		if _, found, _ := unstructured.NestedMap(resources[0].Object, "spec", "prometheusConfig", "externalLabels"); found {
+			t.Fatal("MonitoringStack must not carry externalLabels without a cluster name")
+		}
+	})
 }
 
 func TestTempoRouteTargetsTheSecureGateway(t *testing.T) {
