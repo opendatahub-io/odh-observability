@@ -113,6 +113,33 @@ var (
 		Kind:    "ServiceMonitor",
 	}
 
+	// Kueue queueing objects (kueue.x-k8s.io/v1beta2) used by the GPU-hours
+	// e2e to exercise real workload admission.
+	ResourceFlavor = schema.GroupVersionKind{
+		Group:   "kueue.x-k8s.io",
+		Version: "v1beta2",
+		Kind:    "ResourceFlavor",
+	}
+
+	ClusterQueue = schema.GroupVersionKind{
+		Group:   "kueue.x-k8s.io",
+		Version: "v1beta2",
+		Kind:    "ClusterQueue",
+	}
+
+	LocalQueue = schema.GroupVersionKind{
+		Group:   "kueue.x-k8s.io",
+		Version: "v1beta2",
+		Kind:    "LocalQueue",
+	}
+
+	// Kueue (kueue.openshift.io/v1) — the OpenShift Kueue operator's instance CR.
+	Kueue = schema.GroupVersionKind{
+		Group:   "kueue.openshift.io",
+		Version: "v1",
+		Kind:    "Kueue",
+	}
+
 	// PodMonitor (monitoring.rhobs/v1) for RHOBS stack.
 	PodMonitor = schema.GroupVersionKind{
 		Group:   "monitoring.rhobs",
