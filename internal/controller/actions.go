@@ -93,6 +93,7 @@ const (
 	PersesOperatorAccessNetworkPolicyTemplate        = "resources/perses-operator-access-network-policy.tmpl.yaml"
 	OperatorPrometheusRulesTemplate                  = "monitoring/operator-prometheusrules.tmpl.yaml"
 	AcceleratorRecordingRulesTemplate                = "resources/accelerator-recording-rules.tmpl.yaml"
+	AcceleratorAttributionRulesTemplate              = "resources/accelerator-attribution-recording-rules.tmpl.yaml"
 	UsageLogsOpenTelemetryCollectorTemplate          = "resources/usage-logs-opentelemetry-collector.tmpl.yaml"
 	UsageLogsOpenTelemetryCollectorRBACTemplate      = "resources/usage-logs-opentelemetry-collector-rbac.tmpl.yaml"
 	UsageLogsOpenTelemetryCollectorNPTemplate        = "resources/usage-logs-opentelemetry-collector-network-policy.tmpl.yaml"
@@ -204,6 +205,7 @@ func deployMonitoringStackWithQuerierAndRestrictions(
 		src(AlertmanagerProxyNetworkPolicyTemplate),
 		src(AlertmanagerRouteTemplate),
 		src(AcceleratorRecordingRulesTemplate),
+		src(AcceleratorAttributionRulesTemplate),
 		src(PrometheusRouteTemplate),
 		src(PrometheusServiceOverrideTemplate),
 		src(PrometheusNetworkPolicyTemplate),

@@ -67,6 +67,21 @@ spec:
         - sourceLabels: [odh_federation_source]
           regex: model-resources
           action: drop
+        # Reserve the recording-rule output names: exactly the records
+        # emitted by the accelerator recording-rule templates deployed
+        # into this Prometheus. Workload exposition and OTLP pushes are
+        # tenant-controlled, and a seeded series carrying one of these
+        # names would be summed alongside rule output by the aggregation
+        # rules and tenant queries. Recording rules are evaluated inside
+        # Prometheus and never traverse this scrape, and the trusted DCGM
+        # receiver only admits DCGM_FI_* names, so no legitimate series
+        # matches this drop; unrelated accelerator_* names from workload
+        # exposition stay accepted. The contract test cross-checks this
+        # list against the rules templates so a new record cannot silently
+        # reopen the hole.
+        - sourceLabels: [__name__]
+          regex: accelerator_dcgm_scrape_availability|accelerator_dcgm_scrape_up|accelerator_gpu_hours_allocated|accelerator_gpu_hours_allocated_by_cluster|accelerator_gpu_hours_allocated_by_device|accelerator_gpu_hours_allocated_by_model|accelerator_gpu_hours_allocated_by_namespace|accelerator_gpu_hours_allocated_by_namespace_queue|accelerator_gpu_hours_allocated_kueue|accelerator_gpu_hours_utilized|accelerator_gpu_hours_utilized_by_namespace|accelerator_gpu_utilization|accelerator_memory_used_bytes|accelerator_pod_owner|accelerator_power_usage_watts|accelerator_temperature_celsius
+          action: drop
         - sourceLabels: [k8s_namespace_name]
           regex: (.+)
           targetLabel: namespace
