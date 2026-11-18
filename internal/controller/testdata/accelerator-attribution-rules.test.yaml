@@ -9,10 +9,12 @@ tests:
   - interval: 30s
     input_series:
       # Trusted and fully attributed: value 0 the whole time — zero utilization
-      # still means the device is allocated.
-      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="team",pod="model",modelName="A100-SXM4-40GB",UUID="GPU-aaa",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
+      # still means the device is allocated. Attributed series carry both the
+      # promoted namespace/pod and the receiver-stamped odh_dcgm_workload_*
+      # pair the Tier 1 selectors require.
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="team",pod="model",odh_dcgm_workload_namespace="team",odh_dcgm_workload_pod="model",modelName="A100-SXM4-40GB",UUID="GPU-aaa",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
         values: '0 0x20'
-      - series: 'DCGM_FI_PROF_GR_ENGINE_ACTIVE{namespace="team",pod="model",modelName="A100-SXM4-40GB",UUID="GPU-aaa",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
+      - series: 'DCGM_FI_PROF_GR_ENGINE_ACTIVE{namespace="team",pod="model",odh_dcgm_workload_namespace="team",odh_dcgm_workload_pod="model",modelName="A100-SXM4-40GB",UUID="GPU-aaa",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
         values: '0.5 0.5x20'
       # Attacker forging workload attribution: no verified marker, so the
       # rules must not count it, for the attacker or for the victim.
@@ -22,16 +24,20 @@ tests:
       # can stamp "verified" in production.
       - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="attacker",pod="exporter",modelName="A100-SXM4-40GB",UUID="GPU-forged",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="forged"}'
         values: '0.9 0.9x20'
-      # Trusted but unattributed (no workload pod): stays in the monitoring
-      # namespace, counted for reconciliation.
-      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="redhat-ods-monitoring",modelName="A30",UUID="GPU-free",gpu="2",Hostname="gpu-node-2",node="gpu-node-2",odh_dcgm_source="verified"}'
+      # Trusted but unattributed (no workload attached): DCGM exports the
+      # free device without workload labels, so the receiver never stamps
+      # odh_dcgm_workload_*, and Prometheus stamps its own target labels —
+      # the collector's namespace and pod — onto the series. Both are
+      # non-empty, so only the workload-label matchers can exclude the
+      # device from billing shapes.
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="redhat-ods-monitoring",pod="data-science-collector-0",modelName="A30",UUID="GPU-free",gpu="2",Hostname="gpu-node-2",node="gpu-node-2",odh_dcgm_source="verified"}'
         values: '0 0x20'
       # Trusted series that stops mid-fixture: recorded output must go stale
       # (absent by eval_time 480s, more than one lookback after tick 90s).
-      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="team",pod="stopped",modelName="A100-SXM4-40GB",UUID="GPU-stopped",gpu="1",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="team",pod="stopped",odh_dcgm_workload_namespace="team",odh_dcgm_workload_pod="stopped",modelName="A100-SXM4-40GB",UUID="GPU-stopped",gpu="1",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
         values: '0 0x2'
       # Queueless tenant workload: must stay counted, without queue labels.
-      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="other",pod="plain",modelName="H100",UUID="GPU-bbb",gpu="0",Hostname="gpu-node-3",node="gpu-node-3",odh_dcgm_source="verified"}'
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="other",pod="plain",odh_dcgm_workload_namespace="other",odh_dcgm_workload_pod="plain",modelName="H100",UUID="GPU-bbb",gpu="0",Hostname="gpu-node-3",node="gpu-node-3",odh_dcgm_source="verified"}'
         values: '0 0x20'
       # kube-state-metrics, federated from platform Prometheus: only the
       # trusted federation receiver stamps odh_federation_source, so the
@@ -72,8 +78,15 @@ tests:
             value: 1
           - labels: 'accelerator_gpu_hours_allocated{namespace="other",pod="plain",modelName="H100",UUID="GPU-bbb",gpu="0",Hostname="gpu-node-3",node="gpu-node-3",vendor="nvidia"}'
             value: 1
-          - labels: 'accelerator_gpu_hours_allocated{namespace="redhat-ods-monitoring",modelName="A30",UUID="GPU-free",gpu="2",Hostname="gpu-node-2",node="gpu-node-2",vendor="nvidia"}'
-            value: 1
+      # Unattributed (free) devices are excluded from every billing shape:
+      # their namespace/pod are Prometheus target labels — the collector's
+      # identity — not workload attribution, even though both are non-empty.
+      - expr: accelerator_gpu_hours_allocated{UUID="GPU-free"}
+        eval_time: 120s
+        exp_samples: []
+      - expr: accelerator_gpu_hours_allocated{namespace="redhat-ods-monitoring",UUID="GPU-free"}
+        eval_time: 120s
+        exp_samples: []
       # Forged attribution (exported_namespace) and forged markers produce no
       # billing output for either the attacker or the victim.
       - expr: accelerator_gpu_hours_allocated{namespace="victim"}
@@ -115,7 +128,8 @@ tests:
         eval_time: 120s
         exp_samples: []
       # Tier 3: Shape 2 — primary billing metric. At 120s the stopped series
-      # still contributes to team via the lookback.
+      # still contributes to team via the lookback. The free device adds no
+      # bucket: it never enters Tier 1.
       - expr: accelerator_gpu_hours_allocated_by_namespace
         eval_time: 120s
         exp_samples:
@@ -123,14 +137,13 @@ tests:
             value: 2
           - labels: 'accelerator_gpu_hours_allocated_by_namespace{namespace="other",vendor="nvidia"}'
             value: 1
-          - labels: 'accelerator_gpu_hours_allocated_by_namespace{namespace="redhat-ods-monitoring",vendor="nvidia"}'
-            value: 1
-      # Tier 3: Shape 3 — cluster total.
+      # Tier 3: Shape 3 — cluster total: allocated devices only, so the free
+      # device does not inflate it to the cluster's GPU capacity.
       - expr: accelerator_gpu_hours_allocated_by_cluster
         eval_time: 120s
         exp_samples:
           - labels: 'accelerator_gpu_hours_allocated_by_cluster{vendor="nvidia"}'
-            value: 4
+            value: 3
       # Tier 3: Shape 6 — per GPU family.
       - expr: accelerator_gpu_hours_allocated_by_model
         eval_time: 120s
@@ -138,8 +151,6 @@ tests:
           - labels: 'accelerator_gpu_hours_allocated_by_model{modelName="A100-SXM4-40GB",vendor="nvidia"}'
             value: 2
           - labels: 'accelerator_gpu_hours_allocated_by_model{modelName="H100",vendor="nvidia"}'
-            value: 1
-          - labels: 'accelerator_gpu_hours_allocated_by_model{modelName="A30",vendor="nvidia"}'
             value: 1
       # Tier 3: Shape 7 — per device (pod dropped, UUID kept).
       - expr: accelerator_gpu_hours_allocated_by_device
@@ -150,8 +161,6 @@ tests:
           - labels: 'accelerator_gpu_hours_allocated_by_device{namespace="team",modelName="A100-SXM4-40GB",UUID="GPU-stopped",vendor="nvidia"}'
             value: 1
           - labels: 'accelerator_gpu_hours_allocated_by_device{namespace="other",modelName="H100",UUID="GPU-bbb",vendor="nvidia"}'
-            value: 1
-          - labels: 'accelerator_gpu_hours_allocated_by_device{namespace="redhat-ods-monitoring",modelName="A30",UUID="GPU-free",vendor="nvidia"}'
             value: 1
       # Tier 3: Kueue slice of Shape 2.
       - expr: accelerator_gpu_hours_allocated_by_namespace_queue{label_kueue_x_k8s_io_cluster_queue_name="cq-a"}
@@ -189,8 +198,6 @@ tests:
             value: 1
           - labels: 'accelerator_gpu_hours_allocated_by_namespace{namespace="other",vendor="nvidia"}'
             value: 1
-          - labels: 'accelerator_gpu_hours_allocated_by_namespace{namespace="redhat-ods-monitoring",vendor="nvidia"}'
-            value: 1
   # Release-and-reassignment at the timing boundary: while the previous pod's
   # samples are still inside the 45s presence window, the timestamp freshness
   # guard must keep only the assignment carrying the device's newest sample,
@@ -202,19 +209,19 @@ tests:
   # be recorded at rule eval 60s (its window (15s,60s] still holds tick 30s).
   - interval: 30s
     input_series:
-      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="team",pod="old",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="team",pod="old",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_workload_namespace="team",odh_dcgm_workload_pod="old",odh_dcgm_source="verified"}'
         values: '0 0'
-      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="team",pod="new",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="team",pod="new",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_workload_namespace="team",odh_dcgm_workload_pod="new",odh_dcgm_source="verified"}'
         values: '_ _ 0 0x3'
-      - series: 'DCGM_FI_PROF_GR_ENGINE_ACTIVE{namespace="team",pod="old",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
+      - series: 'DCGM_FI_PROF_GR_ENGINE_ACTIVE{namespace="team",pod="old",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_workload_namespace="team",odh_dcgm_workload_pod="old",odh_dcgm_source="verified"}'
         values: '0.25 0.25'
-      - series: 'DCGM_FI_PROF_GR_ENGINE_ACTIVE{namespace="team",pod="new",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_source="verified"}'
+      - series: 'DCGM_FI_PROF_GR_ENGINE_ACTIVE{namespace="team",pod="new",modelName="A100-SXM4-40GB",UUID="GPU-handoff",gpu="0",Hostname="gpu-node-1",node="gpu-node-1",odh_dcgm_workload_namespace="team",odh_dcgm_workload_pod="new",odh_dcgm_source="verified"}'
         values: '_ _ 0.75 0.75x3'
       # Simultaneous time-sliced sharers: equal sample timestamps, so the
       # freshness guard must keep both counted.
-      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="shared",pod="slice-a",modelName="H100",UUID="GPU-slice",gpu="1",Hostname="gpu-node-2",node="gpu-node-2",odh_dcgm_source="verified"}'
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="shared",pod="slice-a",modelName="H100",UUID="GPU-slice",gpu="1",Hostname="gpu-node-2",node="gpu-node-2",odh_dcgm_workload_namespace="shared",odh_dcgm_workload_pod="slice-a",odh_dcgm_source="verified"}'
         values: '0 0x6'
-      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="shared",pod="slice-b",modelName="H100",UUID="GPU-slice",gpu="1",Hostname="gpu-node-2",node="gpu-node-2",odh_dcgm_source="verified"}'
+      - series: 'DCGM_FI_DEV_GPU_UTIL{namespace="shared",pod="slice-b",modelName="H100",UUID="GPU-slice",gpu="1",Hostname="gpu-node-2",node="gpu-node-2",odh_dcgm_workload_namespace="shared",odh_dcgm_workload_pod="slice-b",odh_dcgm_source="verified"}'
         values: '0 0x6'
     promql_expr_test:
       # Mid-handoff, before new reports: old is allocated.

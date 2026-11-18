@@ -25,12 +25,16 @@ import (
 // recording rules without requiring GPU hardware: a synthetic DCGM exporter in
 // the trusted GPU-operator namespace reports an allocated-but-idle GPU
 // (utilization 0) for a real tenant pod, and the recorded billing metrics are
-// checked through the namespace proxy. The Kueue subtest additionally proves
+// checked through the namespace proxy. The fixture also reports a free GPU
+// with no workload labels; the unattributed-device subtest proves it stays
+// out of every billing shape. The Kueue subtest additionally proves
 // the platform kube-state-metrics exposes pod labels through federation; on
 // clusters whose KSM allowlist filters kueue.x-k8s.io/* it fails, which is the
 // signal that Tier 2 degraded to passthrough. The reserved-name subtest
 // proves a workload cannot seed recording-rule output names through the
-// workload scrape path.
+// workload scrape path. The reassignment subtest proves a device handoff
+// through both scrape hops: the timestamp freshness guard collapses the
+// device onto the successor workload once the original exporter is gone.
 func (tc *MonitoringTestCtx) ValidateAcceleratorGPUHoursRecording(t *testing.T) {
 	t.Helper()
 	tc = tc.WithT(t)
@@ -98,11 +102,17 @@ func (tc *MonitoringTestCtx) ValidateAcceleratorGPUHoursRecording(t *testing.T) 
 	// Synthetic DCGM exporter in the trusted namespace: the GPU is allocated
 	// (GPU_UTIL present, value 0) but idle, with occupancy 0.5.
 	gpu := "GPU-e2e-" + id
+	// A second device with no workload labels: DCGM exports hardware series
+	// for every physical GPU, free or not, and only workloads bound to a pod
+	// carry namespace/pod labels. The unattributed-device subtest asserts
+	// this free GPU stays out of the billing shapes.
+	freeGPU := "GPU-free-e2e-" + id
 	data := fmt.Sprintf("# TYPE DCGM_FI_DEV_GPU_UTIL gauge\n"+
 		"DCGM_FI_DEV_GPU_UTIL{namespace=%q,pod=\"model\",modelName=\"E2E-GPU\",UUID=%q,gpu=\"0\",Hostname=\"gpu-node-e2e\",node=\"gpu-node-e2e\"} 0\n"+
+		"DCGM_FI_DEV_GPU_UTIL{modelName=\"E2E-FREE-GPU\",UUID=%q,gpu=\"1\",Hostname=\"gpu-node-e2e\",node=\"gpu-node-e2e\"} 0\n"+
 		"# TYPE DCGM_FI_PROF_GR_ENGINE_ACTIVE gauge\n"+
 		"DCGM_FI_PROF_GR_ENGINE_ACTIVE{namespace=%q,pod=\"model\",modelName=\"E2E-GPU\",UUID=%q,gpu=\"0\",Hostname=\"gpu-node-e2e\",node=\"gpu-node-e2e\"} 0.5\n",
-		namespace, gpu, namespace, gpu)
+		namespace, gpu, freeGPU, namespace, gpu)
 	server := fmt.Sprintf(`from http.server import BaseHTTPRequestHandler, HTTPServer
 class Handler(BaseHTTPRequestHandler):
  def do_GET(self):
@@ -172,12 +182,28 @@ httpd.serve_forever()
 		tc.awaitReservedNameRejection(t, rootCAs, host, viewer, namespace, forge)
 	})
 
+	// Unattributed device: a free GPU — hardware series with no workload
+	// labels — must stay out of every billing shape. The queries go through
+	// the monitor viewer in the monitoring namespace: the free device's
+	// series carries the collector's Prometheus target labels (the
+	// monitoring namespace), not the tenant's, so a tenant-viewer assertion
+	// would pass vacuously.
+	t.Run("Unattributed device", func(t *testing.T) {
+		tc.awaitGPUHoursUnattributedExcluded(t, rootCAs, host, viewer, monitorViewer, namespace, freeGPU)
+	})
+
 	// Tenant isolation: a foreign viewer sees no billing data for the tenant.
 	query := fmt.Sprintf(`accelerator_gpu_hours_allocated{UUID=%q}`, gpu)
 	status, response, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, host, foreignViewer, foreign, query)
 	if err != nil || status != http.StatusOK || len(response.Data.Result) != 0 {
 		t.Fatalf("foreign tenant can see GPU-hours sample: status=%d count=%d error=%v", status, len(response.Data.Result), err)
 	}
+
+	// Reassignment: the timestamp freshness guard must collapse the device
+	// onto the successor workload once the original exporter is gone.
+	t.Run("Device reassignment", func(t *testing.T) {
+		tc.awaitGPUHoursReassignment(t, rootCAs, host, viewer, namespace, gpu, id, exporter)
+	})
 }
 
 // awaitPrometheusQuery polls a PromQL query through the namespace proxy until
@@ -400,4 +426,136 @@ func (tc *MonitoringTestCtx) awaitReservedNameRejection(t *testing.T, rootCAs *x
 	if len(response.Data.Result) != 1 || response.Data.Result[0].Metric["namespace"] != namespace || response.Data.Result[0].Value[1] != "1" {
 		t.Fatalf("billing aggregate corrupted by the forged series: results=%v", response.Data.Result)
 	}
+}
+
+// awaitGPUHoursUnattributedExcluded proves a free device stays out of the
+// billing shapes. DCGM exports hardware series for every physical GPU, free
+// or not, but only workloads bound to a pod carry namespace/pod labels; the
+// workload-label matchers in the Tier 1 rules must therefore exclude the
+// free device. The free device's queries go through the monitor viewer in
+// the monitoring namespace: an unattributed series carries the collector's
+// Prometheus target labels (namespace = the monitoring namespace),
+// invisible to the tenant viewer, so a tenant-viewer assertion would pass
+// vacuously. The count_over_time precondition proves the raw samples have
+// flowed — with 15s rule evaluations on a 45s presence window, a device the
+// rules wrongly counted would already have records — so the empty exclusion
+// result is the filter working, not a missing scrape.
+func (tc *MonitoringTestCtx) awaitGPUHoursUnattributedExcluded(t *testing.T, rootCAs *x509.CertPool, host, viewer, monitorViewer, namespace, freeGPU string) {
+	t.Helper()
+	// The >= bool 2 form pushes the sample-count comparison into the query,
+	// so the poll can assert on the returned 1 like every other value check
+	// here (the JSON value element is an any).
+	tc.awaitPrometheusQuery(t, rootCAs, host, monitorViewer, tc.MonitoringNamespace,
+		fmt.Sprintf(`count_over_time(DCGM_FI_DEV_GPU_UTIL{UUID=%q, odh_dcgm_source="verified"}[2m]) >= bool 2`, freeGPU),
+		func(response prometheusQueryResponse) error {
+			if len(response.Data.Result) != 1 || response.Data.Result[0].Value[1] != "1" {
+				return fmt.Errorf("expected at least two raw samples from the free device: results=%v", response.Data.Result)
+			}
+			return nil
+		})
+	// The raw samples are proven, so query directly: an Eventually on
+	// absence would pass vacuously before the device is scraped at all.
+	query := fmt.Sprintf(`accelerator_gpu_hours_allocated{UUID=%q}`, freeGPU)
+	status, response, err := queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, host, monitorViewer, tc.MonitoringNamespace, query)
+	if err != nil || status != http.StatusOK || len(response.Data.Result) != 0 {
+		t.Fatalf("free device was counted as allocated: status=%d count=%d error=%v", status, len(response.Data.Result), err)
+	}
+	// The exclusion must not take the attributed device with it: the
+	// tenant's billing aggregate stays at exactly one GPU.
+	status, response, err = queryMetricsViaNamespaceProxy(tc.Context(), rootCAs, host, viewer, namespace, "accelerator_gpu_hours_allocated_by_namespace")
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("query billing aggregate: status=%d error=%v", status, err)
+	}
+	if len(response.Data.Result) != 1 || response.Data.Result[0].Metric["namespace"] != namespace || response.Data.Result[0].Value[1] != "1" {
+		t.Fatalf("billing aggregate lost the attributed device: results=%v", response.Data.Result)
+	}
+}
+
+// awaitGPUHoursReassignment proves a device handoff through both scrape
+// hops: a second fixture exporter attributes the same device to a successor
+// workload, and once the original exporter is deleted the timestamp
+// freshness guard must leave exactly the successor's assignment recorded.
+func (tc *MonitoringTestCtx) awaitGPUHoursReassignment(t *testing.T, rootCAs *x509.CertPool, host, viewer, namespace, gpu, id, original string) {
+	t.Helper()
+	const operatorNamespace = "nvidia-gpu-operator"
+
+	// The successor must match the collector's DCGM discovery: pods in the
+	// GPU operator namespace named nvidia-dcgm-exporter*, port 9400.
+	successor := "nvidia-dcgm-exporter-e2e-" + id + "-b"
+	data := fmt.Sprintf("# TYPE DCGM_FI_DEV_GPU_UTIL gauge\n"+
+		"DCGM_FI_DEV_GPU_UTIL{namespace=%q,pod=\"model2\",modelName=\"E2E-GPU\",UUID=%q,gpu=\"0\",Hostname=\"gpu-node-e2e\",node=\"gpu-node-e2e\"} 0\n"+
+		"# TYPE DCGM_FI_PROF_GR_ENGINE_ACTIVE gauge\n"+
+		"DCGM_FI_PROF_GR_ENGINE_ACTIVE{namespace=%q,pod=\"model2\",modelName=\"E2E-GPU\",UUID=%q,gpu=\"0\",Hostname=\"gpu-node-e2e\",node=\"gpu-node-e2e\"} 0.5\n",
+		namespace, gpu, namespace, gpu)
+	server := fmt.Sprintf(`from http.server import BaseHTTPRequestHandler, HTTPServer
+class Handler(BaseHTTPRequestHandler):
+ def do_GET(self):
+  data = %q.encode()
+  self.send_response(200)
+  self.send_header('Content-Type', 'text/plain; version=0.0.4')
+  self.send_header('Content-Length', str(len(data)))
+  self.end_headers()
+  self.wfile.write(data)
+httpd = HTTPServer(('0.0.0.0', 9400), Handler)
+httpd.serve_forever()
+`, data)
+	tc.createFixtureResource(t, gvk.Pod, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: successor, Namespace: operatorNamespace, Labels: map[string]string{"app": "odh-dcgm-fixture"}},
+		Spec: corev1.PodSpec{
+			SecurityContext: fixturePodSecurityContext(),
+			Containers: []corev1.Container{{
+				Name:            "fixture",
+				Image:           "registry.access.redhat.com/ubi9/python-311:latest",
+				Command:         []string{"python3", "-c", server},
+				Ports:           []corev1.ContainerPort{{ContainerPort: 9400}},
+				SecurityContext: fixtureContainerSecurityContext(),
+			}},
+		},
+	})
+	t.Cleanup(func() {
+		tc.DeleteResource(WithMinimalObject(gvk.Pod, types.NamespacedName{Name: successor, Namespace: operatorNamespace}),
+			WithIgnoreNotFound(true), WithWaitForDeletion(true), WithEventuallyTimeout(5*time.Minute))
+	})
+
+	// Wait for the successor's raw samples before triggering the handoff,
+	// so the post-handoff assertion cannot pass vacuously. Assert on the raw
+	// series, not the record: raw scrapes are replica-independent (every
+	// Prometheus replica scrapes every collector), while the recorded series
+	// is not — while both exporters compete for the device, the freshness
+	// guard's winner differs per replica (each replica scrapes the collectors
+	// at its own offsets and evaluates on its own grid), and the namespace
+	// proxy serves from a single replica. The successor's record is
+	// therefore not guaranteed to be tenant-visible during contention, and
+	// asserting it there would be flaky by design.
+	tc.awaitPrometheusQuery(t, rootCAs, host, viewer, namespace,
+		fmt.Sprintf(`DCGM_FI_DEV_GPU_UTIL{UUID=%q, pod="model2", odh_dcgm_source="verified"}`, gpu),
+		func(response prometheusQueryResponse) error {
+			if len(response.Data.Result) != 1 {
+				return fmt.Errorf("expected the successor's raw DCGM samples: results=%v", response.Data.Result)
+			}
+			return nil
+		})
+
+	// The original exporter's own cleanup tolerates absence, so deleting it
+	// here explicitly is safe.
+	tc.DeleteResource(WithMinimalObject(gvk.Pod, types.NamespacedName{Name: original, Namespace: operatorNamespace}),
+		WithIgnoreNotFound(true), WithWaitForDeletion(true), WithEventuallyTimeout(5*time.Minute))
+
+	// After the handoff the device must be attributed to the successor only:
+	// the successor is the device's only live source, so its samples are
+	// strictly fresher on every replica and the guard drops the superseded
+	// assignment's samples even while they are still inside the 45s presence
+	// window. The rule manager's stale markers end the original record's
+	// instant-query visibility, so exactly one assignment must remain.
+	query := fmt.Sprintf(`accelerator_gpu_hours_allocated{UUID=%q}`, gpu)
+	tc.awaitPrometheusQuery(t, rootCAs, host, viewer, namespace, query, func(response prometheusQueryResponse) error {
+		if len(response.Data.Result) != 1 {
+			return fmt.Errorf("expected exactly one assignment after the handoff: results=%v", response.Data.Result)
+		}
+		result := response.Data.Result[0]
+		if result.Metric["namespace"] != namespace || result.Metric["pod"] != "model2" || result.Value[1] != "1" {
+			return fmt.Errorf("expected the successor assignment after the handoff: %v %v", result.Metric, result.Value)
+		}
+		return nil
+	})
 }

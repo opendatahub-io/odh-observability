@@ -176,19 +176,19 @@ func wantAttributionGroups() []attributionGroupSpec {
 				{
 					record: "accelerator_gpu_hours_allocated",
 					expr: `max by (namespace, pod, modelName, UUID, gpu, Hostname, node) ` +
-						`((count_over_time(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified"}[45s]) > bool 0) ` +
-						`and (timestamp(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified"}) ` +
+						`((count_over_time(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""}[45s]) > bool 0) ` +
+						`and (timestamp(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""}) ` +
 						`== on (UUID, gpu, Hostname, node) group_left ` +
-						`max by (UUID, gpu, Hostname, node) (timestamp(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified"}))))`,
+						`max by (UUID, gpu, Hostname, node) (timestamp(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""}))))`,
 					labels: map[string]string{"vendor": "nvidia"},
 				},
 				{
 					record: "accelerator_gpu_hours_utilized",
 					expr: `max by (namespace, pod, modelName, UUID, gpu, Hostname, node) ` +
-						`(avg_over_time(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified"}[45s]) ` +
-						`and (timestamp(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified"}) ` +
+						`(avg_over_time(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""}[45s]) ` +
+						`and (timestamp(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""}) ` +
 						`== on (UUID, gpu, Hostname, node) group_left ` +
-						`max by (UUID, gpu, Hostname, node) (timestamp(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified"}))))`,
+						`max by (UUID, gpu, Hostname, node) (timestamp(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""}))))`,
 					labels: map[string]string{"vendor": "nvidia"},
 				},
 			},
