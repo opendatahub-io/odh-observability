@@ -9,7 +9,7 @@ spec:
   config:
     display:
       name: "RHOAI GPU Health"
-      description: "NVIDIA DCGM device health for the cluster. Every accelerator query reads the recording rules through the cluster-wide Data Science Prometheus datasource, because the default namespace label identifies the collector target rather than the GPU workload, while workload attribution is carried by exported_namespace and exported_pod; the namespace-scoped datasource cannot serve them. The capacity panel reads kube-state-metrics from OpenShift Monitoring instead, because the Data Science stack does not scrape it. The panels describe node-level GPU health. Per-project attribution comes from the DCGM exporter's Kubernetes pod mapping, so it covers pods holding a device and cannot split a device shared by several pods."
+      description: "NVIDIA DCGM device health for the cluster. Fleet accelerator panels read the recording rules through the cluster-wide Data Science Prometheus datasource because unattributed devices are not workload-namespaced. Workload correlation uses the namespace-scoped Data Science datasource: the built-in DCGM scrape promotes verified workload namespace and pod labels to the canonical namespace and pod labels. The capacity panel reads kube-state-metrics from OpenShift Monitoring instead, because the Data Science stack does not scrape it."
     duration: "1h"
     layouts:
       - kind: Grid
@@ -339,7 +339,7 @@ spec:
         spec:
           display:
             name: "Utilization by project"
-            description: "Utilization summed per consuming namespace, deduplicated per device within each project. The DCGM exporter maps each device to pods through the kubelet pod-resources API. A device shared by multiple pods in one project is counted once; a device shared across projects appears under each project, so project values are not additive across projects."
+            description: "Utilization for the selected project, deduplicated per device. Only the built-in DCGM scrape's verified pod mapping is promoted to namespace and pod labels; unattributed devices are excluded. A device shared by multiple pods in one project is counted once. If a device is shared across projects, each authorized project sees its own value, so values are not additive across projects."
           plugin:
             kind: TimeSeriesChart
             spec:
@@ -365,6 +365,6 @@ spec:
                   spec:
                     datasource:
                       kind: PrometheusDatasource
-                      name: data-science-cluster-prometheus-datasource
-                    query: sum by (exported_namespace) (max by (exported_namespace, node, gpu) (accelerator_gpu_utilization{exported_namespace=~".+", exported_namespace!="nvidia-gpu-operator"}))
-                    seriesNameFormat: '{{ "{{" }}exported_namespace{{ "}}" }}'
+                      name: data-science-prometheus-datasource
+                    query: sum by (namespace) (max by (namespace, node, gpu) (accelerator_gpu_utilization{odh_dcgm_source="verified", namespace=~".+"}))
+                    seriesNameFormat: '{{ "{{" }}namespace{{ "}}" }}'

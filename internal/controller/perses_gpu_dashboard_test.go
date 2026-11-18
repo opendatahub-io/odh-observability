@@ -29,6 +29,7 @@ import (
 // GPU workload, so the namespace-scoped datasource cannot serve them, and
 // OpenShift Thanos never sees the Data Science recording rules.
 const clusterPrometheusDatasourceName = "data-science-cluster-prometheus-datasource"
+const dataSciencePrometheusDatasourceName = "data-science-prometheus-datasource"
 
 // The capacity panel is the one query the Data Science stack cannot answer:
 // kube-state-metrics is scraped by OpenShift Monitoring, so that panel pins the
@@ -116,11 +117,13 @@ func TestPersesGPUHealthDashboardTemplateContract(t *testing.T) {
 		},
 	}
 
-	// Panel queries read the accelerator recording rules, which this dashboard
-	// can only reach through the Data Science cluster-wide datasource: the
-	// namespace proxy injects namespace= while accelerator series carry the
-	// collector target's default namespace, so a scoped datasource never matches.
+	// Fleet panels need the cluster-wide lane for unattributed accelerator
+	// series. The by-project panel uses the namespace-scoped lane because #162
+	// promotes verified built-in DCGM workload identity to namespace/pod.
 	ocpLaneQueries := []string{`sum(kube_node_status_capacity{resource="nvidia_com_gpu"}) or vector(-1)`}
+	namespaceScopedQueries := []string{
+		`sum by (namespace) (max by (namespace, node, gpu) (accelerator_gpu_utilization{odh_dcgm_source="verified", namespace=~".+"}))`,
+	}
 	wantQueries := []string{
 		"count(count by (node, gpu) (accelerator_gpu_utilization)) or vector(0)",
 		`sum(kube_node_status_capacity{resource="nvidia_com_gpu"}) or vector(-1)`,
@@ -131,7 +134,7 @@ func TestPersesGPUHealthDashboardTemplateContract(t *testing.T) {
 		"accelerator_temperature_celsius",
 		"vector(83)",
 		"accelerator_power_usage_watts",
-		`sum by (exported_namespace) (max by (exported_namespace, node, gpu) (accelerator_gpu_utilization{exported_namespace=~".+", exported_namespace!="nvidia-gpu-operator"}))`,
+		`sum by (namespace) (max by (namespace, node, gpu) (accelerator_gpu_utilization{odh_dcgm_source="verified", namespace=~".+"}))`,
 	}
 	wantPanels := []string{
 		"gpusReporting", "gpusAdvertised", "meanUtilization", "hotGpus",
@@ -184,6 +187,8 @@ func TestPersesGPUHealthDashboardTemplateContract(t *testing.T) {
 				wantDatasource := clusterPrometheusDatasourceName
 				if slices.Contains(ocpLaneQueries, q.query) {
 					wantDatasource = ocpPrometheusDatasourceName
+				} else if slices.Contains(namespaceScopedQueries, q.query) {
+					wantDatasource = dataSciencePrometheusDatasourceName
 				}
 				if q.datasource != wantDatasource {
 					t.Errorf("panel %q must pin %s, got %q", q.panel, wantDatasource, q.datasource)
@@ -223,18 +228,18 @@ func TestPersesGPUHealthDashboardTemplateContract(t *testing.T) {
 				t.Errorf("series name format: want %q, got %q", wantFormat, format)
 			}
 
-			// The by-project panel is populated from the DCGM exporter's pod
-			// mapping, so its description has to name that source of truth.
+			// The by-project panel must use only the verified built-in DCGM
+			// identity promoted by the namespace-scoped Data Science lane.
 			correlation, ok := panels["gpuByProject"].(map[string]any)
 			if !ok {
 				t.Fatalf("gpuByProject has unexpected type %T", panels["gpuByProject"])
 			}
 			description, _, _ := unstructured.NestedString(correlation, "spec", "display", "description")
-			if !strings.Contains(description, "pod-resources") {
-				t.Errorf("by-project panel must name the pod-mapping source, got %q", description)
-			}
 			if !strings.Contains(description, "not additive") {
 				t.Errorf("by-project panel must explain shared-device attribution, got %q", description)
+			}
+			if !strings.Contains(description, "verified") || !strings.Contains(description, "selected project") {
+				t.Errorf("by-project panel must explain verified namespace-scoped attribution, got %q", description)
 			}
 		})
 	}

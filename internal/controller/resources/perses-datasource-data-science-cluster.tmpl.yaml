@@ -3,12 +3,10 @@
 # remains the default. Authorized by explicit cluster-wide metrics access to
 # the OpenShift k8s Prometheus API, not by node-metrics access alone.
 #
-# This lane exists for series the namespace-scoped proxy cannot serve:
-# accelerator_* is recorded from DCGM scrapes whose default namespace label
-# identifies the collector target, not the GPU workload. The exporter's
-# per-device workload mapping is exposed separately as exported_namespace and
-# exported_pod. prom-label-proxy's namespace=<selected> projection therefore
-# drops accelerator_* for every workload namespace.
+# This lane exists for fleet and unattributed series the namespace-scoped
+# proxy cannot serve. Verified built-in DCGM samples are promoted to canonical
+# namespace/pod labels and are available through the namespace-scoped DS lane;
+# unattributed accelerator_* devices remain cluster-wide fleet health data.
 apiVersion: perses.dev/{{.PersesAPIVersion}}
 kind: PersesDatasource
 metadata:
