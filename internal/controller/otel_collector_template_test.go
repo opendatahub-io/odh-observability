@@ -124,13 +124,15 @@ func TestModelResourceFederationScrapeIsNarrowAndAuthenticated(t *testing.T) {
 	assertAuthenticatedModelResourceFederationJob(t, job)
 
 	params, found, err := unstructured.NestedStringSlice(job, "params", "match[]")
-	if err != nil || !found || len(params) != 3 {
-		t.Fatalf("federation job must have exactly three metric matchers: found=%t params=%v error=%v", found, params, err)
+	if err != nil || !found || len(params) != 5 {
+		t.Fatalf("federation job must have exactly five metric matchers: found=%t params=%v error=%v", found, params, err)
 	}
 	for _, want := range []string{
 		`{__name__="node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate"}`,
 		`{__name__="kube_resourcequota", resource=~"cpu|requests[.]cpu|limits[.]cpu", type=~"hard|used"}`,
 		`{__name__="kube_pod_container_resource_limits", resource="cpu", unit="core"}`,
+		`{__name__="kube_pod_labels", label_kueue_x_k8s_io_cluster_queue_name=~".+"}`,
+		`{__name__="kube_pod_owner"}`,
 	} {
 		if !slices.Contains(params, want) {
 			t.Errorf("federation job is missing matcher %q: %v", want, params)

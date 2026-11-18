@@ -10,9 +10,10 @@ import (
 // namespace/pod attribution for user workload metrics. The prometheus exporter
 // endpoint must promote the collector's k8sattributes-enriched
 // k8s_namespace_name/k8s_pod_name labels to namespace/pod via
-// metricRelabelings, and must not set honorLabels (which would trust
+// metricRelabelings, must not set honorLabels (which would trust
 // workload-supplied labels and drop the exported_namespace/exported_pod
-// labels Korrel8r relies on).
+// labels Korrel8r relies on), and must reject workload-supplied series that
+// seed the reserved recording-rule output names.
 func TestCollectorServiceMonitorsPrometheusEndpointConfig(t *testing.T) { //nolint:gocyclo // Validate related trust-boundary relabel rules together.
 	resources := renderObservabilityTemplate(t, CollectorServiceMonitorsTemplate, map[string]any{
 		"Namespace":      "redhat-ods-monitoring",
@@ -39,37 +40,41 @@ func TestCollectorServiceMonitorsPrometheusEndpointConfig(t *testing.T) { //noli
 		{sourceLabels: []string{"k8s_namespace_name"}, targetLabel: "namespace"},
 		{sourceLabels: []string{"k8s_pod_name"}, targetLabel: "pod"},
 	}
-	if len(relabels) != len(want)+3 {
-		t.Fatalf("expected %d metricRelabelings, got %d", len(want)+3, len(relabels))
+	if len(relabels) != len(want)+4 {
+		t.Fatalf("expected %d metricRelabelings, got %d", len(want)+4, len(relabels))
 	}
 	dropRule, ok := relabels[0].(map[string]any)
 	if !ok || dropRule["action"] != "drop" || dropRule["regex"] != "model-resources" || !containsString(dropRule["sourceLabels"], "odh_federation_source") {
 		t.Fatalf("first metricRelabeling must exclude marked federation samples, not same-named workload metrics: %v", relabels[0])
 	}
-	for i, raw := range relabels[1:3] {
+	nameDrop, ok := relabels[1].(map[string]any)
+	if !ok || nameDrop["action"] != "drop" || nameDrop["regex"] != "accelerator_.*" || !containsString(nameDrop["sourceLabels"], "__name__") {
+		t.Fatalf("second metricRelabeling must drop reserved recording-rule names seeded by workload exposition: %v", relabels[1])
+	}
+	for i, raw := range relabels[2:4] {
 		relabel, ok := raw.(map[string]any)
 		if !ok {
-			t.Fatalf("metricRelabelings[%d] has unexpected type: %T", i, raw)
+			t.Fatalf("metricRelabelings[%d] has unexpected type: %T", i+2, raw)
 		}
 		if !containsString(relabel["sourceLabels"], want[i].sourceLabels[0]) {
-			t.Errorf("metricRelabelings[%d].sourceLabels = %v, want [%s]", i, relabel["sourceLabels"], want[i].sourceLabels[0])
+			t.Errorf("metricRelabelings[%d].sourceLabels = %v, want [%s]", i+2, relabel["sourceLabels"], want[i].sourceLabels[0])
 		}
 		if relabel["targetLabel"] != want[i].targetLabel {
-			t.Errorf("metricRelabelings[%d].targetLabel = %v, want %q", i, relabel["targetLabel"], want[i].targetLabel)
+			t.Errorf("metricRelabelings[%d].targetLabel = %v, want %q", i+2, relabel["targetLabel"], want[i].targetLabel)
 		}
 		if relabel["regex"] != "(.+)" {
-			t.Errorf("metricRelabelings[%d].regex = %v, want %q: the default (.*) matches an empty value and would blank the promoted label", i, relabel["regex"], "(.+)")
+			t.Errorf("metricRelabelings[%d].regex = %v, want %q: the default (.*) matches an empty value and would blank the promoted label", i+2, relabel["regex"], "(.+)")
 		}
 		if action, present := relabel["action"]; present && action != "replace" {
-			t.Errorf("metricRelabelings[%d].action = %v, want unset or %q", i, action, "replace")
+			t.Errorf("metricRelabelings[%d].action = %v, want unset or %q", i+2, action, "replace")
 		}
 	}
 	for i, target := range []string{"namespace", "pod"} {
-		rule, ok := relabels[i+3].(map[string]any)
+		rule, ok := relabels[i+4].(map[string]any)
 		if !ok || rule["targetLabel"] != target || rule["regex"] != `verified;([^;]+);([^;]+)` || rule["replacement"] != []string{"$1", "$2"}[i] ||
 			!containsString(rule["sourceLabels"], "odh_dcgm_source") || !containsString(rule["sourceLabels"], "odh_dcgm_workload_namespace") ||
 			!containsString(rule["sourceLabels"], "odh_dcgm_workload_pod") {
-			t.Errorf("trusted DCGM identity promotion rule %d is invalid: %v", i, relabels[i+3])
+			t.Errorf("trusted DCGM identity promotion rule %d is invalid: %v", i, relabels[i+4])
 		}
 	}
 

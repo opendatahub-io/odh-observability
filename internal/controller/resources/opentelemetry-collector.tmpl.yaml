@@ -222,6 +222,12 @@ spec:
                   # runtime CPU usage or an individual container's CPU limit.
                   - '{__name__="kube_resourcequota", resource=~"cpu|requests[.]cpu|limits[.]cpu", type=~"hard|used"}'
                   - '{__name__="kube_pod_container_resource_limits", resource="cpu", unit="core"}'
+                  # Kueue attribution for the accelerator GPU-hours recording
+                  # rules. Filtering kube_pod_labels to Kueue-managed pods
+                  # bounds its cardinality; kube_pod_owner is one series per
+                  # pod and is scoped to GPU pods by the recording rules.
+                  - '{__name__="kube_pod_labels", label_kueue_x_k8s_io_cluster_queue_name=~".+"}'
+                  - '{__name__="kube_pod_owner"}'
               bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
               tls_config:
                 ca_file: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
