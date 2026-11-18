@@ -37,14 +37,26 @@ spec:
         # sample timestamp are kept, so a handoff takes effect at the first
         # scrape of the new pod. Simultaneous time-sliced sharers have equal
         # timestamps and stay counted.
+        # The workload-label matchers exclude unattributed devices: DCGM
+        # exports hardware series for every physical GPU, free or not, and
+        # only workloads carry namespace/pod labels. The trusted receiver
+        # copies those into odh_dcgm_workload_* (absent on free devices),
+        # and Prometheus stamps unattributed series with its own target
+        # labels — the collector's namespace and pod — so namespace/pod are
+        # non-empty there and cannot discriminate. Filtering on
+        # odh_dcgm_workload_* (same pair the ServiceMonitor promotion
+        # requires before overwriting namespace/pod) keeps idle GPUs out of
+        # every billing shape; without it, by_cluster reports the cluster's
+        # total GPU capacity and the monitoring namespace appears to hold
+        # every free device.
         - record: accelerator_gpu_hours_allocated
           expr: >-
             max by (namespace, pod, modelName, UUID, gpu, Hostname, node)
-            ((count_over_time(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified"}[45s]) > bool 0)
+            ((count_over_time(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""}[45s]) > bool 0)
             and
-            (timestamp(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified"})
+            (timestamp(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""})
             == on (UUID, gpu, Hostname, node) group_left
-            max by (UUID, gpu, Hostname, node) (timestamp(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified"}))))
+            max by (UUID, gpu, Hostname, node) (timestamp(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""}))))
           labels:
             vendor: nvidia
 {{- if .ClusterName }}
@@ -55,17 +67,18 @@ spec:
         # occupancy (not rescaled by transform/gpu_metrics, unlike
         # DCGM_FI_DEV_GPU_UTIL), so the instantaneous value is already the
         # utilization fraction. avg_over_time applies the same 45s staleness
-        # bound, and the same timestamp freshness guard drops superseded
-        # assignments after a reassignment. Requires the DCGM profiling
+        # bound, the same timestamp freshness guard drops superseded
+        # assignments after a reassignment, and the same workload-label
+        # matchers exclude unattributed devices. Requires the DCGM profiling
         # module on the exporter.
         - record: accelerator_gpu_hours_utilized
           expr: >-
             max by (namespace, pod, modelName, UUID, gpu, Hostname, node)
-            (avg_over_time(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified"}[45s])
+            (avg_over_time(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""}[45s])
             and
-            (timestamp(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified"})
+            (timestamp(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""})
             == on (UUID, gpu, Hostname, node) group_left
-            max by (UUID, gpu, Hostname, node) (timestamp(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified"}))))
+            max by (UUID, gpu, Hostname, node) (timestamp(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""}))))
           labels:
             vendor: nvidia
 {{- if .ClusterName }}
