@@ -99,8 +99,13 @@ log attributes to OTLP resource attributes before exporting. Records missing
 either or both IDs continue through the pipeline; grouping does not supply a
 missing identity.
 
-The generated local LokiStack indexes both IDs under
-`spec.limits.tenants.application.otlp.streamLabels.resourceAttributes`. It also
+The generated local LokiStack indexes both IDs, the tenant, and the usage
+dimensions under
+`spec.limits.tenants.application.otlp.streamLabels.resourceAttributes`: the
+gateway stamps `tenant_name` as a resource attribute (the MaaS tenant
+reconciler sources it from the reconciled Tenant), and the MaaS API read
+proxy injects a `tenant_name` matcher into every query, so it must be indexed
+for tenant-scoped reads to match any streams. It also
 retains the existing application attributes and the global `service.name`
 attribute, which becomes Loki's `service_name` label.
 
