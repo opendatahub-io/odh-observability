@@ -441,6 +441,58 @@ func TestRunProbe_PersistentUnavailable_CountsFailure(t *testing.T) {
 	}
 }
 
+// TestRunProbe_InFlightWriteStopsAtBudget is a write that does not return until its
+// context is cancelled. The attempt's context must expire with the budget, so the
+// probe records one failure and does not wait on the parent context.
+func TestRunProbe_InFlightWriteStopsAtBudget(t *testing.T) {
+	base := selectorAwareWebhookClient(t, enrolledNamespaceLabels)
+	c := &blockUntilCancelClient{Client: base}
+	p := newTestProbe(c)
+
+	const budget = 200 * time.Millisecond
+	start := time.Now()
+	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
+	p.runProbe(context.Background(), budget)
+	elapsed := time.Since(start)
+
+	if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 1 {
+		t.Errorf("expected one failure when the in-flight write hits the budget, got %v", got)
+	}
+	if elapsed > budget+300*time.Millisecond {
+		t.Errorf("in-flight write ran past the budget: elapsed %s, budget %s", elapsed, budget)
+	}
+	if !c.sawDeadline {
+		t.Error("expected the write context to carry the budget deadline")
+	}
+}
+
+// TestRunProbe_NoRetryAfterBudget is a webhook rejection that returns immediately.
+// The retry wait must not start another attempt once the budget has expired, and
+// that expiry still counts as one failure.
+func TestRunProbe_NoRetryAfterBudget(t *testing.T) {
+	base := selectorAwareWebhookClient(t, enrolledNamespaceLabels)
+
+	var attempts int
+	c := &countingUnavailableClient{Client: base, failUntil: 1 << 30, attempts: &attempts}
+	p := newTestProbe(c)
+
+	const budget = 100 * time.Millisecond
+	start := time.Now()
+	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
+	p.runProbe(context.Background(), budget)
+	elapsed := time.Since(start)
+
+	if attempts != 1 {
+		t.Errorf("expected no write after the budget expired, attempts=%d", attempts)
+	}
+	if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 1 {
+		t.Errorf("expected one failure when the budget expires before a retry, got %v", got)
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Errorf("retry wait ran past the budget: elapsed %s", elapsed)
+	}
+}
+
 // countingUnavailableClient fails Create/Update with a webhook-unavailable error
 // for the first failUntil attempts, then delegates to the wrapped client.
 type countingUnavailableClient struct {
@@ -465,4 +517,19 @@ func (c *countingUnavailableClient) Update(ctx context.Context, obj client.Objec
 		return errNoEndpoints
 	}
 	return c.Client.Update(ctx, obj, opts...)
+}
+
+// blockUntilCancelClient blocks Create until the write context is done, then
+// returns that context's error.
+type blockUntilCancelClient struct {
+	client.Client
+	sawDeadline bool
+}
+
+func (c *blockUntilCancelClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if _, ok := ctx.Deadline(); ok {
+		c.sawDeadline = true
+	}
+	<-ctx.Done()
+	return ctx.Err()
 }

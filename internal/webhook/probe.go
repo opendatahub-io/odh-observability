@@ -122,22 +122,44 @@ func (p *AdmissionProbe) Start(ctx context.Context) error {
 
 // writeWithRetry performs a create/update and retries while the only problem is that
 // the webhook is still unreachable (endpoints not yet published after the server
-// started). Any other error — or still-unreachable after budget — is returned.
-func (p *AdmissionProbe) writeWithRetry(ctx context.Context, budget time.Duration, write func() error) error {
+// started). Each attempt uses a context that expires with the budget, so an in-flight
+// write cannot run past it. The parent context is only the shutdown signal: cancelling
+// it returns without a probe failure, while reaching the budget returns the last error
+// so the caller records one failure. Any other error — or still-unreachable after
+// budget — is returned.
+func (p *AdmissionProbe) writeWithRetry(ctx context.Context, budget time.Duration, write func(context.Context) error) error {
 	deadline := time.Now().Add(budget)
+	var err error
 	for {
-		err := write()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// A retry whose wait ran out the budget must not start another write.
+		if err != nil && !time.Now().Before(deadline) {
+			return err
+		}
+		remaining := time.Until(deadline)
+		if remaining < 0 {
+			remaining = 0
+		}
+		writeCtx, cancel := context.WithTimeout(ctx, remaining)
+		err = write(writeCtx)
+		cancel()
 		if err == nil || !isWebhookUnavailable(err) {
 			return err
 		}
-		if time.Now().After(deadline) {
+		wait := 500 * time.Millisecond
+		if until := time.Until(deadline); until < wait {
+			wait = until
+		}
+		if wait <= 0 {
 			return err
 		}
 		p.log.V(1).Info("webhook not reachable yet, retrying probe write", "reason", err.Error())
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(wait):
 		}
 	}
 }
@@ -230,7 +252,9 @@ func (p *AdmissionProbe) runProbe(ctx context.Context, writeBudget time.Duration
 	}
 
 	if err != nil {
-		if err := p.writeWithRetry(ctx, writeBudget, func() error { return p.client.Create(ctx, probePodMonitor) }); err != nil {
+		if err := p.writeWithRetry(ctx, writeBudget, func(writeCtx context.Context) error {
+			return p.client.Create(writeCtx, probePodMonitor)
+		}); err != nil {
 			if ctx.Err() != nil {
 				return // shutting down, not a probe failure
 			}
@@ -251,7 +275,9 @@ func (p *AdmissionProbe) runProbe(ctx context.Context, writeBudget time.Duration
 		existingAnnotations["probe-updated-at"] = now.Format(time.RFC3339)
 		existing.SetAnnotations(existingAnnotations)
 
-		if err := p.writeWithRetry(ctx, writeBudget, func() error { return p.client.Update(ctx, existing) }); err != nil {
+		if err := p.writeWithRetry(ctx, writeBudget, func(writeCtx context.Context) error {
+			return p.client.Update(writeCtx, existing)
+		}); err != nil {
 			if ctx.Err() != nil {
 				return // shutting down, not a probe failure
 			}
