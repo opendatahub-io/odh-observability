@@ -1,0 +1,32 @@
+name: API contract
+
+on:
+  pull_request:
+    branches: [main]
+
+# Baseline: 1d9fc9d9123095561c5d3fedf97c0293fd841a09 from refs/heads/main,
+# the latest upstream/main head used to prepare this pull request (2026-11-13).
+# Moving this baseline requires approval from someone other than the author.
+# The reusable workflows are pinned to the central repository's latest release
+# commit, d63fe27957117fd99161a693c7fdef9e20efb9d9 (tag: latest).
+jobs:
+  crd-monitoring:
+    name: CRD compatibility (Monitoring)
+    permissions:
+      contents: read
+    uses: red-hat-data-services/api-contract-tests/.github/workflows/provider-crd-check.yml@d63fe27957117fd99161a693c7fdef9e20efb9d9 # latest
+    with:
+      crd-glob: charts/odh-observability/crds/*.yaml
+      baseline-refs: 1d9fc9d9123095561c5d3fedf97c0293fd841a09
+      mode: enforce
+
+  api-contract-coverage:
+    name: API contract coverage
+    permissions:
+      contents: read
+    uses: red-hat-data-services/api-contract-tests/.github/workflows/provider-coverage-check.yml@d63fe27957117fd99161a693c7fdef9e20efb9d9 # latest
+    with:
+      crd-globs: charts/odh-observability/crds/*.yaml
+      baseline-refs: 1d9fc9d9123095561c5d3fedf97c0293fd841a09
+      mode: enforce
+      yq-version: "4.45.1"
