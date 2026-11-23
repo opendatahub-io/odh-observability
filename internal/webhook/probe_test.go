@@ -303,7 +303,7 @@ func TestIsWebhookUnavailable(t *testing.T) {
 		want bool
 	}{
 		{"nil", nil, false},
-		{"no endpoints", errors.New(`Internal error occurred: failed calling webhook "podmonitor-injector.opendatahub.io": no endpoints available for service "odh-observability-webhook"`), true},
+		{"no endpoints", errNoEndpoints, true},
 		{"failed calling webhook", errors.New(`failed calling webhook "x": context deadline exceeded`), true},
 		{"connection refused", errors.New("Post https://svc:9443/mutate: connection refused"), true},
 		{"genuine admission denial", errors.New("admission webhook denied the request: bad spec"), false},
@@ -497,11 +497,13 @@ func TestRunProbe_NoRetryAfterBudget(t *testing.T) {
 // for the first failUntil attempts, then delegates to the wrapped client.
 type countingUnavailableClient struct {
 	client.Client
+
 	failUntil int
 	attempts  *int
 }
 
-var errNoEndpoints = errors.New(`Internal error occurred: failed calling webhook "podmonitor-injector.opendatahub.io": no endpoints available for service "odh-observability-webhook"`)
+var errNoEndpoints = errors.New("Internal error occurred: failed calling webhook " +
+	`"podmonitor-injector.opendatahub.io": no endpoints available for service "odh-observability-webhook"`)
 
 func (c *countingUnavailableClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
 	*c.attempts++
@@ -523,6 +525,7 @@ func (c *countingUnavailableClient) Update(ctx context.Context, obj client.Objec
 // returns that context's error.
 type blockUntilCancelClient struct {
 	client.Client
+
 	sawDeadline bool
 }
 

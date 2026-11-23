@@ -138,10 +138,7 @@ func (p *AdmissionProbe) writeWithRetry(ctx context.Context, budget time.Duratio
 		if err != nil && !time.Now().Before(deadline) {
 			return err
 		}
-		remaining := time.Until(deadline)
-		if remaining < 0 {
-			remaining = 0
-		}
+		remaining := max(time.Until(deadline), 0)
 		writeCtx, cancel := context.WithTimeout(ctx, remaining)
 		err = write(writeCtx)
 		cancel()
