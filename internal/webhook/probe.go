@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -75,15 +76,25 @@ type AdmissionProbe struct {
 	interval     time.Duration
 	retryTimeout time.Duration
 	log          logr.Logger
+
+	// startupTimeout is the write-retry budget for the first probe only. The webhook
+	// server's local :9443 listener is up before this runnable starts, but the webhook
+	// Service has no endpoints until the pod passes its readiness probe
+	// (initialDelaySeconds + periodSeconds) and the endpoints are published. Until then,
+	// with failurePolicy=Fail, the API server rejects the probe's write with
+	// "no endpoints available". This budget must outlast that whole window so the first
+	// probe after startup does not record a false failure; the short retryTimeout cannot.
+	startupTimeout time.Duration
 }
 
 func NewAdmissionProbe(client client.Client, namespace string, interval time.Duration) *AdmissionProbe {
 	return &AdmissionProbe{
-		client:       client,
-		namespace:    namespace,
-		interval:     interval,
-		retryTimeout: 10 * time.Second,
-		log:          ctrl.Log.WithName("webhook-probe"),
+		client:         client,
+		namespace:      namespace,
+		interval:       interval,
+		retryTimeout:   10 * time.Second,
+		startupTimeout: 2 * time.Minute,
+		log:            ctrl.Log.WithName("webhook-probe"),
 	}
 }
 
@@ -93,7 +104,10 @@ func (p *AdmissionProbe) Start(ctx context.Context) error {
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
 
-	p.runProbe(ctx)
+	// First probe: the webhook Service endpoints are not published until this pod
+	// becomes Ready, so retry a webhook-unreachable write for the longer startupTimeout
+	// instead of retryTimeout, which would expire before endpoints exist.
+	p.runProbe(ctx, p.startupTimeout)
 
 	for {
 		select {
@@ -101,14 +115,51 @@ func (p *AdmissionProbe) Start(ctx context.Context) error {
 			p.log.Info("stopping webhook admission probe")
 			return nil
 		case <-ticker.C:
-			p.runProbe(ctx)
+			p.runProbe(ctx, p.retryTimeout)
 		}
 	}
 }
 
+// writeWithRetry performs a create/update and retries while the only problem is that
+// the webhook is still unreachable (endpoints not yet published after the server
+// started). Any other error — or still-unreachable after budget — is returned.
+func (p *AdmissionProbe) writeWithRetry(ctx context.Context, budget time.Duration, write func() error) error {
+	deadline := time.Now().Add(budget)
+	for {
+		err := write()
+		if err == nil || !isWebhookUnavailable(err) {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+		p.log.V(1).Info("webhook not reachable yet, retrying probe write", "reason", err.Error())
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// isWebhookUnavailable reports whether err is the API server rejecting the write
+// because the mutating webhook could not be reached (startup / endpoint lag),
+// rather than a genuine admission or validation failure.
+func isWebhookUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "no endpoints available") ||
+		strings.Contains(msg, "failed calling webhook") ||
+		strings.Contains(msg, "connection refused")
+}
+
 // runProbe executes one probe cycle: create/patch a test PodMonitor without the scrape label,
-// wait for webhook mutation, verify the label was added.
-func (p *AdmissionProbe) runProbe(ctx context.Context) {
+// wait for webhook mutation, verify the label was added. writeBudget bounds how long a
+// webhook-unreachable write is retried before it counts as a failure (longer on the first
+// probe to cover endpoint publication after startup).
+func (p *AdmissionProbe) runProbe(ctx context.Context, writeBudget time.Duration) {
 	now := time.Now()
 	webhookProbeLastAttemptTimestamp.SetToCurrentTime()
 
@@ -179,7 +230,10 @@ func (p *AdmissionProbe) runProbe(ctx context.Context) {
 	}
 
 	if err != nil {
-		if err := p.client.Create(ctx, probePodMonitor); err != nil {
+		if err := p.writeWithRetry(ctx, writeBudget, func() error { return p.client.Create(ctx, probePodMonitor) }); err != nil {
+			if ctx.Err() != nil {
+				return // shutting down, not a probe failure
+			}
 			p.log.Error(err, "failed to create probe PodMonitor")
 			webhookProbeFailuresTotal.Inc()
 			return
@@ -197,7 +251,10 @@ func (p *AdmissionProbe) runProbe(ctx context.Context) {
 		existingAnnotations["probe-updated-at"] = now.Format(time.RFC3339)
 		existing.SetAnnotations(existingAnnotations)
 
-		if err := p.client.Update(ctx, existing); err != nil {
+		if err := p.writeWithRetry(ctx, writeBudget, func() error { return p.client.Update(ctx, existing) }); err != nil {
+			if ctx.Err() != nil {
+				return // shutting down, not a probe failure
+			}
 			p.log.Error(err, "failed to update probe PodMonitor")
 			webhookProbeFailuresTotal.Inc()
 			return
@@ -205,11 +262,11 @@ func (p *AdmissionProbe) runProbe(ctx context.Context) {
 		p.log.V(1).Info("updated probe PodMonitor (removed scrape label, webhook should re-add it)")
 	}
 
-	// Read back and verify the webhook added the scrape label. The webhook server
-	// (which runs in this same pod) may not be serving yet right after startup, and
-	// with failurePolicy=Ignore configured, the API server silently admits the object unmutated
-	// until the webhook is reachable. Poll for a few seconds so the first probe after
-	// startup — and any transient re-admission delay — does not record a false failure.
+	// Read back and verify the webhook added the scrape label. With the shipped
+	// failurePolicy=Fail, an unreachable webhook causes the write above to be rejected
+	// (handled by writeWithRetry), not a silent unmutated admit. This poll still covers
+	// a transient re-admission delay where the write succeeded but the mutation has not
+	// yet settled, so it does not record a false failure.
 	var labels map[string]string
 	var lastErr error
 	deadline := time.Now().Add(p.retryTimeout)

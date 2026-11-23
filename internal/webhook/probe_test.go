@@ -18,6 +18,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -165,7 +166,7 @@ func TestRunProbe_EnrolledNamespace_Create(t *testing.T) {
 	p := newTestProbe(c)
 
 	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
-	p.runProbe(context.Background())
+	p.runProbe(context.Background(), p.retryTimeout)
 
 	if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 0 {
 		t.Errorf("expected no new failures, got %v", got)
@@ -184,9 +185,9 @@ func TestRunProbe_EnrolledNamespace_Update(t *testing.T) {
 
 	// First run creates the canary; the second exercises the Update branch, where
 	// the probe must strip the label so the objectSelector lets the webhook run again.
-	p.runProbe(context.Background())
+	p.runProbe(context.Background(), p.retryTimeout)
 	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
-	p.runProbe(context.Background())
+	p.runProbe(context.Background(), p.retryTimeout)
 
 	if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 0 {
 		t.Errorf("expected no new failures on second run, got %v", got)
@@ -208,7 +209,7 @@ func TestRunProbe_UnenrolledNamespace(t *testing.T) {
 			p := newTestProbe(c)
 
 			beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
-			p.runProbe(context.Background())
+			p.runProbe(context.Background(), p.retryTimeout)
 
 			if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 1 {
 				t.Errorf("expected exactly one new failure for unenrolled namespace, got %v", got)
@@ -228,7 +229,7 @@ func TestRunProbe_MissingNamespace(t *testing.T) {
 	p := newTestProbe(c)
 
 	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
-	p.runProbe(context.Background())
+	p.runProbe(context.Background(), p.retryTimeout)
 
 	if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 1 {
 		t.Errorf("expected exactly one new failure when the probe namespace is missing, got %v", got)
@@ -243,7 +244,7 @@ func TestRunProbe_ExistingCanaryWithStaleLabel(t *testing.T) {
 	p := newTestProbe(c)
 
 	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
-	p.runProbe(context.Background())
+	p.runProbe(context.Background(), p.retryTimeout)
 
 	if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 0 {
 		t.Errorf("expected no new failures, got %v", got)
@@ -291,4 +292,177 @@ func TestStart_ContextCancellation(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Start did not return after context cancellation")
 	}
+}
+
+// --- isWebhookUnavailable ----------------------------------------------------
+
+func TestIsWebhookUnavailable(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"no endpoints", errors.New(`Internal error occurred: failed calling webhook "podmonitor-injector.opendatahub.io": no endpoints available for service "odh-observability-webhook"`), true},
+		{"failed calling webhook", errors.New(`failed calling webhook "x": context deadline exceeded`), true},
+		{"connection refused", errors.New("Post https://svc:9443/mutate: connection refused"), true},
+		{"genuine admission denial", errors.New("admission webhook denied the request: bad spec"), false},
+		{"unrelated", errors.New("some other error"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isWebhookUnavailable(tt.err); got != tt.want {
+				t.Errorf("isWebhookUnavailable(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// --- writeWithRetry / startup race -------------------------------------------
+
+// TestRunProbe_StartupRace_NoFalseFailure simulates the controller start: the
+// first few writes are rejected because the webhook Service has no endpoints yet,
+// then endpoints appear and the write succeeds. With the first-probe startupTimeout
+// budget the probe retries and records no failure.
+func TestRunProbe_StartupRace_NoFalseFailure(t *testing.T) {
+	base := selectorAwareWebhookClient(t, enrolledNamespaceLabels)
+
+	var attempts int
+	c := &countingUnavailableClient{Client: base, failUntil: 2, attempts: &attempts}
+
+	p := newTestProbe(c)
+	p.startupTimeout = 2 * time.Second // allow a few 500ms retries
+
+	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
+	p.runProbe(context.Background(), p.startupTimeout)
+
+	if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 0 {
+		t.Errorf("expected no failure during startup race, got %v (attempts=%d)", got, attempts)
+	}
+	if attempts < 2 {
+		t.Errorf("expected the write to be retried, attempts=%d", attempts)
+	}
+}
+
+// seedCanary returns an existing probe PodMonitor already carrying the scrape label,
+// so runProbe takes the Update branch rather than Create.
+func seedCanary() *unstructured.Unstructured {
+	o := &unstructured.Unstructured{}
+	o.SetGroupVersionKind(gvk.PodMonitor)
+	o.SetNamespace(probeTestNamespace)
+	o.SetName(probeObjectName)
+	o.SetLabels(map[string]string{labelMonitoring: "true", "webhook-probe": "true"})
+	return o
+}
+
+// TestRunProbe_StartupRace_Update_NoFalseFailure is the restart case from the ticket:
+// a canary already exists, so the first probe's write is an Update. It is rejected
+// until endpoints publish ("failed to update probe PodMonitor"), then succeeds within
+// startupTimeout and records no failure.
+func TestRunProbe_StartupRace_Update_NoFalseFailure(t *testing.T) {
+	base := selectorAwareWebhookClient(t, enrolledNamespaceLabels, seedCanary())
+
+	var attempts int
+	c := &countingUnavailableClient{Client: base, failUntil: 2, attempts: &attempts}
+
+	p := newTestProbe(c)
+	p.startupTimeout = 2 * time.Second
+
+	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
+	p.runProbe(context.Background(), p.startupTimeout)
+
+	if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 0 {
+		t.Errorf("expected no failure during startup Update race, got %v (attempts=%d)", got, attempts)
+	}
+	if attempts < 2 {
+		t.Errorf("expected the Update to be retried, attempts=%d", attempts)
+	}
+}
+
+// TestRunProbe_ContextCancelled_NoFailure confirms that a write aborted by context
+// cancellation (shutdown) is not counted as a probe failure.
+func TestRunProbe_ContextCancelled_NoFailure(t *testing.T) {
+	base := selectorAwareWebhookClient(t, enrolledNamespaceLabels)
+
+	var attempts int
+	c := &countingUnavailableClient{Client: base, failUntil: 1 << 30, attempts: &attempts}
+
+	p := newTestProbe(c)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
+	p.runProbe(ctx, time.Minute)
+
+	if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 0 {
+		t.Errorf("expected no failure when context is cancelled, got %v", got)
+	}
+}
+
+// TestRunProbe_ShortBudgetFailsFast confirms the point raised in review: the short
+// retryTimeout used on steady-state ticks expires before endpoints publish, so a
+// startup-length outage under that budget is counted — which is why the first probe
+// must use the longer startupTimeout instead.
+func TestRunProbe_ShortBudgetFailsFast(t *testing.T) {
+	base := selectorAwareWebhookClient(t, enrolledNamespaceLabels)
+
+	var attempts int
+	// Unavailable for ~1.5s (3 attempts at 500ms); longer than the 300ms budget below.
+	c := &countingUnavailableClient{Client: base, failUntil: 3, attempts: &attempts}
+
+	p := newTestProbe(c)
+	p.retryTimeout = 300 * time.Millisecond
+
+	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
+	p.runProbe(context.Background(), p.retryTimeout)
+
+	if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 1 {
+		t.Errorf("expected one failure when the short budget expires before endpoints publish, got %v", got)
+	}
+}
+
+// TestRunProbe_PersistentUnavailable_CountsFailure confirms that if the webhook
+// stays unreachable past the budget (the path really is down), one failure is
+// recorded — the real signal the alert depends on.
+func TestRunProbe_PersistentUnavailable_CountsFailure(t *testing.T) {
+	base := selectorAwareWebhookClient(t, enrolledNamespaceLabels)
+
+	var attempts int
+	c := &countingUnavailableClient{Client: base, failUntil: 1 << 30, attempts: &attempts}
+
+	p := newTestProbe(c)
+
+	beforeFailures := gaugeValue(t, webhookProbeFailuresTotal)
+	p.runProbe(context.Background(), 300*time.Millisecond)
+
+	if got := gaugeValue(t, webhookProbeFailuresTotal) - beforeFailures; got != 1 {
+		t.Errorf("expected exactly one failure when webhook stays down, got %v", got)
+	}
+}
+
+// countingUnavailableClient fails Create/Update with a webhook-unavailable error
+// for the first failUntil attempts, then delegates to the wrapped client.
+type countingUnavailableClient struct {
+	client.Client
+	failUntil int
+	attempts  *int
+}
+
+var errNoEndpoints = errors.New(`Internal error occurred: failed calling webhook "podmonitor-injector.opendatahub.io": no endpoints available for service "odh-observability-webhook"`)
+
+func (c *countingUnavailableClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	*c.attempts++
+	if *c.attempts <= c.failUntil {
+		return errNoEndpoints
+	}
+	return c.Client.Create(ctx, obj, opts...)
+}
+
+func (c *countingUnavailableClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	*c.attempts++
+	if *c.attempts <= c.failUntil {
+		return errNoEndpoints
+	}
+	return c.Client.Update(ctx, obj, opts...)
 }
