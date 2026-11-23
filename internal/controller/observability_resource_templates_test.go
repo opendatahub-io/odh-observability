@@ -879,7 +879,7 @@ func TestUsageLogsLokiStackIndexesMaaSIdentity(t *testing.T) {
 			name: "application identity and existing usage labels",
 			path: []string{"spec", "limits", "tenants", "application", "otlp", "streamLabels", "resourceAttributes"},
 			want: []string{
-				"kubernetes_namespace_name", "model", "subscription", "response_type",
+				"kubernetes_namespace_name", "model", "subscription", "response_type", "tenant_name",
 				"gateway_namespace_name", "gateway_deployment_name", "upstream_namespace_name", "upstream_deployment_name",
 				"organization_id", "user_id",
 			},

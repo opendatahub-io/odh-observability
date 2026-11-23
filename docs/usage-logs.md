@@ -99,21 +99,26 @@ log attributes to OTLP resource attributes before exporting. Records missing
 either or both IDs continue through the pipeline; grouping does not supply a
 missing identity.
 
-The generated local LokiStack indexes both IDs under
-`spec.limits.tenants.application.otlp.streamLabels.resourceAttributes`. It also
-retains the existing application attributes and the global `service.name`
+The gateway stamps `tenant_name` on usage records as an OTLP resource attribute,
+so the collector forwards it without grouping.
+
+The generated local LokiStack indexes `tenant_name`, `organization_id`, and
+`user_id` under `spec.limits.tenants.application.otlp.streamLabels.resourceAttributes`.
+It also retains the existing application attributes and the global `service.name`
 attribute, which becomes Loki's `service_name` label.
 
 Both steps are required by the
 [MaaS API Loki read proxy](https://github.com/opendatahub-io/models-as-a-service/pull/1773).
-Organization views inject an `organization_id` matcher into the LogQL stream
-selector. Queries using `only_user=true` also inject a `user_id` matcher. A field
-stored only as structured metadata cannot satisfy these stream-selector matchers.
+The proxy scopes every query by `tenant_name`, so a cluster without that stream
+label matches no logs. Organization views inject an `organization_id` matcher
+into the LogQL stream selector. Queries using `only_user=true` also inject a
+`user_id` matcher. A field stored only as structured metadata cannot satisfy
+these stream-selector matchers.
 
 For example, a user-scoped query requires newly ingested logs that match:
 
 ```logql
-{service_name="models-as-a-service", organization_id="<organization-id>", user_id="<username>"}
+{service_name="models-as-a-service", tenant_name="<tenant>", organization_id="<organization-id>", user_id="<username>"}
 ```
 
 Records without the required identity remain ingested but are excluded from that

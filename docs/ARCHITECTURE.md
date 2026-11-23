@@ -200,13 +200,15 @@ configure the collector, and setting both produces local and remote writes.
 | `usage-logs-loki-stack.tmpl.yaml` | Optional `LokiStack/data-science-usage-logs-lokistack` |
 | `usage-logs-lokistack-network-policy.tmpl.yaml` | Local usage-log LokiStack ingress policy |
 
-MaaS owns the gateway access logger and identity capture. The collector's
+MaaS owns the gateway access logger and identity capture. The gateway stamps
+`tenant_name` on usage records as an OTLP resource attribute; the collector's
 `groupbyattrs/maas` processor promotes `organization_id` and `user_id`, when
 present, from log attributes to resource attributes. Both logs pipelines run it
 before batching. The local LokiStack indexes these resource attributes for its
 `application` tenant, alongside the existing usage-log attributes and the global
 `service.name` attribute. This supports the identity matchers injected by the
-MaaS API Loki read proxy. Records missing the IDs continue through the collector.
+MaaS API Loki read proxy, which scopes every query by `tenant_name`. Records
+missing an identity attribute continue through the collector.
 
 Source-cluster attributes configured under `usageLogs.attributes` are added only
 to the remote pipeline. The receiving hub owns its Loki indexing configuration;

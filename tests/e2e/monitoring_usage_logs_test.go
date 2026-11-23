@@ -886,11 +886,12 @@ func (tc *MonitoringTestCtx) ValidateUsageLogsLokiStackConfiguration(t *testing.
 			Namespace: tc.MonitoringNamespace,
 		}),
 		WithCondition(And(
-			jq.Match(`.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes | length == 10`),
+			jq.Match(`.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes | length == 11`),
 			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "kubernetes_namespace_name")] | length == 1`),
 			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "model")] | length == 1`),
 			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "subscription")] | length == 1`),
 			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "response_type")] | length == 1`),
+			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "tenant_name")] | length == 1`),
 			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "gateway_namespace_name")] | length == 1`),
 			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "gateway_deployment_name")] | length == 1`),
 			jq.Match(`[.spec.limits.tenants.application.otlp.streamLabels.resourceAttributes[] | select(.name == "upstream_namespace_name")] | length == 1`),
