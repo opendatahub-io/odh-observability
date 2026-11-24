@@ -53,6 +53,8 @@ const (
 	envTestUpgradeCOOChannel        = "E2E_TEST_UPGRADE_COO_CHANNEL"
 	envTestUpgradeTempoChannel      = "E2E_TEST_UPGRADE_TEMPO_CHANNEL"
 	envTestUpgradeReport            = "E2E_TEST_UPGRADE_REPORT"
+	envTestAIGridEnabled            = "E2E_TEST_AI_GRID_ENABLED"
+	envTestAIGridConfig             = "E2E_TEST_AI_GRID_CONFIG"
 )
 
 // TestPackages is set at build time via -ldflags.
@@ -272,6 +274,8 @@ func EnvTestFlags() []string {
 		envTestUpgradeCOOChannel:        "-upgrade-coo-channel",
 		envTestUpgradeTempoChannel:      "-upgrade-tempo-channel",
 		envTestUpgradeReport:            "-upgrade-report",
+		envTestAIGridEnabled:            "-ai-grid-enabled",
+		envTestAIGridConfig:             "-ai-grid-config",
 	}
 
 	var flags []string

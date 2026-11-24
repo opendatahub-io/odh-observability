@@ -42,16 +42,17 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
+# Keep live E2E packages excluded; explicitly include isolated AI Grid helper tests.
 test: manifests generate fmt vet ## Run tests with coverage (full pipeline).
-	go test $(shell go list ./... | grep -v /tests/e2e) -coverprofile cover.out
+	go test $(shell go list ./... | grep -v /tests/e2e) ./tests/e2e/aigrid -coverprofile cover.out
 
 .PHONY: unit-test
 unit-test: ## Run unit tests (no codegen prerequisites).
-	go test $(shell go list ./... | grep -v /tests/e2e)
+	go test $(shell go list ./... | grep -v /tests/e2e) ./tests/e2e/aigrid
 
 .PHONY: test-verbose
 test-verbose: ## Run unit tests with verbose output.
-	go test -v $(shell go list ./... | grep -v /tests/e2e)
+	go test -v $(shell go list ./... | grep -v /tests/e2e) ./tests/e2e/aigrid
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint against code.
@@ -68,6 +69,10 @@ e2e-test-monitoring: ## Run only the monitoring e2e suite against a cluster.
 .PHONY: e2e-test-coo-compatibility
 e2e-test-coo-compatibility: ## Run COO 1.5 / RHOAI 3.6 compatibility release-gate test (fixed CSV and Perses image contract).
 	go test ./tests/e2e/ -v -timeout 90m -count=1 $(E2E_TEST_FLAGS) -run '^TestCOOVersionCompatibility$$'
+
+.PHONY: e2e-test-ai-grid
+e2e-test-ai-grid: ## Run the opt-in AI Grid OATS suite against a prepared hub and two spokes.
+	go test ./tests/e2e/ -v -timeout 90m -count=1 $(E2E_TEST_FLAGS) -run '^TestAIGridObservability$$' -ai-grid-enabled=true
 
 .PHONY: e2e-test-olm-upgrade-survivability
 e2e-test-olm-upgrade-survivability: ## Run in-place COO/Tempo OLM upgrade survivability test (set E2E_TEST_* env vars; requires target channels).

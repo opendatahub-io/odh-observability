@@ -1,0 +1,58 @@
+# Replace all example endpoints, identities, image references and file paths.
+# Opt in with -ai-grid-enabled=true / E2E_TEST_AI_GRID_ENABLED=true.
+# Supply this path via -ai-grid-config / E2E_TEST_AI_GRID_CONFIG.
+# Paths are relative to this file; credentials must be single-line token files.
+# The suite creates fresh subscriptions and inference keys; do not add
+# subscription or apiKeyFile inputs. Existing namespaces/models must be ready.
+hubContext: hub
+grafana:
+  image: registry.example.test/grafana:REPLACE_WITH_APPROVED_VERSION
+  # routeCAFile: credentials/hub-router-ca.pem
+metrics:
+  url: https://rbac-query-proxy.apps.hub.example.test
+  tokenFile: credentials/hub-metrics-reader
+  # caFile: credentials/hub-router-ca.pem
+logs:
+  # Tenant query root; do not append /otlp or /loki/api/v1/query.
+  url: https://usage-logs.apps.hub.example.test/api/logs/v1/infrastructure
+  tokenFile: credentials/hub-logs-reader
+  # caFile: credentials/hub-router-ca.pem
+timeout: 5m
+pollInterval: 5s
+metricNameRE: authorized_hits(_total)?
+spokes:
+  - context: spoke1
+    # Context is a kubeconfig alias. These two values identify the actual
+    # ACM ManagedCluster and ClusterVersion.spec.clusterID for that source.
+    clusterName: first-acm-managed-cluster-name
+    clusterID: first-openshift-cluster-id
+    organizationID: test-organization
+    maas:
+      apiURL: https://maas.apps.first.example.test/maas-api
+      namespace: models-as-a-service
+      modelRef: existing-model-reference
+      modelNamespace: models-as-a-service
+      username: test-user # MaaS management identity of the spoke kubecontext.
+    model: request-model-alias
+    modelLabel: served-model-name
+    inferenceURL: https://maas.apps.first.example.test/v1/chat/completions
+    # caFile: credentials/first-router-ca.pem
+    controllerNamespace: redhat-ods-applications
+    # Deploy this controller image before testing; the suite checks but does not deploy it.
+    expectedControllerImage: quay.io/your-org/odh-observability@sha256:REPLACE_WITH_CHECKOUT_DIGEST
+  - context: spoke2
+    clusterName: second-acm-managed-cluster-name
+    clusterID: second-openshift-cluster-id
+    organizationID: test-organization
+    maas:
+      apiURL: https://maas.apps.second.example.test/maas-api
+      namespace: models-as-a-service
+      modelRef: existing-model-reference
+      modelNamespace: models-as-a-service
+      username: test-user # MaaS management identity of the spoke kubecontext.
+    model: request-model-alias
+    modelLabel: served-model-name
+    inferenceURL: https://maas.apps.second.example.test/v1/chat/completions
+    # caFile: credentials/second-router-ca.pem
+    controllerNamespace: redhat-ods-applications
+    expectedControllerImage: quay.io/your-org/odh-observability@sha256:REPLACE_WITH_CHECKOUT_DIGEST
