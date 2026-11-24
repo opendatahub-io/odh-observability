@@ -7,8 +7,10 @@ import io
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -41,6 +43,41 @@ def namespace_role(name: str) -> dict:
 
 
 class LiveSetupContractTests(unittest.TestCase):
+    def test_documented_recovery_is_scoped_and_requires_confirmation(self) -> None:
+        skill = (Path(SCRIPT_DIR).parent / "SKILL.md").read_text(encoding="utf-8")
+        setup = skill.split("### Live cleanup", 1)[0]
+        self.assertEqual(setup.count('observability.opendatahub.io/live-test-run: "${RUN_ID}"'), 6)
+        recovery = skill.split("Identify an abandoned run", 1)[1].split("```bash\n", 1)[1].split("\n```", 1)[0]
+        run_id = "abcdef0123456789abcdef0123456789"
+        cases = (
+            ("confirmed", f"{run_id}\n{run_id}\n", False, 4),
+            ("wrong confirmation", f"{run_id}\nother\n", False, 0),
+            ("invalid ID", "invalid\n", False, 0),
+            ("listing failed", f"{run_id}\n{run_id}\n", True, 0),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            oc = Path(directory) / "oc"
+            oc.write_text(
+                '#!/bin/sh\nprintf "%s\\n" "$*" >> "$OC_CALLS"\n'
+                '[ "${OC_FAIL_GET:-}" != 1 ] || [ "$1" != get ]\n',
+                encoding="utf-8",
+            )
+            oc.chmod(0o755)
+            for name, user_input, fail_get, expected_deletes in cases:
+                with self.subTest(name=name):
+                    calls = Path(directory) / "calls"
+                    calls.write_text("", encoding="utf-8")
+                    env = {**os.environ, "PATH": f"{directory}:{os.environ['PATH']}", "OC_CALLS": str(calls)}
+                    env["OC_FAIL_GET"] = "1" if fail_get else "0"
+                    subprocess.run(["bash", "-c", recovery], input=user_input, text=True,
+                                   capture_output=True, check=True, env=env)
+                    deletes = [line for line in calls.read_text(encoding="utf-8").splitlines()
+                               if line.startswith("delete ")]
+                    self.assertEqual(len(deletes), expected_deletes)
+                    for command in deletes:
+                        self.assertIn(f"observability.opendatahub.io/live-test-run={run_id}", command)
+                        self.assertIn("app.kubernetes.io/part-of=observability-logs-query-live-test", command)
+
     def test_live_result_sanitizer_removes_raw_data_and_logql(self) -> None:
         payload = {
             "schema_version": "1",

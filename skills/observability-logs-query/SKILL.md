@@ -125,7 +125,7 @@ Run discovery first and keep its validated inventory for the test workload:
 
 ```bash
 set -euo pipefail
-RUN_ID="$(date +%s)-$$"
+RUN_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
 TEST_NAMESPACE="rhai-15151-logs-query-${RUN_ID}"
 TEST_SERVICE_ACCOUNT=logs-query-test
 TEST_READER_ROLE="rhai-15151-logs-query-reader-${RUN_ID}"
@@ -152,7 +152,15 @@ oc get configmap data-science-lokistack-gateway-ca-bundle \
   -o jsonpath='{.data.service-ca\.crt}' > "$CA_FILE"
 test -s "$CA_FILE"
 
-oc create namespace "$TEST_NAMESPACE"
+cat <<EOF | oc create -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${TEST_NAMESPACE}
+  labels:
+    app.kubernetes.io/part-of: observability-logs-query-live-test
+    observability.opendatahub.io/live-test-run: "${RUN_ID}"
+EOF
 
 # Install cleanup before creating any additional temporary resources. The
 # unique names above prevent this trap from deleting another test's resources.
@@ -188,6 +196,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: observability-logs-query-live-test
     app.kubernetes.io/managed-by: manual-test
+    observability.opendatahub.io/live-test-run: "${RUN_ID}"
 rules:
 - apiGroups: [loki.grafana.com]
   resources: [application]
@@ -201,6 +210,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: observability-logs-query-live-test
     app.kubernetes.io/managed-by: manual-test
+    observability.opendatahub.io/live-test-run: "${RUN_ID}"
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -217,6 +227,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: observability-logs-query-live-test
     app.kubernetes.io/managed-by: manual-test
+    observability.opendatahub.io/live-test-run: "${RUN_ID}"
 rules:
 - apiGroups: [""]
   resources: [namespaces]
@@ -229,6 +240,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: observability-logs-query-live-test
     app.kubernetes.io/managed-by: manual-test
+    observability.opendatahub.io/live-test-run: "${RUN_ID}"
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -267,6 +279,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: observability-logs-query-live-test
     app.kubernetes.io/managed-by: manual-test
+    observability.opendatahub.io/live-test-run: "${RUN_ID}"
 spec:
   podSelector:
     matchLabels:
@@ -401,22 +414,48 @@ means the temporary NetworkPolicy selector or pod labels are wrong.
 ### Live cleanup
 
 The setup block installs an `EXIT` trap that removes the temporary resources,
-including the cluster-scoped RBAC, even when validation fails or the shell is
-interrupted. If the shell was restarted before the trap ran, execute:
+including the cluster-scoped RBAC, when the shell exits normally. If the shell
+was restarted before the trap ran, first list the labeled resources and their
+run IDs. NetworkPolicies may be in a non-default monitoring namespace:
 
 ```bash
-oc delete pod/logs-query-test -n "$TEST_NAMESPACE" --ignore-not-found
-oc delete configmap/logs-query-skill configmap/loki-gateway-ca \
-  -n "$TEST_NAMESPACE" --ignore-not-found
-oc delete networkpolicy "$TEST_NETWORK_POLICY" \
-  -n "$MONITORING_NAMESPACE" --ignore-not-found
-oc delete clusterrolebinding "$TEST_READER_BINDING" \
-  "$TEST_NAMESPACE_BINDING" --ignore-not-found
-oc delete clusterrole "$TEST_READER_ROLE" "$TEST_NAMESPACE_ROLE" \
-  --ignore-not-found
-oc delete namespace "$TEST_NAMESPACE" --ignore-not-found
-rm -f "$CA_FILE" logs-result.json
+LABEL=app.kubernetes.io/part-of=observability-logs-query-live-test
+RUN_LABEL=observability.opendatahub.io/live-test-run
+oc get namespaces -l "$LABEL" -L "$RUN_LABEL"
+oc get clusterroles -l "$LABEL" -L "$RUN_LABEL"
+oc get clusterrolebindings -l "$LABEL" -L "$RUN_LABEL"
+oc get networkpolicies --all-namespaces -l "$LABEL" -L "$RUN_LABEL"
 ```
+
+Identify an abandoned run from the listings, not a concurrent active run. Enter
+its run ID below, inspect the matching resources, and confirm the same ID before
+deleting. Deleting its namespace also removes the pod and ConfigMaps.
+
+```bash
+if read -r -p "Abandoned run ID: " RUN_ID && [[ "$RUN_ID" =~ ^[0-9a-f]{32}$ ]]; then
+  SELECTOR="app.kubernetes.io/part-of=observability-logs-query-live-test,observability.opendatahub.io/live-test-run=${RUN_ID}"
+  if oc get namespaces -l "$SELECTOR" &&
+     oc get clusterroles -l "$SELECTOR" &&
+     oc get clusterrolebindings -l "$SELECTOR" &&
+     oc get networkpolicies --all-namespaces -l "$SELECTOR" &&
+     read -r -p "Type the run ID again to delete these resources: " CONFIRM_RUN_ID &&
+     [[ "$CONFIRM_RUN_ID" == "$RUN_ID" ]]; then
+    oc delete networkpolicies --all-namespaces -l "$SELECTOR" --ignore-not-found
+    oc delete clusterrolebindings -l "$SELECTOR" --ignore-not-found
+    oc delete clusterroles -l "$SELECTOR" --ignore-not-found
+    oc delete namespaces -l "$SELECTOR" --ignore-not-found
+  else
+    echo "Cleanup cancelled."
+  fi
+else
+  echo "Invalid run ID; cleanup cancelled."
+fi
+```
+
+Runs created before the run label was added require manual inspection and
+deletion by exact resource name; never delete all resources with only the
+shared `part-of` label. Remove any local CA file and `logs-result.json` after
+verifying they are no longer needed.
 
 Do not delete or patch the operator-owned
 `data-science-lokistack-gateway-ingress` policy. The checked-in
