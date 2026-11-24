@@ -17,6 +17,20 @@ import discover_endpoints  # noqa: E402
 
 
 class DiscoverEndpointsTests(unittest.TestCase):
+    @patch.object(discover_endpoints.subprocess, "run")
+    def test_run_oc_uses_bounded_client_and_subprocess_timeouts(
+        self, mock_run: object
+    ) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="{}", stderr=""
+        )  # type: ignore[attr-defined]
+        self.assertEqual(discover_endpoints.run_oc(["get", "pods", "-o", "json"]), {})
+        call = mock_run.call_args  # type: ignore[attr-defined]
+        self.assertEqual(
+            call.kwargs["timeout"], discover_endpoints.OC_COMMAND_TIMEOUT_SECONDS
+        )
+        self.assertEqual(call.args[0][:2], ["oc", "--request-timeout=20s"])
+
     def test_service_endpoint_preserves_query_base_path(self) -> None:
         output = {"query_endpoints": []}
         service = {
