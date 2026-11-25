@@ -39,6 +39,7 @@ SAFE_OC_ERROR_CATEGORIES = frozenset(
     }
 )
 OC_COMMAND_TIMEOUT_SECONDS = 30
+OC_REQUEST_TIMEOUT = "20s"
 
 
 class OcError(RuntimeError):
@@ -70,7 +71,7 @@ def oc_error_category(stderr: str) -> str:
 
 
 def run_oc(args: list[str], namespace: str | None = None) -> Any:
-    command = ["oc"]
+    command = ["oc", f"--request-timeout={OC_REQUEST_TIMEOUT}"]
     if namespace:
         command.extend(["-n", namespace])
     command.extend(args)

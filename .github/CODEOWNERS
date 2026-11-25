@@ -1,0 +1,4 @@
+# Keep API contract policy and workflow changes owner-reviewed.
+.github/CODEOWNERS @bro-adm @cgoodfred @chambridge @dayakar349 @den-rgb @grdryn @heorhiig @kahowell @marianmacik @steventobin @tgitelman
+.github/workflows/api-contract.yml @bro-adm @cgoodfred @chambridge @dayakar349 @den-rgb @grdryn @heorhiig @kahowell @marianmacik @steventobin @tgitelman
+.rhoai/ @bro-adm @cgoodfred @chambridge @dayakar349 @den-rgb @grdryn @heorhiig @kahowell @marianmacik @steventobin @tgitelman
