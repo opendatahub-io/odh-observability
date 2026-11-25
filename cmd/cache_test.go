@@ -149,22 +149,49 @@ func TestManagerCacheOptions_SplitNamespaces(t *testing.T) {
 		assertMonitoringLabelSelector(t, check.name, check.cfg.Label)
 	}
 
-	// Workload, service, and route types are scoped to monitoringNS + openshift-logging with label filtering.
+	// Deployment, Service, and Route cache all objects in monitoringNS so opted-out unlabeled singletons remain visible without APIReader.
 	for _, check := range []struct {
 		name string
 		cfg  cache.ByObject
 	}{
 		{"Deployment", byObjectEntry[*appsv1.Deployment](t, opts)},
-		{"Job", byObjectEntry[*batchv1.Job](t, opts)},
 		{"Service", byObjectEntry[*corev1.Service](t, opts)},
-		{"ServiceAccount", byObjectEntry[*corev1.ServiceAccount](t, opts)},
 		{"Route", byObjectEntry[*routev1.Route](t, opts)},
 	} {
-		assertNamespaceScopedMonitoringSelector(t, check.name, check.cfg, monitoringNS, moncontroller.ClusterLoggingNamespace)
+		if _, allNS := check.cfg.Namespaces[cache.AllNamespaces]; allNS {
+			t.Fatalf("%s: cache must not watch AllNamespaces when MONITORING_NAMESPACE is set", check.name)
+		}
+		if len(check.cfg.Namespaces) != 1 {
+			t.Fatalf("%s: Namespaces len: want 1, got %d", check.name, len(check.cfg.Namespaces))
+		}
+		nsCfg, ok := check.cfg.Namespaces[monitoringNS]
+		if !ok {
+			t.Fatalf("%s: missing namespace %q", check.name, monitoringNS)
+		}
+		if nsCfg.LabelSelector != nil || nsCfg.FieldSelector != nil {
+			t.Fatalf("%s: expected unfiltered monitoringNS entry, got %+v", check.name, nsCfg)
+		}
 	}
 
-	// ConfigMap: scoped to monitoringNS (labeled only; odh-monitoring-config uses dedicated cache + APIReader).
-	assertNamespaceScopedMonitoringSelector(t, "ConfigMap", byObjectEntry[*corev1.ConfigMap](t, opts), monitoringNS)
+	// Job is label-filtered inside monitoringNS; ServiceAccount is label-filtered inside monitoringNS + openshift-logging.
+	assertNamespaceScopedMonitoringSelector(t, "Job", byObjectEntry[*batchv1.Job](t, opts), monitoringNS)
+	assertNamespaceScopedMonitoringSelector(t, "ServiceAccount", byObjectEntry[*corev1.ServiceAccount](t, opts), monitoringNS, moncontroller.ClusterLoggingNamespace)
+
+	// ConfigMap: monitoringNS unfiltered + podNS restricted to odh-monitoring-config.
+	cmCfg := byObjectEntry[*corev1.ConfigMap](t, opts)
+	if _, allNS := cmCfg.Namespaces[cache.AllNamespaces]; allNS {
+		t.Fatal("ConfigMap cache must not watch AllNamespaces when MONITORING_NAMESPACE is set")
+	}
+	if len(cmCfg.Namespaces) != 2 {
+		t.Fatalf("ConfigMap Namespaces len: want 2, got %d", len(cmCfg.Namespaces))
+	}
+	if nsCfg, ok := cmCfg.Namespaces[monitoringNS]; !ok || nsCfg.LabelSelector != nil || nsCfg.FieldSelector != nil {
+		t.Fatalf("ConfigMap monitoringNS entry unexpected: %+v", nsCfg)
+	}
+	if cmCfg.Namespaces[podNS].FieldSelector == nil ||
+		cmCfg.Namespaces[podNS].FieldSelector.String() != "metadata.name="+moncontroller.PlatformConfigName {
+		t.Fatalf("ConfigMap podNS FieldSelector: got %v", cmCfg.Namespaces[podNS].FieldSelector)
+	}
 
 	// Secret: scoped to monitoringNS and podNS (webhook cert only).
 	secretCfg := byObjectEntry[*corev1.Secret](t, opts)
@@ -270,7 +297,7 @@ func TestManagerCacheOptions_CacheNewValidation(t *testing.T) {
 }
 
 func TestManagerCacheOptions_UnsetMonitoringNamespacePreservesStandaloneMode(t *testing.T) {
-	opts, err := managerCacheOptions("", "opendatahub", "odh-observability")
+	opts, err := managerCacheOptions("", "", "odh-observability")
 	if err != nil {
 		t.Fatalf("managerCacheOptions failed: %v", err)
 	}
@@ -282,7 +309,7 @@ func TestManagerCacheOptions_UnsetMonitoringNamespacePreservesStandaloneMode(t *
 		}
 	}
 
-	// ConfigMap, EndpointSlice, and workload/service types still remain label-filtered in standalone mode.
+	// ConfigMap, EndpointSlice, and workload/service types remain label-filtered in standalone mode.
 	for _, check := range []struct {
 		name string
 		cfg  cache.ByObject
@@ -308,6 +335,20 @@ func TestManagerCacheOptions_UnsetMonitoringNamespacePreservesStandaloneMode(t *
 	if esCfg.Label == nil || !esCfg.Label.Matches(labels.Set{discoveryv1.LabelServiceName: "kubernetes"}) {
 		t.Fatal("EndpointSlice selector must match kubernetes service when MONITORING_NAMESPACE is unset")
 	}
+
+	// When POD_NAMESPACE is set without MONITORING_NAMESPACE, ConfigMap also includes podNS unfiltered.
+	withPodOpts, err := managerCacheOptions("", "opendatahub", "odh-observability")
+	if err != nil {
+		t.Fatalf("managerCacheOptions with podNS failed: %v", err)
+	}
+	cmCfg := byObjectEntry[*corev1.ConfigMap](t, withPodOpts)
+	if len(cmCfg.Namespaces) != 2 {
+		t.Fatalf("ConfigMap Namespaces len: want 2, got %d", len(cmCfg.Namespaces))
+	}
+	assertMonitoringLabelSelector(t, "ConfigMap[AllNamespaces]", cmCfg.Namespaces[cache.AllNamespaces].LabelSelector)
+	if _, ok := cmCfg.Namespaces["opendatahub"]; !ok {
+		t.Fatal("ConfigMap cache must include podNS when POD_NAMESPACE is set")
+	}
 }
 
 func TestManagerCacheOptions_ClusterLoggingMonitoringNamespaceDeduplicates(t *testing.T) {
@@ -326,7 +367,7 @@ func TestManagerCacheOptions_ClusterLoggingMonitoringNamespaceDeduplicates(t *te
 	}
 }
 
-func TestManagerCacheOptions_SameNamespaceKeepsConfigMapLabelFiltered(t *testing.T) {
+func TestManagerCacheOptions_SameNamespaceIncludesPlatformConfigMap(t *testing.T) {
 	const ns = "opendatahub"
 	opts, err := managerCacheOptions(ns, ns, "odh-observability")
 	if err != nil {
@@ -337,11 +378,11 @@ func TestManagerCacheOptions_SameNamespaceKeepsConfigMapLabelFiltered(t *testing
 	if len(cmCfg.Namespaces) != 1 {
 		t.Fatalf("ConfigMap Namespaces len: want 1, got %d", len(cmCfg.Namespaces))
 	}
-	sel := cmCfg.Namespaces[ns].LabelSelector
-	if sel == nil || !sel.Matches(labels.Set{odhLabels.PlatformPartOf: moncontroller.MonitoringPartOf}) {
-		t.Fatal("ConfigMap same-namespace selector must match monitoring-managed ConfigMaps")
+	nsCfg, ok := cmCfg.Namespaces[ns]
+	if !ok {
+		t.Fatalf("ConfigMap missing namespace %q", ns)
 	}
-	if sel.Matches(labels.Set{}) {
-		t.Fatal("ConfigMap same-namespace selector must exclude unlabeled ConfigMaps")
+	if nsCfg.LabelSelector != nil || nsCfg.FieldSelector != nil {
+		t.Fatalf("ConfigMap same-namespace entry should be unfiltered to include odh-monitoring-config, got %+v", nsCfg)
 	}
 }

@@ -178,7 +178,6 @@ func main() {
 
 	if err := (&moncontroller.MonitoringReconciler{
 		Client:          mgr.GetClient(),
-		APIReader:       mgr.GetAPIReader(),
 		Scheme:          mgr.GetScheme(),
 		Deployer:        deployer,
 		DynamicClient:   dynamicClient,

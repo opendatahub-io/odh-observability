@@ -25,7 +25,6 @@ import (
 	"time"
 
 	platformcommon "github.com/opendatahub-io/odh-platform-utilities/api/common"
-	odhcache "github.com/opendatahub-io/odh-platform-utilities/pkg/cache"
 	libconditions "github.com/opendatahub-io/odh-platform-utilities/pkg/controller/conditions"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/controller/gc"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/deploy"
@@ -44,7 +43,6 @@ import (
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -52,7 +50,6 @@ import (
 	"k8s.io/client-go/dynamic"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -60,7 +57,6 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 	"github.com/opendatahub-io/odh-observability/internal/controller/conditions"
@@ -153,19 +149,10 @@ func operatorVersion() string {
 type MonitoringReconciler struct {
 	client.Client
 
-	APIReader       client.Reader
 	Scheme          *runtime.Scheme
 	Deployer        *deploy.Deployer
 	DynamicClient   dynamic.Interface
 	DiscoveryClient discovery.DiscoveryInterface
-}
-
-//nolint:ireturn // Returns uncached APIReader when wired, falling back to Client for unit tests.
-func (r *MonitoringReconciler) apiReader() client.Reader {
-	if r.APIReader != nil {
-		return r.APIReader
-	}
-	return r.Client
 }
 
 // +kubebuilder:rbac:groups=services.platform.opendatahub.io,resources=monitorings,verbs=get;list;watch;create;update;patch;delete
@@ -604,10 +591,7 @@ func (r *MonitoringReconciler) renderMonitoringResources(
 		deployAlerting,
 		deployOperatorMonitoring,
 		deployNodeMetricsEndpoint,
-		func(ctx context.Context, c client.Client, m *v1alpha1.Monitoring,
-			cm *conditions.ConditionsManager, sources *[]rendertemplate.TemplateSource) error {
-			return deployKorrel8r(ctx, c, r.apiReader(), m, cm, sources)
-		},
+		deployKorrel8r,
 		func(ctx context.Context, c client.Client, m *v1alpha1.Monitoring,
 			cm *conditions.ConditionsManager, sources *[]rendertemplate.TemplateSource) error {
 			return deployPerses(ctx, c, m, cm, sources, persesVersion, persesFound)
@@ -764,7 +748,7 @@ func (r *MonitoringReconciler) syncPostDeployResources(
 ) {
 	log := logf.FromContext(ctx)
 
-	if err := syncThanosQuerierRouteDestinationCA(ctx, r.Client, r.apiReader(), monitoring); err != nil {
+	if err := syncThanosQuerierRouteDestinationCA(ctx, r.Client, monitoring); err != nil {
 		log.Error(err, "Failed to sync Thanos Querier Route destination CA")
 		cm.MarkFalse(conditions.ConditionMonitoringStackAvailable,
 			"ThanosCAConfigSyncFailed",
@@ -772,7 +756,7 @@ func (r *MonitoringReconciler) syncPostDeployResources(
 	}
 
 	// Populate status.url from the Thanos Querier route.
-	if err := syncStatusURL(ctx, r.apiReader(), monitoring); err != nil {
+	if err := syncStatusURL(ctx, r.Client, monitoring); err != nil {
 		log.Error(err, "Failed to sync status URL")
 	}
 }
@@ -1105,7 +1089,7 @@ func (r *MonitoringReconciler) readPlatformVersion(ctx context.Context) (string,
 	}
 
 	var cm corev1.ConfigMap
-	if err := r.apiReader().Get(ctx, types.NamespacedName{Name: platformConfigName, Namespace: ns}, &cm); err != nil {
+	if err := r.Get(ctx, types.NamespacedName{Name: platformConfigName, Namespace: ns}, &cm); err != nil {
 		if k8serr.IsNotFound(err) {
 			return "", nil
 		}
@@ -1271,15 +1255,6 @@ func namespaceWatchPredicate() predicate.Funcs {
 	}
 }
 
-type runnableCache struct {
-	cache.Cache
-}
-
-//nolint:ireturn // Implements controller-runtime manager's hasCache interface so the cache starts before controllers.
-func (c runnableCache) GetCache() cache.Cache {
-	return c.Cache
-}
-
 // SetupWithManager registers the controller with the manager.
 func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	toSingleton := handler.EnqueueRequestsFromMapFunc(singletonRequests)
@@ -1297,8 +1272,10 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// unrelated Monitoring update or periodic log-discovery reconciliation.
 	networkPolicyPredicate := predicate.Or(managedPredicate,
 		predicate.NewPredicateFuncs(isOpenTelemetryOperatorNetworkPolicyEvent))
+	configMapPredicate := predicate.Or(managedPredicate,
+		predicate.NewPredicateFuncs(isPlatformConfigMap))
 
-	blder := ctrl.NewControllerManagedBy(mgr).
+	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.Monitoring{}).
 		// Watch managed resources for drift detection.
 		Watches(&rbacv1.Role{}, toSingleton, builder.WithPredicates(managedPredicate)).
@@ -1308,7 +1285,7 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&networkingv1.NetworkPolicy{}, toSingleton, builder.WithPredicates(networkPolicyPredicate)).
 		Watches(&appsv1.Deployment{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&batchv1.Job{}, toSingleton, builder.WithPredicates(managedPredicate)).
-		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(managedPredicate)).
+		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(configMapPredicate)).
 		Watches(&corev1.Secret{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&corev1.Secret{}, toSingleton, builder.WithPredicates(predicate.NewPredicateFuncs(isPrometheusWebTLSCASecret))).
 		// The LokiStack storage Secrets are the user's, so they carry no
@@ -1330,44 +1307,6 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// Metadata-only avoids caching large OpenAPI schemas in memory.
 		Watches(&extv1.CustomResourceDefinition{}, toSingleton, builder.OnlyMetadata).
 		// Reconcile when cluster APIServer TLS profile changes.
-		Watches(&configv1.APIServer{}, toSingleton, builder.WithPredicates(predicate.GenerationChangedPredicate{}))
-
-	// Watch odh-monitoring-config via a dedicated single-object cache so
-	// mgr.GetCache() can keep ConfigMaps label-filtered even when POD_NAMESPACE
-	// equals MONITORING_NAMESPACE.
-	if podNS := os.Getenv("POD_NAMESPACE"); podNS != "" {
-		platformConfigCache, err := cache.New(mgr.GetConfig(), cache.Options{
-			HTTPClient:       mgr.GetHTTPClient(),
-			Scheme:           mgr.GetScheme(),
-			Mapper:           mgr.GetRESTMapper(),
-			DefaultTransform: odhcache.StripUnusedFields(),
-			ByObject: map[client.Object]cache.ByObject{
-				&corev1.ConfigMap{}: {
-					Namespaces: map[string]cache.Config{
-						podNS: {
-							FieldSelector: fields.OneTermEqualSelector("metadata.name", platformConfigName),
-						},
-					},
-				},
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("creating platform config cache: %w", err)
-		}
-		if err := mgr.Add(runnableCache{Cache: platformConfigCache}); err != nil {
-			return fmt.Errorf("registering platform config cache: %w", err)
-		}
-		blder = blder.WatchesRawSource(source.Kind(
-			platformConfigCache,
-			&corev1.ConfigMap{},
-			handler.TypedEnqueueRequestsFromMapFunc(func(ctx context.Context, obj *corev1.ConfigMap) []reconcile.Request {
-				return singletonRequests(ctx, obj)
-			}),
-			predicate.NewTypedPredicateFuncs(func(obj *corev1.ConfigMap) bool {
-				return isPlatformConfigMap(obj)
-			}),
-		))
-	}
-
-	return blder.Complete(r)
+		Watches(&configv1.APIServer{}, toSingleton, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		Complete(r)
 }

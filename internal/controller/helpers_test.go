@@ -318,7 +318,7 @@ func TestSyncHelpersUseConfiguredMonitoringNamespace(t *testing.T) {
 		t.Fatalf("CA Secret was not synchronized in the configured namespace: %v", err)
 	}
 
-	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, cli, m); err != nil {
+	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
 		t.Fatalf("syncThanosQuerierRouteDestinationCA: %v", err)
 	}
 	if err := cli.Get(context.Background(), types.NamespacedName{
@@ -459,7 +459,7 @@ func TestSyncThanosQuerierRouteDestinationCA(t *testing.T) {
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(cm, route).Build()
-	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, cli, m); err != nil {
+	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -480,7 +480,7 @@ func TestSyncThanosQuerierRouteDestinationCA_NoRouteOrCA(t *testing.T) {
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).Build()
-	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, cli, m); err != nil {
+	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
 		t.Fatalf("missing ConfigMap should not fail reconciliation: %v", err)
 	}
 
@@ -493,12 +493,12 @@ func TestSyncThanosQuerierRouteDestinationCA_NoRouteOrCA(t *testing.T) {
 	if err := cli.Create(context.Background(), cm); err != nil {
 		t.Fatalf("failed to create empty ConfigMap: %v", err)
 	}
-	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, cli, m); err != nil {
+	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
 		t.Fatalf("empty ConfigMap should not fail reconciliation: %v", err)
 	}
 }
 
-func TestSyncThanosQuerierRouteDestinationCA_UsesAPIReaderAndSkipsOptedOut(t *testing.T) {
+func TestSyncThanosQuerierRouteDestinationCA_SkipsOptedOut(t *testing.T) {
 	s := newTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Metrics = &v1alpha1.Metrics{
@@ -513,7 +513,7 @@ func TestSyncThanosQuerierRouteDestinationCA_UsesAPIReaderAndSkipsOptedOut(t *te
 	cm.SetName(prometheusWebTLSCAConfigMapName)
 	_ = unstructured.SetNestedStringMap(cm.Object, map[string]string{serviceCACertificateKey: ca}, "data")
 
-	t.Run("managed Route read via apiReader is patched", func(t *testing.T) {
+	t.Run("managed Route is patched", func(t *testing.T) {
 		managedRoute := &routev1.Route{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      thanosQuerierRouteName,
@@ -528,7 +528,7 @@ func TestSyncThanosQuerierRouteDestinationCA_UsesAPIReaderAndSkipsOptedOut(t *te
 
 		var patchedCA string
 		patchCalls := 0
-		cachedClient := fake.NewClientBuilder().WithScheme(s).WithObjects(cm).
+		cli := fake.NewClientBuilder().WithScheme(s).WithObjects(cm, managedRoute).
 			WithInterceptorFuncs(interceptor.Funcs{
 				Patch: func(_ context.Context, _ client.WithWatch, obj client.Object, _ client.Patch, _ ...client.PatchOption) error {
 					patchCalls++
@@ -538,9 +538,8 @@ func TestSyncThanosQuerierRouteDestinationCA_UsesAPIReaderAndSkipsOptedOut(t *te
 					return nil
 				},
 			}).Build()
-		apiReader := fake.NewClientBuilder().WithScheme(s).WithObjects(managedRoute).Build()
 
-		if err := syncThanosQuerierRouteDestinationCA(context.Background(), cachedClient, apiReader, m); err != nil {
+		if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if patchCalls != 1 {
@@ -567,16 +566,15 @@ func TestSyncThanosQuerierRouteDestinationCA_UsesAPIReaderAndSkipsOptedOut(t *te
 		}
 
 		patchCalls := 0
-		cachedClient := fake.NewClientBuilder().WithScheme(s).WithObjects(cm).
+		cli := fake.NewClientBuilder().WithScheme(s).WithObjects(cm, optedOutRoute).
 			WithInterceptorFuncs(interceptor.Funcs{
 				Patch: func(_ context.Context, _ client.WithWatch, _ client.Object, _ client.Patch, _ ...client.PatchOption) error {
 					patchCalls++
 					return nil
 				},
 			}).Build()
-		apiReader := fake.NewClientBuilder().WithScheme(s).WithObjects(optedOutRoute).Build()
 
-		if err := syncThanosQuerierRouteDestinationCA(context.Background(), cachedClient, apiReader, m); err != nil {
+		if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if patchCalls != 0 {
@@ -584,8 +582,8 @@ func TestSyncThanosQuerierRouteDestinationCA_UsesAPIReaderAndSkipsOptedOut(t *te
 		}
 
 		got := &routev1.Route{}
-		if err := apiReader.Get(context.Background(), objKey(m.Spec.Namespace, thanosQuerierRouteName), got); err != nil {
-			t.Fatalf("reading Route from apiReader: %v", err)
+		if err := cli.Get(context.Background(), objKey(m.Spec.Namespace, thanosQuerierRouteName), got); err != nil {
+			t.Fatalf("reading Route: %v", err)
 		}
 		if got.Spec.TLS.DestinationCACertificate != "custom-ca" {
 			t.Fatalf("opted-out Route should not be mutated: want %q, got %q", "custom-ca", got.Spec.TLS.DestinationCACertificate)
@@ -685,7 +683,7 @@ func TestSyncStatusURL_NoIngress(t *testing.T) {
 	}
 }
 
-func TestSyncStatusURL_UsesAPIReader(t *testing.T) {
+func TestSyncStatusURL_ReadsOptedOutUnlabeledRoute(t *testing.T) {
 	s := newTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Metrics = &v1alpha1.Metrics{
@@ -703,8 +701,8 @@ func TestSyncStatusURL_UsesAPIReader(t *testing.T) {
 		},
 	}
 
-	apiReader := fake.NewClientBuilder().WithScheme(s).WithObjects(route).WithStatusSubresource(route).Build()
-	if err := syncStatusURL(context.Background(), apiReader, m); err != nil {
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(route).WithStatusSubresource(route).Build()
+	if err := syncStatusURL(context.Background(), cli, m); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if m.Status.URL != "https://opted-out.example.com" {

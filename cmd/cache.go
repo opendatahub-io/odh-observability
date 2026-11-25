@@ -70,7 +70,7 @@ func managerCacheOptions(monitoringNS, podNS, operatorName string) (cache.Option
 	})
 	managedOnly := cache.ByObject{Label: monitoringSelector}
 
-	managedScoped := managedNamespaceCacheByObject(monitoringNS, monitoringSelector)
+	monitoringNSUnfiltered := monitoringNamespaceUnfilteredCacheByObject(monitoringNS, monitoringSelector)
 
 	endpointSliceCache, err := endpointSliceCacheByObject(monitoringNS)
 	if err != nil {
@@ -85,12 +85,12 @@ func managerCacheOptions(monitoringNS, podNS, operatorName string) (cache.Option
 		&rbacv1.RoleBinding{}:        managedOnly,
 		&rbacv1.ClusterRole{}:        managedOnly,
 		&rbacv1.ClusterRoleBinding{}: managedOnly,
-		&appsv1.Deployment{}:         managedScoped,
-		&batchv1.Job{}:               managedScoped,
-		&corev1.Service{}:            managedScoped,
-		&corev1.ServiceAccount{}:     managedScoped,
-		&routev1.Route{}:             managedScoped,
-		&corev1.ConfigMap{}:          configMapCacheByObject(monitoringNS, monitoringSelector),
+		&appsv1.Deployment{}:         monitoringNSUnfiltered,
+		&batchv1.Job{}:               jobCacheByObject(monitoringNS, monitoringSelector),
+		&corev1.Service{}:            monitoringNSUnfiltered,
+		&corev1.ServiceAccount{}:     serviceAccountCacheByObject(monitoringNS, monitoringSelector),
+		&routev1.Route{}:             monitoringNSUnfiltered,
+		&corev1.ConfigMap{}:          configMapCacheByObject(monitoringNS, podNS, monitoringSelector),
 		&discoveryv1.EndpointSlice{}: endpointSliceCache,
 	}
 
@@ -110,12 +110,37 @@ func managerCacheOptions(monitoringNS, podNS, operatorName string) (cache.Option
 	}, nil
 }
 
-// managedNamespaceCacheByObject restricts labeled workload, service, and route
-// informers to monitoringNS and openshift-logging (log-forwarder SA) so user
-// namespaces carrying a copied part-of=monitoring label cannot populate the
-// cache. When MONITORING_NAMESPACE is unset (standalone/local dev), it falls back
-// to cluster-wide label filtering.
-func managedNamespaceCacheByObject(monitoringNS string, monitoringSelector labels.Selector) cache.ByObject {
+// monitoringNamespaceUnfilteredCacheByObject caches all objects of the given
+// type within monitoringNS when MONITORING_NAMESPACE is set so opted-out
+// unlabeled singletons (opendatahub.io/managed: "false") remain readable from
+// the cache without bypassing it via APIReader. When MONITORING_NAMESPACE is
+// unset (standalone/local dev), it falls back to cluster-wide label filtering.
+func monitoringNamespaceUnfilteredCacheByObject(monitoringNS string, monitoringSelector labels.Selector) cache.ByObject {
+	if monitoringNS == "" {
+		return cache.ByObject{Label: monitoringSelector}
+	}
+	return cache.ByObject{
+		Namespaces: map[string]cache.Config{
+			monitoringNS: {},
+		},
+	}
+}
+
+func jobCacheByObject(monitoringNS string, monitoringSelector labels.Selector) cache.ByObject {
+	if monitoringNS == "" {
+		return cache.ByObject{Label: monitoringSelector}
+	}
+	return cache.ByObject{
+		Namespaces: map[string]cache.Config{
+			monitoringNS: {LabelSelector: monitoringSelector},
+		},
+	}
+}
+
+// serviceAccountCacheByObject restricts labeled ServiceAccount informers to
+// monitoringNS and openshift-logging (log-forwarder SA) so user namespaces
+// carrying a copied part-of=monitoring label cannot populate the cache.
+func serviceAccountCacheByObject(monitoringNS string, monitoringSelector labels.Selector) cache.ByObject {
 	if monitoringNS == "" {
 		return cache.ByObject{Label: monitoringSelector}
 	}
@@ -130,21 +155,30 @@ func managedNamespaceCacheByObject(monitoringNS string, monitoringSelector label
 	return cache.ByObject{Namespaces: namespaces}
 }
 
-// configMapCacheByObject restricts the manager's ConfigMap informer to
-// monitoring-managed resources. The platform handshake ConfigMap
-// (odh-monitoring-config in POD_NAMESPACE) is watched via a dedicated
-// single-object cache and read via APIReader so single-namespace installs
-// (where POD_NAMESPACE == MONITORING_NAMESPACE) do not open an unfiltered
-// ConfigMap cache on a shared namespace.
-func configMapCacheByObject(monitoringNS string, monitoringSelector labels.Selector) cache.ByObject {
+// configMapCacheByObject caches monitoringNS ConfigMaps (including unlabeled
+// opted-out ConfigMaps and single-namespace installs where POD_NAMESPACE ==
+// MONITORING_NAMESPACE) plus only odh-monitoring-config in podNS when split.
+func configMapCacheByObject(monitoringNS, podNS string, monitoringSelector labels.Selector) cache.ByObject {
 	if monitoringNS == "" {
-		return cache.ByObject{Label: monitoringSelector}
+		if podNS == "" {
+			return cache.ByObject{Label: monitoringSelector}
+		}
+		return cache.ByObject{
+			Namespaces: map[string]cache.Config{
+				cache.AllNamespaces: {LabelSelector: monitoringSelector},
+				podNS:               {},
+			},
+		}
 	}
-	return cache.ByObject{
-		Namespaces: map[string]cache.Config{
-			monitoringNS: {LabelSelector: monitoringSelector},
-		},
+	namespaces := map[string]cache.Config{
+		monitoringNS: {},
 	}
+	if podNS != "" && podNS != monitoringNS {
+		namespaces[podNS] = cache.Config{
+			FieldSelector: fields.OneTermEqualSelector("metadata.name", moncontroller.PlatformConfigName),
+		}
+	}
+	return cache.ByObject{Namespaces: namespaces}
 }
 
 func secretCacheByObject(monitoringNS, podNS, webhookCertSecretName string) cache.ByObject {
@@ -171,6 +205,10 @@ func networkPolicyCacheByObject(monitoringNS string, monitoringSelector labels.S
 	return cache.ByObject{Namespaces: namespaces}
 }
 
+// endpointSliceCacheByObject restricts EndpointSlices to the default namespace
+// ("kubernetes" service, read by addKorrel8rAPIServerData) and monitoringNS
+// ("korrel8r" service, read by korrel8rReady). If MONITORING_NAMESPACE is set to
+// "default", both service names are combined in the single "default" entry.
 func endpointSliceCacheByObject(monitoringNS string) (cache.ByObject, error) {
 	if monitoringNS == "" || monitoringNS == metav1.NamespaceDefault {
 		req, err := labels.NewRequirement(

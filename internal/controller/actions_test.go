@@ -4013,7 +4013,7 @@ func TestDeployKorrel8r_GatedBySignalConfiguration(t *testing.T) {
 			cm := conditions.NewConditionsManager(m, m.Generation)
 			var sources []rendertemplate.TemplateSource
 			cli := fake.NewClientBuilder().WithScheme(newActionsTestScheme(t)).Build()
-			if err := deployKorrel8r(context.Background(), cli, cli, m, cm, &sources); err != nil {
+			if err := deployKorrel8r(context.Background(), cli, m, cm, &sources); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
@@ -4071,7 +4071,7 @@ func TestDeployKorrel8r_MarksAvailableWhenServiceReady(t *testing.T) {
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
-	if err := deployKorrel8r(context.Background(), cli, cli, m, cm, &sources); err != nil {
+	if err := deployKorrel8r(context.Background(), cli, m, cm, &sources); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -4085,7 +4085,7 @@ func TestDeployKorrel8r_MarksAvailableWhenServiceReady(t *testing.T) {
 	}
 }
 
-func TestDeployKorrel8r_UsesAPIReaderForDeploymentAndService(t *testing.T) {
+func TestDeployKorrel8r_OptedOutUnlabeledResourcesMarkAvailable(t *testing.T) {
 	s := newActionsTestScheme(t)
 	m := newMonitoring(v1alpha1.MonitoringInstanceName)
 	m.Spec.Metrics = &v1alpha1.Metrics{
@@ -4093,23 +4093,7 @@ func TestDeployKorrel8r_UsesAPIReaderForDeploymentAndService(t *testing.T) {
 	}
 
 	replicas := int32(1)
-	cachedClient := fake.NewClientBuilder().WithScheme(s).WithObjects(
-		&discoveryv1.EndpointSlice{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      Korrel8rServiceName + "-abcde",
-				Namespace: m.Spec.Namespace,
-				Labels:    map[string]string{discoveryv1.LabelServiceName: Korrel8rServiceName},
-			},
-			Endpoints: []discoveryv1.Endpoint{{
-				Addresses: []string{"10.0.0.1"},
-				Conditions: discoveryv1.EndpointConditions{
-					Ready: func() *bool { value := true; return &value }(),
-				},
-			}},
-		},
-	).Build()
-	// Opted-out unlabeled Deployment and Service absent from cachedClient.
-	apiReader := fake.NewClientBuilder().WithScheme(s).WithObjects(
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(
 		&appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        Korrel8rServiceName,
@@ -4126,11 +4110,24 @@ func TestDeployKorrel8r_UsesAPIReaderForDeploymentAndService(t *testing.T) {
 				Annotations: map[string]string{"opendatahub.io/managed": "false"},
 			},
 		},
+		&discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      Korrel8rServiceName + "-abcde",
+				Namespace: m.Spec.Namespace,
+				Labels:    map[string]string{discoveryv1.LabelServiceName: Korrel8rServiceName},
+			},
+			Endpoints: []discoveryv1.Endpoint{{
+				Addresses: []string{"10.0.0.1"},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready: func() *bool { value := true; return &value }(),
+				},
+			}},
+		},
 	).Build()
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
-	if err := deployKorrel8r(context.Background(), cachedClient, apiReader, m, cm, &sources); err != nil {
+	if err := deployKorrel8r(context.Background(), cli, m, cm, &sources); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -4161,7 +4158,7 @@ func TestDeployKorrel8r_RendersOwnedResourcesAndConfiguredStores(t *testing.T) {
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
-	if err := deployKorrel8r(context.Background(), cli, cli, m, cm, &sources); err != nil {
+	if err := deployKorrel8r(context.Background(), cli, m, cm, &sources); err != nil {
 		t.Fatalf("deployKorrel8r error: %v", err)
 	}
 

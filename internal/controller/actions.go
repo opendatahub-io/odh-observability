@@ -1414,7 +1414,6 @@ func deployClusterLogForwarder(
 func deployKorrel8r(
 	ctx context.Context,
 	c client.Client,
-	apiReader client.Reader,
 	monitoring *v1alpha1.Monitoring,
 	cm *conditions.ConditionsManager,
 	sources *[]rendertemplate.TemplateSource,
@@ -1425,7 +1424,7 @@ func deployKorrel8r(
 		return nil
 	}
 
-	ready, err := korrel8rReady(ctx, c, apiReader, monitoringNamespace(monitoring))
+	ready, err := korrel8rReady(ctx, c, monitoringNamespace(monitoring))
 	if err != nil {
 		return fmt.Errorf("checking Korrel8r readiness: %w", err)
 	}
@@ -1448,15 +1447,9 @@ func deployKorrel8r(
 // korrel8rReady reports whether the rendered Deployment has ready replicas and
 // its Service has at least one ready endpoint. The endpoint check prevents a
 // selector or Service drift from being reported as an available service.
-// Deployment and Service are read via apiReader so opted-out unlabeled
-// singletons (opendatahub.io/managed: "false") remain visible despite the
-// part-of-filtered manager cache.
-func korrel8rReady(ctx context.Context, c client.Client, apiReader client.Reader, namespace string) (bool, error) {
-	if apiReader == nil {
-		apiReader = c
-	}
+func korrel8rReady(ctx context.Context, c client.Client, namespace string) (bool, error) {
 	deployment := &appsv1.Deployment{}
-	if err := apiReader.Get(ctx, types.NamespacedName{Name: Korrel8rServiceName, Namespace: namespace}, deployment); err != nil {
+	if err := c.Get(ctx, types.NamespacedName{Name: Korrel8rServiceName, Namespace: namespace}, deployment); err != nil {
 		if k8serr.IsNotFound(err) {
 			return false, nil
 		}
@@ -1471,7 +1464,7 @@ func korrel8rReady(ctx context.Context, c client.Client, apiReader client.Reader
 	}
 
 	service := &corev1.Service{}
-	if err := apiReader.Get(ctx, types.NamespacedName{Name: Korrel8rServiceName, Namespace: namespace}, service); err != nil {
+	if err := c.Get(ctx, types.NamespacedName{Name: Korrel8rServiceName, Namespace: namespace}, service); err != nil {
 		if k8serr.IsNotFound(err) {
 			return false, nil
 		}
