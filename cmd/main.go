@@ -130,7 +130,7 @@ func main() {
 		os.Exit(1)
 	}
 	if os.Getenv("MONITORING_NAMESPACE") == "" {
-		setupLog.Info("MONITORING_NAMESPACE not set; Secret and NetworkPolicy caches remain cluster-scoped")
+		setupLog.Info("MONITORING_NAMESPACE not set; Secret, NetworkPolicy, and workload/service caches remain cluster-scoped")
 	}
 
 	mgrOpts := ctrl.Options{

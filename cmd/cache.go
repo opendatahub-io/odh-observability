@@ -70,21 +70,26 @@ func managerCacheOptions(monitoringNS, podNS, operatorName string) (cache.Option
 	})
 	managedOnly := cache.ByObject{Label: monitoringSelector}
 
+	managedScoped := managedNamespaceCacheByObject(monitoringNS, monitoringSelector)
+
 	endpointSliceCache, err := endpointSliceCacheByObject(monitoringNS)
 	if err != nil {
 		return cache.Options{}, err
 	}
 
 	byObject := map[client.Object]cache.ByObject{
+		// Role and RoleBinding remain cluster-wide label-filtered because
+		// TargetAllocator's secret Roles/RoleBindings are rendered into every
+		// non-system namespace and listed cluster-wide during GC.
 		&rbacv1.Role{}:               managedOnly,
 		&rbacv1.RoleBinding{}:        managedOnly,
 		&rbacv1.ClusterRole{}:        managedOnly,
 		&rbacv1.ClusterRoleBinding{}: managedOnly,
-		&appsv1.Deployment{}:         managedOnly,
-		&batchv1.Job{}:               managedOnly,
-		&corev1.Service{}:            managedOnly,
-		&corev1.ServiceAccount{}:     managedOnly,
-		&routev1.Route{}:             managedOnly,
+		&appsv1.Deployment{}:         managedScoped,
+		&batchv1.Job{}:               managedScoped,
+		&corev1.Service{}:            managedScoped,
+		&corev1.ServiceAccount{}:     managedScoped,
+		&routev1.Route{}:             managedScoped,
 		&corev1.ConfigMap{}:          configMapCacheByObject(monitoringNS, monitoringSelector),
 		&discoveryv1.EndpointSlice{}: endpointSliceCache,
 	}
@@ -103,6 +108,26 @@ func managerCacheOptions(monitoringNS, podNS, operatorName string) (cache.Option
 		DefaultTransform: odhcache.StripUnusedFields(),
 		ByObject:         byObject,
 	}, nil
+}
+
+// managedNamespaceCacheByObject restricts labeled workload, service, and route
+// informers to monitoringNS and openshift-logging (log-forwarder SA) so user
+// namespaces carrying a copied part-of=monitoring label cannot populate the
+// cache. When MONITORING_NAMESPACE is unset (standalone/local dev), it falls back
+// to cluster-wide label filtering.
+func managedNamespaceCacheByObject(monitoringNS string, monitoringSelector labels.Selector) cache.ByObject {
+	if monitoringNS == "" {
+		return cache.ByObject{Label: monitoringSelector}
+	}
+	namespaces := map[string]cache.Config{
+		monitoringNS: {LabelSelector: monitoringSelector},
+	}
+	if monitoringNS != moncontroller.ClusterLoggingNamespace {
+		namespaces[moncontroller.ClusterLoggingNamespace] = cache.Config{
+			LabelSelector: monitoringSelector,
+		}
+	}
+	return cache.ByObject{Namespaces: namespaces}
 }
 
 // configMapCacheByObject restricts the manager's ConfigMap informer to

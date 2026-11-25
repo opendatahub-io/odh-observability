@@ -94,6 +94,36 @@ func TestManagerCacheOptions_DefaultTransformStripsUnusedFields(t *testing.T) {
 	}
 }
 
+func assertMonitoringLabelSelector(t *testing.T, context string, sel labels.Selector) {
+	t.Helper()
+	if sel == nil {
+		t.Fatalf("%s: expected Label selector to be set", context)
+	}
+	if !sel.Matches(labels.Set{odhLabels.PlatformPartOf: moncontroller.MonitoringPartOf}) {
+		t.Fatalf("%s: expected Label selector to match monitoring resource", context)
+	}
+	if sel.Matches(labels.Set{"app": "user-workload"}) {
+		t.Fatalf("%s: expected Label selector to exclude unlabeled user resource", context)
+	}
+}
+
+func assertNamespaceScopedMonitoringSelector(t *testing.T, name string, cfg cache.ByObject, namespaces ...string) {
+	t.Helper()
+	if _, allNS := cfg.Namespaces[cache.AllNamespaces]; allNS {
+		t.Fatalf("%s: cache must not watch AllNamespaces when MONITORING_NAMESPACE is set", name)
+	}
+	if len(cfg.Namespaces) != len(namespaces) {
+		t.Fatalf("%s: Namespaces len: want %d, got %d", name, len(namespaces), len(cfg.Namespaces))
+	}
+	for _, ns := range namespaces {
+		nsCfg, ok := cfg.Namespaces[ns]
+		if !ok {
+			t.Fatalf("%s: missing namespace %q", name, ns)
+		}
+		assertMonitoringLabelSelector(t, name+"["+ns+"]", nsCfg.LabelSelector)
+	}
+}
+
 func TestManagerCacheOptions_SplitNamespaces(t *testing.T) {
 	const (
 		monitoringNS = "redhat-ods-monitoring"
@@ -106,7 +136,7 @@ func TestManagerCacheOptions_SplitNamespaces(t *testing.T) {
 		t.Fatalf("managerCacheOptions failed: %v", err)
 	}
 
-	// Managed-only types must require platform.opendatahub.io/part-of=monitoring.
+	// RBAC types remain cluster-wide label-filtered (Role/RoleBinding cover per-namespace TargetAllocator secret RBAC).
 	for _, check := range []struct {
 		name string
 		cfg  cache.ByObject
@@ -115,37 +145,26 @@ func TestManagerCacheOptions_SplitNamespaces(t *testing.T) {
 		{"RoleBinding", byObjectEntry[*rbacv1.RoleBinding](t, opts)},
 		{"ClusterRole", byObjectEntry[*rbacv1.ClusterRole](t, opts)},
 		{"ClusterRoleBinding", byObjectEntry[*rbacv1.ClusterRoleBinding](t, opts)},
+	} {
+		assertMonitoringLabelSelector(t, check.name, check.cfg.Label)
+	}
+
+	// Workload, service, and route types are scoped to monitoringNS + openshift-logging with label filtering.
+	for _, check := range []struct {
+		name string
+		cfg  cache.ByObject
+	}{
 		{"Deployment", byObjectEntry[*appsv1.Deployment](t, opts)},
 		{"Job", byObjectEntry[*batchv1.Job](t, opts)},
 		{"Service", byObjectEntry[*corev1.Service](t, opts)},
 		{"ServiceAccount", byObjectEntry[*corev1.ServiceAccount](t, opts)},
 		{"Route", byObjectEntry[*routev1.Route](t, opts)},
 	} {
-		if check.cfg.Label == nil {
-			t.Fatalf("%s: expected Label selector to be set", check.name)
-		}
-		if !check.cfg.Label.Matches(labels.Set{odhLabels.PlatformPartOf: moncontroller.MonitoringPartOf}) {
-			t.Fatalf("%s: expected Label selector to match monitoring resource", check.name)
-		}
-		if check.cfg.Label.Matches(labels.Set{"app": "user-workload"}) {
-			t.Fatalf("%s: expected Label selector to exclude unlabeled user resource", check.name)
-		}
+		assertNamespaceScopedMonitoringSelector(t, check.name, check.cfg, monitoringNS, moncontroller.ClusterLoggingNamespace)
 	}
 
 	// ConfigMap: scoped to monitoringNS (labeled only; odh-monitoring-config uses dedicated cache + APIReader).
-	cmCfg := byObjectEntry[*corev1.ConfigMap](t, opts)
-	if _, allNS := cmCfg.Namespaces[cache.AllNamespaces]; allNS {
-		t.Fatal("ConfigMap cache must not watch AllNamespaces when MONITORING_NAMESPACE is set")
-	}
-	if len(cmCfg.Namespaces) != 1 {
-		t.Fatalf("ConfigMap Namespaces len: want 1, got %d", len(cmCfg.Namespaces))
-	}
-	if !cmCfg.Namespaces[monitoringNS].LabelSelector.Matches(labels.Set{odhLabels.PlatformPartOf: moncontroller.MonitoringPartOf}) {
-		t.Fatal("ConfigMap monitoringNS selector must match monitoring-managed ConfigMaps")
-	}
-	if cmCfg.Namespaces[monitoringNS].LabelSelector.Matches(labels.Set{}) {
-		t.Fatal("ConfigMap monitoringNS selector must exclude unlabeled ConfigMaps")
-	}
+	assertNamespaceScopedMonitoringSelector(t, "ConfigMap", byObjectEntry[*corev1.ConfigMap](t, opts), monitoringNS)
 
 	// Secret: scoped to monitoringNS and podNS (webhook cert only).
 	secretCfg := byObjectEntry[*corev1.Secret](t, opts)
@@ -263,17 +282,47 @@ func TestManagerCacheOptions_UnsetMonitoringNamespacePreservesStandaloneMode(t *
 		}
 	}
 
-	// ConfigMap and EndpointSlice still remain filtered.
-	cmCfg := byObjectEntry[*corev1.ConfigMap](t, opts)
-	if cmCfg.Label == nil || !cmCfg.Label.Matches(labels.Set{odhLabels.PlatformPartOf: moncontroller.MonitoringPartOf}) {
-		t.Fatal("ConfigMap selector must still match monitoring-managed ConfigMaps")
-	}
-	if cmCfg.Label.Matches(labels.Set{}) {
-		t.Fatal("ConfigMap selector must exclude unlabeled ConfigMaps")
+	// ConfigMap, EndpointSlice, and workload/service types still remain label-filtered in standalone mode.
+	for _, check := range []struct {
+		name string
+		cfg  cache.ByObject
+	}{
+		{"Deployment", byObjectEntry[*appsv1.Deployment](t, opts)},
+		{"Job", byObjectEntry[*batchv1.Job](t, opts)},
+		{"Service", byObjectEntry[*corev1.Service](t, opts)},
+		{"ServiceAccount", byObjectEntry[*corev1.ServiceAccount](t, opts)},
+		{"Route", byObjectEntry[*routev1.Route](t, opts)},
+		{"ConfigMap", byObjectEntry[*corev1.ConfigMap](t, opts)},
+	} {
+		if len(check.cfg.Namespaces) != 0 {
+			t.Fatalf("%s: expected no namespace restriction when MONITORING_NAMESPACE is unset, got %v", check.name, check.cfg.Namespaces)
+		}
+		if check.cfg.Label == nil || !check.cfg.Label.Matches(labels.Set{odhLabels.PlatformPartOf: moncontroller.MonitoringPartOf}) {
+			t.Fatalf("%s: selector must still match monitoring-managed resources", check.name)
+		}
+		if check.cfg.Label.Matches(labels.Set{}) {
+			t.Fatalf("%s: selector must exclude unlabeled resources", check.name)
+		}
 	}
 	esCfg := byObjectEntry[*discoveryv1.EndpointSlice](t, opts)
 	if esCfg.Label == nil || !esCfg.Label.Matches(labels.Set{discoveryv1.LabelServiceName: "kubernetes"}) {
 		t.Fatal("EndpointSlice selector must match kubernetes service when MONITORING_NAMESPACE is unset")
+	}
+}
+
+func TestManagerCacheOptions_ClusterLoggingMonitoringNamespaceDeduplicates(t *testing.T) {
+	opts, err := managerCacheOptions(moncontroller.ClusterLoggingNamespace, "opendatahub", "odh-observability")
+	if err != nil {
+		t.Fatalf("managerCacheOptions failed: %v", err)
+	}
+
+	saCfg := byObjectEntry[*corev1.ServiceAccount](t, opts)
+	if len(saCfg.Namespaces) != 1 {
+		t.Fatalf("ServiceAccount Namespaces len: want 1, got %d", len(saCfg.Namespaces))
+	}
+	sel := saCfg.Namespaces[moncontroller.ClusterLoggingNamespace].LabelSelector
+	if sel == nil || !sel.Matches(labels.Set{odhLabels.PlatformPartOf: moncontroller.MonitoringPartOf}) {
+		t.Fatal("ServiceAccount selector must match monitoring-managed ServiceAccounts")
 	}
 }
 
