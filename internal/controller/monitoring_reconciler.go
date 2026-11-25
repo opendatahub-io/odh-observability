@@ -72,6 +72,7 @@ const (
 	PlatformConfigName                    = platformConfigName
 	platformVersionKey                    = "platformVersion"
 	targetAllocatorSecretRBACName         = "data-science-collector-targetallocator-secrets"
+	TargetAllocatorSecretRBACName         = targetAllocatorSecretRBACName
 	openTelemetryCollectorComponent       = "opentelemetry-collector"
 	openTelemetryTargetAllocatorComponent = "opentelemetry-targetallocator"
 	openTelemetryPartOf                   = "opentelemetry"
@@ -1274,12 +1275,22 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		predicate.NewPredicateFuncs(isOpenTelemetryOperatorNetworkPolicyEvent))
 	configMapPredicate := predicate.Or(managedPredicate,
 		predicate.NewPredicateFuncs(isPlatformConfigMap))
+	// The TargetAllocator secret Role/RoleBinding are the only namespaced RBAC
+	// resources the controller renders, and they are rendered into every
+	// non-system namespace. Restricting the watch to that name prevents
+	// tenant-created objects carrying the part-of=monitoring label from
+	// triggering reconciles; the informer cache applies the same restriction
+	// via a metadata.name field selector (see cmd/cache.go).
+	targetAllocatorRBACPredicate := predicate.And(managedPredicate,
+		predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			return obj.GetName() == targetAllocatorSecretRBACName
+		}))
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.Monitoring{}).
 		// Watch managed resources for drift detection.
-		Watches(&rbacv1.Role{}, toSingleton, builder.WithPredicates(managedPredicate)).
-		Watches(&rbacv1.RoleBinding{}, toSingleton, builder.WithPredicates(managedPredicate)).
+		Watches(&rbacv1.Role{}, toSingleton, builder.WithPredicates(targetAllocatorRBACPredicate)).
+		Watches(&rbacv1.RoleBinding{}, toSingleton, builder.WithPredicates(targetAllocatorRBACPredicate)).
 		Watches(&rbacv1.ClusterRole{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&rbacv1.ClusterRoleBinding{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&networkingv1.NetworkPolicy{}, toSingleton, builder.WithPredicates(networkPolicyPredicate)).

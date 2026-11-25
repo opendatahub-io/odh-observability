@@ -137,16 +137,31 @@ func TestManagerCacheOptions_SplitNamespaces(t *testing.T) {
 	}
 
 	// RBAC types remain cluster-wide label-filtered (Role/RoleBinding cover per-namespace TargetAllocator secret RBAC).
+	// Role and RoleBinding are additionally name-restricted so tenant-created
+	// objects carrying the part-of=monitoring label cannot enter the cache.
 	for _, check := range []struct {
-		name string
-		cfg  cache.ByObject
+		name          string
+		cfg           cache.ByObject
+		wantFieldName string
 	}{
-		{"Role", byObjectEntry[*rbacv1.Role](t, opts)},
-		{"RoleBinding", byObjectEntry[*rbacv1.RoleBinding](t, opts)},
-		{"ClusterRole", byObjectEntry[*rbacv1.ClusterRole](t, opts)},
-		{"ClusterRoleBinding", byObjectEntry[*rbacv1.ClusterRoleBinding](t, opts)},
+		{"Role", byObjectEntry[*rbacv1.Role](t, opts), moncontroller.TargetAllocatorSecretRBACName},
+		{"RoleBinding", byObjectEntry[*rbacv1.RoleBinding](t, opts), moncontroller.TargetAllocatorSecretRBACName},
+		{"ClusterRole", byObjectEntry[*rbacv1.ClusterRole](t, opts), ""},
+		{"ClusterRoleBinding", byObjectEntry[*rbacv1.ClusterRoleBinding](t, opts), ""},
 	} {
 		assertMonitoringLabelSelector(t, check.name, check.cfg.Label)
+		if check.wantFieldName == "" {
+			if check.cfg.Field != nil {
+				t.Fatalf("%s: expected no Field selector, got %v", check.name, check.cfg.Field)
+			}
+			continue
+		}
+		if check.cfg.Field == nil {
+			t.Fatalf("%s: expected Field selector on metadata.name", check.name)
+		}
+		if value, ok := check.cfg.Field.RequiresExactMatch("metadata.name"); !ok || value != check.wantFieldName {
+			t.Fatalf("%s: Field selector metadata.name: want %q, got (%q, %v)", check.name, check.wantFieldName, value, ok)
+		}
 	}
 
 	// Deployment, Service, and Route cache all objects in monitoringNS so opted-out unlabeled singletons remain visible without APIReader.
@@ -334,6 +349,20 @@ func TestManagerCacheOptions_UnsetMonitoringNamespacePreservesStandaloneMode(t *
 	esCfg := byObjectEntry[*discoveryv1.EndpointSlice](t, opts)
 	if esCfg.Label == nil || !esCfg.Label.Matches(labels.Set{discoveryv1.LabelServiceName: "kubernetes"}) {
 		t.Fatal("EndpointSlice selector must match kubernetes service when MONITORING_NAMESPACE is unset")
+	}
+
+	// Role and RoleBinding stay name-restricted in standalone mode too.
+	for _, check := range []struct {
+		name string
+		cfg  cache.ByObject
+	}{
+		{"Role", byObjectEntry[*rbacv1.Role](t, opts)},
+		{"RoleBinding", byObjectEntry[*rbacv1.RoleBinding](t, opts)},
+	} {
+		if value, ok := check.cfg.Field.RequiresExactMatch("metadata.name"); !ok || value != moncontroller.TargetAllocatorSecretRBACName {
+			t.Fatalf("%s: expected metadata.name field selector %q, got (%q, %v)",
+				check.name, moncontroller.TargetAllocatorSecretRBACName, value, ok)
+		}
 	}
 
 	// When POD_NAMESPACE is set without MONITORING_NAMESPACE, ConfigMap also includes podNS unfiltered.

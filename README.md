@@ -38,8 +38,13 @@ make build
 ### Run Locally
 
 ```bash
-POD_NAMESPACE=opendatahub make run
+POD_NAMESPACE=opendatahub MONITORING_NAMESPACE=opendatahub make run
 ```
+
+`MONITORING_NAMESPACE` should match the namespace your `Monitoring` resource
+renders into; without it the operator falls back to unscoped cluster-wide
+caches, which can use excessive memory and cannot read opted-out unlabeled
+resources (see [Environment Variables](#environment-variables)).
 
 ### Deploy to a Cluster
 
@@ -223,6 +228,7 @@ scraping and ClusterLogForwarder-to-Loki delivery do not require this label.
 | Variable | Description |
 |----------|-------------|
 | `POD_NAMESPACE` | Operator's own namespace (required for local run) |
+| `MONITORING_NAMESPACE` | Namespace the operator renders Monitoring resources into. Required in supported deployments (set by the Helm chart). When unset (standalone/local dev only), Secret and NetworkPolicy caches stay unfiltered cluster-wide and other caches fall back to cluster-wide label selectors — opted-out unlabeled singletons (`opendatahub.io/managed: "false"` without the `part-of` label) then become unreadable from the Deployment, Service, and Route caches |
 | `GATEWAY_NAMESPACE` | Optional namespace containing the router or gateway that reaches monitoring proxy routes |
 | `OPERATOR_VERSION` | Stamped into release status |
 | `RELATED_IMAGE_*` | Container image overrides for managed components |

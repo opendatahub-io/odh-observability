@@ -70,6 +70,17 @@ func managerCacheOptions(monitoringNS, podNS, operatorName string) (cache.Option
 	})
 	managedOnly := cache.ByObject{Label: monitoringSelector}
 
+	// Role and RoleBinding remain cluster-wide because TargetAllocator's secret
+	// Roles/RoleBindings are rendered into every non-system namespace and listed
+	// cluster-wide during GC. The metadata.name field selector keeps
+	// tenant-created objects carrying the part-of=monitoring label out of the
+	// cache: data-science-collector-targetallocator-secrets is the only
+	// namespaced RBAC name the controller renders, reads, or collects.
+	targetAllocatorRBACOnly := cache.ByObject{
+		Label: monitoringSelector,
+		Field: fields.OneTermEqualSelector("metadata.name", moncontroller.TargetAllocatorSecretRBACName),
+	}
+
 	monitoringNSUnfiltered := monitoringNamespaceUnfilteredCacheByObject(monitoringNS, monitoringSelector)
 
 	endpointSliceCache, err := endpointSliceCacheByObject(monitoringNS)
@@ -78,11 +89,10 @@ func managerCacheOptions(monitoringNS, podNS, operatorName string) (cache.Option
 	}
 
 	byObject := map[client.Object]cache.ByObject{
-		// Role and RoleBinding remain cluster-wide label-filtered because
-		// TargetAllocator's secret Roles/RoleBindings are rendered into every
-		// non-system namespace and listed cluster-wide during GC.
-		&rbacv1.Role{}:               managedOnly,
-		&rbacv1.RoleBinding{}:        managedOnly,
+		// See targetAllocatorRBACOnly above for why Role and RoleBinding stay
+		// cluster-wide but name- and label-restricted.
+		&rbacv1.Role{}:               targetAllocatorRBACOnly,
+		&rbacv1.RoleBinding{}:        targetAllocatorRBACOnly,
 		&rbacv1.ClusterRole{}:        managedOnly,
 		&rbacv1.ClusterRoleBinding{}: managedOnly,
 		&appsv1.Deployment{}:         monitoringNSUnfiltered,

@@ -188,9 +188,12 @@ build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager ./cmd
 
 .PHONY: run
-run: manifests generate fmt vet ## Run controller locally (requires POD_NAMESPACE, e.g. POD_NAMESPACE=opendatahub make run).
+run: manifests generate fmt vet ## Run controller locally (requires POD_NAMESPACE and MONITORING_NAMESPACE, e.g. POD_NAMESPACE=opendatahub MONITORING_NAMESPACE=opendatahub make run).
 ifndef POD_NAMESPACE
-	$(error POD_NAMESPACE is not set. Usage: POD_NAMESPACE=opendatahub make run)
+	$(error POD_NAMESPACE is not set. Usage: POD_NAMESPACE=opendatahub MONITORING_NAMESPACE=opendatahub make run)
+endif
+ifndef MONITORING_NAMESPACE
+	$(error MONITORING_NAMESPACE is not set. It scopes the informer caches; without it the operator falls back to unscoped cluster-wide caches that cannot read opted-out unlabeled resources. Usage: POD_NAMESPACE=opendatahub MONITORING_NAMESPACE=opendatahub make run)
 endif
 	go run ./cmd
 
