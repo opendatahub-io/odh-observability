@@ -1,0 +1,184 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package main
+
+import (
+	"fmt"
+	"os"
+
+	odhcache "github.com/opendatahub-io/odh-platform-utilities/pkg/cache"
+	odhLabels "github.com/opendatahub-io/odh-platform-utilities/pkg/metadata/labels"
+	routev1 "github.com/openshift/api/route/v1"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/selection"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	moncontroller "github.com/opendatahub-io/odh-observability/internal/controller"
+)
+
+const (
+	defaultOperatorName = "odh-observability"
+	kubernetesSvcName   = "kubernetes"
+)
+
+func managerCacheOptionsFromEnv() (cache.Options, error) {
+	operatorName := os.Getenv("OPERATOR_NAME")
+	if operatorName == "" {
+		operatorName = defaultOperatorName
+	}
+	return managerCacheOptions(
+		os.Getenv("MONITORING_NAMESPACE"),
+		os.Getenv("POD_NAMESPACE"),
+		operatorName,
+	)
+}
+
+// managerCacheOptions restricts controller-runtime informer caches so cluster-wide
+// user resources (such as ConfigMaps, Secrets, Services, and Roles) cannot bloat
+// memory or trigger OOMKill, while keeping every resource read or watched by the
+// reconciler and admission webhook visible.
+func managerCacheOptions(monitoringNS, podNS, operatorName string) (cache.Options, error) {
+	if operatorName == "" {
+		operatorName = defaultOperatorName
+	}
+
+	monitoringSelector := labels.SelectorFromSet(labels.Set{
+		odhLabels.PlatformPartOf: moncontroller.MonitoringPartOf,
+	})
+	managedOnly := cache.ByObject{Label: monitoringSelector}
+
+	endpointSliceCache, err := endpointSliceCacheByObject(monitoringNS)
+	if err != nil {
+		return cache.Options{}, err
+	}
+
+	byObject := map[client.Object]cache.ByObject{
+		&rbacv1.Role{}:               managedOnly,
+		&rbacv1.RoleBinding{}:        managedOnly,
+		&rbacv1.ClusterRole{}:        managedOnly,
+		&rbacv1.ClusterRoleBinding{}: managedOnly,
+		&appsv1.Deployment{}:         managedOnly,
+		&batchv1.Job{}:               managedOnly,
+		&corev1.Service{}:            managedOnly,
+		&corev1.ServiceAccount{}:     managedOnly,
+		&routev1.Route{}:             managedOnly,
+		&corev1.ConfigMap{}:          configMapCacheByObject(monitoringNS, monitoringSelector),
+		&discoveryv1.EndpointSlice{}: endpointSliceCache,
+	}
+
+	// Secret and NetworkPolicy watches/lookups include unlabeled resources in the
+	// effective monitoring namespace (user storage/credential Secrets, the
+	// service-CA Secret, and legacy OTel Operator NetworkPolicies). When
+	// MONITORING_NAMESPACE is unset (standalone/local dev), Monitoring.spec.namespace
+	// is unconstrained, so only scope those caches when MONITORING_NAMESPACE is known.
+	if monitoringNS != "" {
+		byObject[&corev1.Secret{}] = secretCacheByObject(monitoringNS, podNS, operatorName+"-webhook-cert")
+		byObject[&networkingv1.NetworkPolicy{}] = networkPolicyCacheByObject(monitoringNS, monitoringSelector)
+	}
+
+	return cache.Options{
+		DefaultTransform: odhcache.StripUnusedFields(),
+		ByObject:         byObject,
+	}, nil
+}
+
+// configMapCacheByObject restricts the manager's ConfigMap informer to
+// monitoring-managed resources. The platform handshake ConfigMap
+// (odh-monitoring-config in POD_NAMESPACE) is watched via a dedicated
+// single-object cache and read via APIReader so single-namespace installs
+// (where POD_NAMESPACE == MONITORING_NAMESPACE) do not open an unfiltered
+// ConfigMap cache on a shared namespace.
+func configMapCacheByObject(monitoringNS string, monitoringSelector labels.Selector) cache.ByObject {
+	if monitoringNS == "" {
+		return cache.ByObject{Label: monitoringSelector}
+	}
+	return cache.ByObject{
+		Namespaces: map[string]cache.Config{
+			monitoringNS: {LabelSelector: monitoringSelector},
+		},
+	}
+}
+
+func secretCacheByObject(monitoringNS, podNS, webhookCertSecretName string) cache.ByObject {
+	namespaces := map[string]cache.Config{
+		monitoringNS: {},
+	}
+	if podNS != "" && podNS != monitoringNS {
+		namespaces[podNS] = cache.Config{
+			FieldSelector: fields.OneTermEqualSelector("metadata.name", webhookCertSecretName),
+		}
+	}
+	return cache.ByObject{Namespaces: namespaces}
+}
+
+func networkPolicyCacheByObject(monitoringNS string, monitoringSelector labels.Selector) cache.ByObject {
+	namespaces := map[string]cache.Config{
+		monitoringNS: {},
+	}
+	if monitoringNS != moncontroller.ClusterLoggingNamespace {
+		namespaces[moncontroller.ClusterLoggingNamespace] = cache.Config{
+			LabelSelector: monitoringSelector,
+		}
+	}
+	return cache.ByObject{Namespaces: namespaces}
+}
+
+func endpointSliceCacheByObject(monitoringNS string) (cache.ByObject, error) {
+	if monitoringNS == "" || monitoringNS == metav1.NamespaceDefault {
+		req, err := labels.NewRequirement(
+			discoveryv1.LabelServiceName,
+			selection.In,
+			[]string{kubernetesSvcName, moncontroller.Korrel8rServiceName},
+		)
+		if err != nil {
+			return cache.ByObject{}, fmt.Errorf("building EndpointSlice label requirement: %w", err)
+		}
+		selector := labels.NewSelector().Add(*req)
+		if monitoringNS == "" {
+			return cache.ByObject{Label: selector}, nil
+		}
+		return cache.ByObject{
+			Namespaces: map[string]cache.Config{
+				metav1.NamespaceDefault: {LabelSelector: selector},
+			},
+		}, nil
+	}
+
+	return cache.ByObject{
+		Namespaces: map[string]cache.Config{
+			metav1.NamespaceDefault: {
+				LabelSelector: labels.SelectorFromSet(labels.Set{
+					discoveryv1.LabelServiceName: kubernetesSvcName,
+				}),
+			},
+			monitoringNS: {
+				LabelSelector: labels.SelectorFromSet(labels.Set{
+					discoveryv1.LabelServiceName: moncontroller.Korrel8rServiceName,
+				}),
+			},
+		},
+	}, nil
+}

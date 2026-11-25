@@ -276,9 +276,12 @@ const prometheusWebTLSCAConfigMapName = "prometheus-web-tls-ca"
 // the service-serving certificate presented by the authorized proxy. The
 // service-ca operator injects the namespace's service CA into the same
 // ConfigMap used by the Prometheus TLS setup.
-func syncThanosQuerierRouteDestinationCA(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) error {
+func syncThanosQuerierRouteDestinationCA(ctx context.Context, c client.Client, apiReader client.Reader, monitoring *v1alpha1.Monitoring) error {
 	if monitoring.Spec.Metrics == nil || monitoring.Spec.Metrics.Storage == nil {
 		return nil
+	}
+	if apiReader == nil {
+		apiReader = c
 	}
 
 	namespace := monitoringNamespace(monitoring)
@@ -301,11 +304,14 @@ func syncThanosQuerierRouteDestinationCA(ctx context.Context, c client.Client, m
 	}
 
 	route := &routev1.Route{}
-	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: thanosQuerierRouteName}, route); err != nil {
+	if err := apiReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: thanosQuerierRouteName}, route); err != nil {
 		if errors.IsNotFound(err) {
 			return nil
 		}
 		return fmt.Errorf("failed to get Thanos Querier Route: %w", err)
+	}
+	if isNotManagedByODHOperator(route) {
+		return nil
 	}
 	if route.Spec.TLS == nil || route.Spec.TLS.Termination != routev1.TLSTerminationReencrypt {
 		return nil
@@ -324,14 +330,14 @@ func syncThanosQuerierRouteDestinationCA(ctx context.Context, c client.Client, m
 
 // syncStatusURL fetches the Thanos Querier route and updates monitoring.Status.URL.
 // When metrics are not configured the URL is cleared.
-func syncStatusURL(ctx context.Context, c client.Client, monitoring *v1alpha1.Monitoring) error {
+func syncStatusURL(ctx context.Context, reader client.Reader, monitoring *v1alpha1.Monitoring) error {
 	if monitoring.Spec.Metrics == nil || monitoring.Spec.Metrics.Storage == nil {
 		monitoring.Status.URL = ""
 		return nil
 	}
 
 	route := &routev1.Route{}
-	if err := c.Get(ctx, client.ObjectKey{
+	if err := reader.Get(ctx, client.ObjectKey{
 		Namespace: monitoringNamespace(monitoring),
 		Name:      thanosQuerierRouteName,
 	}, route); err != nil {

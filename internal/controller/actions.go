@@ -121,6 +121,7 @@ const (
 
 	defaultMonitoringNamespace           = "opendatahub"
 	clusterLoggingNamespace              = "openshift-logging"
+	ClusterLoggingNamespace              = clusterLoggingNamespace
 	usageLogsLokiStackResourceName       = "data-science-usage-logs-lokistack"
 	lokiStackResourceName                = "data-science-lokistack"
 	clusterLogForwarderResourceName      = "data-science-cluster-log-forwarder"
@@ -129,6 +130,7 @@ const (
 	conditionTypeReady                   = "Ready"
 	conditionStatusTrue                  = "True"
 	openTelemetryCollectorName           = "data-science-collector"
+	tlsSecretPendingReason               = "TLSSecretPending"
 )
 
 //go:embed resources monitoring
@@ -1412,6 +1414,7 @@ func deployClusterLogForwarder(
 func deployKorrel8r(
 	ctx context.Context,
 	c client.Client,
+	apiReader client.Reader,
 	monitoring *v1alpha1.Monitoring,
 	cm *conditions.ConditionsManager,
 	sources *[]rendertemplate.TemplateSource,
@@ -1422,7 +1425,7 @@ func deployKorrel8r(
 		return nil
 	}
 
-	ready, err := korrel8rReady(ctx, c, monitoringNamespace(monitoring))
+	ready, err := korrel8rReady(ctx, c, apiReader, monitoringNamespace(monitoring))
 	if err != nil {
 		return fmt.Errorf("checking Korrel8r readiness: %w", err)
 	}
@@ -1445,9 +1448,15 @@ func deployKorrel8r(
 // korrel8rReady reports whether the rendered Deployment has ready replicas and
 // its Service has at least one ready endpoint. The endpoint check prevents a
 // selector or Service drift from being reported as an available service.
-func korrel8rReady(ctx context.Context, c client.Client, namespace string) (bool, error) {
+// Deployment and Service are read via apiReader so opted-out unlabeled
+// singletons (opendatahub.io/managed: "false") remain visible despite the
+// part-of-filtered manager cache.
+func korrel8rReady(ctx context.Context, c client.Client, apiReader client.Reader, namespace string) (bool, error) {
+	if apiReader == nil {
+		apiReader = c
+	}
 	deployment := &appsv1.Deployment{}
-	if err := c.Get(ctx, types.NamespacedName{Name: Korrel8rServiceName, Namespace: namespace}, deployment); err != nil {
+	if err := apiReader.Get(ctx, types.NamespacedName{Name: Korrel8rServiceName, Namespace: namespace}, deployment); err != nil {
 		if k8serr.IsNotFound(err) {
 			return false, nil
 		}
@@ -1462,7 +1471,7 @@ func korrel8rReady(ctx context.Context, c client.Client, namespace string) (bool
 	}
 
 	service := &corev1.Service{}
-	if err := c.Get(ctx, types.NamespacedName{Name: Korrel8rServiceName, Namespace: namespace}, service); err != nil {
+	if err := apiReader.Get(ctx, types.NamespacedName{Name: Korrel8rServiceName, Namespace: namespace}, service); err != nil {
 		if k8serr.IsNotFound(err) {
 			return false, nil
 		}
@@ -1501,6 +1510,12 @@ func deployWebhookInfrastructure(
 
 	operatorName := getEnvOrDefault("OPERATOR_NAME", "odh-observability")
 	operatorNamespace := os.Getenv("POD_NAMESPACE")
+	if operatorNamespace == "" {
+		cm.MarkNotConfigured(conditions.ConditionWebhookAvailable,
+			tlsSecretPendingReason,
+			"POD_NAMESPACE is not set; cannot locate webhook TLS secret")
+		return nil
+	}
 	secretName := operatorName + "-webhook-cert"
 
 	secret := &corev1.Secret{}
@@ -1509,7 +1524,7 @@ func deployWebhookInfrastructure(
 		if k8serr.IsNotFound(err) {
 			log.Info("webhook TLS secret not yet provisioned by cert-manager, waiting", "secret", secretName)
 			cm.MarkNotConfigured(conditions.ConditionWebhookAvailable,
-				"TLSSecretPending",
+				tlsSecretPendingReason,
 				fmt.Sprintf("Waiting for cert-manager to provision TLS secret %s/%s", operatorNamespace, secretName))
 			return nil
 		}
@@ -1519,7 +1534,7 @@ func deployWebhookInfrastructure(
 	if len(secret.Data["tls.crt"]) == 0 || len(secret.Data["tls.key"]) == 0 {
 		log.Info("webhook TLS secret exists but certificate data not yet populated", "secret", secretName)
 		cm.MarkNotConfigured(conditions.ConditionWebhookAvailable,
-			"TLSSecretPending",
+			tlsSecretPendingReason,
 			"TLS secret exists but certificate data not yet populated by cert-manager")
 		return nil
 	}

@@ -316,7 +316,7 @@ func TestSyncHelpersUseConfiguredMonitoringNamespace(t *testing.T) {
 		t.Fatalf("CA Secret was not synchronized in the configured namespace: %v", err)
 	}
 
-	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
+	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, cli, m); err != nil {
 		t.Fatalf("syncThanosQuerierRouteDestinationCA: %v", err)
 	}
 	if err := cli.Get(context.Background(), types.NamespacedName{
@@ -457,7 +457,7 @@ func TestSyncThanosQuerierRouteDestinationCA(t *testing.T) {
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(cm, route).Build()
-	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
+	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, cli, m); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -478,7 +478,7 @@ func TestSyncThanosQuerierRouteDestinationCA_NoRouteOrCA(t *testing.T) {
 	}
 
 	cli := fake.NewClientBuilder().WithScheme(s).Build()
-	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
+	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, cli, m); err != nil {
 		t.Fatalf("missing ConfigMap should not fail reconciliation: %v", err)
 	}
 
@@ -491,8 +491,54 @@ func TestSyncThanosQuerierRouteDestinationCA_NoRouteOrCA(t *testing.T) {
 	if err := cli.Create(context.Background(), cm); err != nil {
 		t.Fatalf("failed to create empty ConfigMap: %v", err)
 	}
-	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
+	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, cli, m); err != nil {
 		t.Fatalf("empty ConfigMap should not fail reconciliation: %v", err)
+	}
+}
+
+func TestSyncThanosQuerierRouteDestinationCA_UsesAPIReaderAndSkipsOptedOut(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
+
+	const ca = "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n"
+	cm := &unstructured.Unstructured{}
+	cm.SetAPIVersion("v1")
+	cm.SetKind("ConfigMap")
+	cm.SetNamespace(m.Spec.Namespace)
+	cm.SetName(prometheusWebTLSCAConfigMapName)
+	_ = unstructured.SetNestedStringMap(cm.Object, map[string]string{serviceCACertificateKey: ca}, "data")
+
+	// Opted-out, unlabeled Route: not in cached client, only visible via apiReader.
+	optedOutRoute := &routev1.Route{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        thanosQuerierRouteName,
+			Namespace:   m.Spec.Namespace,
+			Annotations: map[string]string{"opendatahub.io/managed": "false"},
+		},
+		Spec: routev1.RouteSpec{
+			TLS: &routev1.TLSConfig{
+				Termination:              routev1.TLSTerminationReencrypt,
+				DestinationCACertificate: "custom-ca",
+			},
+		},
+	}
+
+	cachedClient := fake.NewClientBuilder().WithScheme(s).WithObjects(cm).Build()
+	apiReader := fake.NewClientBuilder().WithScheme(s).WithObjects(optedOutRoute).Build()
+
+	if err := syncThanosQuerierRouteDestinationCA(context.Background(), cachedClient, apiReader, m); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	got := &routev1.Route{}
+	if err := apiReader.Get(context.Background(), objKey(m.Spec.Namespace, thanosQuerierRouteName), got); err != nil {
+		t.Fatalf("reading Route from apiReader: %v", err)
+	}
+	if got.Spec.TLS.DestinationCACertificate != "custom-ca" {
+		t.Fatalf("opted-out Route should not be mutated: want %q, got %q", "custom-ca", got.Spec.TLS.DestinationCACertificate)
 	}
 }
 
@@ -585,6 +631,33 @@ func TestSyncStatusURL_NoIngress(t *testing.T) {
 	// preserves the existing URL.
 	if m.Status.URL != "https://stale.example.com" {
 		t.Errorf("Status.URL: want preserved stale value, got %q", m.Status.URL)
+	}
+}
+
+func TestSyncStatusURL_UsesAPIReader(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
+
+	route := &routev1.Route{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        thanosQuerierRouteName,
+			Namespace:   m.Spec.Namespace,
+			Annotations: map[string]string{"opendatahub.io/managed": "false"},
+		},
+		Status: routev1.RouteStatus{
+			Ingress: []routev1.RouteIngress{{Host: "opted-out.example.com"}},
+		},
+	}
+
+	apiReader := fake.NewClientBuilder().WithScheme(s).WithObjects(route).WithStatusSubresource(route).Build()
+	if err := syncStatusURL(context.Background(), apiReader, m); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if m.Status.URL != "https://opted-out.example.com" {
+		t.Errorf("Status.URL: want %q, got %q", "https://opted-out.example.com", m.Status.URL)
 	}
 }
 

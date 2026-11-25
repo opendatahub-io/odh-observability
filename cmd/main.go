@@ -124,8 +124,18 @@ func main() {
 	cfg := ctrl.GetConfigOrDie()
 	ctx := ctrl.SetupSignalHandler()
 
+	cacheOpts, err := managerCacheOptionsFromEnv()
+	if err != nil {
+		setupLog.Error(err, "Unable to configure manager cache options")
+		os.Exit(1)
+	}
+	if os.Getenv("MONITORING_NAMESPACE") == "" {
+		setupLog.Info("MONITORING_NAMESPACE not set; Secret and NetworkPolicy caches remain cluster-scoped")
+	}
+
 	mgrOpts := ctrl.Options{
 		Scheme: scheme,
+		Cache:  cacheOpts,
 		Metrics: metricsserver.Options{
 			BindAddress:    metricsAddr,
 			SecureServing:  true,
@@ -168,6 +178,7 @@ func main() {
 
 	if err := (&moncontroller.MonitoringReconciler{
 		Client:          mgr.GetClient(),
+		APIReader:       mgr.GetAPIReader(),
 		Scheme:          mgr.GetScheme(),
 		Deployer:        deployer,
 		DynamicClient:   dynamicClient,

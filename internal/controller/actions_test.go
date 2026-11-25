@@ -872,6 +872,28 @@ func TestDeployWebhookInfrastructure_TLSSecretMissing(t *testing.T) {
 	}
 }
 
+func TestDeployWebhookInfrastructure_MissingPodNamespace(t *testing.T) {
+	s := newActionsTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+
+	t.Setenv("OPERATOR_NAME", "odh-observability")
+	t.Setenv("POD_NAMESPACE", "")
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+
+	err := deployWebhookInfrastructure(context.Background(),
+		fake.NewClientBuilder().WithScheme(s).Build(), m, cm, &sources)
+	if err != nil {
+		t.Fatalf("unexpected error when POD_NAMESPACE is empty: %v", err)
+	}
+
+	wc := findCondition(m, conditions.ConditionWebhookAvailable)
+	if wc == nil || wc.Status != metav1.ConditionFalse || wc.Reason != "TLSSecretPending" {
+		t.Errorf("WebhookAvailable: expected False/TLSSecretPending, got %v", wc)
+	}
+}
+
 func TestDeployWebhookInfrastructure_TLSSecretReady(t *testing.T) {
 	s := newActionsTestScheme(t)
 
@@ -3991,7 +4013,7 @@ func TestDeployKorrel8r_GatedBySignalConfiguration(t *testing.T) {
 			cm := conditions.NewConditionsManager(m, m.Generation)
 			var sources []rendertemplate.TemplateSource
 			cli := fake.NewClientBuilder().WithScheme(newActionsTestScheme(t)).Build()
-			if err := deployKorrel8r(context.Background(), cli, m, cm, &sources); err != nil {
+			if err := deployKorrel8r(context.Background(), cli, cli, m, cm, &sources); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
@@ -4049,7 +4071,7 @@ func TestDeployKorrel8r_MarksAvailableWhenServiceReady(t *testing.T) {
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
-	if err := deployKorrel8r(context.Background(), cli, m, cm, &sources); err != nil {
+	if err := deployKorrel8r(context.Background(), cli, cli, m, cm, &sources); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -4060,6 +4082,61 @@ func TestDeployKorrel8r_MarksAvailableWhenServiceReady(t *testing.T) {
 	}
 	if condition.Status != metav1.ConditionTrue {
 		t.Fatalf("status: want True, got %s", condition.Status)
+	}
+}
+
+func TestDeployKorrel8r_UsesAPIReaderForDeploymentAndService(t *testing.T) {
+	s := newActionsTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
+
+	replicas := int32(1)
+	cachedClient := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		&discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      Korrel8rServiceName + "-abcde",
+				Namespace: m.Spec.Namespace,
+				Labels:    map[string]string{discoveryv1.LabelServiceName: Korrel8rServiceName},
+			},
+			Endpoints: []discoveryv1.Endpoint{{
+				Addresses: []string{"10.0.0.1"},
+				Conditions: discoveryv1.EndpointConditions{
+					Ready: func() *bool { value := true; return &value }(),
+				},
+			}},
+		},
+	).Build()
+	// Opted-out unlabeled Deployment and Service absent from cachedClient.
+	apiReader := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        Korrel8rServiceName,
+				Namespace:   m.Spec.Namespace,
+				Annotations: map[string]string{"opendatahub.io/managed": "false"},
+			},
+			Spec:   appsv1.DeploymentSpec{Replicas: &replicas},
+			Status: appsv1.DeploymentStatus{ReadyReplicas: replicas},
+		},
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        Korrel8rServiceName,
+				Namespace:   m.Spec.Namespace,
+				Annotations: map[string]string{"opendatahub.io/managed": "false"},
+			},
+		},
+	).Build()
+
+	cm := conditions.NewConditionsManager(m, m.Generation)
+	var sources []rendertemplate.TemplateSource
+	if err := deployKorrel8r(context.Background(), cachedClient, apiReader, m, cm, &sources); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	condition := findCondition(m, conditions.ConditionKorrel8rAvailable)
+	if condition == nil || condition.Status != metav1.ConditionTrue {
+		t.Fatalf("Korrel8rAvailable: want True, got %v", condition)
 	}
 }
 
@@ -4084,7 +4161,7 @@ func TestDeployKorrel8r_RendersOwnedResourcesAndConfiguredStores(t *testing.T) {
 
 	cm := conditions.NewConditionsManager(m, m.Generation)
 	var sources []rendertemplate.TemplateSource
-	if err := deployKorrel8r(context.Background(), cli, m, cm, &sources); err != nil {
+	if err := deployKorrel8r(context.Background(), cli, cli, m, cm, &sources); err != nil {
 		t.Fatalf("deployKorrel8r error: %v", err)
 	}
 
