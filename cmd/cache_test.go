@@ -125,13 +125,9 @@ func assertNamespaceScopedMonitoringSelector(t *testing.T, name string, cfg cach
 }
 
 func TestManagerCacheOptions_SplitNamespaces(t *testing.T) {
-	const (
-		monitoringNS = "redhat-ods-monitoring"
-		podNS        = "redhat-ods-applications"
-		operatorName = "odh-observability"
-	)
+	const monitoringNS = "redhat-ods-monitoring"
 
-	opts, err := managerCacheOptions(monitoringNS, podNS, operatorName)
+	opts, err := managerCacheOptions(monitoringNS, "redhat-ods-applications", "odh-observability")
 	if err != nil {
 		t.Fatalf("managerCacheOptions failed: %v", err)
 	}
@@ -191,6 +187,19 @@ func TestManagerCacheOptions_SplitNamespaces(t *testing.T) {
 	// Job is label-filtered inside monitoringNS; ServiceAccount is label-filtered inside monitoringNS + openshift-logging.
 	assertNamespaceScopedMonitoringSelector(t, "Job", byObjectEntry[*batchv1.Job](t, opts), monitoringNS)
 	assertNamespaceScopedMonitoringSelector(t, "ServiceAccount", byObjectEntry[*corev1.ServiceAccount](t, opts), monitoringNS, moncontroller.ClusterLoggingNamespace)
+}
+
+func TestManagerCacheOptions_SplitNamespaces_ConfigMapAndSecret(t *testing.T) {
+	const (
+		monitoringNS = "redhat-ods-monitoring"
+		podNS        = "redhat-ods-applications"
+		operatorName = "odh-observability"
+	)
+
+	opts, err := managerCacheOptions(monitoringNS, podNS, operatorName)
+	if err != nil {
+		t.Fatalf("managerCacheOptions failed: %v", err)
+	}
 
 	// ConfigMap: monitoringNS unfiltered + podNS restricted to odh-monitoring-config.
 	cmCfg := byObjectEntry[*corev1.ConfigMap](t, opts)
@@ -219,6 +228,19 @@ func TestManagerCacheOptions_SplitNamespaces(t *testing.T) {
 	if secretCfg.Namespaces[podNS].FieldSelector == nil ||
 		secretCfg.Namespaces[podNS].FieldSelector.String() != "metadata.name=odh-observability-webhook-cert" {
 		t.Fatalf("Secret podNS FieldSelector: got %v", secretCfg.Namespaces[podNS].FieldSelector)
+	}
+}
+
+func TestManagerCacheOptions_SplitNamespaces_Networking(t *testing.T) {
+	const (
+		monitoringNS = "redhat-ods-monitoring"
+		podNS        = "redhat-ods-applications"
+		operatorName = "odh-observability"
+	)
+
+	opts, err := managerCacheOptions(monitoringNS, podNS, operatorName)
+	if err != nil {
+		t.Fatalf("managerCacheOptions failed: %v", err)
 	}
 
 	// NetworkPolicy: monitoringNS (includes OTel policies) + openshift-logging (labeled).
