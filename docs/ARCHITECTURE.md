@@ -136,14 +136,17 @@ Action functions run sequentially in a fixed order. Each function checks whether
 | 4 | `deployMonitoringStackWithQuerierAndRestrictions` | `spec.metrics` | `MonitoringStack`, `ThanosQuerier` | `MonitoringStackAvailable`, `ThanosQuerierAvailable` | 14 templates (see inventory) |
 | 5 | `deployTracingStack` | `spec.traces` | `TempoMonolithic`/`TempoStack`, `Instrumentation` | `TempoAvailable`, `InstrumentationAvailable` | Tempo template + instrumentation |
 | 6 | `deployOpenTelemetryCollector` | `spec.metrics` or `spec.traces` | `OpenTelemetryCollector` | `OpenTelemetryCollectorAvailable` (current-generation `Ready=True`) | collector, RBAC, ServiceMonitors, Prometheus service |
-| 7 | `deployAlerting` | `spec.alerting` | `PrometheusRule` | `AlertingAvailable` | None -- condition-only check |
-| 8 | `deployNodeMetricsEndpoint` | `spec.metrics` | None | `NodeMetricsEndpointAvailable` | prometheus-cluster-proxy |
-| 9 | `deployKorrel8r` | `spec.metrics` or `spec.traces` or `spec.logs` | None | `Korrel8rAvailable` | ConfigMap, Deployment, Service, RBAC, NetworkPolicy |
-| 10 | `deployPerses` | `spec.metrics` or `spec.traces` | `Perses` | `PersesAvailable` | perses, network-policy |
-| 11 | `deployPersesTempoIntegration` | `spec.traces` | `PersesDatasource`, `PersesDashboard` | `PersesTempoDataSourceAvailable` | datasource, CA ConfigMap, dashboard |
-| 12 | `deployPersesPrometheusIntegration` | `spec.metrics` | `PersesDatasource` | `PersesPrometheusDataSourceAvailable` | 2 datasource templates |
+| 7 | `deployDCGMExporterDependency` | `spec.metrics` with the built-in DCGM scrape enabled | `Service`, `EndpointSlice`, `OperatorCondition`/`ClusterExtension` (GPU Operator) | `DCGMExporterAvailable` | None -- condition-only check; the collector gates its own scrape job |
+| 8 | `deployAlerting` | `spec.alerting` | `PrometheusRule` | `AlertingAvailable` | None -- condition-only check |
+| 9 | `deployNodeMetricsEndpoint` | `spec.metrics` | None | `NodeMetricsEndpointAvailable` | prometheus-cluster-proxy |
+| 10 | `deployKorrel8r` | `spec.metrics` or `spec.traces` or `spec.logs` | None | `Korrel8rAvailable` | ConfigMap, Deployment, Service, RBAC, NetworkPolicy |
+| 11 | `deployPerses` | `spec.metrics` or `spec.traces` | `Perses` | `PersesAvailable` | perses, network-policy |
+| 12 | `deployPersesTempoIntegration` | `spec.traces` | `PersesDatasource`, `PersesDashboard` | `PersesTempoDataSourceAvailable` | datasource, CA ConfigMap, dashboard |
+| 13 | `deployPersesPrometheusIntegration` | `spec.metrics` | `PersesDatasource` | `PersesPrometheusDataSourceAvailable` | 2 datasource templates |
 
 When a feature is not configured, the action calls `MarkNotConfigured` (Info severity) which prevents it from contributing to Degraded status. When a required CRD is missing, `MarkFalse` is used, which does contribute to Degraded.
+
+`DCGMExporterAvailable` is optional and informational: the NVIDIA GPU Operator is not required for Monitoring to be Ready, and a cluster without GPUs must not read as degraded. When metrics are not configured or the built-in scrape is disabled, the condition remains `False` at Info severity to explain why there is no exporter verdict. When the exporter Service exists, readiness is determined from its ready EndpointSlices rather than OLM, so a Helm-installed GPU Operator is recognized and a Service left behind by an uninstall is not mistaken for a live exporter. When the Service is absent, OLM is consulted only to distinguish an absent operator from an operator installed with the exporter disabled. A failed lookup is `Unknown`, continues the reconcile, and is retried by the controller. The exporter Service is watched by a narrow predicate, and every verdict carries a bounded five-minute refresh because operator changes can leave no Service event.
 
 ## Resource Inventory
 
@@ -317,6 +320,7 @@ Each action function manages one or more conditions:
 | `NodeMetricsEndpointAvailable` | `deployNodeMetricsEndpoint` |
 | `WebhookAvailable` | `deployWebhookInfrastructure` |
 | `Korrel8rAvailable` | `deployKorrel8r` |
+| `DCGMExporterAvailable` | `deployDCGMExporterDependency` |
 
 ### Condition Severities
 

@@ -28,12 +28,14 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster/olm"
 	libconditions "github.com/opendatahub-io/odh-platform-utilities/pkg/controller/conditions"
 	rendertemplate "github.com/opendatahub-io/odh-platform-utilities/pkg/render/template"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -370,6 +372,127 @@ func isOpenTelemetryCollectorReady(ctx context.Context, c client.Client, namespa
 	}
 
 	return hasCurrentReadyCondition(collector)
+}
+
+const (
+	// gpuOperatorPackageName is the OperatorHub package that installs the DCGM
+	// exporter the accelerator scrape discovers. It is deliberately not a
+	// required dependency: RHOAI does not install or manage it.
+	gpuOperatorPackageName = "gpu-operator-certified"
+	dcgmExporterNamespace  = "nvidia-gpu-operator"
+	dcgmExporterService    = "nvidia-dcgm-exporter"
+)
+
+// deployDCGMExporterDependency reports whether the DCGM exporter the
+// accelerator scrape depends on is present. Nothing is deployed here: the
+// collector template gates its own scrape job, and the condition exists so an
+// operator can tell "no GPU data" from "GPUs are not part of this cluster".
+//
+// Every failure verdict uses Info severity. The GPU Operator is optional, so a
+// missing exporter must never degrade a cluster that simply has no GPUs; the
+// condition participates in the Ready aggregation only when it is True.
+func deployDCGMExporterDependency(
+	ctx context.Context,
+	c client.Client,
+	monitoring *v1alpha1.Monitoring,
+	cm *conditions.ConditionsManager,
+	_ *[]rendertemplate.TemplateSource,
+) error {
+	if monitoring.Spec.Metrics == nil {
+		cm.MarkNotConfigured(conditions.ConditionDCGMExporterAvailable,
+			conditions.MetricsNotConfiguredReason, conditions.MetricsNotConfiguredMessage)
+		return nil
+	}
+
+	// builtinDCGMScrapeEnabled is the documented opt-out: an administrator who
+	// supplies a ServiceMonitor or PodMonitor owns collection, so the platform
+	// has no exporter verdict to give.
+	if !builtinDCGMScrapeEnabled(monitoring.Spec.Metrics) {
+		cm.MarkNotConfigured(conditions.ConditionDCGMExporterAvailable,
+			conditions.DCGMScrapeDisabledReason, conditions.DCGMScrapeDisabledMessage)
+		return nil
+	}
+
+	svc := &corev1.Service{}
+	err := c.Get(ctx, types.NamespacedName{Namespace: dcgmExporterNamespace, Name: dcgmExporterService}, svc)
+	if err != nil {
+		if !k8serr.IsNotFound(err) {
+			markDCGMExporterUnobservable(ctx, cm,
+				"Cannot determine whether the DCGM exporter Service exists", err)
+			return nil
+		}
+
+		// The Service is the direct dependency. When it is absent, OLM is
+		// consulted only to distinguish an absent operator from an operator
+		// installed with the exporter disabled.
+		if _, olmErr := olm.OperatorExists(ctx, c, gpuOperatorPackageName); olmErr != nil {
+			if errors.Is(olmErr, olm.ErrOperatorNotInstalled) || meta.IsNoMatchError(olmErr) {
+				cm.MarkWarning(conditions.ConditionDCGMExporterAvailable,
+					conditions.MissingOperatorReason, conditions.GPUOperatorMissingMessage)
+				return nil
+			}
+			markDCGMExporterUnobservable(ctx, cm,
+				"Cannot determine whether the NVIDIA GPU Operator is installed", olmErr)
+			return nil
+		}
+
+		cm.MarkWarning(conditions.ConditionDCGMExporterAvailable,
+			conditions.DCGMExporterServiceNotFoundReason,
+			fmt.Sprintf(conditions.DCGMExporterServiceMissingMessage, dcgmExporterNamespace, dcgmExporterService))
+		return nil
+	}
+
+	ready, err := dcgmExporterReady(ctx, c)
+	if err != nil {
+		markDCGMExporterUnobservable(ctx, cm, "Cannot determine whether the DCGM exporter is ready", err)
+		return nil
+	}
+	if ready {
+		cm.MarkTrue(conditions.ConditionDCGMExporterAvailable)
+		return nil
+	}
+
+	cm.MarkWarning(conditions.ConditionDCGMExporterAvailable,
+		conditions.DCGMExporterNotReadyReason,
+		fmt.Sprintf(conditions.DCGMExporterNotReadyMessage, dcgmExporterNamespace, dcgmExporterService))
+	return nil
+}
+
+// dcgmExporterReady reports whether the exporter Service has at least one ready
+// endpoint. This intentionally does not depend on OLM: the GPU Operator can
+// also be installed by Helm, and a Service left behind by an uninstall is not
+// evidence that the exporter is still serving.
+func dcgmExporterReady(ctx context.Context, c client.Client) (bool, error) {
+	endpointSlices := &discoveryv1.EndpointSliceList{}
+	if err := c.List(ctx, endpointSlices,
+		client.InNamespace(dcgmExporterNamespace),
+		client.MatchingLabels{discoveryv1.LabelServiceName: dcgmExporterService}); err != nil {
+		return false, fmt.Errorf("listing DCGM exporter endpoint slices: %w", err)
+	}
+	for _, endpointSlice := range endpointSlices.Items {
+		for _, endpoint := range endpointSlice.Endpoints {
+			if endpoint.Conditions.Ready != nil && *endpoint.Conditions.Ready {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// markDCGMExporterUnobservable records a failed lookup and lets the reconcile
+// continue. The GPU Operator is optional, and actions run before rendering, so
+// returning the error here would hold back every required resource in the round
+// over a check nothing depends on. Unknown states what is actually known; the
+// reconcile tail schedules the retry.
+func markDCGMExporterUnobservable(
+	ctx context.Context,
+	cm *conditions.ConditionsManager,
+	what string,
+	err error,
+) {
+	cm.MarkUnknown(conditions.ConditionDCGMExporterAvailable,
+		conditions.DCGMExporterCheckFailedReason, fmt.Sprintf("%s: %v", what, err))
+	logf.FromContext(ctx).Error(err, what)
 }
 
 // deployOperatorMonitoring deploys PrometheusRules for operator self-monitoring
