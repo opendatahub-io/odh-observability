@@ -66,10 +66,13 @@ import (
 const (
 	monitoringFinalizer                   = "monitoring.opendatahub.io/cleanup"
 	monitoringPartOf                      = "monitoring"
+	MonitoringPartOf                      = monitoringPartOf
 	platformType                          = "OpenDataHub"
 	platformConfigName                    = "odh-" + v1alpha1.MonitoringServiceName + "-config"
+	PlatformConfigName                    = platformConfigName
 	platformVersionKey                    = "platformVersion"
 	targetAllocatorSecretRBACName         = "data-science-collector-targetallocator-secrets"
+	TargetAllocatorSecretRBACName         = targetAllocatorSecretRBACName
 	openTelemetryCollectorComponent       = "opentelemetry-collector"
 	openTelemetryTargetAllocatorComponent = "opentelemetry-targetallocator"
 	openTelemetryPartOf                   = "opentelemetry"
@@ -1270,20 +1273,30 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// unrelated Monitoring update or periodic log-discovery reconciliation.
 	networkPolicyPredicate := predicate.Or(managedPredicate,
 		predicate.NewPredicateFuncs(isOpenTelemetryOperatorNetworkPolicyEvent))
-	platformConfigPredicate := predicate.NewPredicateFuncs(isPlatformConfigMap)
+	configMapPredicate := predicate.Or(managedPredicate,
+		predicate.NewPredicateFuncs(isPlatformConfigMap))
+	// The TargetAllocator secret Role/RoleBinding are the only namespaced RBAC
+	// resources the controller renders, and they are rendered into every
+	// non-system namespace. Restricting the watch to that name prevents
+	// tenant-created objects carrying the part-of=monitoring label from
+	// triggering reconciles; the informer cache applies the same restriction
+	// via a metadata.name field selector (see cmd/cache.go).
+	targetAllocatorRBACPredicate := predicate.And(managedPredicate,
+		predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			return obj.GetName() == targetAllocatorSecretRBACName
+		}))
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.Monitoring{}).
 		// Watch managed resources for drift detection.
-		Watches(&rbacv1.Role{}, toSingleton, builder.WithPredicates(managedPredicate)).
-		Watches(&rbacv1.RoleBinding{}, toSingleton, builder.WithPredicates(managedPredicate)).
+		Watches(&rbacv1.Role{}, toSingleton, builder.WithPredicates(targetAllocatorRBACPredicate)).
+		Watches(&rbacv1.RoleBinding{}, toSingleton, builder.WithPredicates(targetAllocatorRBACPredicate)).
 		Watches(&rbacv1.ClusterRole{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&rbacv1.ClusterRoleBinding{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&networkingv1.NetworkPolicy{}, toSingleton, builder.WithPredicates(networkPolicyPredicate)).
 		Watches(&appsv1.Deployment{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&batchv1.Job{}, toSingleton, builder.WithPredicates(managedPredicate)).
-		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(managedPredicate)).
-		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(platformConfigPredicate)).
+		Watches(&corev1.ConfigMap{}, toSingleton, builder.WithPredicates(configMapPredicate)).
 		Watches(&corev1.Secret{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		Watches(&corev1.Secret{}, toSingleton, builder.WithPredicates(predicate.NewPredicateFuncs(isPrometheusWebTLSCASecret))).
 		// The LokiStack storage Secrets are the user's, so they carry no
@@ -1302,7 +1315,8 @@ func (r *MonitoringReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Namespace{}, toSingleton, builder.WithPredicates(namespaceWatchPredicate())).
 		Watches(&routev1.Route{}, toSingleton, builder.WithPredicates(managedPredicate)).
 		// Watch CRDs to react when optional operators are installed / removed.
-		Watches(&extv1.CustomResourceDefinition{}, toSingleton).
+		// Metadata-only avoids caching large OpenAPI schemas in memory.
+		Watches(&extv1.CustomResourceDefinition{}, toSingleton, builder.OnlyMetadata).
 		// Reconcile when cluster APIServer TLS profile changes.
 		Watches(&configv1.APIServer{}, toSingleton, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Complete(r)

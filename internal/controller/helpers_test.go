@@ -28,7 +28,9 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	v1alpha1 "github.com/opendatahub-io/odh-observability/api/v1alpha1"
 	"github.com/opendatahub-io/odh-observability/internal/controller/gvk"
@@ -496,6 +498,99 @@ func TestSyncThanosQuerierRouteDestinationCA_NoRouteOrCA(t *testing.T) {
 	}
 }
 
+func TestSyncThanosQuerierRouteDestinationCA_SkipsOptedOut(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
+
+	const ca = "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n"
+	cm := &unstructured.Unstructured{}
+	cm.SetAPIVersion("v1")
+	cm.SetKind("ConfigMap")
+	cm.SetNamespace(m.Spec.Namespace)
+	cm.SetName(prometheusWebTLSCAConfigMapName)
+	_ = unstructured.SetNestedStringMap(cm.Object, map[string]string{serviceCACertificateKey: ca}, "data")
+
+	t.Run("managed Route is patched", func(t *testing.T) {
+		managedRoute := &routev1.Route{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      thanosQuerierRouteName,
+				Namespace: m.Spec.Namespace,
+			},
+			Spec: routev1.RouteSpec{
+				TLS: &routev1.TLSConfig{
+					Termination: routev1.TLSTerminationReencrypt,
+				},
+			},
+		}
+
+		var patchedCA string
+		patchCalls := 0
+		cli := fake.NewClientBuilder().WithScheme(s).WithObjects(cm, managedRoute).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Patch: func(_ context.Context, _ client.WithWatch, obj client.Object, _ client.Patch, _ ...client.PatchOption) error {
+					patchCalls++
+					if route, ok := obj.(*routev1.Route); ok && route.Spec.TLS != nil {
+						patchedCA = route.Spec.TLS.DestinationCACertificate
+					}
+					return nil
+				},
+			}).Build()
+
+		if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if patchCalls != 1 {
+			t.Fatalf("expected 1 Patch call on managed Route, got %d", patchCalls)
+		}
+		if patchedCA != ca {
+			t.Fatalf("patched destination CA mismatch: want %q, got %q", ca, patchedCA)
+		}
+	})
+
+	t.Run("opted-out Route is skipped without patching", func(t *testing.T) {
+		optedOutRoute := &routev1.Route{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        thanosQuerierRouteName,
+				Namespace:   m.Spec.Namespace,
+				Annotations: map[string]string{"opendatahub.io/managed": "false"},
+			},
+			Spec: routev1.RouteSpec{
+				TLS: &routev1.TLSConfig{
+					Termination:              routev1.TLSTerminationReencrypt,
+					DestinationCACertificate: "custom-ca",
+				},
+			},
+		}
+
+		patchCalls := 0
+		cli := fake.NewClientBuilder().WithScheme(s).WithObjects(cm, optedOutRoute).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Patch: func(_ context.Context, _ client.WithWatch, _ client.Object, _ client.Patch, _ ...client.PatchOption) error {
+					patchCalls++
+					return nil
+				},
+			}).Build()
+
+		if err := syncThanosQuerierRouteDestinationCA(context.Background(), cli, m); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if patchCalls != 0 {
+			t.Fatalf("expected no Patch calls on opted-out Route, got %d", patchCalls)
+		}
+
+		got := &routev1.Route{}
+		if err := cli.Get(context.Background(), objKey(m.Spec.Namespace, thanosQuerierRouteName), got); err != nil {
+			t.Fatalf("reading Route: %v", err)
+		}
+		if got.Spec.TLS.DestinationCACertificate != "custom-ca" {
+			t.Fatalf("opted-out Route should not be mutated: want %q, got %q", "custom-ca", got.Spec.TLS.DestinationCACertificate)
+		}
+	})
+}
+
 // --- syncStatusURL ---
 
 func TestSyncStatusURL_RoutePresent_MultipleIngress(t *testing.T) {
@@ -585,6 +680,33 @@ func TestSyncStatusURL_NoIngress(t *testing.T) {
 	// preserves the existing URL.
 	if m.Status.URL != "https://stale.example.com" {
 		t.Errorf("Status.URL: want preserved stale value, got %q", m.Status.URL)
+	}
+}
+
+func TestSyncStatusURL_ReadsOptedOutUnlabeledRoute(t *testing.T) {
+	s := newTestScheme(t)
+	m := newMonitoring(v1alpha1.MonitoringInstanceName)
+	m.Spec.Metrics = &v1alpha1.Metrics{
+		Storage: &v1alpha1.MetricsStorage{},
+	}
+
+	route := &routev1.Route{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        thanosQuerierRouteName,
+			Namespace:   m.Spec.Namespace,
+			Annotations: map[string]string{"opendatahub.io/managed": "false"},
+		},
+		Status: routev1.RouteStatus{
+			Ingress: []routev1.RouteIngress{{Host: "opted-out.example.com"}},
+		},
+	}
+
+	cli := fake.NewClientBuilder().WithScheme(s).WithObjects(route).WithStatusSubresource(route).Build()
+	if err := syncStatusURL(context.Background(), cli, m); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if m.Status.URL != "https://opted-out.example.com" {
+		t.Errorf("Status.URL: want %q, got %q", "https://opted-out.example.com", m.Status.URL)
 	}
 }
 

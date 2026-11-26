@@ -121,6 +121,7 @@ const (
 
 	defaultMonitoringNamespace           = "opendatahub"
 	clusterLoggingNamespace              = "openshift-logging"
+	ClusterLoggingNamespace              = clusterLoggingNamespace
 	usageLogsLokiStackResourceName       = "data-science-usage-logs-lokistack"
 	lokiStackResourceName                = "data-science-lokistack"
 	clusterLogForwarderResourceName      = "data-science-cluster-log-forwarder"
@@ -129,6 +130,7 @@ const (
 	conditionTypeReady                   = "Ready"
 	conditionStatusTrue                  = "True"
 	openTelemetryCollectorName           = "data-science-collector"
+	tlsSecretPendingReason               = "TLSSecretPending"
 )
 
 //go:embed resources monitoring
@@ -1501,6 +1503,12 @@ func deployWebhookInfrastructure(
 
 	operatorName := getEnvOrDefault("OPERATOR_NAME", "odh-observability")
 	operatorNamespace := os.Getenv("POD_NAMESPACE")
+	if operatorNamespace == "" {
+		cm.MarkNotConfigured(conditions.ConditionWebhookAvailable,
+			tlsSecretPendingReason,
+			"POD_NAMESPACE is not set; cannot locate webhook TLS secret")
+		return nil
+	}
 	secretName := operatorName + "-webhook-cert"
 
 	secret := &corev1.Secret{}
@@ -1509,7 +1517,7 @@ func deployWebhookInfrastructure(
 		if k8serr.IsNotFound(err) {
 			log.Info("webhook TLS secret not yet provisioned by cert-manager, waiting", "secret", secretName)
 			cm.MarkNotConfigured(conditions.ConditionWebhookAvailable,
-				"TLSSecretPending",
+				tlsSecretPendingReason,
 				fmt.Sprintf("Waiting for cert-manager to provision TLS secret %s/%s", operatorNamespace, secretName))
 			return nil
 		}
@@ -1519,7 +1527,7 @@ func deployWebhookInfrastructure(
 	if len(secret.Data["tls.crt"]) == 0 || len(secret.Data["tls.key"]) == 0 {
 		log.Info("webhook TLS secret exists but certificate data not yet populated", "secret", secretName)
 		cm.MarkNotConfigured(conditions.ConditionWebhookAvailable,
-			"TLSSecretPending",
+			tlsSecretPendingReason,
 			"TLS secret exists but certificate data not yet populated by cert-manager")
 		return nil
 	}

@@ -124,8 +124,24 @@ func main() {
 	cfg := ctrl.GetConfigOrDie()
 	ctx := ctrl.SetupSignalHandler()
 
+	cacheOpts, err := managerCacheOptionsFromEnv()
+	if err != nil {
+		setupLog.Error(err, "Unable to configure manager cache options")
+		os.Exit(1)
+	}
+	if os.Getenv("MONITORING_NAMESPACE") == "" {
+		setupLog.Info("MONITORING_NAMESPACE not set; falling back to unfiltered cluster-wide Secret and " +
+			"NetworkPolicy caches and cluster-wide label-filtered caches for all other types. " +
+			"This standalone mode is only for local development: on large clusters the unfiltered " +
+			"caches can consume excessive memory, and opted-out unlabeled singletons " +
+			"(opendatahub.io/managed: \"false\" without the part-of label) are not readable " +
+			"from the Deployment, Service, and Route caches. Set MONITORING_NAMESPACE to the " +
+			"namespace Monitoring resources are rendered into.")
+	}
+
 	mgrOpts := ctrl.Options{
 		Scheme: scheme,
+		Cache:  cacheOpts,
 		Metrics: metricsserver.Options{
 			BindAddress:    metricsAddr,
 			SecureServing:  true,

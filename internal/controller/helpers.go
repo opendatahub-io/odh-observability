@@ -307,6 +307,9 @@ func syncThanosQuerierRouteDestinationCA(ctx context.Context, c client.Client, m
 		}
 		return fmt.Errorf("failed to get Thanos Querier Route: %w", err)
 	}
+	if isNotManagedByODHOperator(route) {
+		return nil
+	}
 	if route.Spec.TLS == nil || route.Spec.TLS.Termination != routev1.TLSTerminationReencrypt {
 		return nil
 	}
