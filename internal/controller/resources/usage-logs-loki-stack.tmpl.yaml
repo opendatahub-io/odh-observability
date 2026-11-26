@@ -29,6 +29,7 @@ spec:
             - name: upstream_deployment_name
             - name: organization_id
             - name: user_id
+            - name: tenant_name
   managementState: Managed
   size: {{ .LokiStackSize }}
   storage:

@@ -881,7 +881,7 @@ func TestUsageLogsLokiStackIndexesMaaSIdentity(t *testing.T) {
 			want: []string{
 				"kubernetes_namespace_name", "model", "subscription", "response_type",
 				"gateway_namespace_name", "gateway_deployment_name", "upstream_namespace_name", "upstream_deployment_name",
-				"organization_id", "user_id",
+				"organization_id", "user_id", "tenant_name",
 			},
 		},
 	} {
