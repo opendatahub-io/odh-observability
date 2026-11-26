@@ -194,6 +194,49 @@ func assertVLLMSpanHasInjectedParent(ctx context.Context, traceID, parentSpanID 
 	return fmt.Errorf("trace %s has no %q span with injected parent ID %s", traceID, vLLMRequestSpanName, wantParent)
 }
 
+func assertAdapterSpanHasInjectedParent(ctx context.Context, traceID, parentSpanID string, oatsEnv []string) error {
+	raw, err := fetchTraceJSON(ctx, traceID, oatsEnv)
+	if err != nil {
+		return err
+	}
+	spans, err := parseTraceSpansFromGCXJSON(raw)
+	if err != nil {
+		return err
+	}
+	wantParent := normalizeSpanID(parentSpanID)
+	for _, span := range spans {
+		if span.Name == "request" && span.ParentSpanID == wantParent {
+			return nil
+		}
+	}
+	return fmt.Errorf("trace %s has no EPP %q span with injected parent ID %s", traceID, "request", wantParent)
+}
+
+func assertAdapterVLLMSpanRelationship(ctx context.Context, traceID string, oatsEnv []string) error {
+	raw, err := fetchTraceJSON(ctx, traceID, oatsEnv)
+	if err != nil {
+		return err
+	}
+	spans, err := parseTraceSpansFromGCXJSON(raw)
+	if err != nil {
+		return err
+	}
+	spansByID := make(map[string]parsedTraceSpan, len(spans))
+	for _, span := range spans {
+		spansByID[span.SpanID] = span
+	}
+	for _, span := range spans {
+		if span.Name != vLLMRequestSpanName || span.ParentSpanID == "" {
+			continue
+		}
+		parent, found := spansByID[span.ParentSpanID]
+		if found && parent.Name == "request" {
+			return nil
+		}
+	}
+	return fmt.Errorf("trace %s has no EPP %q span directly parenting a vLLM %q span", traceID, "request", vLLMRequestSpanName)
+}
+
 func findInferenceServicePredictorPod(ctx context.Context, kube client.Client, namespace, serviceName string) (*corev1.Pod, string, error) {
 	pods := &corev1.PodList{}
 	if err := kube.List(ctx, pods, client.InNamespace(namespace), client.MatchingLabels{
@@ -259,6 +302,113 @@ func TestWriteLLMOatsTraceCaseFileIncludesTraceID(t *testing.T) {
 	require.Contains(t, content, `trace:id = "fedcba9876543210fedcba9876543210"`)
 	require.Contains(t, content, `resource.k8s.pod.name =~ "facebook-opt-125m-single-node-abc.*"`)
 	require.Contains(t, content, `span:parentID = "0123456789abcdef"`)
+}
+
+func TestHTTPSOnlyStatusEndpoint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		endpoint string
+		want     bool
+	}{
+		{name: "https endpoint", endpoint: "https://inference.example.test", want: true},
+		{name: "http endpoint", endpoint: "http://inference.example.test", want: false},
+		{name: "missing host", endpoint: "https:", want: false},
+		{name: "malformed endpoint", endpoint: "://bad", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := httpsEndpoint(tt.endpoint)
+			require.Equal(t, tt.want, ok)
+			if ok {
+				require.Equal(t, tt.endpoint, got)
+			} else {
+				require.Empty(t, got)
+			}
+		})
+	}
+}
+
+func TestHasReadOnlyServiceCAMount(t *testing.T) {
+	t.Parallel()
+
+	certificatePath := "/var/run/secrets/service-ca/service-ca.crt"
+	serviceCAVolume := corev1.Volume{
+		Name: "service-ca",
+		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "openshift-service-ca.crt"},
+			Items:                []corev1.KeyToPath{{Key: "service-ca.crt", Path: "service-ca.crt"}},
+		}},
+	}
+	serviceCAVolumeWithoutItems := serviceCAVolume.DeepCopy()
+	serviceCAVolumeWithoutItems.ConfigMap.Items = nil
+	tests := []struct {
+		name            string
+		volume          corev1.Volume
+		mount           corev1.VolumeMount
+		certificatePath string
+		wantMount       bool
+	}{
+		{
+			name:      "read-only service CA mounted at certificate path",
+			volume:    serviceCAVolume,
+			mount:     corev1.VolumeMount{Name: "service-ca", MountPath: "/var/run/secrets/service-ca", ReadOnly: true},
+			wantMount: true,
+		},
+		{
+			name:            "read-only service CA with default key path",
+			volume:          *serviceCAVolumeWithoutItems,
+			mount:           corev1.VolumeMount{Name: "service-ca", MountPath: "/var/run/secrets/service-ca", ReadOnly: true},
+			certificatePath: "/var/run/secrets/service-ca/service-ca.crt",
+			wantMount:       true,
+		},
+		{
+			name:            "read-only service CA with mismatched default key path",
+			volume:          *serviceCAVolumeWithoutItems,
+			mount:           corev1.VolumeMount{Name: "service-ca", MountPath: "/var/run/secrets/service-ca", ReadOnly: true},
+			certificatePath: "/var/run/secrets/service-ca/nested/ca.pem",
+		},
+		{
+			name:   "writable service CA mount",
+			volume: serviceCAVolume,
+			mount:  corev1.VolumeMount{Name: "service-ca", MountPath: "/var/run/secrets/service-ca"},
+		},
+		{
+			name: "different ConfigMap",
+			volume: corev1.Volume{Name: "service-ca", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "unrelated-config"},
+			}}},
+			mount: corev1.VolumeMount{Name: "service-ca", MountPath: "/var/run/secrets/service-ca", ReadOnly: true},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			pod := &corev1.Pod{Spec: corev1.PodSpec{Volumes: []corev1.Volume{tt.volume}}}
+			container := corev1.Container{VolumeMounts: []corev1.VolumeMount{tt.mount}}
+			path := tt.certificatePath
+			if path == "" {
+				path = certificatePath
+			}
+			require.Equal(t, tt.wantMount, hasReadOnlyServiceCAMount(pod, container, path))
+		})
+	}
+}
+
+func TestRenderOatsMetricsCaseScopesQueriesToService(t *testing.T) {
+	template, err := os.ReadFile(filepath.Join("oats", "vllm", "single-node-metrics", "oats-case.yaml"))
+	require.NoError(t, err)
+
+	const serviceName = "facebook-opt-125m-single-node-abc123"
+	content, err := renderOatsMetricsCase(string(template), serviceName)
+	require.NoError(t, err)
+	require.NotContains(t, content, metricsServiceNamePlaceholder)
+	require.Equal(t, 6, strings.Count(content, `llm_isvc_name="`+serviceName+`"`),
+		"every metric selector must be restricted to this LLMInferenceService")
+	require.Equal(t, 4, strings.Count(content, `value: "> 0"`),
+		"counter and latency bucket assertions should require observations from the test request")
 }
 
 func TestGCXToolingUsesPinnedCacheBinary(t *testing.T) {
