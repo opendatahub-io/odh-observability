@@ -2740,6 +2740,7 @@ func (tc *MonitoringTestCtx) runNetworkingTests(t *testing.T) {
 		t.Run("Trusted DCGM workload attribution", tc.ValidateTrustedDCGMAttribution)
 		t.Run("Trusted DCGM HTTPS workload attribution", tc.ValidateTrustedDCGMTLSAttribution)
 		t.Run("Built-in DCGM opt-out with verified HTTPS monitor", tc.ValidateBuiltinDCGMScrapeOptOutUsesVerifiedHTTPSMonitor)
+		t.Run("Accelerator GPU-hours recording", tc.ValidateAcceleratorGPUHoursRecording)
 		t.Run("OTLP metric identity cannot be spoofed", tc.ValidateOTLPMetricIdentityCannotBeSpoofed)
 		t.Run("Node metrics endpoint deployment", tc.ValidateNodeMetricsEndpointDeployment)
 		t.Run("Node metrics endpoint RBAC configuration", tc.ValidateNodeMetricsEndpointRBACConfiguration)

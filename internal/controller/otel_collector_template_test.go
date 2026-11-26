@@ -124,16 +124,39 @@ func TestModelResourceFederationScrapeIsNarrowAndAuthenticated(t *testing.T) {
 	assertAuthenticatedModelResourceFederationJob(t, job)
 
 	params, found, err := unstructured.NestedStringSlice(job, "params", "match[]")
-	if err != nil || !found || len(params) != 3 {
-		t.Fatalf("federation job must have exactly three metric matchers: found=%t params=%v error=%v", found, params, err)
+	if err != nil || !found || len(params) != 5 {
+		t.Fatalf("federation job must have exactly five metric matchers with attribution enabled: found=%t params=%v error=%v", found, params, err)
 	}
 	for _, want := range []string{
 		`{__name__="node_namespace_pod_container:container_cpu_usage_seconds_total:sum_irate"}`,
 		`{__name__="kube_resourcequota", resource=~"cpu|requests[.]cpu|limits[.]cpu", type=~"hard|used"}`,
 		`{__name__="kube_pod_container_resource_limits", resource="cpu", unit="core"}`,
+		`{__name__="kube_pod_labels", label_kueue_x_k8s_io_cluster_queue_name=~".+"}`,
+		`{__name__="kube_pod_owner"}`,
 	} {
 		if !slices.Contains(params, want) {
 			t.Errorf("federation job is missing matcher %q: %v", want, params)
+		}
+	}
+
+	// The Kueue/pod-owner matchers feed recording rules gated on the
+	// attribution condition; with the built-in DCGM scrape disabled those
+	// rules do not exist, so federating the series is pure ingestion cost.
+	disabled := renderCollectorTemplateWithDCGMScrapeEnabled(t, false)
+	disabledJob := renderedPrometheusScrapeJobsForReceiver(t, disabled, "prometheus/cluster_resources")["cluster-prometheus-model-resources"]
+	disabledParams, found, err := unstructured.NestedStringSlice(disabledJob, "params", "match[]")
+	if err != nil || !found {
+		t.Fatalf("federation job must keep its matchers with attribution disabled: found=%t error=%v", found, err)
+	}
+	if len(disabledParams) != 3 {
+		t.Fatalf("federation job must only keep the CPU/quota matchers with attribution disabled: params=%v", disabledParams)
+	}
+	for _, absent := range []string{
+		`{__name__="kube_pod_labels", label_kueue_x_k8s_io_cluster_queue_name=~".+"}`,
+		`{__name__="kube_pod_owner"}`,
+	} {
+		if slices.Contains(disabledParams, absent) {
+			t.Errorf("federation job must not pull attribution series with attribution disabled: %v", disabledParams)
 		}
 	}
 }
@@ -192,6 +215,33 @@ func TestModelResourceFederationIsOmittedWithoutMetricsStorage(t *testing.T) {
 	}
 	if containsString(metricsPipelines(t, collector)["metrics/scrape"]["receivers"], "prometheus/cluster_resources") {
 		t.Fatal("metrics/scrape pipeline must not include model-resource federation without metrics storage")
+	}
+}
+
+// TestPrometheusExportersExpireStaleSeries guards the stale-series expiry on
+// both Prometheus exporters. Without metric_expiration the exporter serves its
+// last label set for the default 5m after a workload releases a GPU (the
+// exporter target stays alive, only the workload labels disappear), and every
+// re-scrape stamps the zombie series fresh — so GPU-hours allocation keeps
+// being recorded for up to 5m after release. 90s is 3x the 30s scrape
+// interval: it survives two missed scrapes with margin while bounding the
+// release tail to ~90s. send_timestamps must stay unset on the workload
+// exporter: it also serves tenant OTLP pushes, and exporter timestamps from
+// skewed tenant clocks would be rejected as out-of-order, dropping tenant
+// metrics.
+func TestPrometheusExportersExpireStaleSeries(t *testing.T) {
+	collector := renderCollectorTemplate(t)
+	for _, name := range []string{"prometheus", "prometheus/federation"} {
+		exporter, found, err := unstructured.NestedMap(collector.Object, "spec", "config", "exporters", name)
+		if err != nil || !found {
+			t.Fatalf("exporter %q must be present: found=%t error=%v", name, found, err)
+		}
+		if exporter["metric_expiration"] != "90s" {
+			t.Errorf("exporter %q must expire stale series at 90s (3x the 30s scrape interval), got %v", name, exporter["metric_expiration"])
+		}
+		if _, found := exporter["send_timestamps"]; found {
+			t.Errorf("exporter %q must not set send_timestamps: it serves tenant OTLP pushes whose skewed clocks would make samples out-of-order", name)
+		}
 	}
 }
 

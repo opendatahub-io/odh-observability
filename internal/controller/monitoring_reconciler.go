@@ -195,7 +195,7 @@ type MonitoringReconciler struct {
 // +kubebuilder:rbac:groups=operators.coreos.com,resources=clusterserviceversions,verbs=list
 // +kubebuilder:rbac:groups=olm.operatorframework.io,resources=clusterextensions,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
-// +kubebuilder:rbac:groups=config.openshift.io,resources=apiservers,verbs=get;list;watch
+// +kubebuilder:rbac:groups=config.openshift.io,resources=apiservers;infrastructures,verbs=get;list;watch
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
 // +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
 // +kubebuilder:rbac:urls=/metrics;/api;/api/*;/apis;/apis/*,verbs=get

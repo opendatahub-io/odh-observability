@@ -1,0 +1,201 @@
+{{- if and .AcceleratorMetrics .BuiltinDCGMScrapeEnabled }}
+apiVersion: monitoring.rhobs/v1
+kind: PrometheusRule
+metadata:
+  name: data-science-accelerator-attribution-rules
+  namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+spec:
+  groups:
+    # Tier 1: device-to-pod attribution. The 15s interval and presence windows
+    # deliberately deviate from the 30s scrape convention: the 15s evaluation
+    # grid resolves allocation changes at +/-15s — except a release, whose
+    # record clears only after the full pipeline tail (two 30s scrape hops,
+    # the 45s presence window draining, and the collector exporter's 90s
+    # metric_expiration): typically within ~2 minutes of the workload labels
+    # disappearing, ~3 minutes worst case (+30s per missed scrape), and ~5
+    # minutes if that expiry regresses to the exporter default. Only
+    # odh_dcgm_source=verified series (stamped by the isolated trusted DCGM
+    # receiver after labeldrop of exporter-forged odh*dcgm* labels, and
+    # stripped from every other pipeline) are counted. Aggregate on the
+    # ServiceMonitor-promoted namespace/pod only; never on
+    # exported_namespace/exported_pod, which any workload can forge.
+    - name: rhoai.accelerator.attribution
+      interval: 15s
+      rules:
+        # Allocation-based GPU-hours, in units of GPU-hours per hour (0 or 1):
+        # any value of DCGM_FI_DEV_GPU_UTIL within the presence window —
+        # including 0 — means the device is allocated. Integrate over a range
+        # for totals with sum_over_time(m[d]) * 15 / 3600 (the 15s eval
+        # interval): it counts recorded samples only, so a GPU released
+        # mid-range contributes exactly its recorded time. Do NOT integrate
+        # with avg_over_time(m[d]) * <hours>: samples absent after release
+        # are not zeros, so the average would bill the whole range as
+        # allocated. The 45s window is 1.5x the 30s scrape lattice, so
+        # jitter cannot empty it, while staying far below the ~5m lookback
+        # that would keep released GPUs counted. max (not sum) deduplicates
+        # duplicate collector views during TargetAllocator failover.
+        # The timestamp freshness guard prevents double-counting across a
+        # reassignment: while the previous pod's samples are still inside the
+        # 45s window, only the assignment(s) carrying the device's newest
+        # sample timestamp are kept, so a handoff takes effect at the first
+        # scrape of the new pod. Simultaneous time-sliced sharers have equal
+        # timestamps and stay counted.
+        # The workload-label matchers exclude unattributed devices: DCGM
+        # exports hardware series for every physical GPU, free or not, and
+        # only workloads carry namespace/pod labels. The trusted receiver
+        # copies those into odh_dcgm_workload_* (absent on free devices),
+        # and Prometheus stamps unattributed series with its own target
+        # labels — the collector's namespace and pod — so namespace/pod are
+        # non-empty there and cannot discriminate. Filtering on
+        # odh_dcgm_workload_* (same pair the ServiceMonitor promotion
+        # requires before overwriting namespace/pod) keeps idle GPUs out of
+        # every billing shape; without it, by_cluster reports the cluster's
+        # total GPU capacity and the monitoring namespace appears to hold
+        # every free device.
+        - record: accelerator_gpu_hours_allocated
+          expr: >-
+            max by (namespace, pod, modelName, UUID, gpu, Hostname, node)
+            ((count_over_time(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""}[45s]) > bool 0)
+            and
+            (timestamp(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""})
+            == on (UUID, gpu, Hostname, node) group_left
+            max by (UUID, gpu, Hostname, node) (timestamp(DCGM_FI_DEV_GPU_UTIL{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""}))))
+          labels:
+            vendor: nvidia
+{{- if .ClusterName }}
+            cluster: {{ printf "%q" .ClusterName }}
+{{- end }}
+        # Supplementary utilization-based GPU-hours, same units: the
+        # time-integral of DCGM_FI_PROF_GR_ENGINE_ACTIVE. That metric is 0-1
+        # occupancy (not rescaled by transform/gpu_metrics, unlike
+        # DCGM_FI_DEV_GPU_UTIL), so the instantaneous value is already the
+        # utilization fraction. avg_over_time applies the same 45s staleness
+        # bound, the same timestamp freshness guard drops superseded
+        # assignments after a reassignment, and the same workload-label
+        # matchers exclude unattributed devices. Requires the DCGM profiling
+        # module on the exporter.
+        - record: accelerator_gpu_hours_utilized
+          expr: >-
+            max by (namespace, pod, modelName, UUID, gpu, Hostname, node)
+            (avg_over_time(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""}[45s])
+            and
+            (timestamp(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""})
+            == on (UUID, gpu, Hostname, node) group_left
+            max by (UUID, gpu, Hostname, node) (timestamp(DCGM_FI_PROF_GR_ENGINE_ACTIVE{odh_dcgm_source="verified", odh_dcgm_workload_namespace!="", odh_dcgm_workload_pod!=""}))))
+          labels:
+            vendor: nvidia
+{{- if .ClusterName }}
+            cluster: {{ printf "%q" .ClusterName }}
+{{- end }}
+    # Tier 2: attribution enrichment from kube-state-metrics, federated from
+    # platform Prometheus into the metrics/federation pipeline. Both metadata
+    # selectors require the odh_federation_source provenance marker: only the
+    # trusted federation receiver stamps it, the resource-only ServiceMonitor
+    # keeps only marked series, and every other pipeline strips it, so a
+    # workload-exposed kube_pod_labels/kube_pod_owner cannot redirect queue
+    # attribution, suppress the queueless fallback, or duplicate the join
+    # right-hand side (which would fail rule evaluation). The or/unless
+    # left-join keeps non-Kueue pods counted with the queue labels absent
+    # (not zeroed, not dropped); if KSM data is missing entirely the rules
+    # degrade to Tier 1 passthrough.
+    - name: rhoai.accelerator.attribution_enrichment
+      interval: 15s
+      rules:
+        # Kueue queue attribution. The federation matcher filters
+        # kube_pod_labels to Kueue-managed pods, bounding cardinality.
+        - record: accelerator_gpu_hours_allocated_kueue
+          expr: (accelerator_gpu_hours_allocated * on (namespace, pod) group_left (label_kueue_x_k8s_io_cluster_queue_name, label_kueue_x_k8s_io_local_queue_name) kube_pod_labels{odh_federation_source="model-resources", label_kueue_x_k8s_io_cluster_queue_name=~".+"}) or (accelerator_gpu_hours_allocated unless on (namespace, pod) kube_pod_labels{odh_federation_source="model-resources", label_kueue_x_k8s_io_cluster_queue_name=~".+"})
+          labels:
+            vendor: nvidia
+{{- if .ClusterName }}
+            cluster: {{ printf "%q" .ClusterName }}
+{{- end }}
+        # Owner map scoped to GPU-attributed pods only, so kube_pod_owner
+        # cardinality stays proportional to GPU workloads, not cluster size.
+        # Same provenance restriction as the Kueue join above.
+        - record: accelerator_pod_owner
+          expr: sum by (namespace, pod, owner_kind, owner_name) (kube_pod_owner{odh_federation_source="model-resources"} and on (namespace, pod) (count by (namespace, pod) (accelerator_gpu_hours_allocated)))
+{{- if .ClusterName }}
+          labels:
+            cluster: {{ printf "%q" .ClusterName }}
+{{- end }}
+    # Tier 3: pre-aggregated billing shapes. High-cardinality labels (pod,
+    # UUID) are dropped except for the per-device shape. Groups evaluate
+    # independently of Tier 1/2; inputs are at most one 15s tick stale,
+    # negligible for these sums.
+    - name: rhoai.accelerator.allocation
+      interval: 15s
+      rules:
+        # Shape 2: GPU-hours per tenant (namespace) — primary billing metric.
+        # Instantaneously the number of allocated GPUs; integrated over a
+        # range with sum_over_time(m[d]) * 15 / 3600, tenant GPU-hours.
+        - record: accelerator_gpu_hours_allocated_by_namespace
+          expr: sum by (namespace) (accelerator_gpu_hours_allocated)
+          labels:
+            vendor: nvidia
+{{- if .ClusterName }}
+            cluster: {{ printf "%q" .ClusterName }}
+{{- end }}
+        # Shape 3: GPU-hours per cluster.
+        - record: accelerator_gpu_hours_allocated_by_cluster
+          expr: sum(accelerator_gpu_hours_allocated)
+          labels:
+            vendor: nvidia
+{{- if .ClusterName }}
+            cluster: {{ printf "%q" .ClusterName }}
+{{- end }}
+        # Shape 6: GPU-hours per GPU family (modelName).
+        - record: accelerator_gpu_hours_allocated_by_model
+          expr: sum by (modelName) (accelerator_gpu_hours_allocated)
+          labels:
+            vendor: nvidia
+{{- if .ClusterName }}
+            cluster: {{ printf "%q" .ClusterName }}
+{{- end }}
+        # Shape 7: GPU-hours per device (keeps UUID, drops pod).
+        - record: accelerator_gpu_hours_allocated_by_device
+          expr: sum by (namespace, modelName, UUID) (accelerator_gpu_hours_allocated)
+          labels:
+            vendor: nvidia
+{{- if .ClusterName }}
+            cluster: {{ printf "%q" .ClusterName }}
+{{- end }}
+        # Kueue slice of Shape 2; non-Kueue pods appear as the queueless series.
+        - record: accelerator_gpu_hours_allocated_by_namespace_queue
+          expr: sum by (namespace, label_kueue_x_k8s_io_cluster_queue_name) (accelerator_gpu_hours_allocated_kueue)
+          labels:
+            vendor: nvidia
+{{- if .ClusterName }}
+            cluster: {{ printf "%q" .ClusterName }}
+{{- end }}
+        - record: accelerator_gpu_hours_utilized_by_namespace
+          expr: sum by (namespace) (accelerator_gpu_hours_utilized)
+          labels:
+            vendor: nvidia
+{{- if .ClusterName }}
+            cluster: {{ printf "%q" .ClusterName }}
+{{- end }}
+    # Scrape health: quantify DCGM Exporter availability gaps. up here is the
+    # collector's scrape report for the trusted DCGM job, forwarded through
+    # the collector; the DS Prometheus scrape renames its job label to
+    # exported_job. Informational only — billing rules never depend on it.
+    - name: rhoai.accelerator.scrape_health
+      interval: 15s
+      rules:
+        - record: accelerator_dcgm_scrape_up
+          expr: up{exported_job="rhoai-accelerator-metrics"}
+          labels:
+            vendor: nvidia
+{{- if .ClusterName }}
+            cluster: {{ printf "%q" .ClusterName }}
+{{- end }}
+        - record: accelerator_dcgm_scrape_availability
+          expr: max by (node, component) (avg_over_time(up{exported_job="rhoai-accelerator-metrics"}[3m]))
+          labels:
+            vendor: nvidia
+{{- if .ClusterName }}
+            cluster: {{ printf "%q" .ClusterName }}
+{{- end }}
+{{- end }}

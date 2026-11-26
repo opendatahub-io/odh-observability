@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/opendatahub-io/odh-platform-utilities/pkg/cluster"
@@ -157,6 +158,7 @@ func buildTemplateData(ctx context.Context, c client.Client, monitoring *v1alpha
 		"TempoStorage":                    false,
 		"Logs":                            monitoring.Spec.Logs != nil,
 		"AcceleratorMetrics":              monitoring.Spec.Metrics != nil,
+		"ClusterName":                     clusterName(ctx, c),
 		"OperatorNamespace":               operatorNamespace,
 		"OperatorName":                    getEnvOrDefault("OPERATOR_NAME", "odh-observability"),
 		"OperatorPodPrefix":               getEnvOrDefault("OPERATOR_POD_PREFIX", "odh-observability"),
@@ -891,6 +893,65 @@ func getEnvOrDefault(envVar, defaultVal string) string {
 		return v
 	}
 	return defaultVal
+}
+
+// lastClusterName preserves the last observed cluster identity across
+// transient Infrastructure lookup failures: one reconcile reads prod-a, the
+// next API call times out, and the operator must not strip the cluster label
+// from already-published recording-rule and MonitoringStack series until the
+// lookup recovers. Guarded for concurrent reconciles. The operator serves a
+// single cluster per process, so a package-level cache is the right scope.
+var lastClusterName struct {
+	sync.Mutex
+
+	name string
+}
+
+func rememberClusterName(name string) {
+	lastClusterName.Lock()
+	defer lastClusterName.Unlock()
+	lastClusterName.name = name
+}
+
+func recalledClusterName() string {
+	lastClusterName.Lock()
+	defer lastClusterName.Unlock()
+	return lastClusterName.name
+}
+
+// clusterName resolves the cluster identifier used by the accelerator
+// attribution recording rules and the MonitoringStack external labels: the
+// CLUSTER_NAME env var overrides, otherwise the OpenShift Infrastructure CR's
+// status.infrastructureName. A confirmed absence of the CRD or CR (vanilla
+// Kubernetes, or the CR not yet created) leaves the cluster label unset. An
+// unavailable API, in contrast, is not a failed observation: the last
+// successfully observed identity is preserved so a temporary lookup failure
+// cannot unlabel already-published series.
+func clusterName(ctx context.Context, c client.Client) string {
+	if name := getEnvOrDefault("CLUSTER_NAME", ""); name != "" {
+		return name
+	}
+
+	infra := &unstructured.Unstructured{}
+	infra.SetGroupVersionKind(gvk.Infrastructure)
+
+	if err := c.Get(ctx, client.ObjectKey{Name: "cluster"}, infra); err != nil {
+		// A missing CRD or CR just means no cluster label; anything else is
+		// an unavailable API, not a failed observation, so the established
+		// identity stands until the lookup recovers. Either way the
+		// reconcile must never fail.
+		if k8serr.IsNotFound(err) || meta.IsNoMatchError(err) {
+			rememberClusterName("")
+			return ""
+		}
+		logf.FromContext(ctx).Error(err, "Failed to read Infrastructure CR, keeping last observed cluster name",
+			"lastObserved", recalledClusterName())
+		return recalledClusterName()
+	}
+
+	name, _, _ := unstructured.NestedString(infra.Object, "status", "infrastructureName")
+	rememberClusterName(name)
+	return name
 }
 
 // getPersesImage returns the Perses image from environment variable or default.

@@ -222,6 +222,17 @@ spec:
                   # runtime CPU usage or an individual container's CPU limit.
                   - '{__name__="kube_resourcequota", resource=~"cpu|requests[.]cpu|limits[.]cpu", type=~"hard|used"}'
                   - '{__name__="kube_pod_container_resource_limits", resource="cpu", unit="core"}'
+                  # Kueue attribution for the accelerator GPU-hours recording
+                  # rules, gated on the same condition as the rules that
+                  # consume them: with attribution disabled no rule joins
+                  # these series and federating them is pure ingestion cost.
+                  # Filtering kube_pod_labels to Kueue-managed pods bounds
+                  # its cardinality; kube_pod_owner is one series per pod
+                  # and is scoped to GPU pods by the recording rules.
+                  {{- if and .AcceleratorMetrics .BuiltinDCGMScrapeEnabled }}
+                  - '{__name__="kube_pod_labels", label_kueue_x_k8s_io_cluster_queue_name=~".+"}'
+                  - '{__name__="kube_pod_owner"}'
+                  {{- end }}
               bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
               tls_config:
                 ca_file: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
@@ -397,6 +408,20 @@ spec:
           key_file: "/etc/otel-collector/tls/tls.key"
         resource_to_telemetry_conversion:
           enabled: true # by default resource attributes are dropped
+        # Expire stale series: without this the exporter serves its last
+        # label set for the default 5m after a workload releases a GPU (the
+        # exporter target stays alive, only the workload labels disappear),
+        # and every re-scrape stamps the zombie series fresh — so allocation
+        # keeps being recorded for up to 5m after release. 90s is 3x the 30s
+        # scrape interval: it survives two missed scrapes with margin while
+        # bounding the release tail (and the dual-recording window when a GPU
+        # is immediately reassigned) to ~90s. Expiry removes the series from
+        # /metrics, so Prometheus writes its stale marker on the next scrape
+        # and rules and queries clear within one scrape. send_timestamps is
+        # deliberately NOT set: this exporter also serves tenant OTLP pushes
+        # and workload scrapes, exporter timestamps from skewed tenant clocks
+        # would be rejected as out-of-order and drop tenant metrics.
+        metric_expiration: 90s
       # A separate registry prevents workload-controlled metric descriptors
       # from colliding with the trusted federated metric families.
       prometheus/federation:
@@ -406,6 +431,11 @@ spec:
           key_file: "/etc/otel-collector/tls/tls.key"
         resource_to_telemetry_conversion:
           enabled: true
+        # Same expiry policy as the workload exporter above: without it,
+        # deleted pods keep serving kube_pod_labels/kube_pod_owner series
+        # here for the default 5m after the platform Prometheus stops
+        # supplying them.
+        metric_expiration: 90s
       {{- end }}
       {{- if .MetricsExporterNames }}
       {{- range .MetricsExporterNames }}

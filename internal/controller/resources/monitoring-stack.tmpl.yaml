@@ -9,6 +9,12 @@ spec:
   logLevel: debug
   prometheusConfig:
     enableOtlpHttpReceiver: true
+{{- if .ClusterName }}
+    # Stable cluster identity for multi-cluster federation and the
+    # per-cluster GPU-hours recording rule (Shape 3).
+    externalLabels:
+      cluster: {{ printf "%q" .ClusterName }}
+{{- end }}
     persistentVolumeClaim:
       resources:
         requests:
