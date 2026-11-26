@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: sebrandon1/tls-config-lint@109befab109c2bfdc9b3e151d6d53996ec2cf9a8 # v1.2.3
+      - uses: sebrandon1/tls-config-lint@03bba30890c2d9fa659e85c0d9ec2aeb11f76bb0 # v1.2.5
         id: lint
         with:
           severity-threshold: high
