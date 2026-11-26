@@ -8,6 +8,7 @@ metadata:
   namespace: {{.Namespace}}
   labels:
     platform.opendatahub.io/part-of: monitoring
+    platform.opendatahub.io/component: perses-prometheus
   annotations:
     platform.opendatahub.io/description: "Data Science metrics via namespace-enforcing Thanos proxy"
 spec:

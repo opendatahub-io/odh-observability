@@ -1470,7 +1470,7 @@ func TestDeployPersesPrometheusIntegrationSelectsDatasourceTemplates(t *testing.
 			conditionsManager := conditions.NewConditionsManager(monitoring, monitoring.Generation)
 			var sources []rendertemplate.TemplateSource
 
-			err := deployPersesPrometheusIntegration(
+			_, err := deployPersesPrometheusIntegration(
 				context.Background(),
 				fake.NewClientBuilder().WithScheme(scheme).Build(),
 				monitoring,
