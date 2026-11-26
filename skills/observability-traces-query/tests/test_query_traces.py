@@ -345,6 +345,42 @@ class QueryTracesTests(unittest.TestCase):
                 load.assert_not_called()
                 request.assert_not_called()
 
+    def test_rejects_duration_with_traceql_filters_before_discovery(self) -> None:
+        for trace_option, value in (("--status", "error"), ("--query", "{}")):
+            for duration_option in ("--min-duration", "--max-duration"):
+                with self.subTest(trace_option=trace_option, duration_option=duration_option):
+                    args = search_args(**{trace_option[2:]: value, duration_option[2:].replace("-", "_"): "1s"})
+                    for action in (
+                        lambda: query_traces.query_metadata(args, "search"),
+                        lambda: query_traces.build_request(inventory()["query_endpoints"][0], args, {"mode": "search"}),
+                    ):
+                        with self.assertRaises(query_traces.QueryError) as context:
+                            action()
+                        self.assertEqual(context.exception.kind, "invalid_argument")
+
+                    output = io.StringIO()
+                    with (patch("query_traces.load_inventory") as load,
+                          patch("query_traces.request_tempo") as request,
+                          redirect_stdout(output)):
+                        result = query_traces.main([
+                            "--inventory", "inventory.json", "--search", "--start", "1", "--end", "2",
+                            trace_option, value, duration_option, "1s",
+                        ])
+                    self.assertEqual(result, 2)
+                    self.assertEqual(json.loads(output.getvalue())["error"]["type"], "invalid_argument")
+                    load.assert_not_called()
+                    request.assert_not_called()
+
+    @patch.dict(os.environ, {"TRACE_TOKEN": "test-token"})
+    def test_tag_search_accepts_duration_filters(self) -> None:
+        args = search_args(tag=["http.method=GET"], min_duration="1s", max_duration="5s")
+        metadata = query_traces.query_metadata(args, "search")
+        url, _ = query_traces.build_request(inventory()["query_endpoints"][0], args, metadata)
+        params = parse_qs(urlsplit(url).query)
+        self.assertEqual(params["minDuration"], ["1s"])
+        self.assertEqual(params["maxDuration"], ["5s"])
+        self.assertNotIn("q", params)
+
     @patch.dict(os.environ, {"TRACE_TOKEN": "test-token"})
     def test_query_without_tags_builds_traceql_request(self) -> None:
         args = search_args(query='{ .http.method = "GET" }')

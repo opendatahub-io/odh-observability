@@ -117,6 +117,27 @@ class DiscoverEndpointsTests(unittest.TestCase):
             )
         )
 
+    def test_cluster_service_name_requires_full_current_namespace_dns(self) -> None:
+        self.assertEqual(
+            discover_endpoints.cluster_service_name(
+                urlsplit("https://gateway.monitoring.svc.cluster.local:8080/path"),
+                "monitoring",
+            ),
+            "gateway",
+        )
+        for hostname in (
+            "gateway.other.svc.cluster.local",
+            "gateway.monitoring.svc.cluster.local.attacker.example",
+            "gateway.extra.monitoring.svc.cluster.local",
+            "gateway.monitoring.svc",
+        ):
+            with self.subTest(hostname=hostname):
+                self.assertIsNone(
+                    discover_endpoints.cluster_service_name(
+                        urlsplit(f"https://{hostname}:8080/path"), "monitoring"
+                    )
+                )
+
     @patch.object(discover_endpoints, "discover")
     def test_dsci_unavailability_is_failure(self, mock_discover: object) -> None:
         mock_discover.return_value = {"unavailable": [{"component": "dsci"}]}  # type: ignore[attr-defined]
