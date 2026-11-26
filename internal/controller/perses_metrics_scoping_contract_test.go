@@ -118,6 +118,56 @@ func TestPersesMetricsScopingContract_ClusterPrometheusUsesCallerTokenNotSharedS
 	}
 }
 
+// TestPersesMetricsScopingContract_DataScienceClusterDatasourceUsesAuthorizedProxyHub
+// locks the cluster-wide Data Science lane: it goes through the proxy (never
+// straight to the querier), carries no namespace projection, and is not the
+// default. accelerator_* is only reachable here: the scoped lane projects
+// namespace=<selected>, and the series carry the collector's namespace instead
+// of a workload one.
+func TestPersesMetricsScopingContract_DataScienceClusterDatasourceUsesAuthorizedProxyHub(t *testing.T) {
+	t.Parallel()
+
+	for _, apiVersion := range []string{"v1alpha1", "v1alpha2"} {
+		t.Run(apiVersion, func(t *testing.T) {
+			t.Parallel()
+			resources := renderObservabilityTemplate(t, PersesDatasourceDataScienceClusterTemplate, map[string]any{
+				"Namespace":        testMonitoringNamespace,
+				"PersesAPIVersion": apiVersion,
+			})
+			datasource := findRenderedResource(t, resources, "PersesDatasource", "data-science-cluster-prometheus-datasource")
+
+			url, found, err := unstructured.NestedString(datasource.Object, "spec", "config", "plugin", "spec", "proxy", "spec", "url")
+			wantURL := "https://data-science-thanos-querier-proxy." + testMonitoringNamespace + ".svc.cluster.local:8444"
+			if err != nil || !found || url != wantURL {
+				t.Fatalf("cluster-wide DS datasource must use the proxy's :8444 lane: found=%t got=%q want=%q error=%v", found, url, wantURL, err)
+			}
+			if strings.Contains(url, ":10902") || strings.Contains(url, "thanos-querier-data-science-thanos-querier") {
+				t.Fatalf("cluster-wide DS datasource must not bypass to raw Thanos :10902, got %q", url)
+			}
+
+			defaultValue, found, err := unstructured.NestedBool(datasource.Object, "spec", "config", "default")
+			if err != nil || !found || defaultValue {
+				t.Fatalf("cluster-wide DS datasource must not be default (the scoped one is): found=%t value=%t error=%v", found, defaultValue, err)
+			}
+			if _, found, err := unstructured.NestedMap(datasource.Object, "spec", "config", "plugin", "spec", "queryParams"); err != nil {
+				t.Fatalf("reading cluster-wide DS datasource queryParams: %v", err)
+			} else if found {
+				t.Fatal("cluster-wide DS datasource must not force a namespace= query param")
+			}
+
+			enableTLS, found, err := unstructured.NestedBool(datasource.Object, "spec", "client", "tls", "enable")
+			if err != nil || !found || !enableTLS {
+				t.Fatalf("cluster-wide DS datasource must enable TLS: found=%t value=%t error=%v", found, enableTLS, err)
+			}
+			for _, resource := range resources {
+				if resource.GetKind() == "Secret" {
+					t.Fatalf("cluster-wide DS datasource must not render a bearer Secret (caller token), found %q", resource.GetName())
+				}
+			}
+		})
+	}
+}
+
 func TestPersesMetricsScopingContract_TenancyDatasourceNotDefault(t *testing.T) {
 	t.Parallel()
 
@@ -200,6 +250,7 @@ func TestPersesMetricsScopingContract_NetworkPoliciesBlockDirectThanosBypass(t *
 		t.Fatalf("Thanos proxy NetworkPolicy must allow gateway + Perses, got %d rules", len(ingress))
 	}
 	persesAllowed := false
+	clusterWideAllowed := false
 	for _, rawRule := range ingress {
 		rule := asMap(t, rawRule)
 		fromValues, ok := rule["from"].([]any)
@@ -217,16 +268,26 @@ func TestPersesMetricsScopingContract_NetworkPoliciesBlockDirectThanosBypass(t *
 				continue
 			}
 			if labels["instance"] == "data-science-perses" && labels["app.kubernetes.io/name"] == "data-science-perses" {
-				persesAllowed = true
+				// Both lanes terminate at the proxy: 8443 for the namespace-scoped
+				// view, 8444 for the cluster-wide view accelerator_* needs. Neither
+				// reaches the querier's :10902 directly.
 				ports, ok := rule["ports"].([]any)
-				if !ok || len(ports) != 1 || asMap(t, ports[0])["port"] != int64(8443) {
-					t.Fatalf("Perses may only reach the authorized proxy on 8443, got %#v", rule["ports"])
+				if !ok || len(ports) != 1 {
+					t.Fatalf("each Perses rule must allow exactly one proxy port, got %#v", rule["ports"])
+				}
+				switch port := asMap(t, ports[0])["port"]; port {
+				case int64(8443):
+					persesAllowed = true
+				case int64(8444):
+					clusterWideAllowed = true
+				default:
+					t.Fatalf("Perses may only reach the authorized proxy on 8443 or 8444, got %v", port)
 				}
 			}
 		}
 	}
-	if !persesAllowed {
-		t.Fatal("Thanos proxy NetworkPolicy must allow Perses pods on port 8443")
+	if !persesAllowed || !clusterWideAllowed {
+		t.Fatalf("Thanos proxy NetworkPolicy must allow Perses on both lanes: scoped=%t cluster-wide=%t", persesAllowed, clusterWideAllowed)
 	}
 }
 
@@ -256,6 +317,7 @@ func TestPersesMetricsScopingContract_DeploySelectsOnlyScopedDatasources(t *test
 	wantPersesDatasources := []string{
 		PersesDatasourceClusterPrometheusTemplate,
 		PersesDatasourceClusterPrometheusTenancyTemplate,
+		PersesDatasourceDataScienceClusterTemplate,
 		PersesDatasourcePrometheusTemplate,
 	}
 	assertTemplatePaths(t, sources, wantPersesDatasources)
@@ -283,6 +345,7 @@ func TestPersesDatasourceApplyOrder_SortKeepsNonDefaultFirst(t *testing.T) {
 	// Reverse of the desired apply order — sort must still put cluster* first.
 	input := []unstructured.Unstructured{
 		mk("data-science-prometheus-datasource"),
+		mk("data-science-cluster-prometheus-datasource"),
 		mk("cluster-prometheus-tenancy-datasource"),
 		mk("cluster-prometheus-datasource"),
 	}
@@ -293,6 +356,7 @@ func TestPersesDatasourceApplyOrder_SortKeepsNonDefaultFirst(t *testing.T) {
 	want := []string{
 		"cluster-prometheus-datasource",
 		"cluster-prometheus-tenancy-datasource",
+		"data-science-cluster-prometheus-datasource",
 		"data-science-prometheus-datasource",
 	}
 	if len(sorted) != len(want) {

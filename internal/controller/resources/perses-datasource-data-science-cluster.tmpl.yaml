@@ -1,0 +1,40 @@
+# Cluster-wide view of the DATA SCIENCE stack (proxy :8444), not OCP monitoring.
+# Caller token, no shared SA. default:false so the namespace-scoped DS proxy
+# remains the default. Authorized by explicit cluster-wide metrics access to
+# the OpenShift k8s Prometheus API, not by node-metrics access alone.
+#
+# This lane exists for fleet and unattributed series the namespace-scoped
+# proxy cannot serve. Verified built-in DCGM samples are promoted to canonical
+# namespace/pod labels and are available through the namespace-scoped DS lane;
+# unattributed accelerator_* devices remain cluster-wide fleet health data.
+apiVersion: perses.dev/{{.PersesAPIVersion}}
+kind: PersesDatasource
+metadata:
+  name: data-science-cluster-prometheus-datasource
+  namespace: {{.Namespace}}
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+  annotations:
+    platform.opendatahub.io/description: "Cluster-wide Data Science metrics via the authorized Thanos proxy (caller token)"
+spec:
+  client:
+    tls:
+      enable: true
+      caCert:
+        type: configmap
+        namespace: {{.Namespace}}
+        name: prometheus-web-tls-ca
+        certPath: service-ca.crt
+  config:
+    default: false
+    display:
+      name: "Data Science Prometheus (cluster-wide)"
+      description: "Data Science Thanos Querier without namespace projection - cluster-wide series such as accelerator_* (caller token)"
+    plugin:
+      kind: "PrometheusDatasource"
+      spec:
+        proxy:
+          kind: HTTPProxy
+          spec:
+            secret: data-science-cluster-prometheus-datasource-secret
+            url: https://data-science-thanos-querier-proxy.{{.Namespace}}.svc.cluster.local:8444

@@ -59,6 +59,19 @@ data:
         resource: pods
         verb: get
         namespace: "{{ "{{ .Value }}" }}"
+  kube-rbac-proxy-admin.yaml: |
+    # Cluster-wide lane (port 8444). The caller proves access to cluster-level
+    # metrics before the query is forwarded unmodified. Node metrics access is
+    # not sufficient here: unlike the /metrics-only cluster proxy, this lane
+    # exposes PromQL. Require the same explicit OpenShift metrics permission
+    # that cluster-monitoring-view grants on the k8s Prometheus API.
+    authorization:
+      resourceAttributes:
+        apiGroup: monitoring.coreos.com
+        resource: prometheuses
+        subresource: api
+        name: k8s
+        verb: get
 ---
 # REQUIRED QUERY FORMAT: /api/v1/query?query=<promql>&namespace=<namespace-name>
 #
@@ -184,6 +197,86 @@ spec:
                 - ALL
             readOnlyRootFilesystem: true
             runAsNonRoot: true
+        # Cluster-wide lane into the same querier, kept in this pod so it reuses
+        # the service account, TLS material and NetworkPolicy that already exist.
+        # No prom-label-proxy here: there is no namespace matcher to enforce, and
+        # the projection it performs is exactly what hides accelerator_* series.
+        - name: method-gate-admin
+          image: {{.HTTPMethodGateImage}}
+          command:
+            - /manager
+            - method-gate
+          args:
+            - --listen=127.0.0.1:9093
+            - --upstream=http://thanos-querier-data-science-thanos-querier.{{.Namespace}}.svc.cluster.local:10902
+            # Perses sends PromQL as a form POST. Read-only endpoints only; the
+            # admin lane needs no namespace-in-body defence because it does not
+            # authorize per namespace.
+            - --allow-form-post
+          ports:
+            # 15 characters max: the API server rejects longer container port
+            # names outright, and that fails the whole Deployment apply.
+            - containerPort: 9093
+              name: admin-gate
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 100m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          terminationMessagePolicy: FallbackToLogsOnError
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+        - name: kube-rbac-proxy-admin
+          image: {{.KubeRBACProxyImage}}
+          args:
+            - --secure-listen-address=0.0.0.0:8444
+            - --upstream=http://127.0.0.1:9093/
+            - --config-file=/etc/kube-rbac-proxy/kube-rbac-proxy-admin.yaml
+            - --tls-cert-file=/etc/tls/private/tls.crt
+            - --tls-private-key-file=/etc/tls/private/tls.key
+            - --tls-min-version={{.TLSMinVersion}}
+            {{- if .TLSCipherSuites}}
+            - --tls-cipher-suites={{.TLSCipherSuites}}
+            {{- end}}
+            {{- if .TLSCurvePreferences}}
+            - --tls-curve-preferences={{.TLSCurvePreferences}}
+            {{- end}}
+            - --logtostderr=true
+            - --v=2
+          ports:
+            - containerPort: 8444
+              name: https-admin
+              protocol: TCP
+          resources:
+            limits:
+              cpu: 100m
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          terminationMessagePolicy: FallbackToLogsOnError
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kube-rbac-proxy
+              readOnly: true
+            - name: tls
+              mountPath: /etc/tls/private
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
       volumes:
         - name: config
           configMap:
@@ -213,5 +306,10 @@ spec:
       port: 8443
       protocol: TCP
       targetPort: https
+    # Cluster-wide lane. Not exposed through the Route: only Perses queries it.
+    - name: https-admin
+      port: 8444
+      protocol: TCP
+      targetPort: https-admin
   selector:
     app: data-science-thanos-querier-proxy

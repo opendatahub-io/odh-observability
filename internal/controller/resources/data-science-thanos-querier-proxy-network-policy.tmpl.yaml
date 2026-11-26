@@ -37,3 +37,13 @@ spec:
       ports:
         - protocol: TCP
           port: 8443
+    # Cluster-wide lane. Perses only: the Route publishes :8443 alone, so this
+    # port is never reachable from outside the cluster.
+    - from:
+        - podSelector:
+            matchLabels:
+              instance: data-science-perses
+              app.kubernetes.io/name: data-science-perses
+      ports:
+        - protocol: TCP
+          port: 8444
