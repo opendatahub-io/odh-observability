@@ -260,6 +260,18 @@ ResourceQuota `used` is quota-accounted requests or limits, not measured CPU con
 - Upgrade: the reconciler removes legacy Kubernetes SA-token Secrets with these datasource names only when they are owned by the current Monitoring resource and reference the old cluster-proxy service account. Perses operator manages separate Perses API secrets for the datasource TLS configuration.
 - Observe UI / gateway → Perses ingress is owned by Dashboard (`dashboard-perses-access`), not this operator.
 
+### Application log query RBAC
+
+`loki-application-logs-rbac.tmpl.yaml` renders `data-science-application-logs-view`: `get` on `loki.grafana.com/application` named `logs`, aggregated into OpenShift `admin`/`edit`/`view`. We do **not** create a ClusterRoleBinding for this role; Stage-1 arrives through existing bindings to those aggregated roles. Namespaced RoleBindings authorize SARs in that namespace only.
+
+**Cluster-wide vs project:** Auth already ships cluster-wide Stage-1 on `data-science-admingroupcluster-role` (bound to the platform admin group). This Monitoring-owned role is additive project RBAC only and must not rewrite that Auth ClusterRole.
+
+**Product tradeoff:** Kubernetes role aggregation cannot be limited to namespaced RoleBindings. Any pre-existing ClusterRoleBinding to `admin`/`edit`/`view` also gains Stage-1. Accepted for this design (same mechanism OpenShift uses for aggregated API extensions).
+
+Lifecycle is owned by log forwarding (`spec.logs`): the role is created/removed with that stack. The rule has no LokiStack identity, so while it exists any `openshift-logging` tenant-mode gateway — including the usage-logs stack — can accept Stage-1; Stage-2 (OPA) still limits returned data to the caller's namespaces. Removing `spec.logs` removes the role even if `spec.usageLogs` remains.
+
+**Usage-log read path:** because Stage-1 is shared and OPA only filters by namespace, the usage-logs gateway NetworkPolicy must not admit `openshift-console`. Tenant reads go through the MaaS usage-tenancy-proxy (org/user filters); Perses remains for operator dashboards.
+
 ### Korrel8r (Signal Correlation)
 
 | Template | Resources Created |

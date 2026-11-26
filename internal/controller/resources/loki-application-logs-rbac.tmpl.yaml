@@ -1,0 +1,29 @@
+# Project Stage-1: aggregate get application.loki.grafana.com/logs into OpenShift
+# admin/edit/view. No ClusterRoleBinding created here.
+# Cluster-wide Stage-1 stays on Auth's data-science-admingroupcluster-role — do
+# not rewrite that role. Tradeoff: aggregation also expands existing CRBs to
+# admin/edit/view (Kubernetes cannot scope aggregation to namespaced RoleBindings).
+#
+# Owned by spec.logs. No LokiStack identity, so usage-logs gateways also accept
+# Stage-1 while the role exists; Stage-2 (OPA) still NS-filters. Usage-log
+# reads stay on the MaaS tenancy proxy / Perses path — the usage gateway NP
+# must not admit openshift-console (would bypass org/user filters).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: data-science-application-logs-view
+  labels:
+    platform.opendatahub.io/part-of: monitoring
+    platform.opendatahub.io/component: loki-logs
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+  - apiGroups:
+      - loki.grafana.com
+    resources:
+      - application
+    resourceNames:
+      - logs
+    verbs:
+      - get
