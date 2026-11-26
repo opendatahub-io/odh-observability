@@ -93,12 +93,38 @@ Pass test flags through `E2E_TEST_FLAGS` for local Make targets. The container r
 | `-upgrade-coo-channel` | _(empty)_ | Target OLM channel for COO; empty skips the COO upgrade step |
 | `-upgrade-tempo-channel` | _(empty)_ | Target OLM channel for Tempo Operator; empty skips the Tempo upgrade step |
 | `-upgrade-report` | _(empty)_ | Optional JSON report path under `ARTIFACTS` / `E2E_ARTIFACTS` / `e2e-artifacts` (always logged when the test finishes) |
+| `-ai-grid-enabled` | `false` | Enable `TestAIGridObservability` (`E2E_TEST_AI_GRID_ENABLED`); the AI Grid Make target sets this to `true` |
+| `-ai-grid-config` | _(empty)_ | Three-cluster YAML configuration path (`E2E_TEST_AI_GRID_CONFIG`), required when AI Grid is enabled |
 
 `TestCOOVersionCompatibility` always requires COO CSV prefix `cluster-observability-operator.v1.5`, RHOAI CSV prefix `rhods-operator.3.6`, the RHOAI-pinned Perses image digest, and Perses plus Prometheus dashboard proxy checks. Those requirements are not configurable.
 
 ### Bumping the release gate (e.g. RHOAI 3.7 / COO 1.6)
 
 Edit the `releaseGateContract` struct in `tests/e2e/config_test.go` (three fields only). In the same PR: update `TestReleaseGateCOOCSVVersions` / `TestReleaseGateRHOAICSVVersions` expected pass/fail examples if the minor version changes, align `PersesImage` with the operator’s pinned Perses default when that moves, run `make e2e-test-coo-compatibility` on a clean target cluster, and link the PR to the release milestone. No flags or `E2E_TEST_*` overrides—reviewers see the version bump in one diff hunk.
+
+### AI Grid hub and two-spoke OATS test
+
+`make e2e-test-ai-grid` runs the opt-in `TestAIGridObservability` suite against an
+externally prepared three-cluster environment. It provisions temporary Grafana
+datasources for ACM Thanos and hub Loki, sends identifiable inference traffic on
+both spokes, and asserts organization-attributed metrics and usage logs using
+OATS. It creates a fresh MaaS policy/subscription/key per spoke and removes them
+after each case. The expected tenant label is `organization_id`.
+
+Opt in with `-ai-grid-enabled=true` or `E2E_TEST_AI_GRID_ENABLED=true`, and
+provide the configuration through `-ai-grid-config` or `E2E_TEST_AI_GRID_CONFIG`.
+The dedicated Make target enables the suite automatically. A configuration path
+alone does not opt in.
+
+The isolated helper package and its regression tests are in [aigrid/](aigrid/).
+The standard unit-test targets explicitly include them without running the live
+three-cluster suite.
+
+- [Expected three-cluster environment, credentials and permissions](oats/ai-grid/README.md#expected-test-environment)
+- [Opt-in commands and configuration example](oats/ai-grid/README.md#opt-in-and-run)
+- [Created resources and automatic cleanup](oats/ai-grid/README.md#resources-and-lifecycle)
+- [MaaS certificate troubleshooting and temporary HTTPS proxy workaround](oats/ai-grid/README.md#troubleshooting)
+- [Recovery after failure or an interrupted runner](oats/ai-grid/README.md#cleanup-after-failure-or-interruption)
 
 ### Inference test namespaces
 

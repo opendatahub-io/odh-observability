@@ -44,6 +44,8 @@ type TestContextConfig struct {
 	upgradeCOOChannel       string
 	upgradeTempoChannel     string
 	upgradeReport           string
+	aiGridEnabled           bool
+	aiGridConfig            string
 	Timeouts                TestTimeouts
 }
 
@@ -69,6 +71,8 @@ func (c *TestContextConfig) registerFlags() {
 	flag.StringVar(&c.upgradeCOOChannel, "upgrade-coo-channel", "", "target OLM channel for Cluster Observability Operator (empty skips COO upgrade)")
 	flag.StringVar(&c.upgradeTempoChannel, "upgrade-tempo-channel", "", "target OLM channel for Tempo Operator (empty skips Tempo upgrade)")
 	flag.StringVar(&c.upgradeReport, "upgrade-report", "", "optional path to write JSON upgrade survivability diagnostics (always logged on failure)")
+	flag.BoolVar(&c.aiGridEnabled, "ai-grid-enabled", false, "enable TestAIGridObservability; requires -ai-grid-config")
+	flag.StringVar(&c.aiGridConfig, "ai-grid-config", "", "path to the three-cluster AI Grid YAML configuration")
 
 	flag.DurationVar(&c.Timeouts.defaultEventuallyTimeout, "eventually-timeout", 0, "default eventually timeout")
 	flag.DurationVar(&c.Timeouts.defaultEventuallyPollInterval, "eventually-poll-interval", 0, "default eventually poll interval")
@@ -82,6 +86,9 @@ func (c *TestContextConfig) validate() error {
 	case APIModeModule, APIModeDSC:
 	default:
 		return fmt.Errorf("invalid api-mode %q: must be %q or %q", c.apiMode, APIModeModule, APIModeDSC)
+	}
+	if c.aiGridEnabled && strings.TrimSpace(c.aiGridConfig) == "" {
+		return errors.New("ai-grid-enabled requires -ai-grid-config or E2E_TEST_AI_GRID_CONFIG")
 	}
 	if c.compatibilityReport != "" {
 		if _, err := resolveCompatibilityReportPath(c.compatibilityReport); err != nil {
